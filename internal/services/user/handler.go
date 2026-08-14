@@ -1,0 +1,446 @@
+package user
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+)
+
+// Handler 暴露用户 HTTP 接口。
+type Handler struct {
+	svc      *Service
+	verifier *middleware.TokenVerifier
+}
+
+// NewHandler 构造 handler。
+func NewHandler(svc *Service, verifier *middleware.TokenVerifier) *Handler {
+	return &Handler{svc: svc, verifier: verifier}
+}
+
+// Register 路由。
+func (h *Handler) Register(r *gin.Engine) {
+	// 健康检查（免鉴权，供管理后台 / 网关 / 探针探活）。
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "time": time.Now().Unix()})
+	})
+	g := r.Group("/api/v1/user")
+	// 公开路由
+	g.POST("/register", h.register)
+	g.POST("/send-code", h.sendCode)
+	g.POST("/verify", h.verify)
+	g.POST("/login", h.login)
+	g.POST("/refresh", h.refresh)
+	g.POST("/logout", h.logout)
+	g.POST("/forgot", h.forgot)
+	g.POST("/reset", h.reset)
+
+	// 鉴权路由（复用 T-01 的 HMAC 中间件）
+	auth := g.Group("")
+	auth.Use(middleware.Auth(h.verifier))
+	auth.GET("/me", h.me)
+	auth.POST("/tfa/setup", h.tfaSetup)
+	auth.POST("/tfa/enable", h.tfaEnable)
+	auth.POST("/tfa/disable", h.tfaDisable)
+	auth.POST("/kyc/submit", h.kycSubmit)
+	auth.GET("/kyc", h.kycGet)
+	auth.POST("/kyc/review", h.kycReview)
+
+	// 管理后台聚合接口（cmd/admin 以 admin token 调用；上游 Auth 不强制 role）。
+	auth.GET("/admin/list", h.adminList)
+	auth.POST("/admin", h.adminCreate)
+	auth.PUT("/admin/:id", h.adminUpdate)
+	auth.POST("/admin/:id/freeze", h.adminFreeze)
+	auth.POST("/admin/:id/unfreeze", h.adminUnfreeze)
+}
+
+func (h *Handler) register(c *gin.Context) {
+	var req struct {
+		Target   string `json:"target"`
+		Password string `json:"password"`
+		Code     string `json:"code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Target == "" || req.Password == "" || req.Code == "" {
+		response.Error(c, http.StatusBadRequest, 400, "target, password and code required")
+		return
+	}
+	id, err := h.svc.Register(req.Target, req.Password, req.Code)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"user_id": id, "message": "registered"})
+}
+
+func (h *Handler) sendCode(c *gin.Context) {
+	var req struct {
+		Target  string `json:"target"`
+		Purpose string `json:"purpose"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Target == "" || req.Purpose == "" {
+		response.Error(c, http.StatusBadRequest, 400, "target and purpose required")
+		return
+	}
+	if err := h.svc.SendCode(req.Target, req.Purpose); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"message": "code sent"})
+}
+
+func (h *Handler) verify(c *gin.Context) {
+	var req struct {
+		Target  string `json:"target"`
+		Code    string `json:"code"`
+		Purpose string `json:"purpose"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Target == "" || req.Code == "" {
+		response.Error(c, http.StatusBadRequest, 400, "target and code required")
+		return
+	}
+	if req.Purpose == "" {
+		req.Purpose = PurposeVerify
+	}
+	if err := h.svc.VerifyAccount(req.Target, req.Code, req.Purpose); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"message": "verified"})
+}
+
+func (h *Handler) login(c *gin.Context) {
+	var req struct {
+		Target  string `json:"target"`
+		Password string `json:"password"`
+		TFACode string `json:"tfa_code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Target == "" || req.Password == "" {
+		response.Error(c, http.StatusBadRequest, 400, "target and password required")
+		return
+	}
+	res, err := h.svc.Login(req.Target, req.Password, req.TFACode)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{
+		"access_token":  res.AccessToken,
+		"refresh_token": res.RefreshToken,
+		"expires_in":    res.ExpiresIn,
+		"user_id":       res.User.ID,
+		"kyc_level":     res.User.KYCLevel,
+		"tfa_enabled":   res.User.TFAEnabled,
+	})
+}
+
+func (h *Handler) refresh(c *gin.Context) {
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.RefreshToken == "" {
+		response.Error(c, http.StatusBadRequest, 400, "refresh_token required")
+		return
+	}
+	token, err := h.svc.Refresh(req.RefreshToken)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"access_token": token})
+}
+
+func (h *Handler) logout(c *gin.Context) {
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.RefreshToken == "" {
+		response.Error(c, http.StatusBadRequest, 400, "refresh_token required")
+		return
+	}
+	if err := h.svc.Logout(req.RefreshToken); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"message": "logged out"})
+}
+
+func (h *Handler) forgot(c *gin.Context) {
+	var req struct {
+		Target string `json:"target"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Target == "" {
+		response.Error(c, http.StatusBadRequest, 400, "target required")
+		return
+	}
+	if err := h.svc.ForgotPassword(req.Target); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"message": "if account exists, code sent"})
+}
+
+func (h *Handler) reset(c *gin.Context) {
+	var req struct {
+		Target      string `json:"target"`
+		Code        string `json:"code"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Target == "" || req.Code == "" || req.NewPassword == "" {
+		response.Error(c, http.StatusBadRequest, 400, "target, code and new_password required")
+		return
+	}
+	if err := h.svc.ResetPassword(req.Target, req.Code, req.NewPassword); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"message": "password reset"})
+}
+
+func (h *Handler) me(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, http.StatusUnauthorized, 401, "unauthorized")
+		return
+	}
+	u, kyc, err := h.svc.GetProfile(uid)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{
+		"user_id":        u.ID,
+		"email":          u.Email,
+		"phone":          u.Phone,
+		"status":         u.Status,
+		"kyc_level":      u.KYCLevel,
+		"tfa_enabled":    u.TFAEnabled,
+		"email_verified": u.EmailVerified,
+		"phone_verified": u.PhoneVerified,
+		"kyc":            kyc,
+	})
+}
+
+func (h *Handler) tfaSetup(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	secret, uri, err := h.svc.SetupTFA(uid)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"secret": secret, "otpauth_uri": uri, "message": "scan qr then enable with code"})
+}
+
+func (h *Handler) tfaEnable(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Code == "" {
+		response.Error(c, http.StatusBadRequest, 400, "code required")
+		return
+	}
+	if err := h.svc.EnableTFA(uid, req.Code); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"tfa_enabled": true})
+}
+
+func (h *Handler) tfaDisable(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Code == "" {
+		response.Error(c, http.StatusBadRequest, 400, "code required")
+		return
+	}
+	if err := h.svc.DisableTFA(uid, req.Code); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"tfa_enabled": false})
+}
+
+func (h *Handler) kycSubmit(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	var req KYCRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "bad request")
+		return
+	}
+	if err := h.svc.SubmitKYC(uid, req); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"kyc_level": int(KYCPending), "message": "kyc submitted"})
+}
+
+func (h *Handler) kycGet(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	_, kyc, err := h.svc.GetProfile(uid)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"kyc": kyc})
+}
+
+func (h *Handler) kycReview(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	_ = uid
+	var req struct {
+		UserID       int64  `json:"user_id"`
+		Approve      bool   `json:"approve"`
+		RejectReason string `json:"reject_reason"`
+		Reviewer     string `json:"reviewer"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.UserID == 0 {
+		response.Error(c, http.StatusBadRequest, 400, "user_id required")
+		return
+	}
+	if err := h.svc.ReviewKYC(req.UserID, req.Approve, req.RejectReason, req.Reviewer); err != nil {
+		fail(c, err)
+		return
+	}
+	level := int(KYCVerified)
+	if !req.Approve {
+		level = int(KYCRejected)
+	}
+	response.JSON(c, gin.H{"kyc_level": level, "message": "review done"})
+}
+
+// ---- 管理后台聚合接口 ----
+
+func (h *Handler) adminList(c *gin.Context) {
+	us, err := h.svc.ListAll()
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	out := make([]gin.H, 0, len(us))
+	for _, u := range us {
+		username := u.Email
+		if username == "" {
+			username = u.Phone
+		}
+		out = append(out, gin.H{
+			"id":         u.ID,
+			"username":   username,
+			"email":      u.Email,
+			"phone":      u.Phone,
+			"status":     int(u.Status),
+			"kyc_level":  int(u.KYCLevel),
+			"created_at": u.CreatedAt,
+		})
+	}
+	response.JSON(c, gin.H{"users": out})
+}
+
+func (h *Handler) adminCreate(c *gin.Context) {
+	var req struct {
+		Target  string `json:"target"`
+		Username string `json:"username"`
+		Email   string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "invalid body")
+		return
+	}
+	target := req.Target
+	if target == "" {
+		target = req.Email
+	}
+	if target == "" {
+		target = req.Username
+	}
+	if target == "" || req.Password == "" {
+		response.Error(c, http.StatusBadRequest, 400, "target and password required")
+		return
+	}
+	id, err := h.svc.AdminCreate(target, req.Password)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"id": id, "message": "user created"})
+}
+
+func (h *Handler) adminUpdate(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "invalid id")
+		return
+	}
+	var req struct {
+		Email     *string `json:"email"`
+		Status    *int    `json:"status"`
+		KYCLevel  *int    `json:"kyc_level"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "invalid body")
+		return
+	}
+	in := AdminUpdateInput{}
+	if req.Email != nil {
+		in.Email = req.Email
+	}
+	if req.Status != nil {
+		st := Status(*req.Status)
+		in.Status = &st
+	}
+	if req.KYCLevel != nil {
+		kl := KYCLevel(*req.KYCLevel)
+		in.KYCLevel = &kl
+	}
+	if err := h.svc.AdminUpdate(id, in); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"status": "ok"})
+}
+
+func (h *Handler) adminFreeze(c *gin.Context) {
+	h.adminSetStatus(c, true)
+}
+
+func (h *Handler) adminUnfreeze(c *gin.Context) {
+	h.adminSetStatus(c, false)
+}
+
+func (h *Handler) adminSetStatus(c *gin.Context, frozen bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "invalid id")
+		return
+	}
+	st := StatusNormal
+	if frozen {
+		st = StatusFrozen
+	}
+	if err := h.svc.SetStatus(id, st); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"status": "ok", "frozen": frozen})
+}
+
+// fail 把业务错误映射为 HTTP 响应。
+func fail(c *gin.Context, err error) {
+	switch err {
+	case ErrNotFound, ErrRefreshInvalid:
+		response.Error(c, http.StatusUnauthorized, 401, err.Error())
+	case ErrWrongPassword, ErrTFAFailed, ErrTFARequired:
+		response.Error(c, http.StatusUnauthorized, 401, err.Error())
+	case ErrUserExists, ErrInvalidCode, ErrCodeExpired, ErrCodeConsumed,
+		ErrTFANotEnabled, ErrKYCPending, ErrKYCNotPending, ErrInvalidAccount, ErrFrozen:
+		response.Error(c, http.StatusBadRequest, 400, err.Error())
+	default:
+		response.Error(c, http.StatusInternalServerError, 500, err.Error())
+	}
+}

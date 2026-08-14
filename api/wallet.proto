@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package crypto_exchange.api;
+
+option go_package = "github.com/coldlar/crypto-exchange/internal/gen/wallet";
+
+// Wallet 钱包总账对外 gRPC 服务（示例，演示 proto 代码生成链路）。
+service Wallet {
+  // 查询余额
+  rpc Balance(BalanceReq) returns (BalanceResp);
+  // 充值（生产来自链上充值网关回调）
+  rpc Deposit(DepositReq) returns (DepositResp);
+}
+
+message BalanceReq {
+  int64 user_id = 1;
+  string asset = 2;
+}
+
+message BalanceResp {
+  double available = 1;
+  double frozen = 2;
+  double withdraw_frozen = 3;
+}
+
+message DepositReq {
+  int64 user_id = 1;
+  string asset = 2;
+  double amount = 3;
+  string ref = 4;
+}
+
+message DepositResp {
+  bool ok = 1;
+  string message = 2;
+}
