@@ -1,0 +1,75 @@
+server:
+  port: 8080
+  mode: debug # debug | release
+  rate_limit_per_sec: 100        # 单实例每 IP 限流（req/s）
+  allowed_origins:              # 跨域白名单；为空则拒绝一切跨域
+    - "http://localhost:5173"    # ce-frontend 用户前端（dev）
+    - "http://localhost:5174"    # web-admin 管理后台前端（dev）
+  max_body_bytes: 1048576        # 请求体上限（1 MiB）
+  tls:
+    cert_file: ""                # 同时配置 cert/key 才启用 HTTPS
+    key_file: ""
+
+mysql:
+  # 远端 MySQL（sqlpub 托管）。注意：go-sql-driver 原生格式为 user:pass@tcp(host:port)/db?params，
+  # 不是 mysql:// 前缀。
+  # 库名必须用 wallet：该账号授权为 GRANT ALL ON wallet.*，crypto_exchange 库不存在且无建库权限。
+  # 驱动固定 v1.7.1：v1.10 与 sqlpub 代理(8.0.41-sqlpub-mysql-proxy)的 caching_sha2 明文认证不兼容
+  # （收到 AuthMoreData 后未做 RSA 公钥交换即误判成功 → unexpected EOF）；v1.7.1 默认即可完成 RSA 交换。
+  # 不要加 get_server_public_key 参数：v1.7.1 不识别该 DSN 参数（会当成会话变量 → 1193 错误）。
+  dsn: "wallet_user123x:1PBPz2pglouf2FdF@tcp(mysql6.sqlpub.com:3311)/wallet?charset=utf8mb4&parseTime=true"
+  max_open: 100
+  max_idle: 10
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+kafka:
+  brokers:
+    - "127.0.0.1:9092"
+  order_topic: "exchange.orders"
+  trade_topic: "exchange.trades"
+
+auth:
+  # Bearer Token 共享密钥（HMAC-SHA256）。生产务必从密钥管理注入并定期轮换，勿提交真实密钥。
+  # 也可通过环境变量 AUTH_SECRET 覆盖（优先级高于此处）。
+  secret: "dev-only-change-me"
+
+matching:
+  # 撮合引擎服务（cmd/matching）专用配置。
+  url: "http://127.0.0.1:8085"  # spot/futures 调用的匹配权威基址；空则匹配不可用
+  snapshot_interval_sec: 5     # 订单簿周期快照间隔（秒）
+  leader_ttl_sec: 10           # leader 租约时长（秒）；follower 在租约过期后竞争接管
+  # 预注册并对外提供服务的交易对；为空时取默认超集（现货+合约永续）。
+  symbols:
+    - BTC_USDT
+    - ETH_USDT
+    - BTC_USDT_PERP
+    - ETH_USDT_PERP
+
+services:
+  user: "http://127.0.0.1:8081"
+  spot: "http://127.0.0.1:8082"
+  market: "http://127.0.0.1:8083"
+  futures: "http://127.0.0.1:8084"
+  margin: "http://127.0.0.1:8087"
+  notification: "http://127.0.0.1:8088"
+  risk: "http://127.0.0.1:8089"
+  options: "http://127.0.0.1:8090"
+  otc: "http://127.0.0.1:8091"
+  wealth: "http://127.0.0.1:8092"
+  settlement: "http://127.0.0.1:8086"
+
+# 管理后台后端（cmd/admin）：仅 role=admin 的 token 可访问其 /api/admin/* 接口。
+admin:
+  addr: ":8095"                  # 监听地址（避开 services 段已占用的 8090）
+  username: "admin"             # 管理后台登录用户名
+  # password_hash 是登录口令的 bcrypt 哈希；比对走 bcrypt.CompareHashAndPassword，
+  # 不再使用明文口令。可通过环境变量 ADMIN_PASSWORD_HASH 覆盖（优先级高于此处）。
+  # 下面为口令 "admin123" 的 bcrypt 哈希（仅开发演示用，生产请替换）。
+  password_hash: "$2a$10$1whA6AwKmcb/6mLrQe0mPOBYY04TcCXmXHlNP2FdRyh/4HaCYJ7nG"
+  token_ttl_sec: 3600           # 签发的 admin token 有效期（秒）
+  allowed_origins:
+    - "http://localhost:5174"    # 管理后台前端来源

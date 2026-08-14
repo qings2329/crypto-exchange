@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package user;
+
+option go_package = "github.com/coldlar/crypto-exchange/api/user;userpb";
+
+service UserService {
+  rpc Register(RegisterReq) returns (RegisterResp);
+  rpc Login(LoginReq) returns (LoginResp);
+  rpc GetProfile(GetProfileReq) returns (Profile);
+}
+
+message RegisterReq {
+  string email = 1;
+  string password = 2;
+}
+
+message RegisterResp {
+  int64 user_id = 1;
+  string message = 2;
+}
+
+message LoginReq {
+  string email = 1;
+  string password = 2;
+}
+
+message LoginResp {
+  string token = 1;
+}
+
+message GetProfileReq {
+  int64 user_id = 1;
+}
+
+message Profile {
+  int64 user_id = 1;
+  string email = 2;
+  int32 kyc_level = 3;
+}

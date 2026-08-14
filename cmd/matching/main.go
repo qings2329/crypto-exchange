@@ -1,0 +1,366 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
+	"github.com/coldlar/crypto-exchange/internal/matching"
+	"github.com/coldlar/crypto-exchange/internal/matching/persist"
+	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
+	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
+	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+	"github.com/coldlar/crypto-exchange/internal/ws"
+)
+
+// cmd/matching 是撮合引擎的独立部署形态，演示「多实例单写者」：
+//   - 以 MySQL 为共享后端（ce_matching_* 表）时，多个进程同时启动，仅一个为 leader，
+//     负责写订单簿；其余为 follower（standby），leader 租约过期后竞争接管，接管时从
+//     快照+WAL 恢复，不丢单。
+//   - 未配置 MySQL 时使用内存 Store，退化为单实例（仍走 leader 选举逻辑，仅一个进程有效）。
+//
+// 这是撮合引擎支持多实例部署的权威形态，也是全交易所的「单一匹配权威」：
+// spot/futures 等服务改为调用本服务的 HTTP(+WS) API（见 DEVELOPMENT_TASKS §17/§18），
+// 从而把「匹配」收敛为单一可水平容灾的组件。本服务对外暴露：
+//   - POST /order      提交订单（leader-only），支持 user_id（强平/记账溯源）
+//   - POST /cancel     撤销订单（leader-only）
+//   - POST /match-now  同步撮合（leader-only），用于强平，返回真实成交
+//   - GET  /depth      订单簿深度（leader-only）
+//   - GET  /ws?symbol= 行情 WebSocket：按 symbol 推送成交与深度（symbol 空=全部）
+//   - GET  /health     健康与 leader 状态
+func main() {
+	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
+	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN (overrides config); empty=in-memory")
+	addr := flag.String("addr", ":8085", "HTTP listen addr")
+	nodeID := flag.String("node-id", "", "unique node id (default NODE_ID env or hostname-pid)")
+	flag.Parse()
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		panic(err)
+	}
+	log, _ := logger.New(cfg.Server.Mode)
+	defer func() { _ = log.Sync() }()
+
+	// 交易对集合：优先 config.Matching.Symbols，否则默认覆盖现货与合约永续。
+	symbols := cfg.Matching.Symbols
+	if len(symbols) == 0 {
+		symbols = []string{"BTC_USDT", "ETH_USDT", "BTC_USDT_PERP", "ETH_USDT_PERP"}
+	}
+
+	// 选择 Store：配置了 DSN 则用 MySQL（跑迁移），否则内存。
+	var store matching.Store
+	dsn := *mysqlDSN
+	if dsn == "" {
+		dsn = cfg.MySQL.DSN
+	}
+	if dsn != "" {
+		ms, merr := persist.NewMySQLStore(dsn)
+		if merr != nil {
+			log.Fatal("matching mysql store unavailable", zap.String("dsn", dsn), zap.Error(merr))
+		}
+		if err := migrate.New(ms.DB(), persist.Migrations()).Up(); err != nil {
+			log.Fatal("matching migration failed", zap.Error(err))
+		}
+		store = ms
+		log.Info("matching store: mysql", zap.String("dsn", dsn))
+		defer func() { _ = ms.Close() }()
+	} else {
+		store = persist.NewMemStore()
+		log.Info("matching store: in-memory (single instance)")
+	}
+
+	id := *nodeID
+	if id == "" {
+		id = os.Getenv("NODE_ID")
+	}
+	if id == "" {
+		h, _ := os.Hostname()
+		id = h + "-" + itoa(os.Getpid())
+	}
+
+	snapInterval := time.Duration(cfg.Matching.SnapshotIntervalSec) * time.Second
+	ttl := time.Duration(cfg.Matching.LeaderTTLSec) * time.Second
+	if ttl <= 0 {
+		ttl = 10 * time.Second
+	}
+
+	// 行情广播中心：撮合产生的成交/深度经 onTrade/onBook 推送给订阅 WS 的客户端
+	// （spot/futures 的 matching.Client 据此驱动各自的业务逻辑与前端行情）。
+	hub := ws.NewHub()
+
+	var e *matching.Engine
+	e = matching.NewEngine(
+		func(symbol string, t matching.Trade) {
+			hub.Broadcast(symbol, gin.H{"type": "trade", "symbol": symbol, "data": t})
+		},
+		func(symbol string) {
+			bids, asks, ok := e.Depth(symbol)
+			if !ok {
+				return
+			}
+			hub.Broadcast(symbol, gin.H{
+				"type":  "depth",
+				"symbol": symbol,
+				"data":  gin.H{"bids": bids, "asks": asks},
+			})
+		},
+	)
+	e.UseStore(store, id, snapInterval)
+	for _, s := range symbols {
+		e.Register(s) // 预注册空簿，保证即使无活动也有交易对可服务
+	}
+
+	var isLeader atomic.Bool
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// leader 选举循环：tryAcquire → recover+snapshot / 失去则 Reset 进入 standby。
+	go func() {
+		ticker := time.NewTicker(ttl / 2)
+		defer ticker.Stop()
+		leader := false
+		var snapCancel context.CancelFunc
+		for {
+			select {
+			case <-ctx.Done():
+				if leader {
+					_ = store.ReleaseLeader(ctx, id)
+				}
+				if snapCancel != nil {
+					snapCancel()
+				}
+				return
+			case <-ticker.C:
+				ok, lerr := store.TryAcquireLeader(ctx, id, ttl)
+				if lerr != nil {
+					log.Warn("leader election error", zap.Error(lerr))
+					continue
+				}
+				switch {
+				case ok && !leader:
+					if rerr := e.Recover(ctx); rerr != nil {
+						log.Error("recover failed", zap.Error(rerr))
+						continue
+					}
+					for _, s := range symbols {
+						e.Register(s)
+					}
+					leader = true
+					isLeader.Store(true)
+					var snapCtx context.Context
+					snapCtx, snapCancel = context.WithCancel(ctx)
+					go e.SnapshotLoop(snapCtx)
+					log.Info("became leader", zap.String("node", id))
+				case !ok && leader:
+					leader = false
+					isLeader.Store(false)
+					if snapCancel != nil {
+						snapCancel()
+						snapCancel = nil
+					}
+					e.Reset()
+					log.Warn("lost leadership, entering standby", zap.String("node", id))
+				case leader:
+					if renewed, rerr := store.RenewLeader(ctx, id, ttl); rerr != nil || !renewed {
+						leader = false
+						isLeader.Store(false)
+						if snapCancel != nil {
+							snapCancel()
+							snapCancel = nil
+						}
+						e.Reset()
+						log.Warn("leadership expired, entering standby", zap.String("node", id))
+					}
+				}
+			}
+		}
+	}()
+
+	r := gin.New()
+	r.Use(middleware.Common(log, cfg)...)
+
+	leaderGuard := func(c *gin.Context) {
+		if !isLeader.Load() {
+			response.Error(c, http.StatusServiceUnavailable, 503, "not leader")
+			c.Abort()
+			return
+		}
+	}
+
+	r.POST("/order", func(c *gin.Context) {
+		leaderGuard(c)
+		if c.IsAborted() {
+			return
+		}
+		var req struct {
+			Symbol string  `json:"symbol"`
+			Side   string  `json:"side"`
+			Price  float64 `json:"price"`
+			Qty    float64 `json:"qty"`
+			UserID int64   `json:"user_id"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.Error(c, 400, 400, "bad request")
+			return
+		}
+		if req.Qty <= 0 {
+			response.Error(c, 400, 400, "qty must be positive")
+			return
+		}
+		side := matching.Buy
+		if req.Side == "sell" {
+			side = matching.Sell
+		}
+		o := &matching.Order{
+			UserID: req.UserID,
+			Side:   side,
+			Price:  req.Price,
+			Qty:    req.Qty,
+			Time:   time.Now().UnixNano(),
+		}
+		if !e.Submit(req.Symbol, o) {
+			response.Error(c, 400, 400, "unknown symbol")
+			return
+		}
+		response.JSON(c, gin.H{"order_id": o.ID, "status": "accepted"})
+	})
+
+	r.POST("/cancel", func(c *gin.Context) {
+		leaderGuard(c)
+		if c.IsAborted() {
+			return
+		}
+		var req struct {
+			Symbol  string `json:"symbol"`
+			OrderID int64  `json:"order_id"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.Error(c, 400, 400, "bad request")
+			return
+		}
+		canceled := e.Cancel(req.Symbol, req.OrderID)
+		response.JSON(c, gin.H{"symbol": req.Symbol, "order_id": req.OrderID, "canceled": canceled})
+	})
+
+	// /match-now：同步撮合一笔订单并返回真实成交（用于强平）。rest=false 时市价单
+	// 未成交部分直接丢弃（由调用方以保险基金兜底成交）。注意本路径不触发 onTrade，
+	// 因此强平成交不会经 WS 重复广播给上游（避免重入），其记账由调用方同步处理。
+	r.POST("/match-now", func(c *gin.Context) {
+		leaderGuard(c)
+		if c.IsAborted() {
+			return
+		}
+		var req struct {
+			Symbol string  `json:"symbol"`
+			Side   string  `json:"side"`
+			Price  float64 `json:"price"`
+			Qty    float64 `json:"qty"`
+			UserID int64   `json:"user_id"`
+			Rest   bool    `json:"rest"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.Error(c, 400, 400, "bad request")
+			return
+		}
+		if req.Qty <= 0 {
+			response.Error(c, 400, 400, "qty must be positive")
+			return
+		}
+		side := matching.Buy
+		if req.Side == "sell" {
+			side = matching.Sell
+		}
+		o := &matching.Order{
+			UserID: req.UserID,
+			Side:   side,
+			Price:  req.Price,
+			Qty:    req.Qty,
+			Time:   time.Now().UnixNano(),
+		}
+		trades, fully := e.MatchNow(req.Symbol, o, req.Rest)
+		response.JSON(c, gin.H{
+			"symbol":       req.Symbol,
+			"trades":       trades,
+			"filled":       o.Filled,
+			"fully_filled": fully,
+		})
+	})
+
+	r.GET("/depth", func(c *gin.Context) {
+		leaderGuard(c)
+		if c.IsAborted() {
+			return
+		}
+		symbol := c.Query("symbol")
+		bids, asks, ok := e.Depth(symbol)
+		if !ok {
+			response.Error(c, 400, 400, "unknown symbol")
+			return
+		}
+		response.JSON(c, gin.H{"symbol": symbol, "bids": bids, "asks": asks})
+	})
+
+	// /ws：行情 WebSocket。symbol 空表示订阅全部交易对；否则仅该 symbol。
+	r.GET("/ws", func(c *gin.Context) {
+		hub.Handle(c.Writer, c.Request)
+	})
+
+	r.GET("/health", func(c *gin.Context) {
+		leader, _ := store.IsLeader(ctx, id)
+		response.JSON(c, gin.H{
+			"node":      id,
+			"leader":    leader,
+			"is_leader": isLeader.Load(),
+			"symbols":   symbols,
+			"time":      time.Now().Unix(),
+		})
+	})
+
+	log.Info("matching service starting", zap.String("addr", *addr), zap.String("node", id), zap.Strings("symbols", symbols))
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		cancel()
+		_ = store.ReleaseLeader(context.Background(), id)
+		_ = log.Sync()
+		os.Exit(0)
+	}()
+
+	if err := cfg.Listen(r, *addr); err != nil {
+		log.Fatal("server exited", zap.Error(err))
+	}
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	var b [20]byte
+	pos := len(b)
+	for i > 0 {
+		pos--
+		b[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
+	}
+	return string(b[pos:])
+}

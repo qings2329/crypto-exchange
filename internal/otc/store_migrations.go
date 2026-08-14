@@ -1,0 +1,98 @@
+package otc
+
+import (
+	"database/sql"
+
+	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
+)
+
+// OtcMigrations 是 otc 服务的建表迁移。
+// 版本号使用 96xx 段（全局唯一，避免与其他模块冲突，见 migrate 包约定）。
+var OtcMigrations = []migrate.Migration{
+	{
+		Version: 9601,
+		Name:    "create_ce_otc_advertisements",
+		Up: `CREATE TABLE IF NOT EXISTS ce_otc_advertisements (
+				id             BIGINT        NOT NULL AUTO_INCREMENT,
+				user_id        BIGINT        NOT NULL,
+				side           VARCHAR(8)    NOT NULL,
+				asset          VARCHAR(32)   NOT NULL,
+				fiat_currency  VARCHAR(8)    NOT NULL DEFAULT '',
+				price          DOUBLE        NOT NULL DEFAULT 0,
+				min_amount     DOUBLE        NOT NULL DEFAULT 0,
+				max_amount     DOUBLE        NOT NULL DEFAULT 0,
+				payment_methods VARCHAR(255) NOT NULL DEFAULT '',
+				status         VARCHAR(16)   NOT NULL DEFAULT 'open',
+				created_at     DATETIME(3)   NOT NULL,
+				updated_at     DATETIME(3)   NOT NULL,
+				PRIMARY KEY (id),
+				INDEX idx_user (user_id),
+				INDEX idx_side_asset (side, asset)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		Down: `DROP TABLE IF EXISTS ce_otc_advertisements`,
+	},
+	{
+		Version: 9602,
+		Name:    "create_ce_otc_orders",
+		Up: `CREATE TABLE IF NOT EXISTS ce_otc_orders (
+				id             BIGINT        NOT NULL AUTO_INCREMENT,
+				ad_id          BIGINT        NOT NULL,
+				maker_id       BIGINT        NOT NULL,
+				taker_id       BIGINT        NOT NULL,
+				side           VARCHAR(8)    NOT NULL,
+				asset          VARCHAR(32)   NOT NULL,
+				fiat_currency  VARCHAR(8)    NOT NULL DEFAULT '',
+				crypto_amount  DOUBLE        NOT NULL DEFAULT 0,
+				price          DOUBLE        NOT NULL DEFAULT 0,
+				fiat_amount    DOUBLE        NOT NULL DEFAULT 0,
+				payment_method VARCHAR(64)   NOT NULL DEFAULT '',
+				status         VARCHAR(16)   NOT NULL DEFAULT 'pending',
+				rating         INT           NOT NULL DEFAULT 0,
+				created_at     DATETIME(3)   NOT NULL,
+				paid_at        DATETIME(3)   NULL DEFAULT NULL,
+				completed_at   DATETIME(3)   NULL DEFAULT NULL,
+				updated_at     DATETIME(3)   NOT NULL,
+				PRIMARY KEY (id),
+				INDEX idx_maker (maker_id),
+				INDEX idx_taker (taker_id),
+				INDEX idx_status (status)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		Down: `DROP TABLE IF EXISTS ce_otc_orders`,
+	},
+	{
+		Version: 9603,
+		Name:    "create_ce_otc_counterparties",
+		Up: `CREATE TABLE IF NOT EXISTS ce_otc_counterparties (
+				id              BIGINT        NOT NULL AUTO_INCREMENT,
+				user_id         BIGINT        NOT NULL,
+				counterparty_id BIGINT        NOT NULL,
+				trades_total    INT           NOT NULL DEFAULT 0,
+				trades_completed INT          NOT NULL DEFAULT 0,
+				rating_sum      INT           NOT NULL DEFAULT 0,
+				rating_count    INT           NOT NULL DEFAULT 0,
+				created_at      DATETIME(3)   NOT NULL,
+				updated_at      DATETIME(3)   NOT NULL,
+				PRIMARY KEY (id),
+				UNIQUE KEY uniq_pair (user_id, counterparty_id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		Down: `DROP TABLE IF EXISTS ce_otc_counterparties`,
+	},
+}
+
+// NewMySQLStore 打开 MySQL 并跑迁移，返回 MySQL 版 Store。
+func NewMySQLStore(dsn string) (*mysqlStore, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	runner := migrate.New(db, OtcMigrations)
+	if err := runner.Up(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &mysqlStore{db: db}, nil
+}
