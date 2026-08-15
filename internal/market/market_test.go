@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/coldlar/crypto-exchange/internal/pkg/influxdb"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 )
 
@@ -291,5 +294,146 @@ func TestHandleKlines(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// fakeCandleStore 是内存版 CandleStore，用于验证 market 的「内存+持久化」合并逻辑，
+// 无需外部 InfluxDB。Write 仅记录（供验证落盘触发），Query 返回预置历史。
+type fakeCandleStore struct {
+	mu      sync.Mutex
+	writes  []*influxdb.Candle
+	history []*influxdb.Candle // 早于内存环形的历史（按 open_time 升序）
+}
+
+func (f *fakeCandleStore) Write(_ context.Context, c influxdb.Candle) error {
+	f.mu.Lock()
+	cp := c
+	f.writes = append(f.writes, &cp)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeCandleStore) Query(_ context.Context, symbol, interval string, start, end, limit int64) ([]*influxdb.Candle, error) {
+	f.mu.Lock()
+	out := make([]*influxdb.Candle, 0, len(f.history))
+	for _, c := range f.history {
+		if c.Symbol != symbol || c.Interval != interval {
+			continue
+		}
+		if c.OpenTime < start {
+			continue
+		}
+		if end > 0 && c.OpenTime >= end {
+			break
+		}
+		cp := *c
+		out = append(out, &cp)
+	}
+	f.mu.Unlock()
+	if limit > 0 && int64(len(out)) > limit {
+		out = out[int64(len(out))-limit:]
+	}
+	return out, nil
+}
+
+func (f *fakeCandleStore) Close() error { return nil }
+
+func (f *fakeCandleStore) written() []*influxdb.Candle {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*influxdb.Candle, len(f.writes))
+	copy(out, f.writes)
+	return out
+}
+
+// TestKlinesMergesStore 验证：内存不足且装配了持久化层时，Klines 从 Store 回取更早历史并
+// 合并到内存结果之后，最终按 limit 截断；且回取区间为 (内存最早根, ...) 不重复。
+func TestKlinesMergesStore(t *testing.T) {
+	m := NewMarket()
+
+	// 预置持久化层：3 根早于内存的历史（open_time = 60000,120000,180000），属于 "1m"，
+	// 时间戳按 1m 桶对齐（60000ms），避免与内存当前桶重叠。
+	store := &fakeCandleStore{
+		history: []*influxdb.Candle{
+			{Symbol: "BTCUSDT", Interval: "1m", OpenTime: 60000, Close: 11},
+			{Symbol: "BTCUSDT", Interval: "1m", OpenTime: 120000, Close: 12},
+			{Symbol: "BTCUSDT", Interval: "1m", OpenTime: 180000, Close: 13},
+		},
+	}
+	m.SetCandleStore(store)
+
+	// 向内存灌入 2 根：open_time = 240000（收盘历史）、300000（当前未收盘），均按 1m 桶对齐。
+	m.ApplyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 14, Qty: 1, Ts: 240000})
+	m.ApplyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 15, Qty: 1, Ts: 300000})
+
+	// limit=100 远超内存 2 根，应从 Store 补足到 100 根以内（实际 5 根）。
+	all := m.Klines("BTCUSDT", "1m", 100)
+	if len(all) != 5 {
+		t.Fatalf("expected 5 candles (3 persisted + 1 closed + 1 current), got %d: %+v", len(all), all)
+	}
+	// 升序且时间连续：60000,120000,180000,240000,300000。
+	want := []int64{60000, 120000, 180000, 240000, 300000}
+	for i, w := range want {
+		if all[i].OpenTime != w {
+			t.Fatalf("merged order wrong at %d: got %d want %d (all=%+v)", i, all[i].OpenTime, w, all)
+		}
+	}
+	if all[4].OpenTime != 300000 || all[4].Close != 15 {
+		t.Fatalf("current candle should be last: %+v", all[4])
+	}
+
+	// 小 limit 截断到末尾 N 根（内存 2 + 最少补足）。
+	limited := m.Klines("BTCUSDT", "1m", 4)
+	if len(limited) != 4 {
+		t.Fatalf("expected 4 after limit, got %d", len(limited))
+	}
+	if limited[0].OpenTime != 120000 {
+		t.Fatalf("limit should keep last 4 starting at 120000, got %d", limited[0].OpenTime)
+	}
+}
+
+// TestPushHistoryPersistsClosedCandle 验证收盘时落盘被触发（经 Store.Write），且不影响内存聚合。
+func TestPushHistoryPersistsClosedCandle(t *testing.T) {
+	m := NewMarket()
+	store := &fakeCandleStore{}
+	m.SetCandleStore(store)
+
+	// 第一桶 60000 的一笔成交 -> 当前未收盘，不应立即落盘。
+	m.ApplyTrade(mq.TradeEvent{Symbol: "ETHUSDT", Price: 10, Qty: 1, Ts: 60000})
+	if len(store.written()) != 0 {
+		t.Fatalf("open candle should not be persisted yet, got %d", len(store.written()))
+	}
+	// 跨桶 120000 -> 60000 桶收盘，应触发异步落盘（等待后台 goroutine）。
+	m.ApplyTrade(mq.TradeEvent{Symbol: "ETHUSDT", Price: 20, Qty: 1, Ts: 120000})
+
+	deadline := time.Now().Add(2 * time.Second)
+	var wrote []*influxdb.Candle
+	for time.Now().Before(deadline) {
+		wrote = store.written()
+		if len(wrote) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(wrote) != 1 {
+		t.Fatalf("expected 1 persisted closed candle, got %d", len(wrote))
+	}
+	if wrote[0].OpenTime != 60000 || wrote[0].Close != 10 {
+		t.Fatalf("persisted candle mismatch: %+v", wrote[0])
+	}
+	// 内存侧：关闭 60000 + 当前 120000，共 2 根。
+	if got := m.Klines("ETHUSDT", "1m", 100); len(got) != 2 {
+		t.Fatalf("in-memory should still have 2 candles, got %d", len(got))
+	}
+}
+
+// TestKlinesNilStoreNoPanic 验证未装配 Store 时（默认内存路径）Klines 行为与改动前一致、不 panic。
+func TestKlinesNilStoreNoPanic(t *testing.T) {
+	m := NewMarket()
+	m.ApplyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 100, Qty: 1, Ts: 60000})
+	m.ApplyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 100, Qty: 1, Ts: 120000})
+	// limit 远超内存上限，但 Store 为 nil -> 仅返回内存 2 根，不报错不阻塞。
+	if got := m.Klines("BTCUSDT", "1m", 100000); len(got) != 2 {
+		t.Fatalf("nil store should return in-memory only, got %d", len(got))
 	}
 }

@@ -43,7 +43,7 @@
 | T-13 | proto 生成脚本 | gRPC/protobuf 代码生成脚本与 CI 集成 | README「待补充」 | **已完成**（新增 `api/wallet.proto` + `scripts/gen_proto.sh` + Makefile `proto` 目标） |
 | T-14 | 其余业务线服务 | 实现 otc / options / margin / wealth / risk / settlement / notification 业务线 | README「待补充」 | **已完成**：settlement（T-15）、margin 现货杠杆（§7）、notification 站内信（§8）、risk 风控（§9）、options 期权（§10）、otc 场外交易（§11）、wealth 理财资管（§12）均已实现并验证（`go build/vet/test ./...` 全绿）；**T-14 全部 7 子业务线均已跑远程冒烟**（settlement 为纯费用/健康检查 HTTP 服务、无 MySQL 持久化，仅跑 HTTP 冒烟；其余 6 项均跑远程 MySQL 冒烟） |
 | T-15 | settlement 服务化 | `internal/settlement` 模块已存在，需封装为独立服务并接入账本 | 目录现状 | **已完成**（新增 `cmd/settlement` 独立服务：手续费估算/健康端点，`make build` 含 settlement，运行时验证通过） |
-| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **部分接入（Kafka+Redis 已落地，见 §21/§22）**：Kafka 交易清算（§21）+ **Redis 集群级限流（§22）** 已接入；InfluxDB/ES 仍仅声明，待各业务接入 |
+| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **部分接入（Kafka+Redis+InfluxDB 已落地，见 §21/§22/§23）**：Kafka 交易清算（§21）+ **Redis 集群级限流（§22）** + **InfluxDB 行情 K 线持久化（§23）** 已接入；ES 仍仅声明，待各业务接入 |
 | T-17 | 对账 / 审计报表 | 基于 `Ledger` 流水做借贷恒等校验、对账与审计看板 | 资金安全闭环延伸 | **已完成**（`Ledger.Reconcile/IsBalanced/RunReconcileOnce` + 定时巡检 + `/wallet/reconcile` 端点 + Prometheus 指标已具备） |
 | T-18 | 安全加固（暂不引入中间件） | 统一安全中间件套件：审计日志、安全响应头、受控 CORS、请求体限制、边缘/入口鉴权与公开端点豁免、TLS 可配置；修复 spot/futures 无鉴权下单漏洞与 market/futures 端口冲突 | 安全审计发现 | **已完成**（见 §13） |
 
@@ -421,3 +421,24 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 **验证**：
 - `go build/vet/test ./...` 全绿（新增 redis 单测通过）。
 - **真·集群限流（需 `docker compose up -d redis`）**：多实例网关共享 Redis 计数，单 IP 在 `rate_limit_per_sec` 内总请求数被全局约束；Redis 停服时自动回退内存限流（单测覆盖降级路径的逻辑等价性）。
+
+## 23. InfluxDB 行情 K 线持久化接入（T-16，2026-08-15，已完成）
+
+**背景**：docker-compose 声明了 InfluxDB（`influxdb:2.7`，:8086）但此前从未接入；行情服务 `internal/market` 的 K 线历史仅保存在内存环形缓冲（`klineCap=500`，`internal/market/market.go:25`），进程重启即丢失，且 `/api/v1/market/klines?limit=` 超出 500 根后无法回取更早历史——无法支撑长周期技术分析。
+
+**改动**：把 K 线持久化抽象为 `influxdb.CandleStore`，行情服务在每根 K 线收盘时异步落盘，并在回取超内存上限时从 InfluxDB 补足更早历史（未配置/不可达时降级内存，行为不变）：
+
+- `internal/pkg/influxdb/influxdb.go`（新增）：`Candle` 持久化表示（字段与 `market.Candle` 对齐，独立定义以避免 `market<->influxdb` 循环依赖）+ `CandleStore` 接口（`Write(ctx, Candle) error` / `Query(ctx, symbol, interval, start, end, limit)` / `Close()`）；`New(url, token, org, bucket)`——url 为空返回 `memStore`（内存环形，单测确定性实现），否则返回 `influxStore`（经 `github.com/influxdata/influxdb-client-go/v2` 写入 measurement `kline`：symbol/interval 为 tag，OHLCV 与买卖拆分量为 field，`OpenTime` 为时间戳）。依赖已 `go get` 加入 go.mod。`Query` 用 Flux（`range`+`filter`+`pivot`+`sort`+`limit`）回读并按 `_time` 还原 `Candle`。
+- `internal/market/market.go`：新增可选字段 `Store influxdb.CandleStore` + `SetCandleStore`（启动期装配一次，之后不变更，避免与后台写入竞争）；`pushHistory`（K 线收盘处）在追加内存环形后**异步**（goroutine + 3s 超时）拷贝落盘；扩展 `Klines`——当 `limit>klineCap` 且 `Store!=nil` 时，以内存最早根的 `OpenTime` 为右开区间向 `Store` 回取 `limit-len(out)` 根更早历史并合并（2s 超时），查询失败静默降级为内存结果（fail-degraded）；新增 `Close()` 释放 `Store`。
+- `internal/market/server.go`：`NewServer` 按 `cfg.InfluxDB.URL` 装配持久化层（`influxdb.New(...)`），并记日志区分「influxdb / in-memory only」；`Server.Close` 先 `market.Close()` 再取消上下文。
+- `internal/pkg/config/config.go` + `configs/config.yaml`：新增 `influxdb`（url/token/org/bucket）；默认 `url: ""`，即仅内存、不连接 InfluxDB（fail-degraded），配置示例见 yaml 注释（docker-compose 的 :8086 实例）。
+
+**设计要点**：
+- 零回归：`influxdb.url` 为空时 `Store` 为 nil，`pushHistory`/`Klines` 走原内存路径，行为与改动前完全一致；`TestHandleKlines` 等既有单测不受影响。
+- 故障可降级：落盘为 best-effort（后台 goroutine，错误仅记录），回取失败静默回退内存，行情服务不因 InfluxDB 抖动而不可用。
+- 无循环依赖：`influxdb` 包不反向依赖 `market`，两者通过字段对齐的转换函数 `toInfluxCandle`/`fromInfluxCandle` 桥接。
+- 落盘异步、读取带超时：写入在锁外后台进行（不在 `pushHistory` 持锁路径做网络 I/O）；读取 2s 超时避免阻塞 `/klines` 请求。
+
+**验证**：
+- `go build/vet/test ./...` 全绿（新增 influxdb 单测 + market 扩展 Klines 单测通过）。
+- **真·持久化（需 `docker compose up -d influxdb` + 配置 influxdb.url/token/org/bucket）**：起 `cmd/matching`（发布 `exchange.trades`）→ `cmd/market` 消费聚合 → 已收盘 K 线写入 InfluxDB；重启 `cmd/market` 后 `GET /api/v1/market/klines?symbol=BTCUSDT&interval=1m&limit=1000` 可回取内存环形之外的更早历史。无 InfluxDB 时默认内存路径与单测覆盖合并/降级逻辑。
