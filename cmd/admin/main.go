@@ -15,11 +15,16 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
+	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN for admin persistence (trading pairs/chains/coins/notifications/accounts); overrides config mysql.dsn")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+	// 命令行 --mysql-dsn 优先于配置文件中的 mysql.dsn，便于本地一键指定可持久化数据库。
+	if *mysqlDSN != "" {
+		cfg.MySQL.DSN = *mysqlDSN
 	}
 	if cfg.Server.Mode != "" {
 		gin.SetMode(cfg.Server.Mode)

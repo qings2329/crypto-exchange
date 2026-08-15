@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
+	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
 	"github.com/coldlar/crypto-exchange/internal/ws"
 )
@@ -51,6 +54,9 @@ func main() {
 	}
 	log, _ := logger.New(cfg.Server.Mode)
 	defer func() { _ = log.Sync() }()
+
+	// 按配置覆盖 Kafka 协议协商版本（无 -tags kafka 时为空操作）。
+	mq.SetKafkaVersion(cfg.Kafka.Version)
 
 	// 交易对集合：优先 config.Matching.Symbols，否则默认覆盖现货与合约永续。
 	symbols := cfg.Matching.Symbols
@@ -99,10 +105,37 @@ func main() {
 	// （spot/futures 的 matching.Client 据此驱动各自的业务逻辑与前端行情）。
 	hub := ws.NewHub()
 
+	// 成交流/深度流发布器：配置了 Kafka brokers 且以 -tags kafka 构建时投递到 Kafka
+	// （exchange.trades / market.depth），否则退回内存发布器（无消费方，仅不阻断撮合）。
+	pub := mq.NewPublisher(cfg.Kafka.Brokers, cfg.Kafka.TradeTopic, cfg.Kafka.DepthTopic, nil)
+	defer func() { _ = pub.Close() }()
+
+	// 深度节流发布所需的状态（符号表 + 锁），由 onBook 标记、节流 goroutine 消费。
+	depthMu := sync.Mutex{}
+	pendingDepth := map[string]bool{}
+	const depthTopN = 20
+	const depthPublishInterval = 200 * time.Millisecond
+
 	var e *matching.Engine
 	e = matching.NewEngine(
 		func(symbol string, t matching.Trade) {
 			hub.Broadcast(symbol, gin.H{"type": "trade", "symbol": symbol, "data": t})
+			// 成交同时发布到 Kafka 成交流（exchange.trades），供清算/行情/风控消费。
+			takerSide := "buy"
+			if t.TakerSide == matching.Sell {
+				takerSide = "sell"
+			}
+			if err := pub.PublishTrade(context.Background(), mq.TradeEvent{
+				Symbol:    symbol,
+				Price:     t.Price,
+				Qty:       t.Qty,
+				TakerID:   t.TakerID,
+				MakerID:   t.MakerID,
+				TakerSide: takerSide,
+				Ts:        time.Now().UnixMilli(),
+			}); err != nil {
+				log.Warn("publish trade failed", zap.String("symbol", symbol), zap.Error(err))
+			}
 		},
 		func(symbol string) {
 			bids, asks, ok := e.Depth(symbol)
@@ -114,6 +147,10 @@ func main() {
 				"symbol": symbol,
 				"data":  gin.H{"bids": bids, "asks": asks},
 			})
+			// 标记该交易对深度待发布（由节流 goroutine 聚合后发往 Kafka）。
+			depthMu.Lock()
+			pendingDepth[symbol] = true
+			depthMu.Unlock()
 		},
 	)
 	e.UseStore(store, id, snapInterval)
@@ -121,9 +158,48 @@ func main() {
 		e.Register(s) // 预注册空簿，保证即使无活动也有交易对可服务
 	}
 
-	var isLeader atomic.Bool
+	// 上下文：驱动深度节流 goroutine 与 leader 选举循环的退出。
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 深度节流发布：onBook 仅标记待发布 symbol，本 goroutine 按固定间隔聚合最新深度
+	// 发送到 market.depth（避免每笔订单都发全量快照，见 KAFKA_TOPICS.md「深度快照（节流）」）。
+	// 必须在 e 注册完成且 ctx 声明后启动。
+	go func() {
+		ticker := time.NewTicker(depthPublishInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				depthMu.Lock()
+				syms := make([]string, 0, len(pendingDepth))
+				for s := range pendingDepth {
+					syms = append(syms, s)
+					delete(pendingDepth, s)
+				}
+				depthMu.Unlock()
+				for _, sym := range syms {
+					bids, asks, ok := e.Depth(sym)
+					if !ok {
+						continue
+					}
+					ev := mq.DepthEvent{
+						Symbol: sym,
+						Bids:   aggregateDepth(bids, depthTopN, true),
+						Asks:   aggregateDepth(asks, depthTopN, false),
+						Ts:     time.Now().UnixMilli(),
+					}
+					if err := pub.PublishDepth(context.Background(), ev); err != nil {
+						log.Warn("publish depth failed", zap.String("symbol", sym), zap.Error(err))
+					}
+				}
+			}
+		}
+	}()
+
+	var isLeader atomic.Bool
 
 	// leader 选举循环：tryAcquire → recover+snapshot / 失去则 Reset 进入 standby。
 	go func() {
@@ -363,4 +439,29 @@ func itoa(i int) string {
 		b[pos] = '-'
 	}
 	return string(b[pos:])
+}
+
+// aggregateDepth 把订单簿层级聚合为深度行（top-N）：买盘取价格最高 N 档、卖盘取价格最低 N 档，
+// 每档 volume 为该档各订单 Qty 之和。用于发布到 market.depth 的节流快照。
+func aggregateDepth(levels []matching.Level, n int, isBid bool) []mq.DepthLevel {
+	ls := make([]matching.Level, len(levels))
+	copy(ls, levels)
+	sort.Slice(ls, func(i, j int) bool {
+		if isBid {
+			return ls[i].Price > ls[j].Price
+		}
+		return ls[i].Price < ls[j].Price
+	})
+	if len(ls) > n {
+		ls = ls[:n]
+	}
+	out := make([]mq.DepthLevel, 0, len(ls))
+	for _, l := range ls {
+		var v float64
+		for _, o := range l.Orders {
+			v += o.Qty
+		}
+		out = append(out, mq.DepthLevel{Price: l.Price, Volume: v})
+	}
+	return out
 }

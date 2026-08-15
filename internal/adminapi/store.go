@@ -5,9 +5,10 @@ import (
 	"time"
 )
 
-// 本文件定义管理后台的内存管理态（原型骨架）：用户/交易对/公链/币种/充值提币/通知，
-// 以及风控、账本对账、服务健康的只读快照。数据启动 seed、CRUD 落在内存，重启即丢失；
-// 生产应替换为 user/settlement/oracle 等真实下游（见 DEVELOPMENT_TASKS.md §19）。
+// 本文件定义管理后台的内存管理态（原型骨架）：用户/充值提币（来自 futures 上游或示例
+// 降级）/风控/账本对账/服务健康的只读快照与审批会话态。数据启动 seed、重启即丢失。
+// 管理员自有配置（交易对/公链/币种/本地通知）已迁至 store_catalog.go 的 CatalogStore
+// （MySQL 优先，失败回退内存），见 DEVELOPMENT_TASKS.md §19。
 
 // AdminUser 是用户与账户管理视图（聚合账户/余额/KYC/冻结状态）。
 type AdminUser struct {
@@ -131,33 +132,27 @@ type ServiceHealth struct {
 }
 
 // Store 是管理后台的内存管理态，所有写操作受锁保护。
+// 注意：交易对/公链/币种/本地通知等管理员自有配置已迁至 CatalogStore（见 store_catalog.go），
+// 本 Store 仅保留用户/充值提币示例与风控/账本/健康等只读快照、以及提现审批会话态。
 type Store struct {
 	mu sync.RWMutex
 
 	users       []AdminUser
-	symbols     []SymbolConfig
-	chains      []Chain
-	coins       []Coin
 	deposits    []Deposit
 	withdrawals []Withdrawal
-	notifs      []Notification
 
 	// 会话态：充值提币来自 futures 上游实时数据；下面两个映射仅用于在审批时把
 	// 前端使用的稳定数字 id 反查回链上事件（TxHash），并缓存本次会话的审批结果。
-	wdByID       map[int64]Withdrawal
-	wdApprovals  map[int64]string // id -> approved|rejected
+	wdByID      map[int64]Withdrawal
+	wdApprovals map[int64]string // id -> approved|rejected
 
 	risk   RiskSnapshot
 	ledger LedgerSummary
 	health []ServiceHealth
 
 	seqUser int64
-	seqSym  int64
-	seqChain int64
-	seqCoin int64
 	seqDep  int64
 	seqWd   int64
-	seqNotif int64
 }
 
 // NewStore 构造并 seed 示例数据的管理态。
@@ -171,28 +166,7 @@ func NewStore() *Store {
 		{ID: 1003, Username: "carol", Email: "carol@x.com", Status: "frozen", KYC: "verified", Balance: 0, CreatedAt: now.Add(-24 * time.Hour)},
 	}
 	s.seqUser = 1003
-	// 交易对
-	s.symbols = []SymbolConfig{
-		{Symbol: "BTC_USDT", Base: "BTC", Quote: "USDT", Status: "online", FeeRate: 0.001, MaxLeverage: 20, MinQty: 0.0001},
-		{Symbol: "ETH_USDT", Base: "ETH", Quote: "USDT", Status: "online", FeeRate: 0.001, MaxLeverage: 20, MinQty: 0.001},
-		{Symbol: "BTC_USDT_PERP", Base: "BTC", Quote: "USDT", Status: "online", FeeRate: 0.0005, MaxLeverage: 100, MinQty: 0.0001},
-	}
-	s.seqSym = 3
-	// 公链
-	s.chains = []Chain{
-		{ID: 1, Name: "Bitcoin", Symbol: "BTC", Confirmations: 3, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
-		{ID: 2, Name: "Ethereum", Symbol: "ETH", Confirmations: 12, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
-		{ID: 3, Name: "Tron", Symbol: "TRX", Confirmations: 20, DepositEnabled: true, WithdrawEnabled: false, UpdatedAt: now},
-	}
-	s.seqChain = 3
-	// 币种
-	s.coins = []Coin{
-		{ID: 1, Symbol: "BTC", Name: "Bitcoin", Chain: "Bitcoin", Precision: 8, WithdrawFee: 0.0005, UpdatedAt: now},
-		{ID: 2, Symbol: "ETH", Name: "Ethereum", Chain: "Ethereum", Precision: 18, WithdrawFee: 0.01, UpdatedAt: now},
-		{ID: 3, Symbol: "USDT", Name: "Tether", Chain: "Ethereum", Precision: 6, WithdrawFee: 1, UpdatedAt: now},
-	}
-	s.seqCoin = 3
-	// 充值提币
+	// 充值提币（示例降级数据；上游可达时由 listDeposits/listWithdrawals 实时覆盖）。
 	s.deposits = []Deposit{
 		{ID: 1, UserID: 1001, Coin: "BTC", Chain: "Bitcoin", Amount: 0.5, TxHash: "0xabc...", Status: "confirmed", Time: now.Add(-5 * time.Hour)},
 		{ID: 2, UserID: 1002, Coin: "USDT", Chain: "Ethereum", Amount: 1000, TxHash: "0xdef...", Status: "pending", Time: now.Add(-1 * time.Hour)},
@@ -202,12 +176,6 @@ func NewStore() *Store {
 		{ID: 1, UserID: 1001, Coin: "BTC", Chain: "Bitcoin", Amount: 0.1, Address: "bc1xyz...", TxHash: "", Status: "pending", Time: now.Add(-30 * time.Minute)},
 	}
 	s.seqWd = 1
-	// 通知
-	s.notifs = []Notification{
-		{ID: 1, Title: "系统维护通知", Body: "今晚 02:00-02:30 进行撮合引擎升级。", Level: "info", CreatedAt: now.Add(-6 * time.Hour)},
-		{ID: 2, Title: "ETH 提币临时关闭", Body: "Tron 链拥堵，USDT-TRC20 提币暂停。", Level: "warning", CreatedAt: now.Add(-2 * time.Hour)},
-	}
-	s.seqNotif = 2
 	s.wdByID = map[int64]Withdrawal{}
 	s.wdApprovals = map[int64]string{}
 	// 风控快照

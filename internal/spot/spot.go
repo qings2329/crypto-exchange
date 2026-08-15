@@ -8,8 +8,37 @@
 package spot
 
 import (
+	"strings"
+
 	"github.com/coldlar/crypto-exchange/internal/matching"
 )
+
+// assets 是某交易对拆分出的基础资产与计价资产（如 BTC_USDT → base=BTC, quote=USDT）。
+type assets struct {
+	base  string
+	quote string
+}
+
+// splitSymbol 将交易对符号拆为基础/计价资产。现货符号形如 "BTC_USDT"。
+func splitSymbol(symbol string) (base, quote string, ok bool) {
+	parts := strings.SplitN(symbol, "_", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+// freezeRec 记录一笔未完全成交的现货订单所预冻结的资金，便于成交时按笔递减、
+// 撤单时释放剩余冻结，避免用户资金被长期占用。
+type freezeRec struct {
+	user        int64
+	side        matching.Side
+	symbol      string
+	base        string
+	quote       string
+	frozenQuote float64 // 买方预冻结的计价资产（price*qty），随成交递减
+	frozenBase  float64 // 卖方预冻结的基础资产（qty），随成交递减
+}
 
 // depthRow 是深度聚合后的单行，便于 JSON 序列化与前端渲染。
 type depthRow struct {

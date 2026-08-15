@@ -31,6 +31,10 @@ kafka:
     - "127.0.0.1:9092"
   order_topic: "exchange.orders"
   trade_topic: "exchange.trades"
+  depth_topic: "market.depth"
+  # 协议协商版本（sarama 与 broker 对齐用）。空则用内置默认 V3_6_0_0；
+  # 实际 Kafka 为更新/更旧版本时改为对应值（如 "3.8.0"），sarama 会向下协商。
+  version: "3.6.0"
 
 auth:
   # Bearer Token 共享密钥（HMAC-SHA256）。生产务必从密钥管理注入并定期轮换，勿提交真实密钥。

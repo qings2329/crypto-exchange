@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -340,11 +341,14 @@ func (s *Server) freezeUnfreeze(c *gin.Context, frozen bool) {
 	s.ok(c, gin.H{"id": id, "frozen": frozen, "status": statusWord(frozen)})
 }
 
-// --- 交易对/参数配置 ---
+// --- 交易对/参数配置（持久化于 CatalogStore：MySQL 优先，失败回退内存）---
 func (s *Server) listSymbols(c *gin.Context) {
-	s.store.mu.RLock()
-	defer s.store.mu.RUnlock()
-	s.ok(c, s.store.symbols)
+	syms, err := s.catalog.ListSymbols()
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "list symbols failed: "+err.Error())
+		return
+	}
+	s.ok(c, syms)
 }
 
 func (s *Server) upsertSymbol(c *gin.Context) {
@@ -353,25 +357,22 @@ func (s *Server) upsertSymbol(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid symbol config")
 		return
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
-	for i := range s.store.symbols {
-		if s.store.symbols[i].Symbol == sym.Symbol {
-			s.store.symbols[i] = sym
-			s.ok(c, s.store.symbols[i])
-			return
-		}
+	out, err := s.catalog.UpsertSymbol(sym)
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "upsert symbol failed: "+err.Error())
+		return
 	}
-	s.store.seqSym++
-	s.store.symbols = append(s.store.symbols, sym)
-	s.ok(c, sym)
+	s.ok(c, out)
 }
 
-// --- 公链管理 ---
+// --- 公链管理（持久化于 CatalogStore）---
 func (s *Server) listChains(c *gin.Context) {
-	s.store.mu.RLock()
-	defer s.store.mu.RUnlock()
-	s.ok(c, s.store.chains)
+	chs, err := s.catalog.ListChains()
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "list chains failed: "+err.Error())
+		return
+	}
+	s.ok(c, chs)
 }
 
 func (s *Server) createChain(c *gin.Context) {
@@ -380,13 +381,12 @@ func (s *Server) createChain(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid chain")
 		return
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
-	s.store.seqChain++
-	ch.ID = s.store.seqChain
-	ch.UpdatedAt = time.Now()
-	s.store.chains = append(s.store.chains, ch)
-	s.ok(c, ch)
+	out, err := s.catalog.CreateChain(ch)
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "create chain failed: "+err.Error())
+		return
+	}
+	s.ok(c, out)
 }
 
 func (s *Server) updateChain(c *gin.Context) {
@@ -400,34 +400,26 @@ func (s *Server) updateChain(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid body")
 		return
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
-	for i := range s.store.chains {
-		if s.store.chains[i].ID == id {
-			if patch.Name != "" {
-				s.store.chains[i].Name = patch.Name
-			}
-			if patch.Symbol != "" {
-				s.store.chains[i].Symbol = patch.Symbol
-			}
-			if patch.Confirmations != 0 {
-				s.store.chains[i].Confirmations = patch.Confirmations
-			}
-			s.store.chains[i].DepositEnabled = patch.DepositEnabled
-			s.store.chains[i].WithdrawEnabled = patch.WithdrawEnabled
-			s.store.chains[i].UpdatedAt = time.Now()
-			s.ok(c, s.store.chains[i])
+	out, err := s.catalog.UpdateChain(id, patch)
+	if err != nil {
+		if errors.Is(err, ErrCatalogNotFound) {
+			s.fail(c, http.StatusNotFound, "chain not found")
 			return
 		}
+		s.fail(c, http.StatusInternalServerError, "update chain failed: "+err.Error())
+		return
 	}
-	s.fail(c, http.StatusNotFound, "chain not found")
+	s.ok(c, out)
 }
 
-// --- 币种管理 ---
+// --- 币种管理（持久化于 CatalogStore）---
 func (s *Server) listCoins(c *gin.Context) {
-	s.store.mu.RLock()
-	defer s.store.mu.RUnlock()
-	s.ok(c, s.store.coins)
+	coins, err := s.catalog.ListCoins()
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "list coins failed: "+err.Error())
+		return
+	}
+	s.ok(c, coins)
 }
 
 func (s *Server) createCoin(c *gin.Context) {
@@ -436,13 +428,12 @@ func (s *Server) createCoin(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid coin")
 		return
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
-	s.store.seqCoin++
-	coin.ID = s.store.seqCoin
-	coin.UpdatedAt = time.Now()
-	s.store.coins = append(s.store.coins, coin)
-	s.ok(c, coin)
+	out, err := s.catalog.CreateCoin(coin)
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "create coin failed: "+err.Error())
+		return
+	}
+	s.ok(c, out)
 }
 
 func (s *Server) updateCoin(c *gin.Context) {
@@ -456,31 +447,16 @@ func (s *Server) updateCoin(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid body")
 		return
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
-	for i := range s.store.coins {
-		if s.store.coins[i].ID == id {
-			if patch.Symbol != "" {
-				s.store.coins[i].Symbol = patch.Symbol
-			}
-			if patch.Name != "" {
-				s.store.coins[i].Name = patch.Name
-			}
-			if patch.Chain != "" {
-				s.store.coins[i].Chain = patch.Chain
-			}
-			if patch.Precision != 0 {
-				s.store.coins[i].Precision = patch.Precision
-			}
-			if patch.WithdrawFee != 0 {
-				s.store.coins[i].WithdrawFee = patch.WithdrawFee
-			}
-			s.store.coins[i].UpdatedAt = time.Now()
-			s.ok(c, s.store.coins[i])
+	out, err := s.catalog.UpdateCoin(id, patch)
+	if err != nil {
+		if errors.Is(err, ErrCatalogNotFound) {
+			s.fail(c, http.StatusNotFound, "coin not found")
 			return
 		}
+		s.fail(c, http.StatusInternalServerError, "update coin failed: "+err.Error())
+		return
 	}
-	s.fail(c, http.StatusNotFound, "coin not found")
+	s.ok(c, out)
 }
 
 // --- 充值提币记录（实时聚合 futures 链上事件；上游不可达时降级为内存示例）---
@@ -610,7 +586,7 @@ func (s *Server) markWithdrawal(c *gin.Context, id int64, status string) {
 	s.ok(c, gin.H{"id": id, "status": status, "indexed": found})
 }
 
-// --- 运营通知管理（list 实时聚合 notification 服务，本地公告叠加）---
+// --- 运营通知管理（list 实时聚合 notification 服务，本地公告叠加；本地公告持久化于 CatalogStore）---
 func (s *Server) listNotifications(c *gin.Context) {
 	ctx := c.Request.Context()
 	out := []Notification{}
@@ -638,11 +614,13 @@ func (s *Server) listNotifications(c *gin.Context) {
 			}
 		}
 	}
-	s.store.mu.RLock()
-	for _, n := range s.store.notifs {
-		out = append(out, n)
+	// 本地公告（管理后台自有，持久化于 CatalogStore）。
+	local, err := s.catalog.ListNotifications()
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "list local notifications failed: "+err.Error())
+		return
 	}
-	s.store.mu.RUnlock()
+	out = append(out, local...)
 	s.ok(c, out)
 }
 
@@ -652,14 +630,12 @@ func (s *Server) createNotification(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid notification")
 		return
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
-	s.store.seqNotif++
-	n.ID = s.store.seqNotif
-	n.CreatedAt = time.Now()
-	n.Source = "local" // 管理后台本地公告
-	s.store.notifs = append(s.store.notifs, n)
-	s.ok(c, n)
+	out, err := s.catalog.CreateNotification(n)
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "create notification failed: "+err.Error())
+		return
+	}
+	s.ok(c, out)
 }
 
 func (s *Server) deleteNotification(c *gin.Context) {
@@ -668,16 +644,15 @@ func (s *Server) deleteNotification(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
-	s.store.mu.Lock()
-	defer s.store.mu.Unlock()
-	for i := range s.store.notifs {
-		if s.store.notifs[i].ID == id {
-			s.store.notifs = append(s.store.notifs[:i], s.store.notifs[i+1:]...)
-			s.ok(c, gin.H{"deleted": id})
+	if err := s.catalog.DeleteNotification(id); err != nil {
+		if errors.Is(err, ErrCatalogNotFound) {
+			s.fail(c, http.StatusNotFound, "notification not found")
 			return
 		}
+		s.fail(c, http.StatusInternalServerError, "delete notification failed: "+err.Error())
+		return
 	}
-	s.fail(c, http.StatusNotFound, "notification not found")
+	s.ok(c, gin.H{"deleted": id})
 }
 
 // posSideStr 把 futures 的 PosSide(int) 映射为人类可读方向。

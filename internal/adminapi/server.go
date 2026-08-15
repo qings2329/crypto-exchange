@@ -20,8 +20,9 @@ type Server struct {
 	cfg      *config.Config
 	verifier *middleware.TokenVerifier
 	store    *Store
-	up       *UpstreamClient
-	adminStore AdminStore // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
+	up         *UpstreamClient
+	adminStore AdminStore  // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
+	catalog    CatalogStore // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
 }
 
 // NewServer 装配管理后台服务。verifier 使用全局 auth 共享密钥（与用户 token 同一密钥，
@@ -51,12 +52,25 @@ func NewServer(cfg *config.Config) *Server {
 		log.Printf("[admin] seed bootstrap admin failed: %v", err)
 	}
 
+	// 管理员自有配置存储：优先 MySQL，连接/迁移失败则回退内存（本地无 MySQL 时可运行）。
+	catalog, isMemCat, catErr := NewCatalogStore(cfg.MySQL.DSN)
+	if catErr != nil {
+		log.Printf("[admin] catalog store: falling back to in-memory (mysql unavailable: %v)", catErr)
+	}
+	if isMemCat {
+		log.Printf("[admin] WARNING: trading pairs/chains/coins/notifications persisted in memory only; restart resets them. Configure mysql.dsn for real persistence.")
+	}
+	if err := SeedCatalog(catalog); err != nil {
+		log.Printf("[admin] seed catalog failed: %v", err)
+	}
+
 	return &Server{
 		cfg:        cfg,
 		verifier:   verifier,
 		store:      NewStore(),
 		up:         NewUpstreamClient(selfToken),
 		adminStore: adminStore,
+		catalog:    catalog,
 	}
 }
 

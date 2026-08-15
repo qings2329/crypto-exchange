@@ -43,6 +43,8 @@ type Config struct {
 		Brokers    []string `yaml:"brokers"`
 		OrderTopic string   `yaml:"order_topic"`
 		TradeTopic string   `yaml:"trade_topic"`
+		DepthTopic string   `yaml:"depth_topic"`
+		Version    string   `yaml:"version"` // 协议协商版本，如 "3.6.0"；空则使用内置默认（V3_6_0_0）
 	} `yaml:"kafka"`
 
 	// Auth 是 Bearer Token 共享密钥（HMAC-SHA256）。生产应从密钥管理注入，勿写死。
