@@ -66,6 +66,11 @@ services:
   wealth: "http://127.0.0.1:8092"
   settlement: "http://127.0.0.1:8086"
 
+# 清算/结算服务（cmd/settlement）：交易手续费清算配置。
+# trade_fee_rate 为 taker 手续费率；<=0 用内置默认 0.1%。
+settlement:
+  trade_fee_rate: 0.001
+
 # 指数价预言机（internal/oracle）：真实多交易所 REST 喂价。
 # 留空（删除 feeds 或整个 oracle 段）时各服务回退到内置 StaticFeed 演示（futures 默认演示）。
 # 字段：name 源标识；type http/static；url 需含 %s 占位；symbol 交易所交易对（覆盖内部 symbol）；

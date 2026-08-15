@@ -43,7 +43,7 @@
 | T-13 | proto 生成脚本 | gRPC/protobuf 代码生成脚本与 CI 集成 | README「待补充」 | **已完成**（新增 `api/wallet.proto` + `scripts/gen_proto.sh` + Makefile `proto` 目标） |
 | T-14 | 其余业务线服务 | 实现 otc / options / margin / wealth / risk / settlement / notification 业务线 | README「待补充」 | **已完成**：settlement（T-15）、margin 现货杠杆（§7）、notification 站内信（§8）、risk 风控（§9）、options 期权（§10）、otc 场外交易（§11）、wealth 理财资管（§12）均已实现并验证（`go build/vet/test ./...` 全绿）；**T-14 全部 7 子业务线均已跑远程冒烟**（settlement 为纯费用/健康检查 HTTP 服务、无 MySQL 持久化，仅跑 HTTP 冒烟；其余 6 项均跑远程 MySQL 冒烟） |
 | T-15 | settlement 服务化 | `internal/settlement` 模块已存在，需封装为独立服务并接入账本 | 目录现状 | **已完成**（新增 `cmd/settlement` 独立服务：手续费估算/健康端点，`make build` 含 settlement，运行时验证通过） |
-| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | 部分接入（MySQL 已用；Redis/Kafka/InfluxDB/ES 仅声明，待各业务接入） |
+| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **部分接入（Kafka 已落地，见 §21）**：`cmd/matching` 已发布 `exchange.trades`/`market.depth` 到 Kafka（需 `-tags kafka`）；**`cmd/settlement` 新增交易清算消费端**，订阅 `exchange.trades` 把每笔成交手续费入账 `ce_settlement_trades`（幂等去重 + 聚合统计 + `/cleared`·`/stats` 端点），T-02 设计的「撮合成交→Kafka→清算入账」资金闭环打通。Redis/InfluxDB/ES 仍仅声明，待各业务接入 |
 | T-17 | 对账 / 审计报表 | 基于 `Ledger` 流水做借贷恒等校验、对账与审计看板 | 资金安全闭环延伸 | **已完成**（`Ledger.Reconcile/IsBalanced/RunReconcileOnce` + 定时巡检 + `/wallet/reconcile` 端点 + Prometheus 指标已具备） |
 | T-18 | 安全加固（暂不引入中间件） | 统一安全中间件套件：审计日志、安全响应头、受控 CORS、请求体限制、边缘/入口鉴权与公开端点豁免、TLS 可配置；修复 spot/futures 无鉴权下单漏洞与 market/futures 端口冲突 | 安全审计发现 | **已完成**（见 §13） |
 
@@ -379,3 +379,25 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - 风控快照、账本对账、服务健康、运营通知当前是 admin 服务内存只读骨架，应后续接入 futures/settlement 实时强平/穿仓/ADL、结算对账与各微服务健康探测。
 - 用户、交易对、公链、币种、充值提币 CRUD 为内存态，应后续对接 user/settlement 真实持久化（数据库/链上网关）。
 - 管理后台登录为明文凭据（config 内），生产应改为哈希+密钥管理，并可对接真实管理员账号体系。
+
+## 21. Kafka 交易清算接入（T-16，2026-08-15，已完成）
+
+**背景**：§18 把撮合收敛为单一 `cmd/matching` 权威服务后，`cmd/matching` 在每笔成交时经 `internal/pkg/mq` 发布 `exchange.trades` 到 Kafka（需 `-tags kafka` 构建），但**没有任何消费端真正消费并记账**——T-02 设计的「成交流发布 Kafka 触发清算、闭合资金链路」只完成了一半（发布侧）。`cmd/settlement` 此前仅是纯 HTTP 费用估算/健康服务，未消费成交流。
+
+**改动**：给 `cmd/settlement` 接上 Kafka 消费端，把每笔成交流驱动到交易所手续费账户清算入账，打通 T-02 资金闭环：
+
+- `internal/settlement/clearing.go`（新增）：`ClearedTrade`（清算流水，含确定性幂等键 `ID`）、`ClearingStats`（聚合：总成交数/总量/总手续费/按 symbol 累计）、`ClearingStore` 接口、`Clearer`（消费 `mq.TradeEvent` → 计算 `Fee=Price*Qty*TradeFeeRate` → 幂等入账 + 更新统计）。`TradeID` 以 FNV-64a 对成交关键字段哈希得到稳定幂等键，保证 Kafka at-least-once 下重复投递可安全跳过。
+- `internal/settlement/store_clearing_mem.go`（新增）：内存清算存储（id 索引去重，回退/单测用）。
+- `internal/settlement/store_clearing_mysql.go` + `store_clearing_migrations.go`（新增）：MySQL 实现，`ce_settlement_trades`（版本 9801，主键 `id` + `INSERT IGNORE` 幂等，`idx_symbol`/`idx_cleared_at` 二级索引），沿用 `internal/pkg/migrate` 与 `ce_` 前缀约定。`NewClearingStore(dsn)` 优先 MySQL、失败回退内存。
+- `cmd/settlement/main.go`（重写）：`mq.NewSubscriber(brokers, "settlement-clearer", handler)` 订阅 `exchange.trades`，handler 解包 `TradeEvent` 调 `Clearer.Clear`；新增 `GET /api/v1/settlement/cleared?limit=`（最近清算成交）与 `GET /api/v1/settlement/stats`（聚合统计）；信号退出时关闭 subscriber/store。手续费模型保持原 (链,资产) 维度费率。
+- `internal/pkg/config/config.go` + `configs/config.yaml`：新增 `settlement.trade_fee_rate`（默认 0.001，<=0 用 `DefaultTradeFeeRate`）。
+- `internal/settlement/clearing_test.go`（新增）：`TestClearerRecordsAndAggregates`/`TestClearerIdempotent`/`TestClearerViaSubscriber`（经 `InMemSubscriber.Feed` 走 Kafka 消费解包路径）/`TestTradeIDStable`，覆盖入账、幂等、统计、消费路径。
+
+**设计要点**：
+- 清算与用户资金解耦：现货/合约的用户余额变动仍由 spot/futures 直接经 Ledger 处理；本层只归集**交易所应收手续费**到独立清算流水，避免与用户资金混算，符合 T-02「清算服务记账」的语义。
+- 降级保证可用：默认（无 `-tags kafka`）构建下 `mq.NewSubscriber` 退回 `InMemSubscriber`（`Subscribe` 为 no-op），清算消费不可用但 HTTP 费用估算/健康端点照常；配置了 brokers 且 `-tags kafka` 时启用真实消费组。发布侧 `cmd/matching` 同理，故真实闭环需两端均以 `-tags kafka` 构建并存在可达的 Kafka broker。
+- 幂等：Kafka at-least-once + 主键 `INSERT IGNORE`，重复成交仅落库一次、仅计一次统计。
+
+**验证**：
+- `go build/vet/test ./...` 全绿（新增清算单测通过）；`go build -tags kafka ./...` 全绿（sarama 已在 go.mod，发布/消费两侧 Kafka 路径均可编译）。
+- **真·端到端（需 docker-compose 起 Kafka）**：`docker compose up -d kafka` → 以 `go build -tags kafka` 起 `cmd/matching`（发布 `exchange.trades`）与 `cmd/settlement`（消费清算）→ 下成交单 → `GET /api/v1/settlement/cleared` 可见该笔清算流水、`/stats` 累计手续费。无 broker 时默认构建退回内存，单测覆盖消费/幂等逻辑。
