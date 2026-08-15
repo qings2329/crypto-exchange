@@ -5,7 +5,7 @@
 //     settlement（链上充提网关模拟）、oracle（预言机指数价）、matching（撮合引擎）。
 //   - 本包负责把上述领域组件「装配」成可运行服务（回调接线、后台循环、风控参数），
 //     并通过 RegisterRoutes 暴露 HTTP 边界。不含 Store/Model（账本持久化由 ledger 负责）。
-//   - cmd/futures/main.go 仅做进程级装配：读配置、建 ledger/publisher、MySQL 持久化
+//   - cmd/futures/main.go 仅做进程级装配：读配置、建 ledger、MySQL 持久化
 //     生命周期（恢复/种子/信号/保存），再调用 NewServer + RegisterRoutes + Run。
 //
 // 这样 cmd 保持薄装配层，业务逻辑与 HTTP 边界集中在 futuresapi，符合项目服务分层约定。
@@ -24,7 +24,6 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
-	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/ws"
 )
@@ -37,7 +36,6 @@ type ginH = map[string]interface{}
 type Server struct {
 	log       *zap.Logger
 	ledgerSvc *ledger.Ledger
-	publisher mq.Publisher
 	dsn       string
 
 	hub          *ws.Hub
@@ -61,17 +59,17 @@ type Server struct {
 // 多实例收敛（见 DEVELOPMENT_TASKS §18）：撮合不再由本进程内的 matching.Engine 完成，
 // 而是改为调用独立的 cmd/matching 服务（matcher 为 *client.Client，满足 matching.Matcher）。
 // 成交/深度由 cmd/matching 经 WebSocket 推送，本服务的 onTrade 由该推送驱动（更新标记价、
-// 触发强平、广播行情、发布成交流）；强平平仓则通过 matcher.MatchNow 同步向 cmd/matching
-// 索取真实成交。这样全交易所的匹配权威唯一，订单簿不再随服务进程分裂。
+// 触发强平、广播行情）；强平平仓则通过 matcher.MatchNow 同步向 cmd/matching 索取真实成交。
+// 成交流由 cmd/matching 统一发布到 Kafka（exchange.trades），本服务不再重复发布。
+// 这样全交易所的匹配权威唯一，订单簿不再随服务进程分裂。
 //
 // 调用方约定：在调用前必须已经完成账本快照恢复或种子充值（本函数会配置账本风控参数并启动巡检，
 // 但不负责账本初始状态的载入）。onTrade 由 WS 推送在成交后调用，此时 s.liquidator 已赋值。
-func NewServer(ledgerSvc *ledger.Ledger, publisher mq.Publisher, log *zap.Logger, dsn, matchingURL string) *Server {
+func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		log:       log,
 		ledgerSvc: ledgerSvc,
-		publisher: publisher,
 		dsn:       dsn,
 		hub:       ws.NewHub(),
 		symbols:   []string{"BTC_USDT_PERP", "ETH_USDT_PERP"},
@@ -343,22 +341,6 @@ func (s *Server) onTrade(symbol string, t matching.Trade) {
 		"data": t,
 		"mark": mark,
 	})
-
-	takerSide := "buy"
-	if t.TakerSide == matching.Sell {
-		takerSide = "sell"
-	}
-	if err := s.publisher.PublishTrade(context.Background(), mq.TradeEvent{
-		Symbol:    symbol,
-		Price:     t.Price,
-		Qty:       t.Qty,
-		TakerID:   t.TakerID,
-		MakerID:   t.MakerID,
-		TakerSide: takerSide,
-		Ts:        time.Now().UnixMilli(),
-	}); err != nil {
-		s.log.Warn("publish trade failed", zap.String("symbol", symbol), zap.Error(err))
-	}
 }
 
 // onLiquidation 是强平器的强平事件回调：处理部分强平释放保证金与整仓强平没收保证金入保险基金。
@@ -553,7 +535,6 @@ func (s *Server) fundingLoop() {
 }
 
 // Close 停止所有后台组件（预言机、链上网关、对账巡检、资金费循环、行情订阅），并释放上下文。
-// publisher 的生命周期由 cmd 负责（NewServer 仅引用，不关闭）。
 func (s *Server) Close() {
 	s.cancel()
 	if s.oracleSvc != nil {

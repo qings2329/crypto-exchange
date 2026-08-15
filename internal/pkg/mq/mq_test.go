@@ -35,11 +35,38 @@ func TestInMemPublisherDropsOldestWhenFull(t *testing.T) {
 	}
 }
 
-func TestNewPublisherFallsBackToInMem(t *testing.T) {
-	// 默认（无 kafka tag）即使给了 brokers 也退回内存发布器，保证离线可运行。
-	p := NewPublisher([]string{"127.0.0.1:9092"}, "trades", nil)
-	if _, ok := p.(*InMemPublisher); !ok {
-		t.Fatalf("expected InMemPublisher fallback, got %T", p)
+func TestInMemPublisherDepthBuffers(t *testing.T) {
+	p := NewInMemPublisher(4, nil)
+	want := DepthEvent{Symbol: "BTCUSDT", Bids: []DepthLevel{{Price: 50000, Volume: 1}}, Ts: 1}
+	if err := p.PublishDepth(context.Background(), want); err != nil {
+		t.Fatalf("publish depth: %v", err)
+	}
+	drained := p.DrainDepth()
+	if len(drained) != 1 || drained[0].Symbol != "BTCUSDT" || len(drained[0].Bids) != 1 {
+		t.Fatalf("drain depth mismatch: %+v", drained)
+	}
+	// 成交缓冲不应被深度缓冲污染。
+	if len(p.Drain()) != 0 {
+		t.Fatal("trade buffer should be empty after only depth publishes")
+	}
+}
+
+func TestInMemSubscriberRoundTrip(t *testing.T) {
+	var gotTopic string
+	var gotData []byte
+	sub := NewInMemSubscriber(func(_ context.Context, topic string, data []byte) error {
+		gotTopic = topic
+		gotData = append([]byte(nil), data...)
+		return nil
+	})
+	if err := sub.Feed("exchange.trades", []byte(`{"symbol":"BTCUSDT"}`)); err != nil {
+		t.Fatalf("feed: %v", err)
+	}
+	if gotTopic != "exchange.trades" {
+		t.Fatalf("expected topic exchange.trades, got %q", gotTopic)
+	}
+	if string(gotData) != `{"symbol":"BTCUSDT"}` {
+		t.Fatalf("unexpected payload: %s", gotData)
 	}
 }
 

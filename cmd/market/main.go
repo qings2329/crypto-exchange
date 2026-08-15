@@ -10,6 +10,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 )
 
 // cmd/market 是行情服务的「装配层」，仅负责读配置、建日志、调用 market.NewServer
@@ -25,6 +26,9 @@ func main() {
 	}
 	log, _ := logger.New(cfg.Server.Mode)
 	defer func() { _ = log.Sync() }()
+
+	// 按配置覆盖 Kafka 协议协商版本（无 -tags kafka 时为空操作）。
+	mq.SetKafkaVersion(cfg.Kafka.Version)
 
 	server := market.NewServer(cfg, log)
 	defer server.Close()

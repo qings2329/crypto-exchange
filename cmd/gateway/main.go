@@ -42,6 +42,9 @@ func main() {
 		"/api/v1/spot/ws",
 		"/api/v1/market/ticker",
 		"/api/v1/market/ws",
+		"/api/v1/market/depth",
+		"/api/v1/market/trades",
+		"/api/v1/market/klines",
 	))...)
 
 	// 简单路由转发：把各业务线路径反代到对应后端服务（含 WebSocket 升级透传）。

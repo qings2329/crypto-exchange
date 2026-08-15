@@ -40,9 +40,13 @@ type Level struct {
 type Trade struct {
 	Price     float64
 	Qty       float64
-	TakerID   int64
-	MakerID   int64
+	TakerID   int64 // 吃单用户 ID（资金记账溯源）
+	MakerID   int64 // 挂单用户 ID
 	TakerSide Side
+	// TakerOID/MakerOID 为对应订单 ID，便于上游按订单维度释放预冻结资金；
+	// 与 TakerID/MakerID（用户维度）互补，均用于审计与对账。
+	TakerOID int64 `json:"taker_oid"`
+	MakerOID int64 `json:"maker_oid"`
 }
 
 // BookState 是单个交易对订单簿的可序列化快照，用于持久化与恢复。
@@ -136,13 +140,15 @@ func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 			}
 			maker.Filled += qty
 			in.Filled += qty
-			trades = append(trades, Trade{
-				Price:     p,
-				Qty:      qty,
-				TakerID:   in.ID,
-				MakerID:   maker.ID,
-				TakerSide: in.Side,
-			})
+		trades = append(trades, Trade{
+			Price:     p,
+			Qty:      qty,
+			TakerID:   in.UserID,
+			MakerID:   maker.UserID,
+			TakerSide: in.Side,
+			TakerOID:  in.ID,
+			MakerOID:  maker.ID,
+		})
 			if maker.IsFilled() {
 				level.Orders = level.Orders[1:]
 			}
