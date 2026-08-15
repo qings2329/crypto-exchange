@@ -20,6 +20,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -63,10 +64,11 @@ func (f *StaticFeed) Fetch(ctx context.Context, symbol string) (float64, error) 
 
 // HTTPFeedConfig HTTP 喂价源配置。
 type HTTPFeedConfig struct {
-	Name      string        // 源标识
-	URL       string        // REST 地址，需含 %s 占位交易对，如 https://api.x.com/api/v3/ticker/price?symbol=%s
-	Timeout   time.Duration // 请求超时
-	ParseFunc func([]byte) (float64, error) // 响应解析（不同交易所字段不同）
+	Name      string                          // 源标识
+	URL       string                          // REST 地址，需含 %s 占位（被 Symbol 或入参 symbol 替换）
+	Symbol    string                          // 交易所交易对（如 BTCUSDT）；空则用 Fetch 入参 symbol
+	Timeout   time.Duration                   // 请求超时，<=0 用默认 2s
+	ParseFunc func([]byte) (float64, error)  // 响应解析（不同交易所字段不同）
 }
 
 // HTTPFeed 真实 REST 喂价源适配器。
@@ -90,7 +92,11 @@ func NewHTTPFeed(cfg HTTPFeedConfig) *HTTPFeed {
 func (f *HTTPFeed) Name() string { return f.cfg.Name }
 
 func (f *HTTPFeed) Fetch(ctx context.Context, symbol string) (float64, error) {
-	url := fmt.Sprintf(f.cfg.URL, symbol)
+	sym := f.cfg.Symbol
+	if sym == "" {
+		sym = symbol
+	}
+	url := fmt.Sprintf(f.cfg.URL, sym)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
@@ -361,4 +367,85 @@ func OKXParse(body []byte) (float64, error) {
 		return 0, err
 	}
 	return p, nil
+}
+
+// CoinbaseParse Coinbase spot 价格解析：{"data":{"amount":"50000.00","currency":"USD"}}
+// URL 形如 https://api.coinbase.com/v2/prices/%s/spot（%s 为 BTC-USDT）。
+func CoinbaseParse(body []byte) (float64, error) {
+	var r struct {
+		Data struct {
+			Amount string `json:"amount"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return 0, err
+	}
+	var p float64
+	if _, err := fmt.Sscanf(r.Data.Amount, "%f", &p); err != nil {
+		return 0, err
+	}
+	return p, nil
+}
+
+// FeedSpec 声明式喂价源（来自配置文件），由 NewFromConfig 转换为 PriceFeed。
+type FeedSpec struct {
+	Name      string  `yaml:"name"`      // 源标识：binance/okx/coinbase/...
+	Type      string  `yaml:"type"`      // "http" | "static"；空按 "http" 处理
+	URL       string  `yaml:"url"`       // http：REST 地址，需含 %s 占位
+	Symbol    string  `yaml:"symbol"`    // http：交易所交易对（如 BTCUSDT），覆盖内部 symbol
+	Parse     string  `yaml:"parse"`     // http：解析器名 binance/okx/coinbase
+	Price     float64 `yaml:"price"`     // static：固定价
+	TimeoutSec int    `yaml:"timeout_sec"` // http：请求超时（秒），0 用默认 2s
+}
+
+// OracleConf 预言机配置（YAML 友好），对应 configs/config.yaml 的 oracle 段。
+// 沿用仓库约定：时间间隔用 int 秒（yaml.v3 不解析 duration 字符串）。
+type OracleConf struct {
+	PollIntervalSec int                   `yaml:"poll_interval_sec"`
+	Tolerance       float64               `yaml:"tolerance"`
+	MinFeeds        int                   `yaml:"min_feeds"`
+	Feeds           map[string][]FeedSpec `yaml:"feeds"` // 交易对 -> 喂价源列表
+}
+
+// parseFor 依据源名返回对应响应解析器；未知/空默认 Binance。
+func parseFor(name string) func([]byte) (float64, error) {
+	switch strings.ToLower(name) {
+	case "okx":
+		return OKXParse
+	case "coinbase":
+		return CoinbaseParse
+	default:
+		return BinanceParse
+	}
+}
+
+// NewFromConfig 由声明式配置构建预言机：http 类型生成真实 REST 适配器，
+// static 类型生成固定价源（离线演示）。无任何有效喂价源时返回空预言机
+// （IndexPrice 返回 (0,false)，调用方需回退到内置演示或跳过依赖）。
+func NewFromConfig(conf OracleConf) *Oracle {
+	feeds := make(map[string][]PriceFeed, len(conf.Feeds))
+	for sym, specs := range conf.Feeds {
+		for _, s := range specs {
+			switch strings.ToLower(s.Type) {
+			case "static":
+				feeds[sym] = append(feeds[sym], NewStaticFeed(s.Name, s.Price))
+			default: // "http" 或空：仅当配置了 URL 才算有效源
+				if s.URL != "" {
+					feeds[sym] = append(feeds[sym], NewHTTPFeed(HTTPFeedConfig{
+						Name:      s.Name,
+						URL:       s.URL,
+						Symbol:    s.Symbol,
+						Timeout:   time.Duration(s.TimeoutSec) * time.Second,
+						ParseFunc: parseFor(s.Parse),
+					}))
+				}
+			}
+		}
+	}
+	return New(Config{
+		PollInterval: time.Duration(conf.PollIntervalSec) * time.Second,
+		Tolerance:    conf.Tolerance,
+		MinFeeds:     conf.MinFeeds,
+		Feeds:        feeds,
+	})
 }

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
@@ -70,6 +71,9 @@ type Config struct {
 
 	// Admin 是管理后台后端（cmd/admin）配置。
 	Admin AdminConfig `yaml:"admin"`
+
+	// Oracle 是指数价预言机配置（internal/oracle）。为空时各服务回退到内置演示喂价。
+	Oracle oracle.OracleConf `yaml:"oracle"`
 }
 
 // AdminConfig 是管理后台后端（cmd/admin）配置。

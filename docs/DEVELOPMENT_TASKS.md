@@ -20,7 +20,7 @@
 |------|------|------|------|----------|
 | T-01 | 鉴权中间件落地 | 网关/服务校验 token 并写入上下文用户身份，按身份做权限与额度控制 | `internal/pkg/middleware/auth.go:30` `// TODO` | **已完成**（HMAC-SHA256 Bearer 校验 + 单测；网关接入） |
 | T-02 | 成交流发布 Kafka 触发清算 | 撮合成交后发布事件到 Kafka，驱动清算服务记账，闭合资金链路 | `internal/matching/engine.go:59` `// TODO` | **已完成**（新增 `internal/pkg/mq`：Publisher 接口 + InMem 降级 + Kafka 实现(build tag)；futures onTrade 已发布） |
-| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | 阻塞（合规+外部依赖，留待后续） |
+| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC（充值/提现链上回调）仍阻塞**（依赖外部节点+合规，见前述方案 B/C/D） |
 | T-04 | 数据库 migration 与版本管理 | 当前建表靠首次运行 `CREATE TABLE IF NOT EXISTS`，缺可回滚 migration。新建表须 `ce_` 前缀 | README「待补充」 | **已完成**（新增 `internal/pkg/migrate` 运行器 + `ce_schema_migrations` 版本表；ledger 表改由迁移创建；含集成测试） |
 
 ## 2. P1 — 合约交易完善

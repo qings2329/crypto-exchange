@@ -66,6 +66,70 @@ services:
   wealth: "http://127.0.0.1:8092"
   settlement: "http://127.0.0.1:8086"
 
+# 指数价预言机（internal/oracle）：真实多交易所 REST 喂价。
+# 留空（删除 feeds 或整个 oracle 段）时各服务回退到内置 StaticFeed 演示（futures 默认演示）。
+# 字段：name 源标识；type http/static；url 需含 %s 占位；symbol 交易所交易对（覆盖内部 symbol）；
+#       parse binance/okx/coinbase；price static 固定价；timeout_sec 请求超时（秒，0 用默认 2s）。
+oracle:
+  poll_interval_sec: 3
+  tolerance: 0.02          # 离群剔除容差（相对中位偏离），与 oracle.DefaultOutlierTolerance 一致
+  min_feeds: 2             # 最小健康源数
+  feeds:
+    BTC_USDT:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: BTCUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: BTC-USDT
+        parse: okx
+      - name: coinbase
+        type: http
+        url: "https://api.coinbase.com/v2/prices/%s/spot"
+        symbol: BTC-USDT
+        parse: coinbase
+    ETH_USDT:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: ETHUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: ETH-USDT
+        parse: okx
+      - name: coinbase
+        type: http
+        url: "https://api.coinbase.com/v2/prices/%s/spot"
+        symbol: ETH-USDT
+        parse: coinbase
+    BTC_USDT_PERP:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: BTCUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: BTC-USDT
+        parse: okx
+    ETH_USDT_PERP:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: ETHUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: ETH-USDT
+        parse: okx
+
 # 管理后台后端（cmd/admin）：仅 role=admin 的 token 可访问其 /api/admin/* 接口。
 admin:
   addr: ":8095"                  # 监听地址（避开 services 段已占用的 8090）

@@ -67,7 +67,7 @@ func main() {
 	}
 
 	// 价格预言机：OTC 核心流程不强制依赖行情，预留扩展入口（返回 (0,false) 即无价）。
-	oracleSvc := oracle.New(oracle.Config{})
+	oracleSvc := oracle.NewFromConfig(cfg.Oracle)
 	oracleSvc.Start()
 	defer oracleSvc.Stop()
 	priceFn := func(asset string) (float64, bool) {

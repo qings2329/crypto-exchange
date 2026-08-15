@@ -74,7 +74,7 @@ func main() {
 
 	// 装配合约交易服务（引擎/预言机/网关/资金费循环/账本风控），不含业务逻辑。
 	// matchingURL 指向 cmd/matching 服务，撮合收敛为单一权威（见 DEVELOPMENT_TASKS §18）。
-	server := futuresapi.NewServer(ledgerSvc, log, dsn, cfg.Matching.URL)
+	server := futuresapi.NewServer(ledgerSvc, log, dsn, cfg.Matching.URL, cfg.Oracle)
 	defer server.Close()
 
 	// 进程退出前持久化账本状态到 MySQL（正常返回或 Ctrl+C/kill 触发），保证资金安全态不丢失。

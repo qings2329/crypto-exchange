@@ -65,7 +65,7 @@ type Server struct {
 //
 // 调用方约定：在调用前必须已经完成账本快照恢复或种子充值（本函数会配置账本风控参数并启动巡检，
 // 但不负责账本初始状态的载入）。onTrade 由 WS 推送在成交后调用，此时 s.liquidator 已赋值。
-func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string) *Server {
+func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string, oracleConf oracle.OracleConf) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		log:       log,
@@ -94,23 +94,30 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	})
 	ledgerSvc.StartReconciler(15 * time.Second)
 
-	// 指数价预言机：多源聚合（演示用 StaticFeed 模拟价差）。
-	baseIndex := map[string]float64{
-		"BTC_USDT_PERP": 50000,
-		"ETH_USDT_PERP": 3000,
-	}
-	oracleFeeds := make(map[string][]oracle.PriceFeed)
-	for sym, base := range baseIndex {
-		oracleFeeds[sym] = []oracle.PriceFeed{
-			oracle.NewStaticFeed("binance", base),
-			oracle.NewStaticFeed("okx", base*1.0008),
-			oracle.NewStaticFeed("coinbase", base*0.9992),
+	// 指数价预言机：优先使用配置中的真实 REST 喂价（oracle.NewFromConfig）；
+	// 未配置喂价源时回退到内置 StaticFeed 演示（模拟多交易所价差）。
+	var oracleSvc *oracle.Oracle
+	if len(oracleConf.Feeds) > 0 {
+		oracleSvc = oracle.NewFromConfig(oracleConf)
+	} else {
+		baseIndex := map[string]float64{
+			"BTC_USDT_PERP": 50000,
+			"ETH_USDT_PERP": 3000,
 		}
+		oracleFeeds := make(map[string][]oracle.PriceFeed)
+		for sym, base := range baseIndex {
+			oracleFeeds[sym] = []oracle.PriceFeed{
+				oracle.NewStaticFeed("binance", base),
+				oracle.NewStaticFeed("okx", base*1.0008),
+				oracle.NewStaticFeed("coinbase", base*0.9992),
+			}
+		}
+		oracleSvc = oracle.New(oracle.Config{
+			PollInterval: 3 * time.Second,
+			Feeds:        oracleFeeds,
+		})
 	}
-	s.oracleSvc = oracle.New(oracle.Config{
-		PollInterval: 3 * time.Second,
-		Feeds:        oracleFeeds,
-	})
+	s.oracleSvc = oracleSvc
 	s.oracleSvc.Start()
 
 	// 资金费率管理器（演示结算周期 30s）。

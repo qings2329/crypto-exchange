@@ -66,7 +66,7 @@ func main() {
 	}
 
 	// 价格预言机：取标的现货标记价用于 BS 定价与到期结算。无配置源时用空配置（无价格，结算跳过）。
-	oracleSvc := oracle.New(oracle.Config{})
+	oracleSvc := oracle.NewFromConfig(cfg.Oracle)
 	oracleSvc.Start()
 	defer oracleSvc.Stop()
 	priceFn := func(asset string) (float64, bool) {
