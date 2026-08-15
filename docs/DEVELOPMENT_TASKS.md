@@ -43,7 +43,7 @@
 | T-13 | proto 生成脚本 | gRPC/protobuf 代码生成脚本与 CI 集成 | README「待补充」 | **已完成**（新增 `api/wallet.proto` + `scripts/gen_proto.sh` + Makefile `proto` 目标） |
 | T-14 | 其余业务线服务 | 实现 otc / options / margin / wealth / risk / settlement / notification 业务线 | README「待补充」 | **已完成**：settlement（T-15）、margin 现货杠杆（§7）、notification 站内信（§8）、risk 风控（§9）、options 期权（§10）、otc 场外交易（§11）、wealth 理财资管（§12）均已实现并验证（`go build/vet/test ./...` 全绿）；**T-14 全部 7 子业务线均已跑远程冒烟**（settlement 为纯费用/健康检查 HTTP 服务、无 MySQL 持久化，仅跑 HTTP 冒烟；其余 6 项均跑远程 MySQL 冒烟） |
 | T-15 | settlement 服务化 | `internal/settlement` 模块已存在，需封装为独立服务并接入账本 | 目录现状 | **已完成**（新增 `cmd/settlement` 独立服务：手续费估算/健康端点，`make build` 含 settlement，运行时验证通过） |
-| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **部分接入（Kafka 已落地，见 §21）**：`cmd/matching` 已发布 `exchange.trades`/`market.depth` 到 Kafka（需 `-tags kafka`）；**`cmd/settlement` 新增交易清算消费端**，订阅 `exchange.trades` 把每笔成交手续费入账 `ce_settlement_trades`（幂等去重 + 聚合统计 + `/cleared`·`/stats` 端点），T-02 设计的「撮合成交→Kafka→清算入账」资金闭环打通。Redis/InfluxDB/ES 仍仅声明，待各业务接入 |
+| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **部分接入（Kafka+Redis 已落地，见 §21/§22）**：Kafka 交易清算（§21）+ **Redis 集群级限流（§22）** 已接入；InfluxDB/ES 仍仅声明，待各业务接入 |
 | T-17 | 对账 / 审计报表 | 基于 `Ledger` 流水做借贷恒等校验、对账与审计看板 | 资金安全闭环延伸 | **已完成**（`Ledger.Reconcile/IsBalanced/RunReconcileOnce` + 定时巡检 + `/wallet/reconcile` 端点 + Prometheus 指标已具备） |
 | T-18 | 安全加固（暂不引入中间件） | 统一安全中间件套件：审计日志、安全响应头、受控 CORS、请求体限制、边缘/入口鉴权与公开端点豁免、TLS 可配置；修复 spot/futures 无鉴权下单漏洞与 market/futures 端口冲突 | 安全审计发现 | **已完成**（见 §13） |
 
@@ -401,3 +401,23 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 **验证**：
 - `go build/vet/test ./...` 全绿（新增清算单测通过）；`go build -tags kafka ./...` 全绿（sarama 已在 go.mod，发布/消费两侧 Kafka 路径均可编译）。
 - **真·端到端（需 docker-compose 起 Kafka）**：`docker compose up -d kafka` → 以 `go build -tags kafka` 起 `cmd/matching`（发布 `exchange.trades`）与 `cmd/settlement`（消费清算）→ 下成交单 → `GET /api/v1/settlement/cleared` 可见该笔清算流水、`/stats` 累计手续费。无 broker 时默认构建退回内存，单测覆盖消费/幂等逻辑。
+
+## 22. Redis 集群级限流接入（T-16，2026-08-15，已完成）
+
+**背景**：docker-compose 声明了 Redis（`redis:7`，:6379），配置 `redis.addr` 已存在，但全项目此前无任何服务连接它；`internal/pkg/middleware/ratelimit.go` 的限流注释明确写着「生产建议用 redis 令牌桶做分布式限流」，且 config 注释标注 `rate_limit_per_sec` 为「单实例每 IP 限流」——多网关/多实例部署时限流各自为政、可被横向绕过。
+
+**改动**：把限流后端抽象为 `redis.RateLimiter`，所有服务的 `Common` 安全中间件改用 Redis 支持的集群级限流（未配置/不可达时自动回退内存，行为不变）：
+
+- `internal/pkg/redis/redis.go`（新增）：`RateLimiter` 接口（`Allow(key,limit,window) bool`）；`New(addr,password,db)`——addr 为空返回 `memLimiter`（纯内存固定窗口，与原行为一致），否则返回 `redisLimiter`；`redisLimiter` 经 Lua 脚本（`INCR` + 首次 `PEXPIRE`）在 Redis 内做原子固定窗口计数，多实例共享同一计数实现集群级限流；**Redis 不可达时降级到内存限流（fail-degraded）**，保证限流在故障期仍生效而非放行。依赖 `github.com/redis/go-redis/v9`（已 `go get` 加入 go.mod）。
+- `internal/pkg/middleware/ratelimit.go`：新增 `RateLimitWith(lim redis.RateLimiter, limit, window)`，复用 `Allow` 语义；原 `RateLimit`（本地）保留供回退/单测。
+- `internal/pkg/middleware/security.go`：`Common` 内部 `rateLimiter := redis.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)`，把中间件列表中的 `RateLimit(limit, time.Second)` 替换为 `RateLimitWith(rateLimiter, limit, time.Second)`。所有服务（gateway/spot/futures/…/admin）因此统一获得集群级限流，无需各自改动。
+- `internal/pkg/redis/redis_test.go`（新增）：覆盖内存限流的放行/超额拒绝/窗口重置/空 addr 回退。
+
+**设计要点**：
+- 零回归：未配置 `redis.addr` 时 `New` 返回内存实现，`Common` 行为与此前完全一致；配置了但 Redis 宕机时降级内存，限流不失效。
+- 集群一致：配置了 Redis 后，同一客户端 IP 在 `rate_limit_per_sec` 窗口内的请求数在所有网关/服务实例间共享计数，横向扩展不再绕开限流。
+- 一致性原语：Lua 脚本保证 `INCR` 与过期设置的原子性，避免竞态下窗口计数失真。
+
+**验证**：
+- `go build/vet/test ./...` 全绿（新增 redis 单测通过）。
+- **真·集群限流（需 `docker compose up -d redis`）**：多实例网关共享 Redis 计数，单 IP 在 `rate_limit_per_sec` 内总请求数被全局约束；Redis 停服时自动回退内存限流（单测覆盖降级路径的逻辑等价性）。

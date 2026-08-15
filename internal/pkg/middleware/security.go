@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/pkg/redis"
 )
 
 // SecurityHeaders 注入安全响应头并隐藏 Server 标识，降低指纹与点击劫持等风险。
@@ -110,7 +111,8 @@ func AuthWithSkips(v *TokenVerifier, skipPrefixes ...string) gin.HandlerFunc {
 // 设计要点：Audit 紧跟 Recovery 注册，在 c.Next() 之后记录最终状态码，可覆盖所有响应
 // （含被限流/被鉴权拒绝的请求）；SecurityHeaders/CORS/MaxBodySize 均注册在入口追加的
 // Auth 之前，因此即便 Auth 拒绝(Abort)也能为响应写入安全头。限流与请求体上限取自配置，
-// 缺省分别 100 req/s 与 1 MiB；多实例下为单实例内存限流（暂不引入 Redis 的前提下的基础防护）。
+// 缺省分别 100 req/s 与 1 MiB。限流经 redis.New 构建：配置了 redis.addr 时为集群级
+// （多网关/多实例共享计数），未配置或 Redis 不可达时自动回退内存固定窗口（见 internal/pkg/redis）。
 func Common(log *zap.Logger, cfg *config.Config) []gin.HandlerFunc {
 	limit := cfg.Server.RateLimitPerSec
 	if limit <= 0 {
@@ -120,10 +122,11 @@ func Common(log *zap.Logger, cfg *config.Config) []gin.HandlerFunc {
 	if maxBody <= 0 {
 		maxBody = 1 << 20 // 1 MiB
 	}
+	rateLimiter := redis.New(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 	return []gin.HandlerFunc{
 		gin.Recovery(),
 		Audit(log),
-		RateLimit(limit, time.Second),
+		RateLimitWith(rateLimiter, limit, time.Second),
 		SecurityHeaders(),
 		CORS(cfg.Server.AllowedOrigins),
 		MaxBodySize(maxBody),
