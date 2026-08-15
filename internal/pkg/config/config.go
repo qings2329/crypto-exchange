@@ -69,6 +69,13 @@ type Config struct {
 
 	Services map[string]string `yaml:"services"`
 
+	// Settlement 是清算/结算服务（cmd/settlement）配置。
+	Settlement struct {
+		// TradeFeeRate 是交易所对 taker 收取的交易手续费率（如 0.001=0.1%）。
+		// <=0 时使用 internal/settlement.DefaultTradeFeeRate。
+		TradeFeeRate float64 `yaml:"trade_fee_rate"`
+	} `yaml:"settlement"`
+
 	// Admin 是管理后台后端（cmd/admin）配置。
 	Admin AdminConfig `yaml:"admin"`
 
