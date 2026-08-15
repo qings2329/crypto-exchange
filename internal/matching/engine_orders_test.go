@@ -87,14 +87,32 @@ func TestEngineOrderRegistry(t *testing.T) {
 		t.Fatal("GetOrder(999) should be missing")
 	}
 
-	// 成交登记：双边可见，market=futures。
+	// 成交登记：双边可见，market=futures，且从吃单（合约杠杆单）继承 is_margin/leverage。
 	ts1 := e.ListTrades(1, "", 0)
 	if len(ts1) != 1 || ts1[0].Market != "futures" {
 		t.Fatalf("user1 trades wrong: %+v", ts1)
 	}
+	if !ts1[0].IsMargin || ts1[0].Leverage != 10 {
+		t.Fatalf("trade should inherit taker leverage: %+v", ts1[0])
+	}
 	ts2 := e.ListTrades(2, "", 0)
 	if len(ts2) != 1 || ts2[0].Market != "futures" {
 		t.Fatalf("user2 trades wrong: %+v", ts2)
+	}
+	// 成交按杠杆过滤：本场景唯一成交是杠杆，margin=0 应为空。
+	var levTrades, plainTrades []TradeView
+	for _, v := range e.ListTrades(0, "", 0) {
+		if v.IsMargin {
+			levTrades = append(levTrades, v)
+		} else {
+			plainTrades = append(plainTrades, v)
+		}
+	}
+	if len(levTrades) != 1 || len(plainTrades) != 0 {
+		t.Fatalf("trade leverage split wrong: lev=%d plain=%d", len(levTrades), len(plainTrades))
+	}
+	if !levTrades[0].MarginMatches("1") || levTrades[0].MarginMatches("0") {
+		t.Fatal("TradeView.MarginMatches wrong")
 	}
 
 	// 撤销：新挂一笔后撤单，状态应变为 canceled。

@@ -64,6 +64,8 @@ type tradeRecord struct {
 	Seq       int64
 	Symbol    string
 	Market    string
+	IsMargin  bool
+	Leverage  float64
 	Price     float64
 	Qty       float64
 	TakerID   int64
@@ -295,6 +297,8 @@ func (e *Engine) applyTrades(symbol string, taker *Order, trades []Trade) {
 			Seq:       e.tradeSeq,
 			Symbol:    symbol,
 			Market:    taker.Market,
+			IsMargin:  taker.IsMargin,
+			Leverage:  taker.Leverage,
 			Price:     t.Price,
 			Qty:       t.Qty,
 			TakerID:   t.TakerID,
@@ -488,6 +492,8 @@ func (r *tradeRecord) toView() TradeView {
 		ID:        r.Seq,
 		Symbol:    r.Symbol,
 		Market:    r.Market,
+		IsMargin:  r.IsMargin,
+		Leverage:  r.Leverage,
 		Price:     r.Price,
 		Qty:       r.Qty,
 		TakerID:   r.TakerID,
