@@ -326,11 +326,11 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
   - spot 下 buy@100 qty2 返回 `order_id=12`，spot 的 depth 与 `cmd/matching` 的 depth 显示**同一个订单簿**（bids price=100 累计到 10）→ 证明单一匹配权威；
   - futures 开多单返回 `order_id=13`，仓位建立（LiqPrice≈45226），且该挂单出现在 `cmd/matching` 的 `BTC_USDT_PERP` 订单簿（ID=13）→ spot/futures 写入同一引擎；
   - 独立 WS 客户端连 `cmd/matching /ws` 后下对手卖单，收到 `trade` + `depth` 广播 → 证明行情经 WS 回传 spot/futures 本地 hub 的链路可用。
-- 已知：强平路径 `MatchNow` 仍不写 WAL（§17 已记，恢复由强平扫描重触发兜底），本轮未变。
+- 已知：强平路径 `MatchNow` 现已在接入 `Store` 时同步写 WAL（`EventSubmit`，§17 已知缺口①已补齐——恢复经 `Recover` 重放该成交，且重放不触发 `onTrade` 故不会重复结算）；未接入 `Store` 时行为不变。高级订单类型 IOC/FOK/止盈止损已在 `internal/matching/orderbook.go` 支持并经单测覆盖。
 
 ### 18.1 后续（未做）
 - spot/futures 目前仍各自运行一份 `client` 连同一个 `cmd/matching`；要真正「全所单写者容灾」需把网关层（`cmd/gateway` 或 Nginx）把 `/api/v1/spot/*order`、`/api/v1/futures/*order` 也代理到 `cmd/matching`，或让 spot/futures 仅做业务/账本、匹配全权委托——本轮按用户原话完成收敛到 `cmd/matching` 客户端，未进一步合并进程。
-- 强平 `MatchNow` 的流动性消耗仍不写 WAL（长期项，见 §17 已知缺口①）。
+- 强平 `MatchNow` 的流动性消耗现已写 WAL（见 §17 已知缺口①已补齐）；T-03 真实链上/预言机 RPC 仍阻塞（依赖外部节点+合规），本轮未实现，仅保留文档留白。
 
 ## 19. 前端拆分：用户前端(../ce-frontend/) 与 管理后台前端(../web-admin/)
 

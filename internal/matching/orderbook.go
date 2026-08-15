@@ -13,6 +13,13 @@ const (
 	Sell
 )
 
+// 时间约束力（Time-In-Force）。
+const (
+	TIFGTC = "GTC" // 默认：未成交部分挂单，直到成交或撤单
+	TIFIOC = "IOC" // 立即成交否则撤销：尽量撮合，剩余部分直接撤销、不挂单
+	TIFFOK = "FOK" // 全部成交否则撤销：对手盘流动性不足以完全成交时整笔撤销
+)
+
 // Order 是撮合引擎中的一笔委托。
 type Order struct {
 	ID     int64
@@ -22,6 +29,11 @@ type Order struct {
 	Qty    float64
 	Filled float64
 	Time   int64 // 时间戳，用于时间优先
+
+	// 高级订单属性（原型支持，默认零值表示普通限价/GTC）。
+	TimeInForce string  // GTC/IOC/FOK，空按 GTC 处理
+	StopPrice   float64 // >0 表示止盈止损单：成交价穿越该触发价后才激活为普通单
+	StopLimit   float64 // 仅 stop-limit 用：激活后作为限价单的挂单价；0 表示激活为市价单
 }
 
 // IsFilled 是否完全成交。
@@ -63,6 +75,8 @@ type OrderBook struct {
 	mu     sync.RWMutex
 	bids   map[float64]*Level // 买盘
 	asks   map[float64]*Level // 卖盘
+	stops  []*Order           // 未触发的止盈止损单：最近成交价穿越触发价后激活为普通单
+	last   float64            // 最近成交价，止盈止损触发判定的参考价
 }
 
 // NewOrderBook 创建订单簿。
@@ -104,10 +118,122 @@ func (ob *OrderBook) Match(in *Order) []Trade {
 // rest=true（默认 Match 行为）：未成交部分挂单到订单簿（限价单正常挂单）。
 // rest=false：市价单（Price=0）未成交部分直接丢弃、不挂单——用于强平场景，
 // 避免空流动性时残留 price=0 挂单污染订单簿（剩余由保险基金兜底成交）。
+//
+// 时间约束力（仅对 taker 生效）：
+//   - IOC：忽略 rest，尽量撮合、剩余直接撤销。
+//   - FOK：先校验对手盘可用流动性是否足以完全成交；不足则整笔撤销、不撮合。
 func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
+	// 止盈止损单：成交价穿越触发价前不入簿，挂起到 stops 等待激活。
+	if in.StopPrice > 0 {
+		if !ob.stopTriggered(in) {
+			ob.stops = append(ob.stops, in)
+			return nil
+		}
+		in = ob.activateStop(in)
+	}
+
+	trades := ob.matchCore(in, rest)
+
+	// 更新最近成交价，并激活穿越触发价的止盈止损单；循环直到无新触发，避免连锁遗漏。
+	if len(trades) > 0 {
+		ob.last = trades[len(trades)-1].Price
+	}
+	for {
+		triggered := ob.drainStops()
+		if len(triggered) == 0 {
+			break
+		}
+		trades = append(trades, triggered...)
+		if len(triggered) > 0 {
+			ob.last = triggered[len(triggered)-1].Price
+		}
+	}
+	return trades
+}
+
+// canFullyFill 调用方必须已持 ob.mu。估算对手盘可用流动性是否足以完全成交 in。
+// 市价单（Price=0）统计全部对手盘；限价单仅统计可成交档位（满足价格优先）。
+func (ob *OrderBook) canFullyFill(in *Order) bool {
+	var available float64
+	opposite := ob.asks
+	bestPrices := ob.sortedAskPrices()
+	if in.Side == Sell {
+		opposite = ob.bids
+		bestPrices = ob.sortedBidPrices()
+	}
+	for _, p := range bestPrices {
+		if in.Price > 0 {
+			// 限价单：仅统计可成交档位。
+			if in.Side == Buy && p > in.Price {
+				break
+			}
+			if in.Side == Sell && p < in.Price {
+				break
+			}
+		}
+		level := opposite[p]
+		for _, o := range level.Orders {
+			available += o.Remaining()
+		}
+	}
+	return available >= in.Qty
+}
+
+// stopTriggered 调用方必须已持 ob.mu。依据最近成交价判定止盈止损单是否触发。
+//   - 买止损（StopPrice>0，无成交价前不触发）：last >= StopPrice 时触发（价格上涨触及）。
+//   - 卖止损：last <= StopPrice 时触发（价格下跌触及）。
+func (ob *OrderBook) stopTriggered(in *Order) bool {
+	if ob.last == 0 {
+		return false // 尚无成交价可参考
+	}
+	if in.Side == Buy {
+		return ob.last >= in.StopPrice
+	}
+	return ob.last <= in.StopPrice
+}
+
+// activateStop 返回激活形态的订单副本（不修改入参，保留原 ID 以便记账对账）：
+// StopLimit>0 激活为限价单（挂单价=StopLimit），否则激活为市价单（Price=0）。
+func (ob *OrderBook) activateStop(in *Order) *Order {
+	act := *in
+	act.StopPrice = 0
+	if in.StopLimit > 0 {
+		act.Price = in.StopLimit
+	} else {
+		act.Price = 0
+	}
+	return &act
+}
+
+// drainStops 调用方必须已持 ob.mu。激活所有已触发止盈止损单并撮合，返回其成交流。
+func (ob *OrderBook) drainStops() []Trade {
+	var out []Trade
+	kept := ob.stops[:0]
+	for _, s := range ob.stops {
+		if ob.stopTriggered(s) {
+			out = append(out, ob.matchCore(ob.activateStop(s), true)...)
+		} else {
+			kept = append(kept, s)
+		}
+	}
+	ob.stops = kept
+	return out
+}
+
+// matchCore 不含止盈止损分支的核心撮合；调用方必须已持 ob.mu。
+func (ob *OrderBook) matchCore(in *Order, rest bool) []Trade {
+	switch in.TimeInForce {
+	case TIFIOC:
+		rest = false
+	case TIFFOK:
+		if !ob.canFullyFill(in) {
+			return nil
+		}
+		rest = false
+	}
 	var trades []Trade
 	opposite := ob.asks
 	own := ob.bids
@@ -122,7 +248,6 @@ func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 		if in.IsFilled() {
 			break
 		}
-		// 价格不满足则停止（限价单）
 		if in.Price > 0 {
 			if in.Side == Buy && p > in.Price {
 				break
@@ -140,15 +265,15 @@ func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 			}
 			maker.Filled += qty
 			in.Filled += qty
-		trades = append(trades, Trade{
-			Price:     p,
-			Qty:      qty,
-			TakerID:   in.UserID,
-			MakerID:   maker.UserID,
-			TakerSide: in.Side,
-			TakerOID:  in.ID,
-			MakerOID:  maker.ID,
-		})
+			trades = append(trades, Trade{
+				Price:     p,
+				Qty:      qty,
+				TakerID:   in.UserID,
+				MakerID:   maker.UserID,
+				TakerSide: in.Side,
+				TakerOID:  in.ID,
+				MakerOID:  maker.ID,
+			})
 			if maker.IsFilled() {
 				level.Orders = level.Orders[1:]
 			}
@@ -158,7 +283,6 @@ func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 		}
 	}
 
-	// 未完全成交：挂单（rest=true 时；市价单在 rest=false 下不挂单）。
 	if !in.IsFilled() && rest && in.Price > 0 {
 		book := own
 		level, ok := book[in.Price]
@@ -167,6 +291,25 @@ func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 			book[in.Price] = level
 		}
 		level.Orders = append(level.Orders, in)
+	}
+	return trades
+}
+
+// SetLast 更新最近成交价（如行情/标记价喂价），并激活穿越触发价的止盈止损单。
+// 返回被激活订单的成交流；引擎可据此回调 onTrade 对外发布。
+func (ob *OrderBook) SetLast(price float64) []Trade {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if price > 0 {
+		ob.last = price
+	}
+	var trades []Trade
+	for {
+		triggered := ob.drainStops()
+		if len(triggered) == 0 {
+			break
+		}
+		trades = append(trades, triggered...)
 	}
 	return trades
 }

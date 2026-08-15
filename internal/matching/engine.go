@@ -82,7 +82,8 @@ func (e *Engine) run(ba *bookActor) {
 			if e.onTrade != nil {
 				e.onTrade(ba.book.symbol, t)
 			}
-			// TODO: 发布成交流到 Kafka，触发清算服务记账
+			// 成交流对外发布（Kafka / WS）由调用方在 onTrade 回调中实现：
+			// 例如 cmd/matching 的 onTrade 会 pub.PublishTrade 到 Kafka 并广播 WS。
 		}
 		if e.onBook != nil {
 			e.onBook(ba.book.symbol)
@@ -147,8 +148,11 @@ func (e *Engine) Cancel(symbol string, orderID int64) bool {
 //     避免空流动性时残留 price=0 挂单污染订单簿）。
 //
 // 注意：本方法同步返回，不会回调 onTrade，因此调用方可安全在强平扫描上下文中使用，
-// 不会因 onTrade 再次触发 UpdateMarkPrice 造成重入。强平消耗订单簿流动性，
-// 该变更目前不写入 WAL（强平属特殊路径），恢复时由强平扫描重新触发，见 DEVELOPMENT_TASKS。
+// 不会因 onTrade 再次触发 UpdateMarkPrice 造成重入。
+//
+// 持久化：接入 Store 时，强平单与普通订单一致写入 WAL（EventSubmit），
+// 因此崩溃恢复能重放该成交，补齐原 §17 已知的"强平流动性不写 WAL"缺口；
+// 恢复经 Recover 重放 EventSubmit 时并不触发 onTrade，故不会重复结算。
 func (e *Engine) MatchNow(symbol string, o *Order, rest bool) ([]Trade, bool) {
 	e.mu.RLock()
 	ba, ok := e.books[symbol]
@@ -156,8 +160,38 @@ func (e *Engine) MatchNow(symbol string, o *Order, rest bool) ([]Trade, bool) {
 	if !ok {
 		return nil, false
 	}
+	if e.store != nil {
+		if o.ID == 0 {
+			if id, err := e.store.NextOrderID(context.Background()); err == nil {
+				o.ID = id
+			}
+		}
+		// 强平单同样写 WAL，保证恢复时可重放（与 Submit 路径一致）。
+		if err := e.store.Append(context.Background(), OrderEvent{
+			Symbol: symbol,
+			Type:   EventSubmit,
+			Order:  o,
+			Ts:     time.Now().UnixNano(),
+		}); err != nil {
+			log.Printf("[matching] WAL append failed (matchnow %d): %v", o.ID, err)
+		}
+	}
 	trades := ba.book.MatchRest(o, rest)
 	return trades, o.IsFilled()
+}
+
+// SetMarkPrice 喂入某交易对最新标记/成交参考价，并激活穿越触发价的止盈止损单。
+// 返回被激活订单的成交流，便于调用方经 onTrade 对外发布（无交易对返回 nil）。
+// 注意：成交驱动的最后价由 MatchRest 内部自动更新；本方法用于"无成交但价格已穿越"的
+// 触发场景（如指数/标记价触发的止损）。
+func (e *Engine) SetMarkPrice(symbol string, price float64) []Trade {
+	e.mu.RLock()
+	ba, ok := e.books[symbol]
+	e.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return ba.book.SetLast(price)
 }
 
 // Depth 获取某交易对深度快照。
