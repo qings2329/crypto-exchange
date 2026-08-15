@@ -153,6 +153,21 @@ func TestAdminOrderManagement(t *testing.T) {
 	if len(trades) != 1 {
 		t.Fatalf("expected 1 futures trade, got %d", len(trades))
 	}
+	// 成交按杠杆过滤：唯一成交来自合约杠杆单，?margin=1 返回1条，?margin=0 返回0条。
+	code, data = getJSON(t, r, "/api/admin/trades?margin=1", tok)
+	if code != http.StatusOK {
+		t.Fatalf("GET /trades?margin=1 expected 200, got %d", code)
+	}
+	if lev := data.(map[string]interface{})["trades"].([]interface{}); len(lev) != 1 {
+		t.Fatalf("expected 1 margin trade, got %d", len(lev))
+	}
+	code, data = getJSON(t, r, "/api/admin/trades?margin=0", tok)
+	if code != http.StatusOK {
+		t.Fatalf("GET /trades?margin=0 expected 200, got %d", code)
+	}
+	if plain := data.(map[string]interface{})["trades"].([]interface{}); len(plain) != 0 {
+		t.Fatalf("expected 0 plain trades, got %d", len(plain))
+	}
 
 	// 无 token → 401。
 	code, _ = getJSON(t, r, "/api/admin/orders", "")

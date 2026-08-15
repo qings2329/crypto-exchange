@@ -58,12 +58,16 @@ func (s *Server) handleAdminTrades(c *gin.Context) {
 	userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
 	symbol := c.Query("symbol")
 	market := c.Query("market")
+	margin := c.Query("margin")
 	limit, _ := strconv.Atoi(c.Query("limit"))
 
 	all := s.matchClient.ListTrades(userID, symbol, 0)
 	trades := make([]matching.TradeView, 0, len(all))
 	for _, v := range all {
 		if market != "" && v.Market != market {
+			continue
+		}
+		if !v.MarginMatches(margin) {
 			continue
 		}
 		trades = append(trades, v)

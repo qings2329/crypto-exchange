@@ -34,9 +34,11 @@ type OrderView struct {
 
 // TradeView 一笔成交的只读视图（买卖双边用户均可见，对应其各自历史）。
 type TradeView struct {
-	ID        int64   `json:"id"`         // 全局成交序号
+	ID        int64   `json:"id"`                     // 全局成交序号
 	Symbol    string  `json:"symbol"`
-	Market    string  `json:"market"`     // spot | futures
+	Market    string  `json:"market"`                // spot | futures
+	IsMargin  bool    `json:"is_margin"`             // 是否杠杆成交（来自吃单订单的杠杆标记）
+	Leverage  float64 `json:"leverage,omitempty"`    // 杠杆倍数（无杠杆为 0）
 	Price     float64 `json:"price"`
 	Qty       float64 `json:"qty"`
 	TakerID   int64   `json:"taker_id"`
@@ -55,13 +57,22 @@ func sideString(s Side) string {
 	return "sell"
 }
 
-// MarginMatches 按查询参数过滤是否匹配杠杆维度：
-// q 为空/"all" 全部通过；"1"/"true"/"margin" 仅杠杆单；"0"/"false" 仅非杠杆单。
-// 供用户侧与管理后台按 ?margin= 过滤复用。
-func (v OrderView) MarginMatches(q string) bool {
+// marginMatches 按查询参数过滤是否匹配杠杆维度：
+// q 为空/"all" 全部通过；"1"/"true"/"margin" 仅杠杆；"0"/"false" 仅非杠杆。
+func marginMatches(isMargin bool, q string) bool {
 	if q == "" || q == "all" {
 		return true
 	}
 	want := q == "1" || q == "true" || q == "margin"
-	return v.IsMargin == want
+	return isMargin == want
+}
+
+// MarginMatches 订单按 ?margin= 过滤（复用 marginMatches）。
+func (v OrderView) MarginMatches(q string) bool {
+	return marginMatches(v.IsMargin, q)
+}
+
+// MarginMatches 成交流水按 ?margin= 过滤（复用 marginMatches）。
+func (v TradeView) MarginMatches(q string) bool {
+	return marginMatches(v.IsMargin, q)
 }

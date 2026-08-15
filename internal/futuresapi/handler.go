@@ -181,13 +181,18 @@ func (s *Server) handleTrades(c *gin.Context) {
 		return
 	}
 	symbol := c.Query("symbol")
+	margin := c.Query("margin")
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	all := s.matcher.ListTrades(uid, symbol, 0)
 	trades := make([]matching.TradeView, 0, len(all))
 	for _, v := range all {
-		if v.Market == "futures" {
-			trades = append(trades, v)
+		if v.Market != "futures" {
+			continue
 		}
+		if !v.MarginMatches(margin) {
+			continue
+		}
+		trades = append(trades, v)
 	}
 	if limit > 0 && len(trades) > limit {
 		trades = trades[:limit]
