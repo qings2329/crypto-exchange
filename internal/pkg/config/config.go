@@ -76,6 +76,16 @@ type Config struct {
 		TradeFeeRate float64 `yaml:"trade_fee_rate"`
 	} `yaml:"settlement"`
 
+	// InfluxDB 是行情 K 线持久化配置（T-16）：已收盘 K 线写入时序库，
+	// 供行情服务在内存环形缓冲（klineCap=500）之外回取更长历史。
+	// URL 为空时行情服务仅用内存，不连接 InfluxDB（fail-degraded）。
+	InfluxDB struct {
+		URL    string `yaml:"url"`    // 如 http://127.0.0.1:8086
+		Token  string `yaml:"token"`  // 有读写权限的 API token
+		Org    string `yaml:"org"`    // 组织名
+		Bucket string `yaml:"bucket"` // 目标 bucket（如 market）
+	} `yaml:"influxdb"`
+
 	// Admin 是管理后台后端（cmd/admin）配置。
 	Admin AdminConfig `yaml:"admin"`
 

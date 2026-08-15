@@ -13,9 +13,11 @@
 package market
 
 import (
+	"context"
 	"sync"
 	"time"
 
+	"github.com/coldlar/crypto-exchange/internal/pkg/influxdb"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 )
 
@@ -107,6 +109,10 @@ type Market struct {
 	depths      map[string]*Depth
 	klines      map[string]map[string]*Candle    // symbol -> interval -> 当前未收盘 K 线
 	klineHistory map[string]map[string][]*Candle // symbol -> interval -> 已收盘历史（环形）
+	// Store 是可选的 K 线持久化层（InfluxDB 等）；为 nil 时仅用内存环形缓冲。
+	// 由 NewServer 按配置装配；pushHistory 在收盘时异步落盘，Klines 在请求超内存
+	// 环形上限时回取更早历史。一旦设置不再变更，避免与后台写入产生数据竞争。
+	Store influxdb.CandleStore
 }
 
 // NewMarket 创建空的行情存储。
@@ -118,6 +124,11 @@ func NewMarket() *Market {
 		klines:       make(map[string]map[string]*Candle),
 		klineHistory:  make(map[string]map[string][]*Candle),
 	}
+}
+
+// SetCandleStore 装配可选的 K 线持久化层（InfluxDB 等）。应在启动期、并发写入前调用一次。
+func (m *Market) SetCandleStore(s influxdb.CandleStore) {
+	m.Store = s
 }
 
 // ApplyTrade 用一笔成交更新行情：刷新 last/时间戳、24h 高低/量，记录近期成交，
@@ -213,6 +224,7 @@ func (m *Market) aggregateKlines(symbol string, price, qty float64, ts int64, ta
 }
 
 // pushHistory 把一根已收盘 K 线追加到历史环形缓冲（调用方须持写锁）。
+// 若装配了持久化层 Store，则异步把该已收盘 K 线落盘（best-effort，失败仅记录不阻断）。
 func (m *Market) pushHistory(symbol, interval string, c *Candle) {
 	hist, ok := m.klineHistory[symbol]
 	if !ok {
@@ -225,6 +237,15 @@ func (m *Market) pushHistory(symbol, interval string, c *Candle) {
 		list = list[len(list)-klineCap:]
 	}
 	hist[interval] = list
+
+	if m.Store != nil {
+		saved := *c // 拷贝后交后台写入，避免与后续只读访问共享指针。
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = m.Store.Write(ctx, toInfluxCandle(&saved))
+		}()
+	}
 }
 
 // ApplyDepth 用订单簿深度快照更新盘口，并以最优买卖档刷新 ticker 的 best_bid/best_ask。
@@ -317,13 +338,23 @@ func (m *Market) CurrentCandle(symbol, interval string) *Candle {
 
 // Klines 返回某交易对某周期的 K 线序列（已收盘历史在前，当前未收盘根在末尾），
 // 按 open_time 升序；limit<=0 或超出上限时截断到 klineCap 且只保留末尾 limit 根。
+//
+// 当请求条数超出内存环形缓冲（klineCap）且装配了持久化层 Store 时，会从 Store 回取
+// 更早的历史补足（[0, 内存最早根) 区间），与内存中的近期 K 线合并后截断到 limit；
+// Store 不可用（未配置或查询失败）时降级为纯内存结果（fail-degraded）。
 func (m *Market) Klines(symbol, interval string, limit int) []*Candle {
 	if limit <= 0 || limit > klineCap {
 		limit = klineCap
 	}
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	hist := m.klineHistory[symbol][interval]
+	// 内存最早根的 open_time 作为向 Store 回取的右开区间（避免与内存结果重复）。
+	end := int64(0)
+	if len(hist) > 0 {
+		end = hist[0].OpenTime
+	} else if cur, ok := m.klines[symbol][interval]; ok {
+		end = cur.OpenTime
+	}
 	out := make([]*Candle, 0, len(hist)+1)
 	for _, c := range hist {
 		cp := *c
@@ -333,6 +364,25 @@ func (m *Market) Klines(symbol, interval string, limit int) []*Candle {
 		cp := *cur
 		out = append(out, &cp)
 	}
+	m.mu.RUnlock()
+
+	// 扩展历史：内存不足且配置了持久化层时，回取更早的已收盘 K 线补足。
+	if m.Store != nil && len(out) < limit {
+		need := limit - len(out)
+		qctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		older, err := m.Store.Query(qctx, symbol, interval, 0, end, int64(need))
+		cancel()
+		if err == nil && len(older) > 0 {
+			merged := make([]*Candle, 0, len(older)+len(out))
+			for _, c := range older {
+				merged = append(merged, fromInfluxCandle(c))
+			}
+			merged = append(merged, out...)
+			out = merged
+		}
+		// 查询失败：静默降级为内存结果（fail-degraded）。
+	}
+
 	if len(out) > limit {
 		out = out[len(out)-limit:]
 	}
@@ -356,4 +406,52 @@ func capLevels(levels []mq.DepthLevel, n int) []mq.DepthLevel {
 		return levels[:n]
 	}
 	return levels
+}
+
+// toInfluxCandle 把内存 K 线转换为持久化表示（字段对齐，避免 market <-> influxdb 循环依赖）。
+func toInfluxCandle(c *Candle) influxdb.Candle {
+	return influxdb.Candle{
+		Symbol:          c.Symbol,
+		Interval:        c.Interval,
+		OpenTime:        c.OpenTime,
+		Open:            c.Open,
+		High:            c.High,
+		Low:             c.Low,
+		Close:           c.Close,
+		Volume:          c.Volume,
+		QuoteVolume:     c.QuoteVolume,
+		BuyVolume:       c.BuyVolume,
+		SellVolume:      c.SellVolume,
+		BuyQuoteVolume:  c.BuyQuoteVolume,
+		SellQuoteVolume: c.SellQuoteVolume,
+		Ts:              c.Ts,
+	}
+}
+
+// fromInfluxCandle 把持久化 K 线转换回内存表示。
+func fromInfluxCandle(c *influxdb.Candle) *Candle {
+	return &Candle{
+		Symbol:          c.Symbol,
+		Interval:        c.Interval,
+		OpenTime:        c.OpenTime,
+		Open:            c.Open,
+		High:            c.High,
+		Low:             c.Low,
+		Close:           c.Close,
+		Volume:          c.Volume,
+		QuoteVolume:     c.QuoteVolume,
+		BuyVolume:       c.BuyVolume,
+		SellVolume:      c.SellVolume,
+		BuyQuoteVolume:  c.BuyQuoteVolume,
+		SellQuoteVolume: c.SellQuoteVolume,
+		Ts:              c.Ts,
+	}
+}
+
+// Close 释放行情存储占用的外部资源（如持久化层连接）；无 Store 时为 no-op。
+func (m *Market) Close() error {
+	if m.Store != nil {
+		return m.Store.Close()
+	}
+	return nil
 }

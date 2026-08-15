@@ -13,6 +13,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/pkg/influxdb"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 	"github.com/coldlar/crypto-exchange/internal/ws"
 )
@@ -43,6 +44,15 @@ func NewServer(cfg *config.Config, log *zap.Logger) *Server {
 		demoSymbols: []string{"BTCUSDT", "ETHUSDT"},
 		ctx:         ctx,
 		cancel:      cancel,
+	}
+	// 行情 K 线持久化（T-16）：配置了 InfluxDB 则落盘已收盘 K 线并支持超内存环形回取；
+	// 未配置则仅用内存（fail-degraded）。
+	if cfg.InfluxDB.URL != "" {
+		m.SetCandleStore(influxdb.New(cfg.InfluxDB.URL, cfg.InfluxDB.Token, cfg.InfluxDB.Org, cfg.InfluxDB.Bucket))
+		s.log.Info("market kline persistence: influxdb",
+			zap.String("url", cfg.InfluxDB.URL), zap.String("bucket", cfg.InfluxDB.Bucket))
+	} else {
+		s.log.Info("market kline persistence: in-memory only (no influxdb configured)")
 	}
 	s.startSource()
 	return s
@@ -265,8 +275,9 @@ func (s *Server) handleKlines(c *gin.Context) {
 	c.JSON(200, s.market.Klines(sym, interval, limit))
 }
 
-// Close 停止数据源（取消上下文）。
+// Close 停止数据源（取消上下文）并释放行情存储占用的外部资源（如 InfluxDB 连接）。
 func (s *Server) Close() {
+	_ = s.market.Close()
 	s.cancel()
 }
 

@@ -71,6 +71,21 @@ services:
 settlement:
   trade_fee_rate: 0.001
 
+# 行情 K 线持久化（T-16）：已收盘 K 线写入 InfluxDB（measurement "kline"），
+# 行情服务在内存环形缓冲（klineCap=500）之外可回取更长历史。
+# url 为空 → 行情服务仅用内存，不连接 InfluxDB（fail-degraded）。
+# 启用时填入 docker-compose 中 influxdb:2.7（:8086）的实例信息，例如：
+#   influxdb:
+#     url: "http://127.0.0.1:8086"
+#     token: "<有读写权限的 API token>"
+#     org: "coldlar"
+#     bucket: "market"
+influxdb:
+  url: ""
+  token: ""
+  org: ""
+  bucket: ""
+
 # 指数价预言机（internal/oracle）：真实多交易所 REST 喂价。
 # 留空（删除 feeds 或整个 oracle 段）时各服务回退到内置 StaticFeed 演示（futures 默认演示）。
 # 字段：name 源标识；type http/static；url 需含 %s 占位；symbol 交易所交易对（覆盖内部 symbol）；
