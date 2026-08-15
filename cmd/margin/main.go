@@ -67,7 +67,7 @@ func main() {
 	}
 
 	// 价格预言机：取借入资产标记价用于强平价评估。无配置源时用空配置（无价格，强平跳过）。
-	oracleSvc := oracle.New(oracle.Config{})
+	oracleSvc := oracle.NewFromConfig(cfg.Oracle)
 	oracleSvc.Start()
 	defer oracleSvc.Stop()
 	priceFn := func(asset string) (float64, bool) {
