@@ -409,6 +409,7 @@ func (s *Server) liquidationCloser(symbol string, userID int64, side futures.Pos
 		Price:  0, // 市价单
 		Qty:    qty,
 		Time:   time.Now().UnixNano(),
+		Market: "futures",
 	}
 	trades, fully := s.matcher.MatchNow(symbol, o, false)
 	var filled, notional float64

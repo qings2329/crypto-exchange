@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -27,6 +28,48 @@ type Engine struct {
 	nodeID          string
 	snapshotInterval time.Duration
 	recovered       bool
+
+	// 订单/成交登记（订单管理模块）：内存态。重启后 open 订单由 Recover 重建，
+	// 历史 filled/canceled 与成交流水丢失（原型限制，见 DEVELOPMENT_TASKS）。
+	ordersMu   sync.Mutex
+	orders     map[int64]*orderMeta
+	userOrders map[int64][]int64
+	trades     []tradeRecord
+	userTrades map[int64][]int64
+	tradeSeq   int64
+}
+
+// orderMeta 是订单在登记表中的不可变快照 + 成交累加量。
+// 关键：不持有 *Order 指针——止盈止损激活产生副本后避免指针错位；
+// FilledQty 按 TakerOID/MakerOID（同 orderID）累加，状态始终正确。
+type orderMeta struct {
+	ID          int64
+	UserID      int64
+	Symbol      string
+	Market      string
+	Side        Side
+	Price       float64
+	Qty         float64
+	FilledQty   float64
+	TimeInForce string
+	Status      OrderStatus
+	CreatedAt   int64
+	UpdatedAt   int64
+}
+
+// tradeRecord 是一笔成交的登记表条目（买卖双边用户均索引）。
+type tradeRecord struct {
+	Seq       int64
+	Symbol    string
+	Market    string
+	Price     float64
+	Qty       float64
+	TakerID   int64
+	MakerID   int64
+	TakerSide Side
+	TakerOID  int64
+	MakerOID  int64
+	Time      int64
 }
 
 type bookActor struct {
@@ -37,9 +80,12 @@ type bookActor struct {
 // NewEngine 创建撮合引擎。
 func NewEngine(onTrade func(symbol string, t Trade), onBook func(symbol string)) *Engine {
 	return &Engine{
-		books:   make(map[string]*bookActor),
-		onTrade: onTrade,
-		onBook:  onBook,
+		books:     make(map[string]*bookActor),
+		onTrade:   onTrade,
+		onBook:    onBook,
+		orders:    make(map[int64]*orderMeta),
+		userOrders: make(map[int64][]int64),
+		userTrades: make(map[int64][]int64),
 	}
 }
 
@@ -78,6 +124,8 @@ func (e *Engine) run(ba *bookActor) {
 	}()
 	for o := range ba.ch {
 		trades := ba.book.Match(o)
+		// 订单状态与成交流水登记（订单管理模块）。
+		e.applyTrades(ba.book.symbol, o, trades)
 		for _, t := range trades {
 			if e.onTrade != nil {
 				e.onTrade(ba.book.symbol, t)
@@ -116,6 +164,7 @@ func (e *Engine) Submit(symbol string, o *Order) bool {
 			log.Printf("[matching] WAL append failed (submit %d): %v", o.ID, err)
 		}
 	}
+	e.registerOrder(o, symbol, time.Now().UnixNano())
 	ba.ch <- o
 	return true
 }
@@ -138,7 +187,16 @@ func (e *Engine) Cancel(symbol string, orderID int64) bool {
 			log.Printf("[matching] WAL append failed (cancel %d): %v", orderID, err)
 		}
 	}
-	return ba.book.Cancel(orderID)
+	if ba.book.Cancel(orderID) {
+		e.ordersMu.Lock()
+		if m, ok := e.orders[orderID]; ok {
+			m.Status = OrderCanceled
+			m.UpdatedAt = time.Now().UnixNano()
+		}
+		e.ordersMu.Unlock()
+		return true
+	}
+	return false
 }
 
 // MatchNow 同步撮合一笔订单（不入队、不触发 onTrade/onBook），返回成交列表与是否完全成交。
@@ -176,7 +234,9 @@ func (e *Engine) MatchNow(symbol string, o *Order, rest bool) ([]Trade, bool) {
 			log.Printf("[matching] WAL append failed (matchnow %d): %v", o.ID, err)
 		}
 	}
+	e.registerOrder(o, symbol, time.Now().UnixNano())
 	trades := ba.book.MatchRest(o, rest)
+	e.applyTrades(symbol, o, trades)
 	return trades, o.IsFilled()
 }
 
@@ -192,6 +252,245 @@ func (e *Engine) SetMarkPrice(symbol string, price float64) []Trade {
 		return nil
 	}
 	return ba.book.SetLast(price)
+}
+
+// ---- 订单管理模块：登记与查询 ----
+
+// registerOrder 登记一笔订单到登记表（幂等：已存在则跳过）。
+func (e *Engine) registerOrder(o *Order, symbol string, now int64) {
+	e.ordersMu.Lock()
+	defer e.ordersMu.Unlock()
+	if _, ok := e.orders[o.ID]; ok {
+		return
+	}
+	e.orders[o.ID] = &orderMeta{
+		ID:          o.ID,
+		UserID:      o.UserID,
+		Symbol:      symbol,
+		Market:      o.Market,
+		Side:        o.Side,
+		Price:       o.Price,
+		Qty:         o.Qty,
+		FilledQty:   o.Filled,
+		TimeInForce: o.TimeInForce,
+		Status:      OrderOpen,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	e.userOrders[o.UserID] = append(e.userOrders[o.UserID], o.ID)
+}
+
+// applyTrades 在撮合完成后更新订单状态并登记成交流水。
+// trades 为本笔 taker 订单产生的成交；maker 侧的 FilledQty 按 MakerOID 累加。
+func (e *Engine) applyTrades(symbol string, taker *Order, trades []Trade) {
+	now := time.Now().UnixNano()
+	e.ordersMu.Lock()
+	for _, t := range trades {
+		e.tradeSeq++
+		rec := tradeRecord{
+			Seq:       e.tradeSeq,
+			Symbol:    symbol,
+			Market:    taker.Market,
+			Price:     t.Price,
+			Qty:       t.Qty,
+			TakerID:   t.TakerID,
+			MakerID:   t.MakerID,
+			TakerSide: t.TakerSide,
+			TakerOID:  t.TakerOID,
+			MakerOID:  t.MakerOID,
+			Time:      now,
+		}
+		e.trades = append(e.trades, rec)
+		e.userTrades[t.TakerID] = append(e.userTrades[t.TakerID], rec.Seq)
+		e.userTrades[t.MakerID] = append(e.userTrades[t.MakerID], rec.Seq)
+		if m, ok := e.orders[t.MakerOID]; ok {
+			m.FilledQty += t.Qty
+			if m.FilledQty >= m.Qty {
+				m.Status = OrderFilled
+			}
+			m.UpdatedAt = now
+		}
+	}
+	if tm, ok := e.orders[taker.ID]; ok {
+		tm.FilledQty = taker.Filled
+		switch {
+		case taker.IsFilled():
+			tm.Status = OrderFilled
+		case e.bookHasOrder(symbol, taker.ID):
+			if tm.FilledQty > 0 {
+				tm.Status = OrderPartial
+			} else {
+				tm.Status = OrderOpen
+			}
+		default:
+			tm.Status = OrderCanceled
+		}
+		tm.UpdatedAt = now
+	}
+	e.ordersMu.Unlock()
+}
+
+// bookHasOrder 回报指定交易对订单簿中是否仍挂有该订单 ID（判断 taker 是否留挂单）。
+func (e *Engine) bookHasOrder(symbol string, id int64) bool {
+	e.mu.RLock()
+	ba, ok := e.books[symbol]
+	e.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	return ba.book.Contains(id)
+}
+
+// rebuildOrderIndex 扫描全部订单簿档位，重建 open 订单登记（重启后调用）。
+// 历史 filled/canceled 与成交流水不重建（原型限制）。
+func (e *Engine) rebuildOrderIndex() {
+	e.mu.RLock()
+	books := make([]*bookActor, 0, len(e.books))
+	for _, ba := range e.books {
+		books = append(books, ba)
+	}
+	e.mu.RUnlock()
+	now := time.Now().UnixNano()
+	for _, ba := range books {
+		bids, asks := ba.book.Depth()
+		for _, lvl := range bids {
+			for _, o := range lvl.Orders {
+				e.registerOrder(o, ba.book.symbol, now)
+			}
+		}
+		for _, lvl := range asks {
+			for _, o := range lvl.Orders {
+				e.registerOrder(o, ba.book.symbol, now)
+			}
+		}
+	}
+}
+
+// tradeBySeq 在单调递增的 trades 切片中二分查找成交记录。
+func (e *Engine) tradeBySeq(seq int64) *tradeRecord {
+	lo, hi := 0, len(e.trades)-1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if e.trades[mid].Seq == seq {
+			return &e.trades[mid]
+		}
+		if e.trades[mid].Seq < seq {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return nil
+}
+
+// ListOrders 返回指定用户的订单（按 user_id 过滤；symbol/status 为空不过滤；
+// limit<=0 不限制）。user_id=0 时返回全部（调试用）。
+func (e *Engine) ListOrders(userID int64, symbol, status string, limit int) []OrderView {
+	e.ordersMu.Lock()
+	defer e.ordersMu.Unlock()
+	var ids []int64
+	if userID != 0 {
+		ids = e.userOrders[userID]
+	} else {
+		ids = make([]int64, 0, len(e.orders))
+		for id := range e.orders {
+			ids = append(ids, id)
+		}
+	}
+	out := make([]OrderView, 0, len(ids))
+	for _, id := range ids {
+		m := e.orders[id]
+		if m == nil {
+			continue
+		}
+		if symbol != "" && m.Symbol != symbol {
+			continue
+		}
+		if status != "" && string(m.Status) != status {
+			continue
+		}
+		out = append(out, m.toView())
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// GetOrder 按订单 ID 返回详情；不存在返回 (OrderView{}, false)。
+func (e *Engine) GetOrder(orderID int64) (OrderView, bool) {
+	e.ordersMu.Lock()
+	defer e.ordersMu.Unlock()
+	m, ok := e.orders[orderID]
+	if !ok {
+		return OrderView{}, false
+	}
+	return m.toView(), true
+}
+
+// ListTrades 返回指定用户的成交流水（按 user_id；symbol 为空不过滤；limit<=0 不限制）。
+// 结果按时间倒序（最新在前）。
+func (e *Engine) ListTrades(userID int64, symbol string, limit int) []TradeView {
+	e.ordersMu.Lock()
+	defer e.ordersMu.Unlock()
+	var seqs []int64
+	if userID != 0 {
+		seqs = e.userTrades[userID]
+	} else {
+		seqs = make([]int64, 0, len(e.trades))
+		for _, r := range e.trades {
+			seqs = append(seqs, r.Seq)
+		}
+	}
+	out := make([]TradeView, 0)
+	for i := len(seqs) - 1; i >= 0; i-- {
+		rec := e.tradeBySeq(seqs[i])
+		if rec == nil {
+			continue
+		}
+		if symbol != "" && rec.Symbol != symbol {
+			continue
+		}
+		out = append(out, rec.toView())
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func (m *orderMeta) toView() OrderView {
+	return OrderView{
+		ID:          m.ID,
+		UserID:      m.UserID,
+		Symbol:      m.Symbol,
+		Market:      m.Market,
+		Side:        sideString(m.Side),
+		Price:       m.Price,
+		Qty:         m.Qty,
+		Filled:      m.FilledQty,
+		Status:      m.Status,
+		TimeInForce: m.TimeInForce,
+		CreatedAt:   m.CreatedAt,
+		UpdatedAt:   m.UpdatedAt,
+	}
+}
+
+func (r *tradeRecord) toView() TradeView {
+	return TradeView{
+		ID:        r.Seq,
+		Symbol:    r.Symbol,
+		Market:    r.Market,
+		Price:     r.Price,
+		Qty:       r.Qty,
+		TakerID:   r.TakerID,
+		MakerID:   r.MakerID,
+		TakerSide: sideString(r.TakerSide),
+		TakerOID:  r.TakerOID,
+		MakerOID:  r.MakerOID,
+		Time:      r.Time,
+	}
 }
 
 // Depth 获取某交易对深度快照。
@@ -259,6 +558,8 @@ func (e *Engine) Recover(ctx context.Context) error {
 			return err
 		}
 	}
+	// 重建 open 订单登记（历史 filled/canceled 与成交流水重启丢失，原型限制）。
+	e.rebuildOrderIndex()
 	log.Printf("[matching] recovered from snapshot@%d + %d wal events", version, len(events))
 	return nil
 }

@@ -3,6 +3,7 @@ package futuresapi
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -33,6 +34,11 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 	r.GET("/api/v1/futures/funding", s.handleFunding)
 	r.GET("/api/v1/futures/funding-history", s.handleFundingHistory)
 	r.GET("/api/v1/futures/ws", s.handleWS)
+	// 用户侧订单管理：仅返回鉴权用户本人的合约订单/成交（按 token 中的 uid + market=futures 过滤）。
+	r.GET("/api/v1/futures/orders", s.handleOrders)
+	r.GET("/api/v1/futures/orders/:id", s.handleOrderDetail)
+	r.GET("/api/v1/futures/trades", s.handleTrades)
+	r.POST("/api/v1/futures/cancel", s.handleCancel)
 
 	// 钱包 / 风控 / 指标（见 handler_wallet.go）
 	s.registerWalletRoutes(r)
@@ -75,6 +81,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 		Price:  req.Price,
 		Qty:    req.Qty,
 		Time:   time.Now().UnixNano(),
+		Market: "futures",
 	}
 	if !s.matcher.Submit(req.Symbol, o) {
 		response.Error(c, 400, 400, "unknown symbol or matching unavailable")
@@ -107,6 +114,102 @@ func (s *Server) handleOrder(c *gin.Context) {
 		}
 	}
 	response.JSON(c, gin.H{"order_id": o.ID, "status": "accepted"})
+}
+
+// handleOrders 返回当前用户本人的合约订单列表，可按 symbol/status 过滤、limit 分页。
+// 现货/合约共用同一撮合引擎登记簿，这里按 market=futures 过滤仅返回合约订单。
+func (s *Server) handleOrders(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	symbol := c.Query("symbol")
+	status := c.Query("status")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	all := s.matcher.ListOrders(uid, symbol, status, 0)
+	orders := make([]matching.OrderView, 0, len(all))
+	for _, v := range all {
+		if v.Market == "futures" {
+			orders = append(orders, v)
+		}
+	}
+	if limit > 0 && len(orders) > limit {
+		orders = orders[:limit]
+	}
+	response.JSON(c, gin.H{"orders": orders})
+}
+
+// handleOrderDetail 返回某笔合约订单详情；仅允许查看本人订单。
+func (s *Server) handleOrderDetail(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.Error(c, 400, 400, "bad order id")
+		return
+	}
+	v, ok2 := s.matcher.GetOrder(id)
+	if !ok2 {
+		response.Error(c, 404, 404, "not found")
+		return
+	}
+	if v.UserID != uid || v.Market != "futures" {
+		response.Error(c, 403, 403, "forbidden")
+		return
+	}
+	response.JSON(c, gin.H{"order": v})
+}
+
+// handleTrades 返回当前用户本人的合约成交流水，可按 symbol 过滤、limit 分页。
+// 按 market=futures 过滤，仅返回合约成交（现货/合约成交在统一登记簿中需区分）。
+func (s *Server) handleTrades(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	symbol := c.Query("symbol")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	all := s.matcher.ListTrades(uid, symbol, 0)
+	trades := make([]matching.TradeView, 0, len(all))
+	for _, v := range all {
+		if v.Market == "futures" {
+			trades = append(trades, v)
+		}
+	}
+	if limit > 0 && len(trades) > limit {
+		trades = trades[:limit]
+	}
+	response.JSON(c, gin.H{"trades": trades})
+}
+
+// handleCancel 撤销一笔合约订单；仅允许撤销本人订单，并校验归属。
+func (s *Server) handleCancel(c *gin.Context) {
+	var req struct {
+		Symbol  string `json:"symbol"`
+		OrderID int64  `json:"order_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, 400, 400, "bad request")
+		return
+	}
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	if v, ok2 := s.matcher.GetOrder(req.OrderID); ok2 {
+		if v.UserID != uid || v.Market != "futures" {
+			response.Error(c, 403, 403, "forbidden")
+			return
+		}
+	}
+	canceled := s.matcher.Cancel(req.Symbol, req.OrderID)
+	response.JSON(c, gin.H{"symbol": req.Symbol, "order_id": req.OrderID, "canceled": canceled})
 }
 
 // handlePositions 查询某交易对的逐仓+全仓持仓，附带全仓用户的共享保证金余额。

@@ -34,6 +34,10 @@ type Order struct {
 	TimeInForce string  // GTC/IOC/FOK，空按 GTC 处理
 	StopPrice   float64 // >0 表示止盈止损单：成交价穿越该触发价后才激活为普通单
 	StopLimit   float64 // 仅 stop-limit 用：激活后作为限价单的挂单价；0 表示激活为市价单
+
+	// Market 标记订单来源市场（"spot" | "futures"），由上游在下单时写入，
+	// 用于订单管理模块按交易类型区分同一撮合引擎内的订单（现货/合约共用同一登记簿）。
+	Market string
 }
 
 // IsFilled 是否完全成交。
@@ -377,6 +381,27 @@ func (ob *OrderBook) Cancel(orderID int64) bool {
 					}
 					return true
 				}
+			}
+		}
+	}
+	return false
+}
+
+// Contains 回报订单簿中是否挂有指定订单 ID（用于判定 taker 是否留挂单）。
+func (ob *OrderBook) Contains(orderID int64) bool {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+	for _, lvl := range ob.bids {
+		for _, o := range lvl.Orders {
+			if o.ID == orderID {
+				return true
+			}
+		}
+	}
+	for _, lvl := range ob.asks {
+		for _, o := range lvl.Orders {
+			if o.ID == orderID {
+				return true
 			}
 		}
 	}

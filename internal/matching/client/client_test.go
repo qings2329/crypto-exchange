@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,10 +97,41 @@ func newFakeREST(t *testing.T) (*httptest.Server, *matching.Engine) {
 		c := e.Cancel(req.Symbol, req.OrderID)
 		okJSON(w, map[string]interface{}{"canceled": c})
 	})
+	mux.HandleFunc("/orders/", func(w http.ResponseWriter, r *http.Request) {
+		idStr := strings.TrimPrefix(r.URL.Path, "/orders/")
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			w.WriteHeader(400)
+			okJSON := map[string]interface{}{"code": 400, "message": "bad id", "data": nil}
+			_ = json.NewEncoder(w).Encode(okJSON)
+			return
+		}
+		if v, ok := e.GetOrder(id); ok {
+			okJSON(w, v)
+		} else {
+			w.WriteHeader(404)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 404, "message": "not found", "data": nil})
+		}
+	})
+	mux.HandleFunc("/orders", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		uid, _ := strconv.ParseInt(q.Get("user_id"), 10, 64)
+		okJSON(w, e.ListOrders(uid, q.Get("symbol"), q.Get("status"), atoi(q.Get("limit"))))
+	})
+	mux.HandleFunc("/trades", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		uid, _ := strconv.ParseInt(q.Get("user_id"), 10, 64)
+		okJSON(w, e.ListTrades(uid, q.Get("symbol"), atoi(q.Get("limit"))))
+	})
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv, e
+}
+
+func atoi(s string) int {
+	n, _ := strconv.Atoi(s)
+	return n
 }
 
 func TestClientSubmitAndDepth(t *testing.T) {
@@ -220,5 +253,55 @@ func TestClientWatch(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("did not receive depth event via WS")
+	}
+}
+
+// TestClientListOrdersAndTrades 验证客户端经假 REST 端点查询订单/成交，
+// 解包契约（data 直接为数组/对象）与跨用户过滤正确。
+func TestClientListOrdersAndTrades(t *testing.T) {
+	srv, e := newFakeREST(t)
+	c := client.New(srv.URL)
+
+	// 播种：用户1的现货限价买（挂单）与用户2的合约市价卖（吃单成交）。
+	if _, _ = e.MatchNow("BTC_USDT", &matching.Order{
+		ID: 1, UserID: 1, Side: matching.Buy, Price: 100, Qty: 1, Time: 1, Market: "spot",
+	}, true); false {
+	}
+	if _, _ = e.MatchNow("BTC_USDT", &matching.Order{
+		ID: 2, UserID: 2, Side: matching.Sell, Price: 0, Qty: 1, Time: 2, Market: "futures",
+	}, false); false {
+	}
+
+	// 用户1仅见自己的订单（现货）。
+	os1 := c.ListOrders(1, "", "", 0)
+	if len(os1) != 1 || os1[0].ID != 1 || os1[0].Market != "spot" || os1[0].Status != matching.OrderFilled {
+		t.Fatalf("user1 orders wrong: %+v", os1)
+	}
+	// 用户2仅见自己的订单（合约）。
+	os2 := c.ListOrders(2, "", "", 0)
+	if len(os2) != 1 || os2[0].ID != 2 || os2[0].Market != "futures" {
+		t.Fatalf("user2 orders wrong: %+v", os2)
+	}
+	// user_id=0 返回全部。
+	all := c.ListOrders(0, "", "", 0)
+	if len(all) != 2 {
+		t.Fatalf("admin all orders should be 2, got %d", len(all))
+	}
+	// 详情查询。
+	v, ok := c.GetOrder(1)
+	if !ok || v.UserID != 1 {
+		t.Fatalf("GetOrder(1) wrong: ok=%v v=%+v", ok, v)
+	}
+	if _, ok := c.GetOrder(999); ok {
+		t.Fatal("GetOrder(999) should not be found")
+	}
+	// 成交：双边用户均可见同一笔，market=futures。
+	ts1 := c.ListTrades(1, "", 0)
+	if len(ts1) != 1 || ts1[0].Market != "futures" {
+		t.Fatalf("user1 trades wrong: %+v", ts1)
+	}
+	ts2 := c.ListTrades(2, "", 0)
+	if len(ts2) != 1 || ts2[0].Market != "futures" {
+		t.Fatalf("user2 trades wrong: %+v", ts2)
 	}
 }

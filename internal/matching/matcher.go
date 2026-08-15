@@ -14,4 +14,14 @@ type Matcher interface {
 	Depth(symbol string) (bids, asks []Level, ok bool)
 	// MatchNow 同步撮合一笔订单并返回成交列表与是否完全成交（用于强平）。
 	MatchNow(symbol string, o *Order, rest bool) ([]Trade, bool)
+	// Cancel 撤销一笔订单；返回是否成功撤销（false 表示订单不存在或已成交/已撤）。
+	Cancel(symbol string, orderID int64) bool
+	// ListOrders 返回指定用户的订单（按 user_id 过滤；symbol/status 为空表示不过滤；
+	// limit<=0 表示不限制）。远程 *client.Client 经 cmd/matching /orders 实现。
+	ListOrders(userID int64, symbol, status string, limit int) []OrderView
+	// GetOrder 按订单 ID 返回详情；不存在返回 (OrderView{}, false)。
+	GetOrder(orderID int64) (OrderView, bool)
+	// ListTrades 返回指定用户的成交流水（按 user_id；symbol 为空表示不过滤；
+	// limit<=0 表示不限制）。远程 *client.Client 经 cmd/matching /trades 实现。
+	ListTrades(userID int64, symbol string, limit int) []TradeView
 }

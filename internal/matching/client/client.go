@@ -134,6 +134,15 @@ func (c *Client) CancelOrder(symbol string, orderID int64) (canceled bool, err e
 	return resp.Canceled, nil
 }
 
+// Cancel 实现 matching.Matcher：经 cmd/matching /cancel 撤销订单；网络/服务端错误返回 false。
+func (c *Client) Cancel(symbol string, orderID int64) bool {
+	canceled, err := c.CancelOrder(symbol, orderID)
+	if err != nil {
+		return false
+	}
+	return canceled
+}
+
 // ---- WebSocket 行情订阅 ----
 
 // TradeEvent 是单笔成交事件（来自 WS）。
@@ -307,4 +316,48 @@ func (c *Client) getJSON(path string, out interface{}) error {
 	}
 	defer resp.Body.Close()
 	return unwrap(resp, out)
+}
+
+// ListOrders 经 cmd/matching /orders 查询指定用户订单。
+func (c *Client) ListOrders(userID int64, symbol, status string, limit int) []matching.OrderView {
+	var out []matching.OrderView
+	q := fmt.Sprintf("user_id=%d", userID)
+	if symbol != "" {
+		q += "&symbol=" + symbol
+	}
+	if status != "" {
+		q += "&status=" + status
+	}
+	if limit > 0 {
+		q += fmt.Sprintf("&limit=%d", limit)
+	}
+	if err := c.getJSON("/orders?"+q, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// GetOrder 经 cmd/matching /orders/:id 查询订单详情。
+func (c *Client) GetOrder(orderID int64) (matching.OrderView, bool) {
+	var out matching.OrderView
+	if err := c.getJSON(fmt.Sprintf("/orders/%d", orderID), &out); err != nil {
+		return matching.OrderView{}, false
+	}
+	return out, true
+}
+
+// ListTrades 经 cmd/matching /trades 查询指定用户成交流水。
+func (c *Client) ListTrades(userID int64, symbol string, limit int) []matching.TradeView {
+	var out []matching.TradeView
+	q := fmt.Sprintf("user_id=%d", userID)
+	if symbol != "" {
+		q += "&symbol=" + symbol
+	}
+	if limit > 0 {
+		q += fmt.Sprintf("&limit=%d", limit)
+	}
+	if err := c.getJSON("/trades?"+q, &out); err != nil {
+		return nil
+	}
+	return out
 }

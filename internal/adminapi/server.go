@@ -7,6 +7,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"github.com/gin-gonic/gin"
 
+	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 )
@@ -21,6 +22,7 @@ type Server struct {
 	verifier *middleware.TokenVerifier
 	store    *Store
 	up         *UpstreamClient
+	matchClient *client.Client // 直连撮合引擎（cmd/matching），用于跨用户订单管理与撤销
 	adminStore AdminStore  // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
 	catalog    CatalogStore // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
 }
@@ -69,6 +71,7 @@ func NewServer(cfg *config.Config) *Server {
 		verifier:   verifier,
 		store:      NewStore(),
 		up:         NewUpstreamClient(selfToken),
+		matchClient: client.New(cfg.Matching.URL),
 		adminStore: adminStore,
 		catalog:    catalog,
 	}
@@ -127,6 +130,15 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 运营看板：账本对账（实时聚合 futures）+ 服务健康（探活各服务）
 		admin.GET("/ledger", s.handleLedger)
 		admin.GET("/services", s.handleServices)
+
+		// 订单管理（跨用户查询/撤销，运营风控用）。读需 trade:read，撤销需 trade:manage（高危）。
+		orders := admin.Group("/orders", middleware.RequirePerm(PermTradeRead))
+		{
+			orders.GET("", s.handleAdminOrders)
+			orders.GET("/:id", s.handleAdminOrderDetail)
+		}
+		admin.GET("/trades", middleware.RequirePerm(PermTradeRead), s.handleAdminTrades)
+		admin.POST("/orders/:id/cancel", middleware.RequirePerm(PermTradeManage), s.handleAdminCancelOrder)
 
 		// 当前管理员自身信息（含角色/权限）；任何已登录管理员可访问。
 		admin.GET("/me", s.adminMe)
