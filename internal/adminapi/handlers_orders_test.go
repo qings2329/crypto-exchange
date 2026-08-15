@@ -87,13 +87,13 @@ func TestAdminOrderManagement(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	match, eng := newFakeMatching(t)
 
-	// 预置：用户1现货挂单（成交），用户2合约吃单（成交）。
+	// 预置：用户1现货挂单（普通，成交），用户2合约吃单（杠杆单，成交）。
 	if _, _ = eng.MatchNow("BTC_USDT", &matching.Order{
 		ID: 1, UserID: 1, Side: matching.Buy, Price: 100, Qty: 1, Time: 1, Market: "spot",
 	}, true); false {
 	}
 	if _, _ = eng.MatchNow("BTC_USDT", &matching.Order{
-		ID: 2, UserID: 2, Side: matching.Sell, Price: 0, Qty: 1, Time: 2, Market: "futures",
+		ID: 2, UserID: 2, Side: matching.Sell, Price: 0, Qty: 1, Time: 2, Market: "futures", IsMargin: true, Leverage: 10,
 	}, false); false {
 	}
 
@@ -116,6 +116,22 @@ func TestAdminOrderManagement(t *testing.T) {
 	orders := data.(map[string]interface{})["orders"].([]interface{})
 	if len(orders) != 2 {
 		t.Fatalf("expected 2 orders via admin, got %d", len(orders))
+	}
+
+	// 杠杆过滤：?margin=1 仅合约杠杆单（1条），?margin=0 仅普通现货单（1条）。
+	code, data = getJSON(t, r, "/api/admin/orders?margin=1", tok)
+	if code != http.StatusOK {
+		t.Fatalf("GET /orders?margin=1 expected 200, got %d", code)
+	}
+	if lev := data.(map[string]interface{})["orders"].([]interface{}); len(lev) != 1 {
+		t.Fatalf("expected 1 margin order, got %d", len(lev))
+	}
+	code, data = getJSON(t, r, "/api/admin/orders?margin=0", tok)
+	if code != http.StatusOK {
+		t.Fatalf("GET /orders?margin=0 expected 200, got %d", code)
+	}
+	if plain := data.(map[string]interface{})["orders"].([]interface{}); len(plain) != 1 {
+		t.Fatalf("expected 1 plain order, got %d", len(plain))
 	}
 
 	// 详情。

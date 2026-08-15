@@ -47,6 +47,8 @@ type orderMeta struct {
 	UserID      int64
 	Symbol      string
 	Market      string
+	IsMargin    bool
+	Leverage    float64
 	Side        Side
 	Price       float64
 	Qty         float64
@@ -268,6 +270,8 @@ func (e *Engine) registerOrder(o *Order, symbol string, now int64) {
 		UserID:      o.UserID,
 		Symbol:      symbol,
 		Market:      o.Market,
+		IsMargin:    o.IsMargin,
+		Leverage:    o.Leverage,
 		Side:        o.Side,
 		Price:       o.Price,
 		Qty:         o.Qty,
@@ -466,6 +470,8 @@ func (m *orderMeta) toView() OrderView {
 		UserID:      m.UserID,
 		Symbol:      m.Symbol,
 		Market:      m.Market,
+		IsMargin:    m.IsMargin,
+		Leverage:    m.Leverage,
 		Side:        sideString(m.Side),
 		Price:       m.Price,
 		Qty:         m.Qty,

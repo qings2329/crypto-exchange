@@ -20,6 +20,8 @@ type OrderView struct {
 	UserID      int64       `json:"user_id"`
 	Symbol      string      `json:"symbol"`
 	Market      string      `json:"market"` // spot | futures
+	IsMargin    bool        `json:"is_margin"`        // 是否杠杆单（现货杠杆/合约均为 true）
+	Leverage    float64     `json:"leverage,omitempty"` // 杠杆倍数（无杠杆为 0）
 	Side        string      `json:"side"`   // buy | sell
 	Price       float64     `json:"price"`  // 0 表示市价单
 	Qty         float64     `json:"qty"`
@@ -51,4 +53,15 @@ func sideString(s Side) string {
 		return "buy"
 	}
 	return "sell"
+}
+
+// MarginMatches 按查询参数过滤是否匹配杠杆维度：
+// q 为空/"all" 全部通过；"1"/"true"/"margin" 仅杠杆单；"0"/"false" 仅非杠杆单。
+// 供用户侧与管理后台按 ?margin= 过滤复用。
+func (v OrderView) MarginMatches(q string) bool {
+	if q == "" || q == "all" {
+		return true
+	}
+	want := q == "1" || q == "true" || q == "margin"
+	return v.IsMargin == want
 }

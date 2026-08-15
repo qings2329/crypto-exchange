@@ -82,6 +82,9 @@ func (s *Server) handleOrder(c *gin.Context) {
 		Qty:    req.Qty,
 		Time:   time.Now().UnixNano(),
 		Market: "futures",
+		// 合约单本质为杠杆单：标记 IsMargin 并透传杠杆倍数，供订单管理按杠杆过滤。
+		IsMargin: true,
+		Leverage: req.Leverage,
 	}
 	if !s.matcher.Submit(req.Symbol, o) {
 		response.Error(c, 400, 400, "unknown symbol or matching unavailable")
@@ -126,13 +129,18 @@ func (s *Server) handleOrders(c *gin.Context) {
 	}
 	symbol := c.Query("symbol")
 	status := c.Query("status")
+	margin := c.Query("margin")
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	all := s.matcher.ListOrders(uid, symbol, status, 0)
 	orders := make([]matching.OrderView, 0, len(all))
 	for _, v := range all {
-		if v.Market == "futures" {
-			orders = append(orders, v)
+		if v.Market != "futures" {
+			continue
 		}
+		if !v.MarginMatches(margin) {
+			continue
+		}
+		orders = append(orders, v)
 	}
 	if limit > 0 && len(orders) > limit {
 		orders = orders[:limit]
