@@ -16,6 +16,7 @@ func (s *Server) handleAdminOrders(c *gin.Context) {
 	symbol := c.Query("symbol")
 	status := c.Query("status")
 	market := c.Query("market")
+	margin := c.Query("margin")
 	limit, _ := strconv.Atoi(c.Query("limit"))
 
 	// user_id=0 时引擎返回全部用户订单。
@@ -23,6 +24,9 @@ func (s *Server) handleAdminOrders(c *gin.Context) {
 	orders := make([]matching.OrderView, 0, len(all))
 	for _, v := range all {
 		if market != "" && v.Market != market {
+			continue
+		}
+		if !v.MarginMatches(margin) {
 			continue
 		}
 		orders = append(orders, v)

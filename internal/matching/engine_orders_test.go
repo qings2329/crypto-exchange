@@ -15,10 +15,15 @@ func TestEngineOrderRegistry(t *testing.T) {
 		ID: 1, UserID: 1, Side: Buy, Price: 100, Qty: 1, Time: 1, Market: "spot",
 	}, true); false {
 	}
-	// 用户2的合约市价卖，吃掉上方挂单，双方完全成交。
+	// 用户2的合约市价卖，吃掉上方挂单，双方完全成交（合约=杠杆单）。
 	if _, _ = e.MatchNow("BTC_USDT", &Order{
-		ID: 2, UserID: 2, Side: Sell, Price: 0, Qty: 1, Time: 2, Market: "futures",
+		ID: 2, UserID: 2, Side: Sell, Price: 0, Qty: 1, Time: 2, Market: "futures", IsMargin: true, Leverage: 10,
 	}, false); false {
+	}
+	// 用户3的现货杠杆买（借币后下的现货杠杆单）。
+	if _, _ = e.MatchNow("BTC_USDT", &Order{
+		ID: 3, UserID: 3, Side: Buy, Price: 50, Qty: 1, Time: 3, Market: "spot", IsMargin: true, Leverage: 3,
+	}, true); false {
 	}
 
 	// 按用户过滤 + market 标记。
@@ -31,15 +36,39 @@ func TestEngineOrderRegistry(t *testing.T) {
 		t.Fatalf("user2 orders wrong: %+v", os2)
 	}
 	// 管理员查全部。
-	if all := e.ListOrders(0, "", "", 0); len(all) != 2 {
-		t.Fatalf("all orders should be 2, got %d", len(all))
+	if all := e.ListOrders(0, "", "", 0); len(all) != 3 {
+		t.Fatalf("all orders should be 3, got %d", len(all))
 	}
 	// 状态过滤。
 	if filled := e.ListOrders(0, "", string(OrderFilled), 0); len(filled) != 2 {
 		t.Fatalf("filled orders should be 2, got %d", len(filled))
 	}
-	if open := e.ListOrders(0, "", string(OrderOpen), 0); len(open) != 0 {
-		t.Fatalf("open orders should be 0, got %d", len(open))
+	if open := e.ListOrders(0, "", string(OrderOpen), 0); len(open) != 1 {
+		t.Fatalf("open orders should be 1, got %d", len(open))
+	}
+	// 杠杆维度：现货杠杆单(订单3)与合约单(订单2)为杠杆，普通现货(订单1)非杠杆。
+	var marginOrders, plainOrders []OrderView
+	for _, v := range e.ListOrders(0, "", "", 0) {
+		if v.IsMargin {
+			marginOrders = append(marginOrders, v)
+		} else {
+			plainOrders = append(plainOrders, v)
+		}
+	}
+	if len(marginOrders) != 2 {
+		t.Fatalf("margin orders should be 2, got %d", len(marginOrders))
+	}
+	if len(plainOrders) != 1 {
+		t.Fatalf("plain orders should be 1, got %d", len(plainOrders))
+	}
+	if !plainOrders[0].MarginMatches("") || !plainOrders[0].MarginMatches("all") {
+		t.Fatal("MarginMatches(\"\")/(\"all\") should pass")
+	}
+	if plainOrders[0].MarginMatches("1") || plainOrders[0].MarginMatches("margin") {
+		t.Fatal("plain order should not match margin filter")
+	}
+	if marginOrders[0].MarginMatches("0") {
+		t.Fatal("margin order should not match margin=0")
 	}
 	// symbol 过滤。
 	if other := e.ListOrders(0, "ETH_USDT", "", 0); len(other) != 0 {
@@ -70,13 +99,13 @@ func TestEngineOrderRegistry(t *testing.T) {
 
 	// 撤销：新挂一笔后撤单，状态应变为 canceled。
 	if _, _ = e.MatchNow("BTC_USDT", &Order{
-		ID: 3, UserID: 3, Side: Buy, Price: 50, Qty: 1, Time: 3, Market: "spot",
+		ID: 4, UserID: 4, Side: Buy, Price: 50, Qty: 1, Time: 4, Market: "spot",
 	}, true); false {
 	}
-	if !e.Cancel("BTC_USDT", 3) {
+	if !e.Cancel("BTC_USDT", 4) {
 		t.Fatal("cancel should succeed for live order")
 	}
-	if v, ok := e.GetOrder(3); !ok || v.Status != OrderCanceled {
+	if v, ok := e.GetOrder(4); !ok || v.Status != OrderCanceled {
 		t.Fatalf("canceled order status wrong: ok=%v v=%+v", ok, v)
 	}
 }

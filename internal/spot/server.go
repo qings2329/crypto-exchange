@@ -101,11 +101,13 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 // handleOrder 提交一笔现货订单（买/卖），经 cmd/matching 撮合，并在撮合前预冻结资金。
 func (s *Server) handleOrder(c *gin.Context) {
 	var req struct {
-		Symbol string  `json:"symbol"`
-		UserID int64   `json:"user_id"`
-		Side   string  `json:"side"`
-		Price  float64 `json:"price"`
-		Qty    float64 `json:"qty"`
+		Symbol   string  `json:"symbol"`
+		UserID   int64   `json:"user_id"`
+		Side     string  `json:"side"`
+		Price    float64 `json:"price"`
+		Qty      float64 `json:"qty"`
+		IsMargin bool    `json:"is_margin"`          // 杠杆现货单（借币后下单）
+		Leverage float64 `json:"leverage,omitempty"` // 杠杆倍数（is_margin 时有效）
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, 400, 400, "bad request")
@@ -135,6 +137,9 @@ func (s *Server) handleOrder(c *gin.Context) {
 		Qty:    req.Qty,
 		Time:   time.Now().UnixNano(),
 		Market: "spot",
+		// 杠杆现货单标记为 IsMargin，倍数透传；用于订单管理按杠杆过滤。
+		IsMargin: req.IsMargin,
+		Leverage: req.Leverage,
 	}
 
 	// 预冻结：撮合前锁定买方计价资产 / 卖方基础资产，杜绝「超卖/超买」。
@@ -320,10 +325,21 @@ func (s *Server) handleOrders(c *gin.Context) {
 	}
 	symbol := c.Query("symbol")
 	status := c.Query("status")
+	margin := c.Query("margin")
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	orders := s.client.ListOrders(uid, symbol, status, limit)
-	if orders == nil {
-		orders = []matching.OrderView{}
+	all := s.client.ListOrders(uid, symbol, status, 0)
+	orders := make([]matching.OrderView, 0, len(all))
+	for _, v := range all {
+		if v.Market != "spot" {
+			continue
+		}
+		if !v.MarginMatches(margin) {
+			continue
+		}
+		orders = append(orders, v)
+	}
+	if limit > 0 && len(orders) > limit {
+		orders = orders[:limit]
 	}
 	response.JSON(c, gin.H{"orders": orders})
 }

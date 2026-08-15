@@ -38,6 +38,10 @@ type Order struct {
 	// Market 标记订单来源市场（"spot" | "futures"），由上游在下单时写入，
 	// 用于订单管理模块按交易类型区分同一撮合引擎内的订单（现货/合约共用同一登记簿）。
 	Market string
+	// IsMargin 标记该单是否为杠杆单（现货杠杆单与合约单均为 true，普通现货单为 false），
+	// 用于订单管理模块按"是否杠杆"过滤。Leverage 为杠杆倍数（无杠杆时 0）。
+	IsMargin bool
+	Leverage float64
 }
 
 // IsFilled 是否完全成交。
