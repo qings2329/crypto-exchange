@@ -3,6 +3,7 @@ package spot
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -91,6 +92,10 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 	r.POST("/api/v1/spot/cancel", s.handleCancel)
 	r.GET("/api/v1/spot/depth", s.handleDepth)
 	r.GET("/api/v1/spot/ws", s.handleWS)
+	// 用户侧订单管理：仅返回鉴权用户本人的订单/成交（按 token 中的 uid 过滤）。
+	r.GET("/api/v1/spot/orders", s.handleOrders)
+	r.GET("/api/v1/spot/orders/:id", s.handleOrderDetail)
+	r.GET("/api/v1/spot/trades", s.handleTrades)
 }
 
 // handleOrder 提交一笔现货订单（买/卖），经 cmd/matching 撮合，并在撮合前预冻结资金。
@@ -129,6 +134,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 		Price:  req.Price,
 		Qty:    req.Qty,
 		Time:   time.Now().UnixNano(),
+		Market: "spot",
 	}
 
 	// 预冻结：撮合前锁定买方计价资产 / 卖方基础资产，杜绝「超卖/超买」。
@@ -303,6 +309,70 @@ func (s *Server) maybeCleanup(orderID int64) {
 	if rec.frozenQuote <= 1e-9 && rec.frozenBase <= 1e-9 {
 		delete(s.openOrders, orderID)
 	}
+}
+
+// handleOrders 返回当前用户本人的现货订单列表，可按 symbol/status 过滤、limit 分页。
+func (s *Server) handleOrders(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	symbol := c.Query("symbol")
+	status := c.Query("status")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	orders := s.client.ListOrders(uid, symbol, status, limit)
+	if orders == nil {
+		orders = []matching.OrderView{}
+	}
+	response.JSON(c, gin.H{"orders": orders})
+}
+
+// handleOrderDetail 返回某笔现货订单详情；仅允许查看本人订单。
+func (s *Server) handleOrderDetail(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.Error(c, 400, 400, "bad order id")
+		return
+	}
+	v, ok2 := s.client.GetOrder(id)
+	if !ok2 {
+		response.Error(c, 404, 404, "not found")
+		return
+	}
+	if v.UserID != uid {
+		response.Error(c, 403, 403, "forbidden")
+		return
+	}
+	response.JSON(c, gin.H{"order": v})
+}
+
+// handleTrades 返回当前用户本人的现货成交流水，可按 symbol 过滤、limit 分页。
+// 按 market=spot 过滤，仅返回现货成交（合约成交在统一登记簿中需区分）。
+func (s *Server) handleTrades(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	symbol := c.Query("symbol")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	all := s.client.ListTrades(uid, symbol, 0)
+	trades := make([]matching.TradeView, 0, len(all))
+	for _, v := range all {
+		if v.Market == "spot" {
+			trades = append(trades, v)
+		}
+	}
+	if limit > 0 && len(trades) > limit {
+		trades = trades[:limit]
+	}
+	response.JSON(c, gin.H{"trades": trades})
 }
 
 // handleDepth 返回某交易对的订单簿深度（来自 cmd/matching）。

@@ -37,6 +37,10 @@ const (
 	PermDepositRead     = "deposit:read"
 	PermWithdrawApproval = "withdraw:approval"
 
+	// 订单管理（跨用户查询/撤销，运营风控用）
+	PermTradeRead  = "trade:read"  // 查看全部用户订单与成交
+	PermTradeManage = "trade:manage" // 撤销任意用户订单（高危）
+
 	// 运营通知
 	PermNotificationManage = "notification:manage"
 
@@ -74,6 +78,9 @@ var allPermissionDefs = []PermissionDef{
 
 	{Key: PermDepositRead, Name: "查看充值", Group: "充值提币"},
 	{Key: PermWithdrawApproval, Name: "审批提币", Group: "充值提币"},
+
+	{Key: PermTradeRead, Name: "查看用户订单", Group: "订单"},
+	{Key: PermTradeManage, Name: "撤销用户订单", Group: "订单"},
 
 	{Key: PermNotificationManage, Name: "管理运营通知", Group: "运营"},
 

@@ -332,6 +332,28 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - spot/futures 目前仍各自运行一份 `client` 连同一个 `cmd/matching`；要真正「全所单写者容灾」需把网关层（`cmd/gateway` 或 Nginx）把 `/api/v1/spot/*order`、`/api/v1/futures/*order` 也代理到 `cmd/matching`，或让 spot/futures 仅做业务/账本、匹配全权委托——本轮按用户原话完成收敛到 `cmd/matching` 客户端，未进一步合并进程。
 - 强平 `MatchNow` 的流动性消耗现已写 WAL（见 §17 已知缺口①已补齐）；T-03 真实链上/预言机 RPC 仍阻塞（依赖外部节点+合规），本轮未实现，仅保留文档留白。
 
+## 20. 集中式订单管理模块（现货/合约订单 + 成交流水查询 + 管理后台跨用户撤销）
+
+**背景**：§18 把匹配收敛为单一 `cmd/matching` 权威服务后，订单/成交状态仅存在于撮合引擎内存（重启丢单、且 spot/futures 无查询入口）。用户要求「几种交易的订单都要有管理模块」——现货与合约（撮合型）的订单/成交需对**用户侧**和**管理后台**都提供查询与管理，且集中实现在撮合引擎，避免各交易类型分裂。
+
+**设计**：
+- 撮合引擎新增**订单/成交登记簿**（`Engine.orders`/`userOrders`/`trades`/`userTrades`）：`registerOrder` 在 `Submit`/`MatchNow` 时写入不可变快照 + `FilledQty` 累加器（避免止盈止损激活副本导致的指针错位）；`applyTrades` 按 `TakerOID/MakerOID` 累加成交并派生状态（open/partial/filled/canceled）；`ListOrders/GetOrder/ListTrades` 支持 `user_id`/`symbol`/`status`/`market`/`limit` 过滤（`user_id=0` 返回全部，供管理后台）。`Recover` 后 `rebuildOrderIndex` 重建 open 订单索引。
+- `matching.Order` 新增 `Market` 字段（`spot`/`futures`），下游下单时写入；`OrderView`/`TradeView` 透出 `market`，使现货/合约共用同一登记簿时仍能按市场区分。**注意**：当前为内存簿，重启后仅 open 订单经 `Recover` 重建，历史 filled/canceled 与成交流水不重建（原型限制）。
+- `matching.Matcher` 接口新增 `Cancel(symbol, orderID) bool`；`*client.Client` 包一层 `CancelOrder` 实现它，使 futures 能以统一接口撤单。
+- `cmd/matching` 新增只读端点（均经 `leaderGuard`，与 `/depth` 一致，因登记簿仅在 leader 维护）：`GET /orders?user_id=&symbol=&status=&limit=`、`GET /orders/:id`、`GET /trades?user_id=&symbol=&limit=`。响应直接以数组/对象作为 `data`（与 client `unwrap` 契约一致）。
+- `internal/spot/server.go`：`GET /api/v1/spot/orders`、`/orders/:id`、`/trades`，仅返回**当前用户本人**订单（按 token `uid` 过滤 + `market=spot`）；详情校验归属（非本人 403）。
+- `internal/futuresapi/handler.go`：`GET /api/v1/futures/orders`、`/orders/:id`、`/trades`、`POST /api/v1/futures/cancel`，仅返回本人 `market=futures` 订单；撤单前校验归属。
+- `internal/adminapi`：新增 `trade:read`/`trade:manage` 两个 RBAC 权限（字典 `allPermissionDefs` 自动授予 super_admin；admin/operator 角色按职责分配）；直连 `cmd/matching`（`cfg.Matching.URL`）新增 `matchClient`；端点 `GET /api/admin/orders`（跨用户，`user_id` 缺省=全部，支持 `symbol`/`status`/`market`/`limit`）、`GET /api/admin/orders/:id`、`GET /api/admin/trades`、`POST /api/admin/orders/:id/cancel`（高危，需 `trade:manage`）。读需 `trade:read`，撤销需 `trade:manage`。
+
+**改动文件（2026-08-15）**：
+- 新增：`internal/matching/view.go`（`OrderView`/`TradeView`/`OrderStatus`）、`internal/adminapi/handlers_orders.go`（管理后台订单代理）、`internal/matching/engine_orders_test.go`、`internal/adminapi/handlers_orders_test.go`。
+- 改：`internal/matching/matcher.go`（`Matcher` 增 `Cancel`）、`engine.go`（登记簿 + 查询 + `rebuildOrderIndex` + `Market` 透出 + 修复 `rebuildOrderIndex` 中 `book.Depth()` 返回值个数误用）、`orderbook.go`（`Order.Market`）、`client/client.go`（`ListOrders/GetOrder/ListTrades` + `Cancel`）、`cmd/matching/main.go`（查询端点）、`internal/spot/server.go`/`internal/futuresapi/handler.go`/`server.go`（用户侧端点 + `Market` 写入）、`internal/adminapi/server.go`/`rbac.go`/`store_adminaccount.go`（权限 + 代理 + 角色种子）。
+- `internal/matching/client/client_test.go`：`newFakeREST` 增加 `/orders`/`orders/`/`trades` 端点，新增 `TestClientListOrdersAndTrades`。
+
+**验证**：
+- `go build/vet/test ./...` 全绿（新增 engine 登记簿、client HTTP 契约、管理后台代理三类测试）。
+- 已知：期货撤单仅移除撮合簿中的挂单，合约持仓/保证金的释放依赖 `internal/futures` 持仓生命周期（已在下单时同步建仓），不在本轮订单管理范围内；管理后台跨用户撤单同理。
+
 ## 19. 前端拆分：用户前端(../ce-frontend/) 与 管理后台前端(../web-admin/)
 
 **背景**：原前端是单一 React 应用 `../ce-frontend/`（哈希路由、token 保护），全是交易页面，管理后台完全不存在。用户要求把前端拆成「用户前端」与「管理后台前端」，并明确选了：① 两个独立项目；② 完整角色鉴权（后端加 role + 管理 API）；③ 管理后台 7 个模块全做（风控与强平监控 / 用户与账户管理 / 交易对配置 / 运营看板 / 充值提币 / 公链管理 / 币种管理）。

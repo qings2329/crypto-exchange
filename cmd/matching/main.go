@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -385,6 +386,48 @@ func main() {
 			return
 		}
 		response.JSON(c, gin.H{"symbol": symbol, "bids": bids, "asks": asks})
+	})
+
+	// 以下查询接口读取「订单/成交登记簿」，该簿仅在 leader 上维护，故统一经 leaderGuard
+	// 路由到 leader（与 /depth 一致）。user_id 由已鉴权的上游服务透传，本服务不再二次鉴权。
+
+	// GET /orders?user_id=&symbol=&status=&limit=：查询指定用户的订单（可按 symbol/status 过滤）。
+	r.GET("/orders", func(c *gin.Context) {
+		leaderGuard(c)
+		if c.IsAborted() {
+			return
+		}
+		userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
+		symbol := c.Query("symbol")
+		status := c.Query("status")
+		limit, _ := strconv.Atoi(c.Query("limit"))
+		response.JSON(c, e.ListOrders(userID, symbol, status, limit))
+	})
+
+	// GET /orders/:id：按订单 ID 查详情；不存在返回 404。
+	r.GET("/orders/:id", func(c *gin.Context) {
+		leaderGuard(c)
+		if c.IsAborted() {
+			return
+		}
+		id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+		if v, ok := e.GetOrder(id); ok {
+			response.JSON(c, v)
+		} else {
+			response.Error(c, http.StatusNotFound, 404, "not found")
+		}
+	})
+
+	// GET /trades?user_id=&symbol=&limit=：查询指定用户的成交流水。
+	r.GET("/trades", func(c *gin.Context) {
+		leaderGuard(c)
+		if c.IsAborted() {
+			return
+		}
+		userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
+		symbol := c.Query("symbol")
+		limit, _ := strconv.Atoi(c.Query("limit"))
+		response.JSON(c, e.ListTrades(userID, symbol, limit))
 	})
 
 	// /ws：行情 WebSocket。symbol 空表示订阅全部交易对；否则仅该 symbol。
