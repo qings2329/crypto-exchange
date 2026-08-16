@@ -97,6 +97,11 @@ settlement:
         address: "bc1examplewatchaddress"
         user_id: 1
         asset: BTC
+      - chain: TRON
+        address: "TRexamplewatchaddress"
+        user_id: 1
+        asset: USDT
+        token: "TR7NHqjiehqjqTD9QgQsrQUDsV7qxXWm1f" # TRC20 合约地址（USDT-TRC20 主网）；空则默认此值
 
 # 行情 K 线持久化（T-16）：已收盘 K 线写入 InfluxDB（measurement "kline"），
 # 行情服务在内存环形缓冲（klineCap=500）之外可回取更长历史。

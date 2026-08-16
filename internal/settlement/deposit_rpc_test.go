@@ -202,3 +202,43 @@ func TestRPCDepositGatewayFallsBackOnConfirmError(t *testing.T) {
 		t.Fatalf("deposit not found after ticks")
 	}
 }
+
+// TestJSONRPCDepositScannerTRON 用 httptest 模拟 TronGrid TRC20 事件响应，验证真实扫描器
+// 过滤出 to==观察地址的入账（value 1000000/1e6 = 1.0），并忽略 to 不匹配的转出。
+func TestJSONRPCDepositScannerTRON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[` +
+			`{"transaction_id":"0xtron1","token_info":{"decimals":6},"value":"1000000","to":"TRwatch"}` +
+			`,{"transaction_id":"0xtron2","token_info":{"decimals":6},"value":"500000","to":"TRother"}` +
+			`]}`))
+	}))
+	defer srv.Close()
+
+	sc := NewJSONRPCDepositScanner(
+		NewJSONRPCClient(map[string]string{"TRON": srv.URL}),
+		[]DepositWatch{{Chain: ChainTRON, Address: "TRwatch", UserID: 3, Asset: "USDT"}},
+		20*time.Millisecond,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := sc.Scan(ctx)
+	if err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+	for ev := range ch {
+		if ev.TxHash == "0xtron2" {
+			t.Fatalf("non-matching 'to' transfer must be filtered out: %+v", ev)
+		}
+		if ev.TxHash == "0xtron1" {
+			if ev.UserID != 3 || ev.Asset != "USDT" || ev.Chain != ChainTRON {
+				t.Fatalf("unexpected event identity: %+v", ev)
+			}
+			if ev.Amount != 1.0 {
+				t.Fatalf("expected amount 1.0 (1000000/1e6), got %v", ev.Amount)
+			}
+			return // 命中即成功
+		}
+	}
+	t.Fatalf("no matching TRC20 deposit event scanned")
+}
