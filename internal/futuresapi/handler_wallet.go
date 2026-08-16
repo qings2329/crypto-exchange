@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
@@ -21,7 +22,8 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.GET("/api/v1/futures/wallet/deposits", s.handleDeposits)
 	r.POST("/api/v1/futures/wallet/deposit/reorg", s.handleDepositReorg)
 	r.POST("/api/v1/futures/wallet/deposit/reorg/depth", s.handleDepositReorgDepth)
-	r.POST("/api/v1/futures/wallet/withdraw/chain", s.handleWithdrawChain)
+	// 链上直接提现绕过冷静期（等同管理员放行），属特权操作，必须管理员角色（F4 修复）。
+	r.POST("/api/v1/futures/wallet/withdraw/chain", middleware.AdminGuard(), s.handleWithdrawChain)
 	r.GET("/api/v1/futures/wallet/withdraws", s.handleWithdraws)
 	r.POST("/api/v1/futures/wallet/withdraw/reorg", s.handleWithdrawReorg)
 	r.POST("/api/v1/futures/wallet/withdraw/reorg/depth", s.handleWithdrawReorgDepth)
@@ -30,7 +32,8 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.POST("/api/v1/futures/wallet/withdraw/cancel", s.handleWithdrawCancel)
 	// 管理员审批/拒绝提现（Admin 后台接真实后端，§25）：approve 跳过冷却期直接放行，
 	// reject 退回冻结；与用户端 finalize/cancel 并存，路径避开 withdraw 下的静态兄弟段以免路由冲突。
-	r.POST("/api/v1/futures/wallet/withdraw/approve/:hold_id", s.handleWithdrawApprove)
+	// approve 跳过冷静期属特权放行，必须管理员角色（F4 修复）。
+	r.POST("/api/v1/futures/wallet/withdraw/approve/:hold_id", middleware.AdminGuard(), s.handleWithdrawApprove)
 	r.POST("/api/v1/futures/wallet/withdraw/reject/:hold_id", s.handleWithdrawReject)
 	r.POST("/api/v1/futures/wallet/withdraw/emergency/freeze", s.handleEmergencyFreeze)
 	r.POST("/api/v1/futures/wallet/withdraw/emergency/resume", s.handleEmergencyResume)
