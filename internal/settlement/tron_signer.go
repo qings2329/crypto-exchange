@@ -242,10 +242,13 @@ func (s *realSigner) signTRON(ctx context.Context, tx *UnsignedTx) (string, erro
 			return "", fmt.Errorf("TRON 收款地址非法: %w", err)
 		}
 		toHash := to[1:] // 20 字节 HASH160 用于 ABI address 编码（剥离 0x41）
-		amount := new(big.Int)
-		if tx.Amount != 0 {
-			amount.SetInt64(int64(math.Round(tx.Amount)))
+		// tx.Amount 为人类单位（与 ETH/BTC 路径一致）；TRC20 默认 6 decimals，
+		// 缩放为基础单位（如 1 USDT → 1e6）。缺缩放会导致金额少发约 1e6 倍。
+		scaled := int64(math.Round(tx.Amount * 1e6))
+		if scaled <= 0 {
+			return "", fmt.Errorf("TRON TRC20 转账金额必须 > 0")
 		}
+		amount := new(big.Int).SetInt64(scaled)
 		data := tronTRC20TransferData(toHash, amount)
 		feeLimit = int64(tx.FeeLimit)
 		value := tronTriggerContract(owner, contract, 0, data)
