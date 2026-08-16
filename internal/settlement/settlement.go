@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -24,6 +25,12 @@ const (
 	ChainTRON Chain = "TRON"
 	ChainBTC  Chain = "BTC"
 )
+
+// emitSendTimeout 是 emit 向订阅者投递事件时的最大阻塞时长。订阅者因背压长期不消费时，
+// 阻塞到此上限即放弃本次投递并告警（而非静默丢弃），避免"链上已确认但用户未到账"且无迹可查。
+// 已入账状态仍持久化在 g.pending，运维可经 Pending() 对账重放。
+// 用 var 而非 const 以便单测调短，缩短背压路径验证耗时。
+var emitSendTimeout = 5 * time.Second
 
 // DepositStatus 充值状态机。
 type DepositStatus int
@@ -247,7 +254,10 @@ func (g *MockChainGateway) emit(ev DepositEvent) {
 	for _, ch := range subs {
 		select {
 		case ch <- ev:
-		default: // 订阅者阻塞则丢弃，避免阻塞确认循环
+		case <-time.After(emitSendTimeout):
+			// 订阅者背压超时：非静默放弃，告警以便对账（状态已持久化于 g.pending）。
+			log.Printf("[settlement] deposit emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+				ev.TxHash, ev.UserID, ev.Status)
 		}
 	}
 }
@@ -415,7 +425,9 @@ func (g *MockChainGateway) emitRollback(ev DepositEvent) {
 	for _, ch := range subs {
 		select {
 		case ch <- ev:
-		default: // 订阅者阻塞则丢弃，避免阻塞
+		case <-time.After(emitSendTimeout):
+			log.Printf("[settlement] deposit rollback emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+				ev.TxHash, ev.UserID, ev.Status)
 		}
 	}
 }
@@ -700,7 +712,9 @@ func (g *MockWithdrawGateway) emit(ev WithdrawEvent) {
 	for _, ch := range subs {
 		select {
 		case ch <- ev:
-		default: // 订阅者阻塞则丢弃，避免阻塞确认循环
+		case <-time.After(emitSendTimeout):
+			log.Printf("[settlement] withdraw emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+				ev.TxHash, ev.UserID, ev.Status)
 		}
 	}
 }
@@ -874,7 +888,9 @@ func (g *MockWithdrawGateway) emitWithdrawRollback(ev WithdrawEvent) {
 	for _, ch := range subs {
 		select {
 		case ch <- ev:
-		default: // 订阅者阻塞则丢弃，避免阻塞确认循环
+		case <-time.After(emitSendTimeout):
+			log.Printf("[settlement] withdraw rollback emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+				ev.TxHash, ev.UserID, ev.Status)
 		}
 	}
 }
