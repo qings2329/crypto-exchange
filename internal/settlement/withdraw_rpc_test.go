@@ -297,6 +297,84 @@ func (f *fakeSignerErr) Sign(ctx context.Context, tx *UnsignedTx) (string, error
 	return "", errors.New("signer unavailable")
 }
 
+// TestNewWithdrawGatewayETHUsesNodeNonceGas 验证 ETH 提现经网关主路径向节点查询真实
+// Nonce（eth_getTransactionCount）/ Gas 价（eth_gasPrice），嵌入签名后以 eth_sendRawTransaction
+// 广播（私钥不出域）。未显式配置 Nonce/Gas 时不再使用过期/默认 0 Nonce。
+func TestNewWithdrawGatewayETHUsesNodeNonceGas(t *testing.T) {
+	var gotNonce, gotGas bool
+	var rawSeen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "eth_getTransactionCount":
+			gotNonce = true
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x9"}`))
+		case "eth_gasPrice":
+			gotGas = true
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x3b9aca00"}`)) // 1 gwei
+		case "eth_sendRawTransaction":
+			if len(req.Params) > 0 {
+				rawSeen = strings.Trim(string(req.Params[0]), `"`)
+			}
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0xethhash"}`))
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":null}`))
+		}
+	}))
+	defer srv.Close()
+
+	g := NewWithdrawGateway(ChainRPCConfig{
+		Enabled:   true,
+		Endpoints: map[string]string{"ETH": srv.URL},
+		HotWallet: HotWalletConfig{
+			Enabled: true, SignerType: "hsm", SignerKey: knownVectorPriv,
+			EthChainID: 1, EthGasLimit: 21000,
+		},
+	})
+	if _, ok := g.(*RPCWithdrawGateway); !ok {
+		t.Fatalf("enabled gateway should be *RPCWithdrawGateway, got %T", g)
+	}
+
+	// 取签名者地址用于恢复校验（与网关内签名器同私钥）。
+	sig, _ := newRealSignerWithSource(HotWalletConfig{SignerKey: knownVectorPriv}, SignerSources{})
+	to := "0x3535353535353535353535353535353535353535"
+	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, 1.0, 0.001, to, false)
+	if err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if !gotNonce || !gotGas {
+		t.Fatalf("expected node nonce + gas queries, got nonce=%v gas=%v", gotNonce, gotGas)
+	}
+	if rawSeen == "" {
+		t.Fatalf("eth_sendRawTransaction did not receive raw")
+	}
+	// nonce 9 应被嵌入 raw，且签名可恢复出签名者地址（与嵌入字段一致、私钥不出域）。
+	n, err := extractETHNonce(rawSeen)
+	if err != nil {
+		t.Fatalf("extract nonce: %v", err)
+	}
+	if n != 9 {
+		t.Fatalf("embedded nonce = %d, want 9", n)
+	}
+	gp, _ := extractETHGasPrice(rawSeen)
+	checkTx := &UnsignedTx{Chain: ChainETH, To: to, Amount: 1.0, Nonce: n, GasPriceWei: gp, GasLimit: 21000, ChainID: 1}
+	rec, err := recoverETHAddressFromRaw(rawSeen, checkTx)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if rec != sig.address {
+		t.Fatalf("recovered address %s != signer address %s", rec, sig.address)
+	}
+	if ev.TxHash != "0xethhash" {
+		t.Fatalf("expected real tx hash from SendRaw, got %q", ev.TxHash)
+	}
+}
+
 // TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath 验证 BTC 提现经网关主路径走
 // 「真实 UTXO 拉取 → 离线签名 → SendRaw 广播」，不再回退节点侧 sendtoaddress：
 // 配置 RPC 端点 + hsm 签名器后，网关先用 listunspent 取 UTXO，做 SIGHASH_ALL 真实签名，

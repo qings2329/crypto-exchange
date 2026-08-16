@@ -86,13 +86,28 @@ type Signer interface {
 //     私钥不可用（未配置/非法）时返回 nil，由网关回退节点侧签名广播（fail-degraded）。
 //   - 未配置/未知类型：返回 nil，回退节点侧签名广播。
 func NewSigner(conf HotWalletConfig) Signer {
-	return NewSignerWithSource(conf, nil)
+	return NewSignerWithSource(conf, SignerSources{})
 }
 
-// NewSignerWithSource 同 NewSigner，但为真实签名器注入可选的 UTXO 源（BTC 真实签名按签名者
-// 自身地址向节点查询未花费输出用，走 listunspent）。stub 签名器忽略 source；未配/非法密钥
-// 返回 nil（网关回退节点侧签名广播，fail-degraded）。
-func NewSignerWithSource(conf HotWalletConfig, source UTXOSource) Signer {
+// ETHStateSource 提供 ETH 真实 Nonce / Gas 价查询（节点不可达返回错误，由签名器回退配置/默认值，
+// fail-degraded）。生产接真实节点；未注入时签名器按 UnsignedTx 内联字段 / 配置兜底。
+type ETHStateSource interface {
+	// Nonce 返回账户当前交易计数（"pending"：含内存池未确认）；用于真实 Nonce 管理。
+	Nonce(ctx context.Context, chain Chain, account string) (uint64, error)
+	// GasPrice 返回节点建议的 gas 价（wei）。
+	GasPrice(ctx context.Context, chain Chain) (uint64, error)
+}
+
+// SignerSources 是离线签名器可选的「外部状态源」集合：BTC 的 UTXO 源、ETH 的 Nonce/Gas 源。
+// 均为可选；未注入时签名器按 UnsignedTx 内联字段 / 配置默认值兜底（fail-degraded）。
+type SignerSources struct {
+	UTXOSource UTXOSource     // BTC 真实签名按自身地址向节点查询未花费输出（listunspent）。
+	ETHState   ETHStateSource // ETH 真实 Nonce/Gas 管理（eth_getTransactionCount / eth_gasPrice）。
+}
+
+// NewSignerWithSource 同 NewSigner，但为真实签名器注入可选外部状态源（BTC UTXO 源 / ETH
+// Nonce·Gas 源）。stub 签名器忽略 sources；未配/非法密钥返回 nil（回退节点侧签名广播）。
+func NewSignerWithSource(conf HotWalletConfig, sources SignerSources) Signer {
 	if !conf.Enabled {
 		return nil
 	}
@@ -100,7 +115,7 @@ func NewSignerWithSource(conf HotWalletConfig, source UTXOSource) Signer {
 	case "stub":
 		return &stubSigner{}
 	case "hsm", "kms":
-		if s, err := newRealSignerWithSource(conf, source); err == nil {
+		if s, err := newRealSignerWithSource(conf, sources); err == nil {
 			return s
 		}
 		return nil // 密钥不可用 → 回退（fail-degraded）
@@ -255,6 +270,33 @@ func (c *JSONRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string)
 	}
 }
 
+// Nonce 查询 ETH 账户当前交易计数（"pending"：含内存池未确认，避免重放/碰撞）。用于真实
+// Nonce 管理：签名器首次签名时取此值，之后本地递增（见 realSigner.resolveNonce）。节点
+// 不可达返回错误，由签名器回退配置/默认值（fail-degraded）。
+func (c *JSONRPCClient) Nonce(ctx context.Context, chain Chain, account string) (uint64, error) {
+	if chain != ChainETH {
+		return 0, fmt.Errorf("nonce query only supported for ETH (got %s)", chain)
+	}
+	res, err := c.rpc(ctx, chain, "eth_getTransactionCount", []interface{}{account, "pending"})
+	if err != nil {
+		return 0, err
+	}
+	return parseHexUint(res)
+}
+
+// GasPrice 查询节点建议的 gas 价（wei）。用于真实 Gas 管理：未显式配置 gasPrice 时采用节点
+// 报价，避免硬编码过时费率。节点不可达返回错误，由签名器回退配置默认值（fail-degraded）。
+func (c *JSONRPCClient) GasPrice(ctx context.Context, chain Chain) (uint64, error) {
+	if chain != ChainETH {
+		return 0, fmt.Errorf("gas price query only supported for ETH (got %s)", chain)
+	}
+	res, err := c.rpc(ctx, chain, "eth_gasPrice", []interface{}{})
+	if err != nil {
+		return 0, err
+	}
+	return parseHexUint(res)
+}
+
 // ConfirmSource 提供某笔交易在真实链上的当前确认数（真实区块确认轮询扩展点）。
 // JSONRPCClient 实现该接口；单测可注入内存假实现验证「真实确认数→状态机推进」。
 type ConfirmSource interface {
@@ -381,6 +423,18 @@ func parseHexInt(b []byte) (int64, error) {
 	return strconv.ParseInt(s, 16, 64)
 }
 
+// parseHexUint 同 parseHexInt 但返回无符号（用于 nonce / gasPrice 等非负量）。
+func parseHexUint(b []byte) (uint64, error) {
+	n, err := parseHexInt(b)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("negative hex value %d", n)
+	}
+	return uint64(n), nil
+}
+
 // tronUSDTContract 是 TRON 主网 USDT(TRC20) 合约地址；TRC20 观察项未配 token 时默认按此过滤。
 const tronUSDTContract = "TR7NHqjiehqjqTD9QgQsrQUDsV7qxXWm1f"
 
@@ -449,16 +503,21 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 		client := NewJSONRPCClient(conf.Endpoints)
 		mg := NewMockWithdrawGateway(req, interval)
 		mg.confirmSource = client // 真实区块确认轮询；节点不可达自动回退模拟
-		// 离线签名边界（nil→节点侧签名）：配置了 BTC 端点时注入 UTXO 源，使 BTC 提现走
-		// 「真实 UTXO 拉取 → 离线签名 → SendRaw」主路径，而非回退节点侧 sendtoaddress。
-		var source UTXOSource
+		// 离线签名边界（nil→节点侧签名）：注入了对应链的外部状态源时，该链提现走
+		// 「真实链上状态拉取 → 离线签名 → SendRaw」主路径，而非回退节点侧签名广播。
+		//   - BTC 端点：注入 UTXO 源（listunspent），避免回退节点侧 sendtoaddress。
+		//   - ETH 端点：注入 Nonce/Gas 源（eth_getTransactionCount / eth_gasPrice），避免用过期/默认 Nonce/Gas。
+		var sources SignerSources
 		if _, ok := conf.Endpoints[string(ChainBTC)]; ok {
-			source = NewRPCUTXOSource(client)
+			sources.UTXOSource = NewRPCUTXOSource(client)
+		}
+		if _, ok := conf.Endpoints[string(ChainETH)]; ok {
+			sources.ETHState = client // *JSONRPCClient 实现 ETHStateSource
 		}
 		return &RPCWithdrawGateway{
 			MockWithdrawGateway: mg,
 			client:              client,
-			signer:              NewSignerWithSource(conf.HotWallet, source),
+			signer:              NewSignerWithSource(conf.HotWallet, sources),
 		}
 	}
 	return NewMockWithdrawGateway(req, interval)

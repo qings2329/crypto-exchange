@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/keccak"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -38,20 +39,26 @@ func mustHex(s string) []byte {
 // TRON（合约调用签名）仍为独立生产项；未实现时 Sign 返回错误，由网关回退节点侧签名广播（fail-degraded）。
 type realSigner struct {
 	priv           *secp256k1.PrivateKey
-	address        string // 由私钥派生的 ETH 地址（0x…），仅用于可观测/日志。
+	address        string // 由私钥派生的 ETH 地址（0x…），仅用于可观测/日志与 Nonce 查询。
 	ethChainID     uint64
 	ethGasPriceWei uint64
 	ethGasLimit    uint64
-	utxoSource     UTXOSource // BTC UTXO 来源（可选；为空则用 UnsignedTx.UTXOs 内联提供）。
+	utxoSource     UTXOSource     // BTC UTXO 来源（可选；为空则用 UnsignedTx.UTXOs 内联提供）。
+	ethState       ETHStateSource // ETH Nonce/Gas 来源（可选；为空则按 UnsignedTx/配置兜底）。
+	// 本地 pending nonce 计数器：首次签名向节点取当前计数，之后本地递增，避免并发/未确认
+	// 期间重放碰撞。mu 保护；haveNonce=false 表示尚未从节点播种。
+	mu        sync.Mutex
+	nextNonce uint64
+	haveNonce bool
 }
 
 // newRealSigner 从配置解析私钥并构造真实签名器；私钥非法/长度不对返回错误（→ fail-degraded）。
 func newRealSigner(conf HotWalletConfig) (*realSigner, error) {
-	return newRealSignerWithSource(conf, nil)
+	return newRealSignerWithSource(conf, SignerSources{})
 }
 
-// newRealSignerWithSource 在 newRealSigner 基础上注入可选 UTXO 源（BTC 真实签名查询用）。
-func newRealSignerWithSource(conf HotWalletConfig, source UTXOSource) (*realSigner, error) {
+// newRealSignerWithSource 在 newRealSigner 基础上注入可选外部状态源（BTC UTXO 源 / ETH Nonce·Gas 源）。
+func newRealSignerWithSource(conf HotWalletConfig, sources SignerSources) (*realSigner, error) {
 	key := strings.TrimPrefix(conf.SignerKey, "0x")
 	b, err := hex.DecodeString(key)
 	if err != nil || len(b) != 32 {
@@ -64,7 +71,8 @@ func newRealSignerWithSource(conf HotWalletConfig, source UTXOSource) (*realSign
 		ethChainID:     conf.EthChainID,
 		ethGasPriceWei: conf.EthGasPriceWei,
 		ethGasLimit:    conf.EthGasLimit,
-		utxoSource:     source,
+		utxoSource:     sources.UTXOSource,
+		ethState:       sources.ETHState,
 	}, nil
 }
 
@@ -72,9 +80,9 @@ func newRealSignerWithSource(conf HotWalletConfig, source UTXOSource) (*realSign
 func (s *realSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
 	switch tx.Chain {
 	case ChainETH:
-		return s.signETH(tx)
+		return s.signETH(ctx, tx)
 	case ChainBTC:
-		return s.signBTC(tx)
+		return s.signBTC(ctx, tx)
 	default:
 		// TRON 合约调用签名为独立生产项；未实现时由网关回退节点侧签名广播（fail-degraded）。
 		return "", fmt.Errorf("realSigner 暂支持 ETH/BTC；链 %s 的真实签名需独立生产项（TRON 合约调用）", tx.Chain)
@@ -83,17 +91,27 @@ func (s *realSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
 
 // signETH 构造一笔 ETH 交易，做 Keccak-256 摘要 + secp256k1 ECDSA 签名 + EIP-155（或 legacy）
 // v 值，最后 RLP 编码为可直接 eth_sendRawTransaction 的 raw hex。
-func (s *realSigner) signETH(tx *UnsignedTx) (string, error) {
+//
+// Nonce / Gas 管理（真实链上状态）：Nonce 优先用 UnsignedTx.Nonce，否则向节点查
+// eth_getTransactionCount("pending") 并本地递增（resolveNonce）；GasPrice 优先用 UnsignedTx，
+// 否则向节点查 eth_gasPrice，再回退配置 eth_gas_price_wei；节点不可达均 fail-degraded 兜底。
+func (s *realSigner) signETH(ctx context.Context, tx *UnsignedTx) (string, error) {
 	chainID := tx.ChainID
 	if chainID == 0 {
 		chainID = s.ethChainID
 	}
 	gasPrice := tx.GasPriceWei
+	if gasPrice == 0 && s.ethState != nil {
+		if gp, err := s.ethState.GasPrice(ctx, ChainETH); err == nil {
+			gasPrice = gp
+		}
+		// 节点不可达：忽略错误，继续用配置默认（fail-degraded）。
+	}
 	if gasPrice == 0 {
 		gasPrice = s.ethGasPriceWei
 	}
 	if gasPrice == 0 {
-		return "", fmt.Errorf("ETH 签名需要 gasPrice（UnsignedTx.GasPriceWei 或 hot_wallet.eth_gas_price_wei 必须 > 0）")
+		return "", fmt.Errorf("ETH 签名需要 gasPrice（UnsignedTx.GasPriceWei / 节点 eth_gasPrice / hot_wallet.eth_gas_price_wei 必须 > 0）")
 	}
 	gasLimit := tx.GasLimit
 	if gasLimit == 0 {
@@ -101,6 +119,10 @@ func (s *realSigner) signETH(tx *UnsignedTx) (string, error) {
 	}
 	if gasLimit == 0 {
 		gasLimit = 21000 // 简单转账默认 gas limit
+	}
+	nonce, err := s.resolveNonce(ctx, tx)
+	if err != nil {
+		return "", err
 	}
 
 	toBytes, err := parseETHAddress(tx.To)
@@ -112,7 +134,7 @@ func (s *realSigner) signETH(tx *UnsignedTx) (string, error) {
 	// 待签摘要：对未签字段做 RLP 编码后取 Keccak-256。EIP-155 下列表含 chainID 与两个 0 占位，
 	// legacy（chainID==0）下不含这三项。
 	unsignedFields := [][]byte{
-		rlpBigInt(big.NewInt(int64(tx.Nonce))),
+		rlpBigInt(big.NewInt(int64(nonce))),
 		rlpBigInt(new(big.Int).SetUint64(gasPrice)),
 		rlpBigInt(new(big.Int).SetUint64(gasLimit)),
 		rlpAddress(toBytes),
@@ -154,7 +176,7 @@ func (s *realSigner) signETH(tx *UnsignedTx) (string, error) {
 
 	// 已签交易 RLP：[nonce, gasPrice, gasLimit, to, value, data, v, r, s]，可 eth_sendRawTransaction 广播。
 	raw := rlpEncodeList([][]byte{
-		rlpBigInt(big.NewInt(int64(tx.Nonce))),
+		rlpBigInt(big.NewInt(int64(nonce))),
 		rlpBigInt(new(big.Int).SetUint64(gasPrice)),
 		rlpBigInt(new(big.Int).SetUint64(gasLimit)),
 		rlpAddress(toBytes),
@@ -165,6 +187,33 @@ func (s *realSigner) signETH(tx *UnsignedTx) (string, error) {
 		rlpBytes(sBytes),
 	})
 	return "0x" + hex.EncodeToString(raw), nil
+}
+
+// resolveNonce 解析用于签名的 Nonce（ETH 真实 Nonce 管理）：
+//   - UnsignedTx.Nonce 显式提供（>0）时直接采用（调用方自管 Nonce）。
+//   - 否则：已本地播种则递增返回；未播种则向节点查 eth_getTransactionCount("pending") 作为
+//     起点并缓存 nextNonce，之后本地递增（避免并发/未确认期间的重放碰撞）；节点不可达时
+//     回退默认 0（fail-degraded，真实环境应与节点确认数保持一致）。
+func (s *realSigner) resolveNonce(ctx context.Context, tx *UnsignedTx) (uint64, error) {
+	if tx.Nonce != 0 {
+		return tx.Nonce, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.haveNonce {
+		n := s.nextNonce
+		s.nextNonce++
+		return n, nil
+	}
+	if s.ethState != nil {
+		if n, err := s.ethState.Nonce(ctx, ChainETH, s.address); err == nil {
+			s.nextNonce = n + 1
+			s.haveNonce = true
+			return n, nil
+		}
+		// 节点不可达：忽略错误，回退默认 0（fail-degraded）。
+	}
+	return 0, nil
 }
 
 // amountToWei 把以 ETH 为单位的金额转换为 wei（big.Int），避免 float64 精度损失。
