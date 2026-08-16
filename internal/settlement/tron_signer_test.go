@@ -162,7 +162,7 @@ func TestRealSignerTRONTriggerSmartContract(t *testing.T) {
 	raw, err := s.Sign(context.Background(), &UnsignedTx{
 		Chain:          ChainTRON,
 		To:             toB58,
-		Amount:         1.0, // 1 个 token 最小单位（脚手架直接用 float 取整）
+		Amount:         1.0, // 1 USDT（人类单位），应缩放为 1e6 基础单位
 		ContractAddress: contractB58,
 		FeeLimit:       100_000_000, // 100 TRX 等价 sun
 	})
@@ -217,8 +217,8 @@ func TestRealSignerTRONTriggerSmartContract(t *testing.T) {
 		t.Fatalf("data 内地址字不匹配：got %x want %x", gotHash, wantHash)
 	}
 	amt := new(big.Int).SetBytes(dataBytes[36:68])
-	if amt.Cmp(big.NewInt(1)) != 0 {
-		t.Fatalf("data 内金额应为 1，got %s", amt)
+	if amt.Cmp(big.NewInt(1_000_000)) != 0 {
+		t.Fatalf("data 内金额应为 1e6（1 USDT 缩放后），got %s", amt)
 	}
 }
 
