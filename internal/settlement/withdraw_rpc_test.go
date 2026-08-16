@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -198,10 +199,28 @@ func TestJSONRPCClientConfirmationsBTC(t *testing.T) {
 	}
 }
 
-// TestJSONRPCClientConfirmationsTRON 验证 TRON 脚手架暂不支持，返回错误（生产补全）。
+// TestJSONRPCClientConfirmationsTRON 用 httptest 模拟 TronGrid：链头 /v1/blocks number=100、
+// 交易 /v1/transactions/{id} blockNumber=95，验证确认数 = 100-95+1 = 6。
 func TestJSONRPCClientConfirmationsTRON(t *testing.T) {
-	c := NewJSONRPCClient(map[string]string{"TRON": "http://127.0.0.1:9090"})
-	if _, err := c.Confirmations(context.Background(), ChainTRON, "txid"); err == nil {
-		t.Fatalf("expected error for TRON confirmation query (scaffold unsupported)")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/blocks"):
+			_, _ = w.Write([]byte(`{"data":[{"number":100}]}`))
+		case strings.HasPrefix(r.URL.Path, "/v1/transactions/"):
+			_, _ = w.Write([]byte(`{"data":[{"blockNumber":95}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewJSONRPCClient(map[string]string{"TRON": srv.URL})
+	conf, err := c.Confirmations(context.Background(), ChainTRON, "deadbeef")
+	if err != nil {
+		t.Fatalf("tron confirmations failed: %v", err)
+	}
+	if conf != 6 {
+		t.Fatalf("expected 6 confirmations (100-95+1), got %d", conf)
 	}
 }
