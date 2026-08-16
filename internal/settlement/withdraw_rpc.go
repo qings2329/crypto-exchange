@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -127,6 +129,79 @@ func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, a
 	}
 }
 
+// ConfirmSource 提供某笔交易在真实链上的当前确认数（真实区块确认轮询扩展点）。
+// JSONRPCClient 实现该接口；单测可注入内存假实现验证「真实确认数→状态机推进」。
+type ConfirmSource interface {
+	// Confirmations 返回交易当前在链上的确认区块数（0 表示尚未上链/未确认）。
+	Confirmations(ctx context.Context, chain Chain, txHash string) (int, error)
+}
+
+// Confirmations 按链向节点查询交易当前确认数（真实区块确认轮询用）：
+//   - ETH：eth_blockNumber 取链头高度，eth_getTransactionByHash 取交易所在区块；
+//     二者之差 +1 即确认数（交易未上链 blockNumber 为 null → 返回 0）。
+//   - BTC：getrawtransaction(txid, true) 的 confirmations 字段（未确认为 0）。
+//   - TRON：脚手架暂不支持，返回错误（生产补全）。
+// 节点不可达由调用方回退到模拟确认（fail-degraded）。
+func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash string) (int, error) {
+	switch chain {
+	case ChainETH:
+		headB, err := c.rpc(ctx, chain, "eth_blockNumber", []interface{}{})
+		if err != nil {
+			return 0, err
+		}
+		head, err := parseHexInt(headB)
+		if err != nil {
+			return 0, err
+		}
+		txB, err := c.rpc(ctx, chain, "eth_getTransactionByHash", []interface{}{txHash})
+		if err != nil {
+			return 0, err
+		}
+		var tx struct {
+			BlockNumber *string `json:"blockNumber"`
+		}
+		if err := json.Unmarshal(txB, &tx); err != nil {
+			return 0, err
+		}
+		if tx.BlockNumber == nil {
+			return 0, nil // 尚未上链
+		}
+		blk, err := parseHexInt([]byte(*tx.BlockNumber))
+		if err != nil {
+			return 0, err
+		}
+		return int(head) - int(blk) + 1, nil
+	case ChainBTC:
+		raw, err := c.rpc(ctx, chain, "getrawtransaction", []interface{}{txHash, true})
+		if err != nil {
+			return 0, err
+		}
+		var r struct {
+			Confirmations int `json:"confirmations"`
+		}
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return 0, err
+		}
+		return r.Confirmations, nil
+	case ChainTRON:
+		return 0, fmt.Errorf("tron confirmation query not supported in scaffold")
+	default:
+		return 0, fmt.Errorf("unsupported chain %s", chain)
+	}
+}
+
+// parseHexInt 把 "0x..." 十六进制整数字节串解析为 int（用于区块高度/确认数）。
+// 先去引号再去 0x 前缀（JSON 字符串结果带引号，顺序不可反）。
+func parseHexInt(b []byte) (int64, error) {
+	s := strings.TrimSpace(string(b))
+	s = strings.Trim(s, `"`)
+	s = strings.TrimPrefix(s, "0x")
+	if s == "" {
+		return 0, nil
+	}
+	return strconv.ParseInt(s, 16, 64)
+}
+
 // RPCWithdrawGateway 是 WithdrawGateway 的真实链上 RPC 实现（T-03 链上 RPC 半边脚手架）。
 // 它嵌入 MockWithdrawGateway，复用其经过验证的确认状态机、孤块/重组回滚与查询能力，
 // 仅在「广播」环节改为调用真实 ChainRPCClient（向节点发送交易、取回真实 TxHash）；
@@ -151,17 +226,24 @@ func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Ch
 }
 
 // NewWithdrawGateway 按配置选择链上提现网关实现：启用且配置了 RPC 端点时返回
-// RPCWithdrawGateway（真实广播 + 模拟确认），否则返回 MockWithdrawGateway（全模拟）。
+// RPCWithdrawGateway（真实广播 + 真实确认轮询），否则返回 MockWithdrawGateway（全部模拟）。
 func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 	req := conf.Required
 	if req <= 0 {
 		req = 2
 	}
+	interval := 2 * time.Second
+	if conf.PollSec > 0 {
+		interval = time.Duration(conf.PollSec) * time.Second
+	}
 	if conf.Enabled && len(conf.Endpoints) > 0 {
+		client := NewJSONRPCClient(conf.Endpoints)
+		mg := NewMockWithdrawGateway(req, interval)
+		mg.confirmSource = client // 真实区块确认轮询；节点不可达自动回退模拟
 		return &RPCWithdrawGateway{
-			MockWithdrawGateway: NewMockWithdrawGateway(req, 2*time.Second),
-			client:              NewJSONRPCClient(conf.Endpoints),
+			MockWithdrawGateway: mg,
+			client:              client,
 		}
 	}
-	return NewMockWithdrawGateway(req, 2*time.Second)
+	return NewMockWithdrawGateway(req, interval)
 }

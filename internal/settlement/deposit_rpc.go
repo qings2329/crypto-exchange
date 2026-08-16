@@ -227,11 +227,18 @@ func NewDepositGateway(conf ChainRPCConfig) DepositGateway {
 	if req <= 0 {
 		req = 2
 	}
+	interval := 2 * time.Second
+	if conf.PollSec > 0 {
+		interval = time.Duration(conf.PollSec) * time.Second
+	}
 	if conf.Enabled && len(conf.Endpoints) > 0 && len(conf.WatchAddresses) > 0 {
+		client := NewJSONRPCClient(conf.Endpoints)
+		mg := NewMockChainGateway(req, interval)
+		mg.confirmSource = client // 真实区块确认轮询；节点不可达自动回退模拟
 		return &RPCDepositGateway{
-			MockChainGateway: NewMockChainGateway(req, 2*time.Second),
-			scanner:          NewJSONRPCDepositScanner(NewJSONRPCClient(conf.Endpoints), conf.WatchAddresses, time.Duration(conf.PollSec)*time.Second),
+			MockChainGateway: mg,
+			scanner:          NewJSONRPCDepositScanner(client, conf.WatchAddresses, interval),
 		}
 	}
-	return NewMockChainGateway(req, 2*time.Second)
+	return NewMockChainGateway(req, interval)
 }

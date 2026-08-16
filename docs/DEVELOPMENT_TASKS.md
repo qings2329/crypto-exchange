@@ -20,7 +20,7 @@
 |------|------|------|------|----------|
 | T-01 | 鉴权中间件落地 | 网关/服务校验 token 并写入上下文用户身份，按身份做权限与额度控制 | `internal/pkg/middleware/auth.go:30` `// TODO` | **已完成**（HMAC-SHA256 Bearer 校验 + 单测；网关接入） |
 | T-02 | 成交流发布 Kafka 触发清算 | 撮合成交后发布事件到 Kafka，驱动清算服务记账，闭合资金链路 | `internal/matching/engine.go:59` `// TODO` | **已完成**（新增 `internal/pkg/mq`：Publisher 接口 + InMem 降级 + Kafka 实现(build tag)；futures onTrade 已发布） |
-| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向完成可插拔脚手架**（§27：提现广播 `RPCWithdrawGateway` + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner`，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**真实区块确认轮询、TRC20 充值过滤、热钱包/离线签名仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
+| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向 + 真实区块确认轮询完成可插拔脚手架**（§27：提现广播 `RPCWithdrawGateway` + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner` + `ConfirmSource`/`JSONRPCClient.Confirmations` 真实确认推进，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听/确认并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**TRC20 充值过滤、热钱包/离线签名仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
 | T-04 | 数据库 migration 与版本管理 | 当前建表靠首次运行 `CREATE TABLE IF NOT EXISTS`，缺可回滚 migration。新建表须 `ce_` 前缀 | README「待补充」 | **已完成**（新增 `internal/pkg/migrate` 运行器 + `ce_schema_migrations` 版本表；ledger 表改由迁移创建；含集成测试） |
 
 ## 2. P1 — 合约交易完善
@@ -542,19 +542,26 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
   - `TestJSONRPCDepositScannerETH`：用 httptest 模拟节点 `eth_getLogs` 响应，验证真实扫描器把命中观察地址的 Transfer 日志解析为 `DepositEvent`（`value 0x0de0b6b3a7640000 = 1e18 wei = 1.0`）。
 - `internal/futuresapi/server.go`：`Server.chainGateway` 字段类型由 `*settlement.MockChainGateway` 改为 `settlement.DepositGateway`（接口），`NewServer` 在以 `cfg.Settlement.ChainRPC` 装配 `NewWithdrawGateway` 的同时也用 `NewDepositGateway(chainRPC)` 装配充值网关，并 `Start()` + `StartScan(ctx)`（ctx 随 `Server.ctx` 取消清理）；`startChainWatchers` / 充值受理 / 回滚 / 重组查询全部经接口调用，零回归。
 
+**设计（真实区块确认轮询，§27 续二）**：把「确认数推进」从模拟「每 tick +1」替换为真实链上确认数查询——这是 T-03 收尾的关键一环，使 Credited 真正与链上安全确认数挂钩（替代与区块高度脱钩的模拟递增）。
+
+- `ConfirmSource` 接口（`withdraw_rpc.go`）：`Confirmations(ctx, chain, txHash) (int, error)`——抽象单笔交易的链上当前确认数；单测可注入内存假实现验证「真实确认数→状态机推进」。
+- `JSONRPCClient.Confirmations`：按链向节点查询确认数——ETH `eth_blockNumber` 取链头、`eth_getTransactionByHash` 取交易所在区块，二者之差 +1；BTC `getrawtransaction(txid, true)` 的 `confirmations` 字段；TRON 脚手架返回错误（生产补全）。
+- `MockChainGateway` / `MockWithdrawGateway` 各新增可选 `confirmSource ConfirmSource` 字段与 `realConfirmations(ctx, chain, txHash, current) int` 辅助：有源且查询成功→用真实确认数推进；否则（无源/节点宕机）→回退模拟 `current+1`（fail-degraded）。`tick()` 的充值 `Pending` 分支、提现 `Broadcasting` 分支据此推进确认数并达标置 Credited。
+- `NewWithdrawGateway` / `NewDepositGateway`：启用且配端点时把 `*JSONRPCClient` 同时设为 `confirmSource`（真实确认轮询）与广播/扫描客户端；确认轮询间隔尊重 `PollSec`（缺省 2s）。未配置则 `confirmSource` 为 nil，退化为纯 Mock（行为不变，零回归）。
+- 测试（`withdraw_rpc_test.go` / `deposit_rpc_test.go` 续）：`TestRPCWithdrawGatewayUsesRealConfirmations` / `TestRPCDepositGatewayUsesRealConfirmations`（注入确定确认数，达标即 Credited）、`TestRPCWithdrawGatewayFallsBackOnConfirmError` / `TestRPCDepositGatewayFallsBackOnConfirmError`（确认源不可达自动回退模拟 +1）、`TestJSONRPCClientConfirmationsETH`（httptest 模拟 `eth_blockNumber=0x10`+交易 `0x9`→确认数 8）/ `TestJSONRPCClientConfirmationsBTC`（取 `confirmations` 字段）/ `TestJSONRPCClientConfirmationsTRON`（返回错误）。
+
 **关键设计点**：
 
-- 确认状态机仍为模拟驱动：`required_confirmations` 与 `PollSec` 配置保留，但确认数推进由 `MockWithdrawGateway` 固定间隔状态机负责（与区块高度脱钩）；**真实区块确认轮询为后续扩展点**——`ChainRPCClient` 可再加 `Confirmations` 方法并由后台 poller 驱动，届时把确认推进从模拟切到真实链。
-- 边界清晰：真实签名 / 热钱包 / Nonce 管理在节点侧或离线签名层；本 JSON-RPC 客户端仅负责协议收发与哈希解析，属脚手架边界，不引入密钥管理。
-- fail-degraded 双保险：未启用、或配置了但节点宕机（`Broadcast` 返回错误），均自动回退模拟广播，无外部节点也能跑，与 §18.1「配置驱动 + 未配置降级」一致。
+- 确认数推进已由真实链上确认数驱动（替代模拟每 tick +1）：`MockWithdrawGateway` / `MockChainGateway` 通过 `confirmSource` 在 `tick()` 中查询节点，达标即 Credited；节点不可达自动回退模拟递增（fail-degraded），无外部节点也能跑。`PollSec` 同时驱动确认轮询与充值扫描间隔。
+- 边界清晰：真实签名 / 热钱包 / Nonce 管理在节点侧或离线签名层；本 JSON-RPC 客户端仅负责协议收发与哈希/确认数解析，属脚手架边界，不引入密钥管理。
+- fail-degraded 双保险：未启用、或配置了但节点宕机（`Broadcast`/`Confirmations` 返回错误），均自动回退模拟（广播/确认），无外部节点也能跑，与 §18.1「配置驱动 + 未配置降级」一致。
 
 **验证**：
 
-- `go build/vet/test ./...` 全绿（新增 `withdraw_rpc_test.go` 4 用例 + `deposit_rpc_test.go` 4 用例；`futuresapi` / `settlement` 既有测试零回归——`handler_wallet_test.go` 经 `WithdrawGateway` / `DepositGateway` 接口验证受理/回滚/历史查询路径不变）。
-- 真实广播路径经 `withdraw_rpc_test.go` 的 `fakeRPCClient`（注入确定哈希 / 注入错误）覆盖「真实哈希注入」与「错误回退」；真实充值扫描路径经 `deposit_rpc_test.go` 的 `TestJSONRPCDepositScannerETH`（httptest 模拟 `eth_getLogs`）覆盖「节点监听→解析入账」；完整端到端（连真实节点取 TxHash / 监听入账）依赖生产节点 URL + 热钱包/离线签名，原型不连真实链。
+- `go build/vet/test ./...` 全绿（本轮新增确认轮询相关用例 7 个；`withdraw_rpc_test.go` 共 7 用例、`deposit_rpc_test.go` 共 6 用例；`futuresapi` / `settlement` 既有测试零回归——`handler_wallet_test.go` 经 `WithdrawGateway` / `DepositGateway` 接口验证受理/回滚/历史查询路径不变）。
+- 真实广播路径经 `withdraw_rpc_test.go` 的 `fakeRPCClient`（注入确定哈希 / 注入错误）覆盖「真实哈希注入」与「错误回退」；真实充值扫描路径经 `deposit_rpc_test.go` 的 `TestJSONRPCDepositScannerETH`（httptest 模拟 `eth_getLogs`）覆盖「节点监听→解析入账」；真实确认轮询经 `Confirmations` 的 ETH/BTC httptest 用例与注入确认数用例覆盖「节点确认数→状态机推进」与「错误回退」；完整端到端（连真实节点广播/监听/确认）依赖生产节点 URL + 热钱包/离线签名，原型不连真实链。
 
 **剩余（T-03 收尾，生产接入最后一环）**：
-- 真实区块确认轮询（替换模拟确认状态机，按 `Required` 安全确认数推进到 Credited；当前提现/充值确认仍由 Mock 状态机按固定间隔推进，与区块高度脱钩）。
-- TRC20(TRON) 充值事件过滤（当前 `scanTRON` 脚手架默认返回空，生产需按合约 topics 调 `triggerconstantcontract`）。
+- TRC20(TRON) 充值事件过滤（当前 `scanTRON` 脚手架默认返回空、`Confirmations` 返回错误，生产需按合约 topics 调 `triggerconstantcontract`）。
 - 真实节点、热钱包或离线签名接入（合规约束，依赖外部节点）。
-- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播与充值回调的**脚手架**均已落地（配置驱动 + 未配置降级），生产填真实节点即生效。
+- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播、充值回调、真实区块确认轮询的**脚手架**均已落地（配置驱动 + 未配置降级），生产填真实节点即生效。
