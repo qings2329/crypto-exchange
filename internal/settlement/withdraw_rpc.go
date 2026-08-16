@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -187,10 +188,62 @@ func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash s
 		}
 		return r.Confirmations, nil
 	case ChainTRON:
-		return 0, fmt.Errorf("tron confirmation query not supported in scaffold")
+		// TronGrid 风格 REST：取链头区块号与交易所在区块号，差值 +1 为确认数。
+		headB, err := c.get(ctx, chain, "/v1/blocks?sort=-number&limit=1")
+		if err != nil {
+			return 0, err
+		}
+		head, err := parseTronHeadBlock(headB)
+		if err != nil {
+			return 0, err
+		}
+		txB, err := c.get(ctx, chain, "/v1/transactions/"+url.PathEscape(txHash))
+		if err != nil {
+			return 0, err
+		}
+		txBlock, found, err := parseTronTxBlock(txB)
+		if err != nil {
+			return 0, err
+		}
+		if !found {
+			return 0, nil // 尚未上链
+		}
+		return int(head) - int(txBlock) + 1, nil
 	default:
 		return 0, fmt.Errorf("unsupported chain %s", chain)
 	}
+}
+
+// parseTronHeadBlock 解析 TronGrid /v1/blocks 响应的链头区块号。
+func parseTronHeadBlock(b []byte) (int64, error) {
+	var r struct {
+		Data []struct {
+			Number int64 `json:"number"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return 0, err
+	}
+	if len(r.Data) == 0 {
+		return 0, fmt.Errorf("tron head block not found")
+	}
+	return r.Data[0].Number, nil
+}
+
+// parseTronTxBlock 解析 TronGrid /v1/transactions/{id} 响应的交易所在区块号；未找到返回 found=false。
+func parseTronTxBlock(b []byte) (int64, bool, error) {
+	var r struct {
+		Data []struct {
+			BlockNumber int64 `json:"blockNumber"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return 0, false, err
+	}
+	if len(r.Data) == 0 {
+		return 0, false, nil
+	}
+	return r.Data[0].BlockNumber, true, nil
 }
 
 // parseHexInt 把 "0x..." 十六进制整数字节串解析为 int（用于区块高度/确认数）。

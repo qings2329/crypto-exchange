@@ -20,7 +20,7 @@
 |------|------|------|------|----------|
 | T-01 | 鉴权中间件落地 | 网关/服务校验 token 并写入上下文用户身份，按身份做权限与额度控制 | `internal/pkg/middleware/auth.go:30` `// TODO` | **已完成**（HMAC-SHA256 Bearer 校验 + 单测；网关接入） |
 | T-02 | 成交流发布 Kafka 触发清算 | 撮合成交后发布事件到 Kafka，驱动清算服务记账，闭合资金链路 | `internal/matching/engine.go:59` `// TODO` | **已完成**（新增 `internal/pkg/mq`：Publisher 接口 + InMem 降级 + Kafka 实现(build tag)；futures onTrade 已发布） |
-| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向 + 真实区块确认轮询 + TRC20 充值过滤完成可插拔脚手架**（§27：提现广播 `RPCWithdrawGateway` + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner`(ETH `eth_getLogs`/BTC `listsinceblock`/TRON TronGrid TRC20 REST) + `ConfirmSource`/`JSONRPCClient.Confirmations` 真实确认推进，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听/确认并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**TRC20 确认数查询、热钱包/离线签名仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
+| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向 + 真实区块确认轮询 + TRC20 充值过滤 + TRC20 确认数查询完成可插拔脚手架**（§27：提现广播 `RPCWithdrawGateway` + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner`(ETH `eth_getLogs`/BTC `listsinceblock`/TRON TronGrid TRC20 REST) + `ConfirmSource`/`JSONRPCClient.Confirmations`(ETH/BTC/TRON 真实确认推进)，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听/确认并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**热钱包/离线签名仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
 | T-04 | 数据库 migration 与版本管理 | 当前建表靠首次运行 `CREATE TABLE IF NOT EXISTS`，缺可回滚 migration。新建表须 `ce_` 前缀 | README「待补充」 | **已完成**（新增 `internal/pkg/migrate` 运行器 + `ce_schema_migrations` 版本表；ledger 表改由迁移创建；含集成测试） |
 
 ## 2. P1 — 合约交易完善
@@ -549,7 +549,7 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 **设计（真实区块确认轮询，§27 续二）**：把「确认数推进」从模拟「每 tick +1」替换为真实链上确认数查询——这是 T-03 收尾的关键一环，使 Credited 真正与链上安全确认数挂钩（替代与区块高度脱钩的模拟递增）。
 
 - `ConfirmSource` 接口（`withdraw_rpc.go`）：`Confirmations(ctx, chain, txHash) (int, error)`——抽象单笔交易的链上当前确认数；单测可注入内存假实现验证「真实确认数→状态机推进」。
-- `JSONRPCClient.Confirmations`：按链向节点查询确认数——ETH `eth_blockNumber` 取链头、`eth_getTransactionByHash` 取交易所在区块，二者之差 +1；BTC `getrawtransaction(txid, true)` 的 `confirmations` 字段；TRON 脚手架返回错误（生产补全）。
+- `JSONRPCClient.Confirmations`：按链向节点查询确认数——ETH `eth_blockNumber` 取链头、`eth_getTransactionByHash` 取交易所在区块，二者之差 +1；BTC `getrawtransaction(txid, true)` 的 `confirmations` 字段；TRON 经 TronGrid REST 取链头 `/v1/blocks` 与交易 `/v1/transactions/{id}` 所在区块号，二者之差 +1（与 ETH/BTC 同一 `ConfirmSource` 机制）。
 - `MockChainGateway` / `MockWithdrawGateway` 各新增可选 `confirmSource ConfirmSource` 字段与 `realConfirmations(ctx, chain, txHash, current) int` 辅助：有源且查询成功→用真实确认数推进；否则（无源/节点宕机）→回退模拟 `current+1`（fail-degraded）。`tick()` 的充值 `Pending` 分支、提现 `Broadcasting` 分支据此推进确认数并达标置 Credited。
 - `NewWithdrawGateway` / `NewDepositGateway`：启用且配端点时把 `*JSONRPCClient` 同时设为 `confirmSource`（真实确认轮询）与广播/扫描客户端；确认轮询间隔尊重 `PollSec`（缺省 2s）。未配置则 `confirmSource` 为 nil，退化为纯 Mock（行为不变，零回归）。
 - 测试（`withdraw_rpc_test.go` / `deposit_rpc_test.go` 续）：`TestRPCWithdrawGatewayUsesRealConfirmations` / `TestRPCDepositGatewayUsesRealConfirmations`（注入确定确认数，达标即 Credited）、`TestRPCWithdrawGatewayFallsBackOnConfirmError` / `TestRPCDepositGatewayFallsBackOnConfirmError`（确认源不可达自动回退模拟 +1）、`TestJSONRPCClientConfirmationsETH`（httptest 模拟 `eth_blockNumber=0x10`+交易 `0x9`→确认数 8）/ `TestJSONRPCClientConfirmationsBTC`（取 `confirmations` 字段）/ `TestJSONRPCClientConfirmationsTRON`（返回错误）。
@@ -566,6 +566,5 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - 真实广播路径经 `withdraw_rpc_test.go` 的 `fakeRPCClient`（注入确定哈希 / 注入错误）覆盖「真实哈希注入」与「错误回退」；真实充值扫描路径经 `deposit_rpc_test.go` 的 `TestJSONRPCDepositScannerETH`（httptest 模拟 `eth_getLogs`）覆盖「节点监听→解析入账」；真实确认轮询经 `Confirmations` 的 ETH/BTC httptest 用例与注入确认数用例覆盖「节点确认数→状态机推进」与「错误回退」；完整端到端（连真实节点广播/监听/确认）依赖生产节点 URL + 热钱包/离线签名，原型不连真实链。
 
 **剩余（T-03 收尾，生产接入最后一环）**：
-- TRC20 确认数查询：`JSONRPCClient.Confirmations` 对 TRON 仍返回错误（脚手架缺实现），故 TRON 充值确认回退到模拟递增；生产可基于 TRC20 事件的 `num`/`block_timestamp` 或 `gettransactionbyid` 解析真实确认数（与 ETH/BTC 同机制接入 `ConfirmSource`）。
 - 真实节点、热钱包或离线签名接入（合规约束，依赖外部节点）。
-- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播、充值回调、真实区块确认轮询、TRC20 充值事件过滤的**脚手架**均已落地（配置驱动 + 未配置降级），生产填真实节点即生效。
+- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播、充值回调、真实区块确认轮询、TRC20 充值事件过滤、**TRC20 确认数查询**的**脚手架**均已落地（配置驱动 + 未配置降级），生产填真实节点即生效。
