@@ -641,3 +641,15 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 
 **剩余（T-03 收尾，生产部署动作）**：
 - 真实节点 URL、HSM/KMS 安全模块硬件接入（合规约束，依赖外部节点 + 硬件）：本仓库已内置**软件等价真实签名器**（`realSigner`：ETH/BTC/TRON 真实 secp256k1 签名）并把**实际签名原语抽离为可替换的 `KeySigner` 后端**。生产接入有两种等价路径：① **配置驱动**（推荐）：`SignerBackend="external"` + 环境变量 `HSM_KIND/HSM_ENDPOINT/HSM_API_KEY/HSM_PUBLIC_KEY` 指向内部签名服务，网关启动时按 `HSMConfig` 自动构造并注册真实后端，**无需手写 `RegisterExternalSigner`**；② **代码注入**：对非常规安全模块（aws-kms / pkcs11 等）用 `RegisterExternalSigner(keyID, backend)` 注册自定义 `KeySigner` 后端。两条路径私钥均永不离开安全模块，其余 settlement 代码不变；未配置则回退节点侧签名广播（fail-degraded）。`UnsignedTx` 的 `Data`/`UTXOs`/`ContractAddress`/`FeeLimit` 等已覆盖 ETH 合约调用 / BTC UTXO / TRON 合约调用的真实签名输入。
+
+**设计（充值/提现事件投递非静默 + 并发安全收尾，§27 续十四）**：在 §27 续「中优先级并发/精度修复」周期（#3/#4/#5/#7）收尾时，补上 emit 投递的非静默化与两个连带并发修复。
+
+- **#4 emit 静默丢弃 credited 事件（中优先级，资金正确性）**：`MockChainGateway.emit` / `emitRollback` 与 `MockWithdrawGateway.emit` / `emitWithdrawRollback` 原先用 `select { case ch<-ev: default: }` 在订阅者背压（channel 满且长期不消费）时**静默丢弃**事件。充值/提现达确认的 `credited` 事件一旦被丢，内部账本永不入账 → 「链上已确认但用户未到账」资金错配且无迹可查。改为**阻塞发送 + 超时上限**：`select { case ch<-ev: case <-time.After(emitSendTimeout): log.Printf("[settlement] ... DROPPED: ...") }`，超时后输出告警（而非静默丢弃）。已入账状态仍持久化在 `g.pending`，运维可经 `Pending()` 对账重放，避免永久丢失。`emitSendTimeout` 由 `const` 改为包级 `var`（默认 `5s`）以便单测调短。
+- **#3 Start 重建 `g.stop` 引入的 data race（本周期发现，随 #4 一并修复）**：#3 为修复「Stop 后再次 Start 失效」在 `Start()` 内 `g.stop = make(chan struct{})` 重建 stop；但后台 goroutine 仍读取字段 `g.stop`，与二次 `Start` 的写形成 data race（`-race` 下 `TestStartStopStart` 触发）。改为 goroutine 捕获**局部变量 `stop`** 后仅读局部，不再读 `g.stop` 字段；`MockChainGateway` 与 `MockWithdrawGateway` 的 `Start` 同改。
+- **`TestGenerateHelpers` 顺序依赖偶发失败（预存问题，本周期修复）**：多个地址测试经 `SetDepositAddressGenerator` 把全局 `depositAddrGen` 改为捕获的 `prev` 还原，前序用例泄漏的非 nil 生成器会经 `prev` 透传到 `TestGenerateHelpers`（其断言 `GenerateAddress` 回退 mock 的 `ETH` 前缀），导致偶发失败。`setGenForTest` / `TestGenerateAddressFallbackUnconfigured` / `TestConfigureDepositAddresses` / `TestDepositAddrGenConcurrent` 统一改为**还原为已知干净的 `nil`**，消除跨用例泄漏。（注：`TestDRKeyLossRekey` 在 `-count>1` 下因 HSM DR 测试自身非幂等 panic，属预存、与本周期无关，未改动。）
+
+- `internal/settlement/settlement.go`：4 个 emit 函数 `default:` 静默丢弃 → 阻塞+`emitSendTimeout` 超时+`log.Printf` 告警；`emitSendTimeout` 改 `var`；`MockChainGateway.Start` / `MockWithdrawGateway.Start` goroutine 捕获局部 `stop`。
+- `internal/settlement/settlement_emit_test.go`（新增）：`TestEmitDeliversCreditedEvent`（credited 事件经 channel 送达，回归投递路径）、`TestEmitBackpressureNotSilent`（背压超时输出 `DROPPED` 告警、且 `Pending()` 仍含 credited 可恢复）。
+- `internal/settlement/deposit_address_test.go` / `deposit_address_race_test.go`：全局生成器还原为 `nil`。
+
+**验证**：`go build ./...`、`go vet ./internal/settlement/ ./internal/futuresapi/`、`go test -race -count=1 ./internal/settlement/ ./internal/futuresapi/` 全绿；`TestEmitBackpressureNotSilent` 触发 `DROPPED` 日志印证非静默路径生效。
