@@ -226,7 +226,8 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 }
 
 // startChainWatchers 启动链上充值/提现的确认、回滚事件监听 goroutine。
-// 这些 goroutine 随 Server.ctx 取消而退出（网关的 Watch 在 ctx 取消时关闭 channel）。
+// 这些 goroutine 随 Server.ctx 取消而退出（Watch 返回的 channel 不再由网关关闭，
+// 消费者经 ctx.Done() 退出，避免向已关闭 channel 发送触发 panic）。
 func (s *Server) startChainWatchers() {
 	// 充值确认入账。
 	go func() {
@@ -235,15 +236,20 @@ func (s *Server) startChainWatchers() {
 			s.log.Error("chain gateway watch failed", zap.Error(err))
 			return
 		}
-		for ev := range ch {
-			if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash); err != nil {
-				s.log.Error("on-chain credit failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
+		for {
+			select {
+			case ev := <-ch:
+				if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash); err != nil {
+					s.log.Error("on-chain credit failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				s.log.Info("on-chain deposit credited",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount), zap.String("tx", ev.TxHash))
+				s.hub.Broadcast("SYS", ginH{"type": "chain_deposit", "data": ev})
+			case <-s.ctx.Done():
+				return
 			}
-			s.log.Info("on-chain deposit credited",
-				zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-				zap.Float64("amount", ev.Amount), zap.String("tx", ev.TxHash))
-			s.hub.Broadcast("SYS", ginH{"type": "chain_deposit", "data": ev})
 		}
 	}()
 
@@ -254,23 +260,28 @@ func (s *Server) startChainWatchers() {
 			s.log.Error("chain gateway watch rollback failed", zap.Error(err))
 			return
 		}
-		for ev := range rch {
-			badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash)
-			if err != nil {
-				s.log.Error("on-chain rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
+		for {
+			select {
+			case ev := <-rch:
+				badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash)
+				if err != nil {
+					s.log.Error("on-chain rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				if badDebt > 0 {
+					s.log.Error("on-chain deposit reverted with BAD DEBT (user already spent funds)",
+						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+						zap.Float64("amount", ev.Amount), zap.Float64("bad_debt", badDebt),
+						zap.String("tx", ev.TxHash))
+				} else {
+					s.log.Warn("on-chain deposit reverted (orphan block)",
+						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+						zap.Float64("amount", ev.Amount), zap.String("tx", ev.TxHash))
+				}
+				s.hub.Broadcast("SYS", ginH{"type": "chain_rollback", "data": ev, "bad_debt": badDebt})
+			case <-s.ctx.Done():
+				return
 			}
-			if badDebt > 0 {
-				s.log.Error("on-chain deposit reverted with BAD DEBT (user already spent funds)",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount), zap.Float64("bad_debt", badDebt),
-					zap.String("tx", ev.TxHash))
-			} else {
-				s.log.Warn("on-chain deposit reverted (orphan block)",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount), zap.String("tx", ev.TxHash))
-			}
-			s.hub.Broadcast("SYS", ginH{"type": "chain_rollback", "data": ev, "bad_debt": badDebt})
 		}
 	}()
 
@@ -281,27 +292,32 @@ func (s *Server) startChainWatchers() {
 			s.log.Error("chain withdraw watch failed", zap.Error(err))
 			return
 		}
-		for ev := range wch {
-			total := ev.Amount + ev.Fee
-			switch ev.Status {
-			case settlement.WithdrawCredited:
-				if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
-					s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
-					continue
+		for {
+			select {
+			case ev := <-wch:
+				total := ev.Amount + ev.Fee
+				switch ev.Status {
+				case settlement.WithdrawCredited:
+					if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
+						s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
+						continue
+					}
+					s.log.Info("on-chain withdraw settled",
+						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+						zap.Float64("amount", ev.Amount), zap.Float64("fee", ev.Fee),
+						zap.String("tx", ev.TxHash))
+					s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
+				case settlement.WithdrawFailed:
+					if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
+						s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
+						continue
+					}
+					s.log.Warn("on-chain withdraw failed, rolled back",
+						zap.Int64("user", ev.UserID), zap.String("tx", ev.TxHash))
+					s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw_failed", "data": ev})
 				}
-				s.log.Info("on-chain withdraw settled",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount), zap.Float64("fee", ev.Fee),
-					zap.String("tx", ev.TxHash))
-				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
-			case settlement.WithdrawFailed:
-				if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
-					s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
-					continue
-				}
-				s.log.Warn("on-chain withdraw failed, rolled back",
-					zap.Int64("user", ev.UserID), zap.String("tx", ev.TxHash))
-				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw_failed", "data": ev})
+			case <-s.ctx.Done():
+				return
 			}
 		}
 	}()
@@ -313,21 +329,26 @@ func (s *Server) startChainWatchers() {
 			s.log.Error("chain withdraw watch rollback failed", zap.Error(err))
 			return
 		}
-		for ev := range wrh {
-			total := ev.Amount + ev.Fee
-			if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
-				s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
+		for {
+			select {
+			case ev := <-wrh:
+				total := ev.Amount + ev.Fee
+				if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
+					s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
+					s.log.Error("withdraw rollback unfreeze failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				s.log.Warn("on-chain withdraw reverted (orphan block), funds returned",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount), zap.Float64("fee", ev.Fee),
+					zap.String("tx", ev.TxHash))
+				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw_rollback", "data": ev})
+			case <-s.ctx.Done():
+				return
 			}
-			if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
-				s.log.Error("withdraw rollback unfreeze failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
-			}
-			s.log.Warn("on-chain withdraw reverted (orphan block), funds returned",
-				zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-				zap.Float64("amount", ev.Amount), zap.Float64("fee", ev.Fee),
-				zap.String("tx", ev.TxHash))
-			s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw_rollback", "data": ev})
 		}
 	}()
 }

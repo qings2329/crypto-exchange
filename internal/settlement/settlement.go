@@ -307,7 +307,6 @@ func (g *MockChainGateway) Watch(ctx context.Context) (<-chan DepositEvent, erro
 			}
 		}
 		g.mu.Unlock()
-		close(ch)
 	}()
 	return ch, nil
 }
@@ -328,7 +327,6 @@ func (g *MockChainGateway) WatchRollback(ctx context.Context) (<-chan DepositEve
 			}
 		}
 		g.mu.Unlock()
-		close(ch)
 	}()
 	return ch, nil
 }
@@ -762,7 +760,6 @@ func (g *MockWithdrawGateway) WatchWithdraw(ctx context.Context) (<-chan Withdra
 			}
 		}
 		g.mu.Unlock()
-		close(ch)
 	}()
 	return ch, nil
 }
@@ -784,7 +781,6 @@ func (g *MockWithdrawGateway) WatchWithdrawRollback(ctx context.Context) (<-chan
 			}
 		}
 		g.mu.Unlock()
-		close(ch)
 	}()
 	return ch, nil
 }
