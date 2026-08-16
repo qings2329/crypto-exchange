@@ -34,7 +34,7 @@ func deriveTestXPUB(t *testing.T) string {
 
 func setGenForTest(t *testing.T, g *DepositAddressGenerator) {
 	t.Helper()
-	prev := depositAddrGen
+	prev := depositAddrGen.Load()
 	SetDepositAddressGenerator(g)
 	t.Cleanup(func() { SetDepositAddressGenerator(prev) })
 }
@@ -141,7 +141,7 @@ func TestGenerateAddressRealWhenConfigured(t *testing.T) {
 
 func TestGenerateAddressFallbackUnconfigured(t *testing.T) {
 	// 确保全局为 nil（无生成器）→ 回退 mock 占位地址（兼容既有 TestGenerateHelpers 的 "ETH" 前缀断言）。
-	prev := depositAddrGen
+	prev := depositAddrGen.Load()
 	SetDepositAddressGenerator(nil)
 	t.Cleanup(func() { SetDepositAddressGenerator(prev) })
 
@@ -205,7 +205,7 @@ func TestNewDepositAddressGeneratorInvalid(t *testing.T) {
 // TestConfigureDepositAddresses 覆盖配置驱动接线函数的各分支：未启用/空 xpub 不注册；
 // 启用且 xpub 合法→注册；xpub 非法→不 panic、不注册（fail-degraded）。
 func TestConfigureDepositAddresses(t *testing.T) {
-	prev := depositAddrGen
+	prev := depositAddrGen.Load()
 	t.Cleanup(func() { SetDepositAddressGenerator(prev) })
 
 	xpub := deriveTestXPUB(t)
@@ -213,28 +213,28 @@ func TestConfigureDepositAddresses(t *testing.T) {
 	// 未启用 → 不注册（全局保持原状，此处为 nil）。
 	SetDepositAddressGenerator(nil)
 	ConfigureDepositAddresses(DepositConfig{Enabled: false, XPUB: xpub})
-	if depositAddrGen != nil {
+	if depositAddrGen.Load() != nil {
 		t.Fatalf("未启用不应注册生成器")
 	}
 
 	// 启用但 xpub 空 → 不注册。
 	ConfigureDepositAddresses(DepositConfig{Enabled: true, XPUB: ""})
-	if depositAddrGen != nil {
+	if depositAddrGen.Load() != nil {
 		t.Fatalf("xpub 空不应注册生成器")
 	}
 
 	// 启用且 xpub 合法 → 注册成功。
 	ConfigureDepositAddresses(DepositConfig{Enabled: true, XPUB: xpub, BTCAddressType: "p2wpkh"})
-	if depositAddrGen == nil {
+	if depositAddrGen.Load() == nil {
 		t.Fatalf("启用且 xpub 合法应注册生成器")
 	}
-	if _, err := depositAddrGen.Address(1, ChainETH); err != nil {
+	if _, err := depositAddrGen.Load().Address(1, ChainETH); err != nil {
 		t.Fatalf("注册后派生失败: %v", err)
 	}
 
 	// xpub 非法 → 不 panic、不覆盖（保持上一步注册的合法生成器）。
 	ConfigureDepositAddresses(DepositConfig{Enabled: true, XPUB: "bad-xpub"})
-	if depositAddrGen == nil {
+	if depositAddrGen.Load() == nil {
 		t.Fatalf("xpub 非法不应清空已注册生成器")
 	}
 }

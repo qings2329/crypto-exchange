@@ -434,7 +434,7 @@ func (g *MockChainGateway) Pending() []DepositEvent {
 // 经 HSM 导出的账户级 xpub 非硬化派生），返回该用户真实的 ETH/BTC/TRON 地址；否则回退确定性的
 // 模拟占位地址（fail-degraded，未配置 HD 派生时仍能运行）。派生失败（含非法 userID）同样回退 mock。
 func GenerateAddress(userID int64, chain Chain) string {
-	if g := depositAddrGen; g != nil {
+	if g := depositAddrGen.Load(); g != nil {
 		if addr, err := g.Address(userID, chain); err == nil && addr != "" {
 			return addr
 		}
