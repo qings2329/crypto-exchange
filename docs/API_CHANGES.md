@@ -85,3 +85,25 @@
 
 ### 迁移
 - `ce_otc_orders.crypto_amount` 由 `DOUBLE` 改为 `VARCHAR(64)`（精确存储定点字符串），迁移版本 `9604` 自动执行（向下兼容回退到 DOUBLE）。
+
+---
+
+## 2026-08-16 — 账本 v1→v2 快照迁移真实数据校验（定点化配套）
+
+- **背景**：账本金额已定点化（`settlement.AssetAmount`）。旧快照（无 `schema_version` 的 float 快照）
+  经 `parseSnapshot` → `migrateV1ToV2` 按资产标准 decimals 迁移。生产环境上线前必须对**真实/全量** v1 快照
+  做预校验，避免未知资产被回退默认 8 位小数而错配精度。
+- **相关提交**：`d40a6c2`（引入 migrateV1ToV2 + 复合 key 解析）、本轮新增 `ValidateV1SnapshotAssets` 预检与多资产迁移测试。
+
+### 预发/生产校验步骤
+1. **抽取真实 v1 快照**：从当前运行实例 `GET /debug/snapshot`（或对应持久化文件）导出 JSON（确保其中**无** `schema_version` 字段，即确为旧格式）。
+2. **未知资产预检**：将快照喂入 `ledger.ValidateV1SnapshotAssets(v1)`，列出所有「未知资产」告警。
+   - 若告警非空：先确认这些资产的真实 decimals；若与 `AssetDecimalsByName` 默认（8）不一致，须先补全该表或自定义迁移，否则金额会被放大/缩小。
+   - 已知资产（BTC/ETH/USDT/USDC/TRX/TRON/TRC20）直接按标准 decimals 迁移，无需干预。
+3. **单元级回归**：`go test ./internal/ledger/ -run 'TestMigrateV1ToV2|TestParseSnapshotVersionRouting|TestValidateV1SnapshotAssets'`
+   已覆盖账户/流水/提现冻结/社会化分摊/复合 key 的多资产生成与「无 schema_version 走迁移、有 schema_version 走直读」路由。
+4. **余额守恒核对**：迁移后用 `Ledger.Snapshot()` 导出 v2，按资产汇总 `Accounts[*].Available`，与 v1 人类单位金额逐资产比对，确认无凭空增减（仅最小单位内的 float 截断，属预期）。
+5. **灰度上线**：先在预发环境用真实形状快照跑一遍 `Restore` + 对账，确认 `SysOtc`/各系统账户余额与迁移前一致，再上生产；生产回滚方案为保留 v1 快照副本，必要时以旧格式 `Restore`。
+
+### 注意
+- `migrateV1ToV2` 对未知资产**静默**采用默认 8 位——这是唯一可能错配精度的路径，故步骤 2 的预检是上线硬性前置。
