@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -36,6 +37,8 @@ type DepositWatch struct {
 	Address string  `yaml:"address"`
 	UserID  int64   `yaml:"user_id"`
 	Asset   string  `yaml:"asset"`
+	// Token 是 TRC20 合约地址（仅 chain=TRON 时用于过滤对应代币）；空则默认 USDT-TRC20 主网合约。
+	Token string `yaml:"token"`
 }
 
 // ChainRPCClient 抽象单链 RPC 广播能力（T-03 链上 RPC 半边）。生产实现直连节点；
@@ -200,6 +203,28 @@ func parseHexInt(b []byte) (int64, error) {
 		return 0, nil
 	}
 	return strconv.ParseInt(s, 16, 64)
+}
+
+// tronUSDTContract 是 TRON 主网 USDT(TRC20) 合约地址；TRC20 观察项未配 token 时默认按此过滤。
+const tronUSDTContract = "TR7NHqjiehqjqTD9QgQsrQUDsV7qxXWm1f"
+
+// get 向链端点（仅 TRON）发起 GET 请求，用于 TronGrid 风格的 TRC20 事件 REST 查询，
+// 与 rpc（JSON-RPC POST）互补。生产 TRON 监控接 TronGrid 或自建 event 服务。
+func (c *JSONRPCClient) get(ctx context.Context, chain Chain, path string) ([]byte, error) {
+	url := c.endpoints[string(chain)]
+	if url == "" {
+		return nil, fmt.Errorf("no rpc endpoint configured for chain %s", chain)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return io.ReadAll(resp.Body)
 }
 
 // RPCWithdrawGateway 是 WithdrawGateway 的真实链上 RPC 实现（T-03 链上 RPC 半边脚手架）。

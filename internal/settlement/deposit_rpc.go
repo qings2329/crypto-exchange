@@ -89,9 +89,7 @@ func (s *JSONRPCDepositScanner) scanChain(ctx context.Context, w DepositWatch) (
 	case ChainBTC:
 		return s.scanBTC(ctx, w)
 	case ChainTRON:
-		// TRON(TRC20) 需按合约 topics 过滤 triggerconstantcontract 事件，脚手架暂不实现，
-		// 返回空（生产补全，见 §27「剩余」）。
-		return nil, nil
+		return s.scanTRON(ctx, w)
 	default:
 		return nil, fmt.Errorf("unsupported chain %s", w.Chain)
 	}
@@ -181,6 +179,70 @@ func weiToAmount(hex string) float64 {
 	}
 	f, _ := new(big.Float).SetInt(v).Float64()
 	return f / 1e18
+}
+
+// scanTRON 用 TronGrid 风格 REST 拉取观察地址的 TRC20 转账（充值）：按合约地址过滤、
+// 仅保留 to==观察地址 的入账，解析 value（最小单位，按 decimals 缩放）为 amount。生产接
+// TronGrid 或自建 event 服务；未配 token 时默认按主网 USDT-TRC20 合约过滤。
+func (s *JSONRPCDepositScanner) scanTRON(ctx context.Context, w DepositWatch) ([]DepositEvent, error) {
+	token := w.Token
+	if token == "" {
+		token = tronUSDTContract
+	}
+	path := fmt.Sprintf("/v1/accounts/%s/transactions/trc20?contract_address=%s&only_confirmed=true", w.Address, token)
+	body, err := s.client.get(ctx, ChainTRON, path)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Data []struct {
+			TransactionID string `json:"transaction_id"`
+			TokenInfo     struct {
+				Decimals int `json:"decimals"`
+			} `json:"token_info"`
+			Value string `json:"value"`
+			To    string `json:"to"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]DepositEvent, 0, len(resp.Data))
+	for _, d := range resp.Data {
+		if !strings.EqualFold(d.To, w.Address) {
+			continue // 仅保留入账（to==观察地址），转出/其他地址忽略
+		}
+		decimals := d.TokenInfo.Decimals
+		if decimals <= 0 {
+			decimals = 6 // USDT-TRC20 默认 6 位小数
+		}
+		amount := tronAmountToFloat(d.Value, decimals)
+		if amount <= 0 {
+			continue
+		}
+		out = append(out, DepositEvent{
+			TxHash:  d.TransactionID,
+			UserID:  w.UserID,
+			Asset:   w.Asset,
+			Amount:  amount,
+			Chain:   ChainTRON,
+			Address: w.Address,
+		})
+	}
+	return out, nil
+}
+
+// tronAmountToFloat 把 TRC20 value（字符串，最小单位整数）按 decimals 缩放为资产数量。
+func tronAmountToFloat(value string, decimals int) float64 {
+	v, ok := new(big.Int).SetString(strings.TrimSpace(value), 10)
+	if !ok {
+		return 0
+	}
+	f := new(big.Float).SetInt(v)
+	div := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	f.Quo(f, div)
+	r, _ := f.Float64()
+	return r
 }
 
 // RPCDepositGateway 是 DepositGateway 的真实链上 RPC 实现（T-03 链上 RPC 半边·充值回调脚手架）。
