@@ -436,7 +436,12 @@ func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash s
 		if err != nil {
 			return 0, err
 		}
-		return int(head) - int(blk) + 1, nil
+		// 链重组或节点时间偏差可能使 blk > head，差值+1 为负；钳制为 0（≡尚未确认），
+		// 避免状态机误判「已确认」而提前入账（#10）。
+		if conf := int(head) - int(blk) + 1; conf > 0 {
+			return conf, nil
+		}
+		return 0, nil
 	case ChainBTC:
 		raw, err := c.rpc(ctx, chain, "getrawtransaction", []interface{}{txHash, true})
 		if err != nil {
@@ -447,6 +452,10 @@ func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash s
 		}
 		if err := json.Unmarshal(raw, &r); err != nil {
 			return 0, err
+		}
+		// 节点在链重组下偶发返回负值确认数；钳制为 0 避免误判已确认（#10）。
+		if r.Confirmations < 0 {
+			return 0, nil
 		}
 		return r.Confirmations, nil
 	case ChainTRON:
@@ -470,7 +479,11 @@ func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash s
 		if !found {
 			return 0, nil // 尚未上链
 		}
-		return int(head) - int(txBlock) + 1, nil
+		// 同 ETH：链重组/节点偏差可能使 txBlock > head，钳制负值（#10）。
+		if conf := int(head) - int(txBlock) + 1; conf > 0 {
+			return conf, nil
+		}
+		return 0, nil
 	default:
 		return 0, fmt.Errorf("unsupported chain %s", chain)
 	}
