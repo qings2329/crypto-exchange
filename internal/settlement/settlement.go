@@ -128,6 +128,9 @@ type MockChainGateway struct {
 	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
 	stop         chan struct{}
 	started      bool
+	// confirmSource 提供真实链上确认数（可选）。非 nil 时 tick 用节点确认数推进充值
+	// 确认（替代模拟「每 tick +1」）；查询失败则回退 +1（fail-degraded）。nil=纯模拟。
+	confirmSource ConfirmSource
 }
 
 // NewMockChainGateway 创建模拟网关；required<=0 默认 2 确认，interval<=0 默认 2s。
@@ -203,7 +206,8 @@ func (g *MockChainGateway) tick() {
 		if ev.Status != DepositPending {
 			continue
 		}
-		ev.Confirmations++
+		// 真实节点可达时用链上确认数推进；否则（未配置/节点宕机）回退模拟 +1。
+		ev.Confirmations = g.realConfirmations(context.Background(), ev.Chain, ev.TxHash, ev.Confirmations)
 		ev.UpdatedAt = now
 		if ev.Confirmations >= ev.Required {
 			ev.Status = DepositCredited
@@ -217,6 +221,17 @@ func (g *MockChainGateway) tick() {
 	for _, ev := range credited {
 		g.emit(ev)
 	}
+}
+
+// realConfirmations 返回 ev 的新确认数：有 confirmSource 且查询成功→用真实链上确认数；
+// 否则（无 source 或查询失败）→回退模拟「当前 +1」（fail-degraded，行为与纯 Mock 一致）。
+func (g *MockChainGateway) realConfirmations(ctx context.Context, chain Chain, txHash string, current int) int {
+	if g.confirmSource != nil {
+		if c, err := g.confirmSource.Confirmations(ctx, chain, txHash); err == nil {
+			return c
+		}
+	}
+	return current + 1
 }
 
 func (g *MockChainGateway) emit(ev DepositEvent) {
@@ -533,6 +548,9 @@ type MockWithdrawGateway struct {
 	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
 	stop         chan struct{}
 	started      bool
+	// confirmSource 提供真实链上确认数（可选）。非 nil 时 tick 在 Broadcasting 阶段用
+	// 节点确认数推进（替代模拟「每 tick +1」）；查询失败回退 +1（fail-degraded）。nil=纯模拟。
+	confirmSource ConfirmSource
 }
 
 // NewMockWithdrawGateway 创建模拟提现网关；required<=0 默认 2 确认，interval<=0 默认 2s。
@@ -617,7 +635,8 @@ func (g *MockWithdrawGateway) tick() {
 				ev.UpdatedAt = now
 			}
 		case WithdrawBroadcasting:
-			ev.Confirmations++
+			// 真实节点可达时用链上确认数推进；否则（未配置/节点宕机）回退模拟 +1。
+			ev.Confirmations = g.realConfirmations(context.Background(), ev.Chain, ev.TxHash, ev.Confirmations)
 			ev.UpdatedAt = now
 			if ev.Confirmations >= ev.Required {
 				ev.Status = WithdrawCredited
@@ -632,6 +651,17 @@ func (g *MockWithdrawGateway) tick() {
 	for _, ev := range done {
 		g.emit(ev)
 	}
+}
+
+// realConfirmations 返回 ev 的新确认数：有 confirmSource 且查询成功→用真实链上确认数；
+// 否则（无 source 或查询失败）→回退模拟「当前 +1」（fail-degraded，行为与纯 Mock 一致）。
+func (g *MockWithdrawGateway) realConfirmations(ctx context.Context, chain Chain, txHash string, current int) int {
+	if g.confirmSource != nil {
+		if c, err := g.confirmSource.Confirmations(ctx, chain, txHash); err == nil {
+			return c
+		}
+	}
+	return current + 1
 }
 
 func (g *MockWithdrawGateway) emit(ev WithdrawEvent) {

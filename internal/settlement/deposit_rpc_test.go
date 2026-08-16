@@ -2,6 +2,7 @@ package settlement
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -131,5 +132,73 @@ func TestJSONRPCDepositScannerETH(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("no deposit event scanned from node")
+	}
+}
+
+// fakeDepositConfirmSource 是 ConfirmSource 的内存假实现（充值确认轮询测试用）。
+type fakeDepositConfirmSource struct {
+	conf int
+	err  error
+}
+
+func (f *fakeDepositConfirmSource) Confirmations(ctx context.Context, chain Chain, txHash string) (int, error) {
+	return f.conf, f.err
+}
+
+// TestRPCDepositGatewayUsesRealConfirmations 验证配置了确认源时，充值确认数按节点返回的
+// 真实确认数推进（而非模拟 +1），达标即置 Credited（真实区块确认轮询路径）。
+func TestRPCDepositGatewayUsesRealConfirmations(t *testing.T) {
+	g := &RPCDepositGateway{
+		MockChainGateway: NewMockChainGateway(2, time.Second),
+	}
+	g.MockChainGateway.confirmSource = &fakeDepositConfirmSource{conf: 3} // 节点返回 3 个确认
+	ev, err := g.SubmitDeposit(1, "ETH", ChainETH, 1.5, "0xWATCH")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g.Tick() // 真实确认数 3 >= 2 -> Credited
+	found := false
+	for _, e := range g.Pending() {
+		if e.TxHash == ev.TxHash {
+			found = true
+			if e.Status != DepositCredited {
+				t.Fatalf("expected Credited, got %s", e.Status)
+			}
+			if e.Confirmations != 3 {
+				t.Fatalf("expected real confirmations 3, got %d", e.Confirmations)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("deposit not found after tick")
+	}
+}
+
+// TestRPCDepositGatewayFallsBackOnConfirmError 验证确认源不可达时自动回退模拟 +1（fail-degraded）。
+func TestRPCDepositGatewayFallsBackOnConfirmError(t *testing.T) {
+	g := &RPCDepositGateway{
+		MockChainGateway: NewMockChainGateway(2, time.Second),
+	}
+	g.MockChainGateway.confirmSource = &fakeDepositConfirmSource{err: errors.New("node unreachable")}
+	ev, err := g.SubmitDeposit(1, "BTC", ChainBTC, 0.5, "bc1xyz")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g.Tick() // 回退模拟 0+1=1
+	g.Tick() // 回退模拟 1+1=2 -> Credited
+	found := false
+	for _, e := range g.Pending() {
+		if e.TxHash == ev.TxHash {
+			found = true
+			if e.Status != DepositCredited {
+				t.Fatalf("expected Credited, got %s", e.Status)
+			}
+			if e.Confirmations != 2 {
+				t.Fatalf("expected simulated confirmations 2, got %d", e.Confirmations)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("deposit not found after ticks")
 	}
 }

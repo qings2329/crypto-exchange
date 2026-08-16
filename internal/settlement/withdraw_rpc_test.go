@@ -2,7 +2,10 @@ package settlement
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -18,6 +21,16 @@ func (f *fakeRPCClient) Broadcast(ctx context.Context, chain Chain, to string, a
 		return "", f.err
 	}
 	return f.hash, nil
+}
+
+// fakeConfirmSource 是 ConfirmSource 的内存假实现，用于无节点环境下验证「真实确认数→状态机推进」。
+type fakeConfirmSource struct {
+	conf int
+	err  error
+}
+
+func (f *fakeConfirmSource) Confirmations(ctx context.Context, chain Chain, txHash string) (int, error) {
+	return f.conf, f.err
 }
 
 // TestNewWithdrawGatewayDisabledReturnsMock 验证未启用 RPC 时回退到模拟网关，
@@ -83,5 +96,112 @@ func TestNewWithdrawGatewayEnabledUsesRPC(t *testing.T) {
 	_, ok := g.(*RPCWithdrawGateway)
 	if !ok {
 		t.Fatalf("enabled gateway should be *RPCWithdrawGateway, got %T", g)
+	}
+}
+
+// TestRPCWithdrawGatewayUsesRealConfirmations 验证配置了确认源时，广播后确认数按节点
+// 返回的真实确认数推进（而非模拟 +1），达标即置 Credited（真实区块确认轮询路径）。
+func TestRPCWithdrawGatewayUsesRealConfirmations(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
+		client:              &fakeRPCClient{hash: "0xREAL"},
+	}
+	g.MockWithdrawGateway.confirmSource = &fakeConfirmSource{conf: 5} // 节点返回 5 个确认
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g.Tick() // Pending -> Broadcasting（确认=1，状态转移）
+	g.Tick() // Broadcasting -> 真实确认数 5 >= 2 -> Credited
+	// 重新取事件核对。
+	for _, e := range g.WithdrawHistory() {
+		if e.TxHash == ev.TxHash {
+			if e.Status != WithdrawCredited {
+				t.Fatalf("expected Credited, got %s", e.Status)
+			}
+			if e.Confirmations != 5 {
+				t.Fatalf("expected real confirmations 5, got %d", e.Confirmations)
+			}
+		}
+	}
+}
+
+// TestRPCWithdrawGatewayFallsBackOnConfirmError 验证确认源不可达时自动回退模拟 +1，
+// 行为与原 Mock 一致（fail-degraded）。
+func TestRPCWithdrawGatewayFallsBackOnConfirmError(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
+		client:              &fakeRPCClient{hash: "0xREAL"},
+	}
+	g.MockWithdrawGateway.confirmSource = &fakeConfirmSource{err: errors.New("node unreachable")}
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainBTC, 0.5, 0.0005, "bc1xyz", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	g.Tick() // Pending -> Broadcasting（确认=1）
+	g.Tick() // Broadcasting -> 回退模拟 1+1=2 -> Credited
+	for _, e := range g.WithdrawHistory() {
+		if e.TxHash == ev.TxHash {
+			if e.Status != WithdrawCredited {
+				t.Fatalf("expected Credited, got %s", e.Status)
+			}
+			if e.Confirmations != 2 {
+				t.Fatalf("expected simulated confirmations 2, got %d", e.Confirmations)
+			}
+		}
+	}
+}
+
+// TestJSONRPCClientConfirmationsETH 用 httptest 模拟节点：eth_blockNumber=0x10、交易
+// blockNumber=0x9，验证确认数 = 16-9+1 = 8。
+func TestJSONRPCClientConfirmationsETH(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "eth_blockNumber":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x10"}`))
+		case "eth_getTransactionByHash":
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"blockNumber":"0x9"}}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := NewJSONRPCClient(map[string]string{"ETH": srv.URL})
+	conf, err := c.Confirmations(context.Background(), ChainETH, "0xdead")
+	if err != nil {
+		t.Fatalf("confirmations failed: %v", err)
+	}
+	if conf != 8 {
+		t.Fatalf("expected 8 confirmations (16-9+1), got %d", conf)
+	}
+}
+
+// TestJSONRPCClientConfirmationsBTC 用 httptest 模拟节点 getrawtransaction，验证直接取 confirmations 字段。
+func TestJSONRPCClientConfirmationsBTC(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"confirmations":4}}`))
+	}))
+	defer srv.Close()
+
+	c := NewJSONRPCClient(map[string]string{"BTC": srv.URL})
+	conf, err := c.Confirmations(context.Background(), ChainBTC, "txid")
+	if err != nil {
+		t.Fatalf("confirmations failed: %v", err)
+	}
+	if conf != 4 {
+		t.Fatalf("expected 4 confirmations, got %d", conf)
+	}
+}
+
+// TestJSONRPCClientConfirmationsTRON 验证 TRON 脚手架暂不支持，返回错误（生产补全）。
+func TestJSONRPCClientConfirmationsTRON(t *testing.T) {
+	c := NewJSONRPCClient(map[string]string{"TRON": "http://127.0.0.1:9090"})
+	if _, err := c.Confirmations(context.Background(), ChainTRON, "txid"); err == nil {
+		t.Fatalf("expected error for TRON confirmation query (scaffold unsupported)")
 	}
 }
