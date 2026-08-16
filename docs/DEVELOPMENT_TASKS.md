@@ -20,7 +20,7 @@
 |------|------|------|------|----------|
 | T-01 | 鉴权中间件落地 | 网关/服务校验 token 并写入上下文用户身份，按身份做权限与额度控制 | `internal/pkg/middleware/auth.go:30` `// TODO` | **已完成**（HMAC-SHA256 Bearer 校验 + 单测；网关接入） |
 | T-02 | 成交流发布 Kafka 触发清算 | 撮合成交后发布事件到 Kafka，驱动清算服务记账，闭合资金链路 | `internal/matching/engine.go:59` `// TODO` | **已完成**（新增 `internal/pkg/mq`：Publisher 接口 + InMem 降级 + Kafka 实现(build tag)；futures onTrade 已发布） |
-| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向 + 真实区块确认轮询 + TRC20 充值过滤 + TRC20 确认数查询完成可插拔脚手架**（§27：提现广播 `RPCWithdrawGateway` + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner`(ETH `eth_getLogs`/BTC `listsinceblock`/TRON TronGrid TRC20 REST) + `ConfirmSource`/`JSONRPCClient.Confirmations`(ETH/BTC/TRON 真实确认推进)，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听/确认并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**热钱包/离线签名仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
+| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向 + 真实区块确认轮询 + TRC20 充值过滤 + TRC20 确认数查询 + 热钱包离线签名边界完成可插拔脚手架**（§27：提现广播 `RPCWithdrawGateway`(+`Signer`/`SendRaw` 离线签名边界) + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner` + `ConfirmSource`/`JSONRPCClient.Confirmations`，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听/确认/离线签名并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**真实 HSM/KMS 签名器、BTC UTXO/Nonce、TRON 带签名合约调用仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
 | T-04 | 数据库 migration 与版本管理 | 当前建表靠首次运行 `CREATE TABLE IF NOT EXISTS`，缺可回滚 migration。新建表须 `ce_` 前缀 | README「待补充」 | **已完成**（新增 `internal/pkg/migrate` 运行器 + `ce_schema_migrations` 版本表；ledger 表改由迁移创建；含集成测试） |
 
 ## 2. P1 — 合约交易完善
@@ -510,11 +510,11 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 **设计**：
 
 - `internal/settlement/withdraw_rpc.go`（新增）：
-  - `ChainRPCConfig`：`Enabled`（是否启用真实广播）、`Endpoints`（链名 ETH/BTC/TRON → RPC URL）、`Required`（`required_confirmations` 阈值，<=0 用默认 2）、`PollSec`（确认轮询间隔，当前仅文档，确认推进由模拟状态机驱动）。
-  - `ChainRPCClient` 接口：`Broadcast(ctx, chain, to, amount) (txHash string, err error)`——抽象单链广播能力，生产直连节点、单测可注入内存假实现验证「真实哈希注入」路径。
-  - `JSONRPCClient`：`ChainRPCClient` 的通用 JSON-RPC 2.0 实现，按链映射到对应节点方法（ETH `eth_sendTransaction` / BTC `sendtoaddress` / TRON `wallet/triggersmartcontract`），负责协议收发与 `result` 解析取 TxHash；节点不可达则按链返回明确错误。
-  - `RPCWithdrawGateway`：嵌入 `MockWithdrawGateway`，**复用其经过验证的确认状态机 / 孤块回滚 / 查询能力**，仅在「广播」环节改为调 `ChainRPCClient` 取得节点返回的真实 TxHash（经 `SubmitWithdrawWithHash` 注入内部事件）；**RPC 不可达时自动回退模拟广播**（fail-degraded），由调用方日志侧记录告警。
-  - `NewWithdrawGateway(conf)`：按配置选择——`Enabled && len(Endpoints)>0` 返回 `RPCWithdrawGateway`，否则返回 `MockWithdrawGateway`。`required` 缺省为 2。
+  - `ChainRPCConfig`：`Enabled`（是否启用真实广播）、`Endpoints`（链名 ETH/BTC/TRON → RPC URL）、`Required`（`required_confirmations` 阈值，<=0 用默认 2）、`PollSec`（确认轮询间隔）、`WatchAddresses`（充值监听「地址→用户」）、`HotWallet`（离线签名边界配置）。
+  - `ChainRPCClient` 接口：`Broadcast(ctx, chain, to, amount)`（节点侧签名广播，回退路径）+ `SendRaw(ctx, chain, rawHex)`（广播已离线签名的原始交易，离线签名主路径）。
+  - `JSONRPCClient`：`ChainRPCClient` 的通用 JSON-RPC 2.0 实现——`Broadcast` 按链映射节点方法（ETH `eth_sendTransaction` / BTC `sendtoaddress` / TRON `wallet/triggersmartcontract`），`SendRaw` 按链映射（ETH `eth_sendRawTransaction` / BTC `sendrawtransaction`；TRON 脚手架返回错误待生产补全），负责协议收发与 `result` 解析取 TxHash。
+  - `RPCWithdrawGateway`：嵌入 `MockWithdrawGateway`，**复用其经过验证的确认状态机 / 孤块回滚 / 查询能力**，广播环节支持两路径：① 配了 `Signer` → 先离线签名再 `SendRaw` 广播原始交易（私钥不出域）；② 无 `Signer` 或签名/广播失败 → 回退节点侧 `Broadcast`（fail-degraded）；节点仍不可达则回退模拟广播。
+  - `NewWithdrawGateway(conf)`：按配置选择——`Enabled && len(Endpoints)>0` 返回 `RPCWithdrawGateway`（真实广播 + 真实确认轮询 + 可选离线签名边界），否则返回 `MockWithdrawGateway`。`required` 缺省为 2。
 - `internal/settlement/withdraw_rpc_test.go`（新增）：
   - `TestNewWithdrawGatewayDisabledReturnsMock`：未启用时回退 Mock、返回本地模拟哈希、行为与改动前一致（零回归）。
   - `TestRPCWithdrawGatewayInjectsRealHash`：配置 RPC 客户端且广播成功时，内部事件采用节点返回的真实 TxHash，其余字段仍由状态机填充。
@@ -567,4 +567,13 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 
 **剩余（T-03 收尾，生产接入最后一环）**：
 - 真实节点、热钱包或离线签名接入（合规约束，依赖外部节点）。
-- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播、充值回调、真实区块确认轮询、TRC20 充值事件过滤、**TRC20 确认数查询**的**脚手架**均已落地（配置驱动 + 未配置降级），生产填真实节点即生效。
+- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播、充值回调、真实区块确认轮询、TRC20 充值事件过滤、**TRC20 确认数查询**、**热钱包离线签名边界**的**脚手架**均已落地（配置驱动 + 未配置降级），生产填真实节点即生效。
+
+**设计（热钱包离线签名边界，§27 续五）**：把「签名」从节点侧解耦到安全域（HSM/KMS/离线签名机），私钥不出域——这是 T-03 收尾的合规关键项，脚手架先把**边界与 fail-degraded 回退**落地。
+
+- `Signer` 接口（`withdraw_rpc.go`）：`Sign(ctx, *UnsignedTx) (rawHex string, err error)`——在热钱包/HSM/安全 enclave 内对交易签名，返回已签名的 raw transaction hex；真实序列化（ETH RLP / BTC UTXO / TRON 合约）与 ECDSA 在安全域内完成，本仓库不持有私钥。`UnsignedTx` 仅描述「要签什么」（Chain/To/Amount/Asset），不含私钥。
+- `HotWalletConfig` + `ChainRPCConfig.HotWallet`：`Enabled` + `SignerType`（生产 `"hsm"`/`"kms"`；脚手架 `"stub"` 仅演示边界）。`NewSigner(conf)` 仅 `"stub"` 返回演示签名器，其余返回 nil → 网关回退节点侧签名广播（fail-degraded）。
+- `JSONRPCClient.SendRaw`：`ChainRPCClient` 新增方法，广播已签名的原始交易——ETH `eth_sendRawTransaction`、BTC `sendrawtransaction`（TRON 脚手架返回错误，待生产接带签名的 `triggerconstantcontract`）。
+- `RPCWithdrawGateway` 新增可选 `signer`：`SubmitWithdraw` 有签名器时走「`Signer.Sign` → `SendRaw`」取回真实 TxHash；**签名/广播失败自动回退节点侧 `Broadcast`**（fail-degraded）；节点仍不可达回退模拟广播。未配签名器时行为与改动前一致（零回归）。
+- 测试（`withdraw_rpc_test.go` 续）：`TestRPCWithdrawGatewayUsesOfflineSigner`（配置签名器→走 `SendRaw` 广播 raw、取回真实哈希、不经 `Broadcast`）、`TestRPCWithdrawGatewaySignerErrorFallsBackToNode`（签名器报错→自动回退节点侧 `Broadcast`）。`fakeRPCClient` 同时实现 `Broadcast`/`SendRaw` 并记录路径。
+- 生产落地需补（均为合规/外部依赖，非本仓库范围）：`HSMWalletSigner`（接 HSM/KMS 做真实 ECDSA + 按链序列化）、BTC UTXO 选择/找零、Nonce/Gas 管理、TRON 带签名合约调用；`config.hot_wallet.signer_type` 配 `"hsm"` 即启用。脚手架 `stubSigner` 仅返回标记化 raw，明确非真实密码学。

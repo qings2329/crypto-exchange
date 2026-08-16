@@ -29,6 +29,52 @@ type ChainRPCConfig struct {
 	// 配置了且启用了 RPC 时，充值网关据此轮询节点检测入账并喂入确认状态机；空则启用了也无
 	// 可扫地址（仅靠 SubmitDeposit 显式注入，等价于模拟行为）。
 	WatchAddresses []DepositWatch `yaml:"watch_addresses"`
+	// HotWallet 离线签名边界配置（T-03 热钱包/离线签名）：启用且配了签名器类型时，提现走
+	// 「离线签名 → SendRaw 广播原始交易」路径（私钥不出域）；未启用则回退节点侧签名广播
+	// （fail-degraded）。生产签名器接 HSM/KMS。
+	HotWallet HotWalletConfig `yaml:"hot_wallet"`
+}
+
+// HotWalletConfig 是离线签名边界配置。生产填 HSM/KMS 类型；脚手架 "stub" 仅演示边界。
+type HotWalletConfig struct {
+	// Enabled 是否启用离线签名边界（false → 网关回退节点侧签名广播）。
+	Enabled bool `yaml:"enabled"`
+	// SignerType 签名器类型：生产 "hsm"/"kms"；脚手架 "stub" 仅演示「签名→SendRaw」链路。
+	SignerType string `yaml:"signer_type"`
+}
+
+// UnsignedTx 是一笔待签名的提现交易（离线签名边界输入）。仅描述「要签什么」，不含私钥；
+// 真实序列化（ETH RLP / BTC UTXO / TRON 合约）与 ECDSA 签名在安全域内完成。
+type UnsignedTx struct {
+	Chain  Chain
+	To     string
+	Amount float64
+	Asset  string
+}
+
+// Signer 离线签名边界：在热钱包 / HSM / 安全 enclave 内对交易签名，返回已签名的 raw
+// transaction hex（私钥不出域）。生产实现接 HSM/KMS；脚手架提供 stubSigner 演示边界。
+type Signer interface {
+	Sign(ctx context.Context, tx *UnsignedTx) (rawHex string, err error)
+}
+
+// NewSigner 按配置构造签名器：仅 "stub" 返回演示签名器；其余（含未配置/生产类型未实现）
+// 返回 nil，由网关回退节点侧签名广播（fail-degraded）。
+func NewSigner(conf HotWalletConfig) Signer {
+	if conf.Enabled && conf.SignerType == "stub" {
+		return &stubSigner{}
+	}
+	return nil
+}
+
+// stubSigner 仅用于演示「离线签名边界」：真实场景签名在 HSM/KMS 内完成、私钥不出域，
+// 且需按链做 RLP/UTXO/合约序列化 + ECDSA。脚手架不实现真实密码学，返回标记化 raw hex
+// 以验证「签名 → SendRaw」链路；生产替换为 HSMWalletSigner。
+type stubSigner struct{}
+
+func (s *stubSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
+	// 演示：把待签内容确定性编码为标记化 raw hex（非真实签名）。
+	return fmt.Sprintf("0xsigned-chain%s-to%s-amt%v-asset%s", tx.Chain, tx.To, tx.Amount, tx.Asset), nil
 }
 
 // DepositWatch 是「链上充值监听」的一条观察项：某链某地址归属某用户某资产。真实 RPC
@@ -45,9 +91,12 @@ type DepositWatch struct {
 // ChainRPCClient 抽象单链 RPC 广播能力（T-03 链上 RPC 半边）。生产实现直连节点；
 // 单测可用内存假实现注入，便于无节点环境下验证「真实哈希注入」路径。
 type ChainRPCClient interface {
-	// Broadcast 向链上广播一笔提现，返回交易哈希。链 specifics（签名/手续费/Nonce/
-	// 热钱包）由实现处理；生产需配合热钱包或离线签名，此处为脚手架边界。
+	// Broadcast 向链上广播一笔提现（节点侧签名），返回交易哈希。仅用于未启用离线签名
+	// 边界的回退路径（fail-degraded）；生产安全的提现应走 Signer + SendRaw。
 	Broadcast(ctx context.Context, chain Chain, to string, amount float64) (txHash string, err error)
+	// SendRaw 广播一笔已离线签名的原始交易（raw hex），返回交易哈希。离线签名边界主路径：
+	// 签名在 Signer（HSM/KMS）内完成，节点仅负责广播。
+	SendRaw(ctx context.Context, chain Chain, rawHex string) (txHash string, err error)
 }
 
 // JSONRPCClient 是 ChainRPCClient 的通用 JSON-RPC 实现，按链映射到对应节点方法
@@ -128,6 +177,31 @@ func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, a
 			return "", err
 		}
 		return string(bytes.Trim(res, `"`)), nil
+	default:
+		return "", fmt.Errorf("unsupported chain %s", chain)
+	}
+}
+
+// SendRaw 广播一笔已离线签名的原始交易（raw hex），返回交易哈希（离线签名边界主路径）。
+//   - ETH：eth_sendRawTransaction（rawHex）。
+//   - BTC：sendrawtransaction（rawHex）。
+//   - TRON：需带签名的 triggerconstantcontract，脚手架返回错误（生产接离线签名后的合约调用）。
+func (c *JSONRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string) (string, error) {
+	switch chain {
+	case ChainETH:
+		res, err := c.rpc(ctx, chain, "eth_sendRawTransaction", []interface{}{rawHex})
+		if err != nil {
+			return "", err
+		}
+		return string(bytes.Trim(res, `"`)), nil
+	case ChainBTC:
+		res, err := c.rpc(ctx, chain, "sendrawtransaction", []interface{}{rawHex})
+		if err != nil {
+			return "", err
+		}
+		return string(bytes.Trim(res, `"`)), nil
+	case ChainTRON:
+		return "", fmt.Errorf("tron offline raw broadcast requires triggerconstantcontract with signature (production)")
 	default:
 		return "", fmt.Errorf("unsupported chain %s", chain)
 	}
@@ -282,19 +356,27 @@ func (c *JSONRPCClient) get(ctx context.Context, chain Chain, path string) ([]by
 
 // RPCWithdrawGateway 是 WithdrawGateway 的真实链上 RPC 实现（T-03 链上 RPC 半边脚手架）。
 // 它嵌入 MockWithdrawGateway，复用其经过验证的确认状态机、孤块/重组回滚与查询能力，
-// 仅在「广播」环节改为调用真实 ChainRPCClient（向节点发送交易、取回真实 TxHash）；
-// 当 RPC 不可达（节点未配置/宕机）时自动回退到模拟广播，保证无外部节点也能运行。
-//
-// 设计要点：确认数推进目前仍由模拟状态机按固定间隔驱动（与区块高度脱钩），真实区块
-// 确认轮询为后续扩展点（ChainRPCClient 可再加 Confirmations 方法并由后台 poller 驱动）。
+// 广播环节支持两种路径：① 配置了离线签名器（Signer）→ 先离线签名再 SendRaw 广播原始
+// 交易（私钥不出域，生产接 HSM/KMS）；② 未配置签名器 → 节点侧签名广播（Broadcast，
+// fail-degraded）。节点不可达时回退模拟广播，保证无外部节点也能运行。
 type RPCWithdrawGateway struct {
 	*MockWithdrawGateway
 	client ChainRPCClient
+	signer Signer // 离线签名器（可选）；nil → 回退节点侧签名广播
 }
 
-// SubmitWithdraw 优先用真实 RPC 广播并注入节点返回的真实 TxHash；RPC 失败则回退模拟。
+// SubmitWithdraw 优先走离线签名边界（有 Signer 时：签名→SendRaw 广播并取回真实 TxHash）；
+// 无 Signer 或签名/广播失败时回退节点侧签名广播（Broadcast）；RPC 仍不可达则回退模拟。
 func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool) (*WithdrawEvent, error) {
 	if g.client != nil {
+		if g.signer != nil {
+			if raw, err := g.signer.Sign(context.Background(), &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset}); err == nil && raw != "" {
+				if h, err := g.client.SendRaw(context.Background(), chain, raw); err == nil && h != "" {
+					return g.MockWithdrawGateway.SubmitWithdrawWithHash(userID, asset, chain, amount, fee, address, willFail, h)
+				}
+			}
+			// 离线签名/广播失败：回退节点侧签名广播（fail-degraded）。
+		}
 		if h, err := g.client.Broadcast(context.Background(), chain, address, amount); err == nil && h != "" {
 			return g.MockWithdrawGateway.SubmitWithdrawWithHash(userID, asset, chain, amount, fee, address, willFail, h)
 		}
@@ -321,6 +403,7 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 		return &RPCWithdrawGateway{
 			MockWithdrawGateway: mg,
 			client:              client,
+			signer:              NewSigner(conf.HotWallet), // 离线签名边界；nil→节点侧签名
 		}
 	}
 	return NewMockWithdrawGateway(req, interval)
