@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/coldlar/crypto-exchange/internal/oracle"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
 )
@@ -13,7 +14,7 @@ import (
 // Config 是全局配置结构，对应 configs/config.yaml。
 type Config struct {
 	Server struct {
-		Port int `yaml:"port"`
+		Port int    `yaml:"port"`
 		Mode string `yaml:"mode"`
 		// RateLimitPerSec 单实例每 IP 限流阈值（默认 100 req/s）。
 		RateLimitPerSec int `yaml:"rate_limit_per_sec"`
@@ -74,6 +75,10 @@ type Config struct {
 		// TradeFeeRate 是交易所对 taker 收取的交易手续费率（如 0.001=0.1%）。
 		// <=0 时使用 internal/settlement.DefaultTradeFeeRate。
 		TradeFeeRate float64 `yaml:"trade_fee_rate"`
+		// ChainRPC 是链上提现网关（T-03 链上 RPC 半边）配置：生产填真实节点 RPC，
+		// 网关据此广播提现并取回真实 TxHash；留空/未启用则回退离线模拟网关
+		// （MockWithdrawGateway），保证无外部节点也能运行（fail-degraded）。
+		ChainRPC settlement.ChainRPCConfig `yaml:"chain_rpc"`
 	} `yaml:"settlement"`
 
 	// InfluxDB 是行情 K 线持久化配置（T-16）：已收盘 K 线写入时序库，

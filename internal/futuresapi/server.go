@@ -38,17 +38,17 @@ type Server struct {
 	ledgerSvc *ledger.Ledger
 	dsn       string
 
-	hub          *ws.Hub
-	symbols      []string
-	oracleSvc    *oracle.Oracle
-	funding      *futures.FundingManager
-	markCalcs    map[string]*futures.MarkPriceCalculator
-	matcher      matching.Matcher
-	client       *client.Client
-	liquidator   *futures.Liquidator
-	feeModel     *settlement.FeeModel
-	chainGateway *settlement.MockChainGateway
-	chainWithdraw *settlement.MockWithdrawGateway
+	hub           *ws.Hub
+	symbols       []string
+	oracleSvc     *oracle.Oracle
+	funding       *futures.FundingManager
+	markCalcs     map[string]*futures.MarkPriceCalculator
+	matcher       matching.Matcher
+	client        *client.Client
+	liquidator    *futures.Liquidator
+	feeModel      *settlement.FeeModel
+	chainGateway  *settlement.MockChainGateway
+	chainWithdraw settlement.WithdrawGateway
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -65,7 +65,7 @@ type Server struct {
 //
 // 调用方约定：在调用前必须已经完成账本快照恢复或种子充值（本函数会配置账本风控参数并启动巡检，
 // 但不负责账本初始状态的载入）。onTrade 由 WS 推送在成交后调用，此时 s.liquidator 已赋值。
-func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string, oracleConf oracle.OracleConf) *Server {
+func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string, oracleConf oracle.OracleConf, chainRPC settlement.ChainRPCConfig) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		log:       log,
@@ -208,10 +208,11 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	s.feeModel.Register(settlement.ChainBTC, "BTC", 0.0005, 0)
 	s.feeModel.Register(settlement.ChainTRON, "USDT", 1, 0)
 
-	// 链上充提网关（模拟）及其事件监听。
+	// 链上充提网关及其事件监听。提现网关按配置在「真实 RPC 广播」与「模拟」间切换
+	// （T-03 链上 RPC 半边脚手架，fail-degraded：未配置回退模拟）。
 	s.chainGateway = settlement.NewMockChainGateway(2, 2*time.Second)
 	s.chainGateway.Start()
-	s.chainWithdraw = settlement.NewMockWithdrawGateway(2, 2*time.Second)
+	s.chainWithdraw = settlement.NewWithdrawGateway(chainRPC)
 	s.chainWithdraw.Start()
 	s.startChainWatchers()
 

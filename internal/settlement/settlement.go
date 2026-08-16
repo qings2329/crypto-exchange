@@ -59,35 +59,35 @@ func (s DepositStatus) String() string {
 // MarshalJSON 暴露充值事件的可读 JSON 契约（领域字段均为未导出，需显式映射）。
 func (e DepositEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]interface{}{
-		"tx_hash":        e.TxHash,
-		"user_id":        e.UserID,
-		"asset":          e.Asset,
-		"amount":         e.Amount,
-		"chain":          string(e.Chain),
-		"address":        e.Address,
-		"confirmations":  e.Confirmations,
-		"required":       e.Required,
-		"status":         e.Status.String(),
-		"block_height":   e.BlockHeight,
-		"created_at":     e.CreatedAt,
-		"updated_at":     e.UpdatedAt,
+		"tx_hash":       e.TxHash,
+		"user_id":       e.UserID,
+		"asset":         e.Asset,
+		"amount":        e.Amount,
+		"chain":         string(e.Chain),
+		"address":       e.Address,
+		"confirmations": e.Confirmations,
+		"required":      e.Required,
+		"status":        e.Status.String(),
+		"block_height":  e.BlockHeight,
+		"created_at":    e.CreatedAt,
+		"updated_at":    e.UpdatedAt,
 	})
 }
 
 // DepositEvent 一笔链上充值事件（贯穿状态机生命周期）。
 type DepositEvent struct {
-	TxHash         string        // 链上交易哈希（幂等键）
-	UserID         int64         // 目标交易所用户
-	Asset          string        // 资产（如 USDT）
-	Amount         float64       // 充值数量
-	Chain          Chain         // 来源链
-	Address        string        // 充值地址（用户专属）
-	Confirmations  int           // 当前区块确认数
-	Required       int           // 安全确认数阈值
-	Status         DepositStatus // 当前状态
-	BlockHeight    int           // 达 Credited 时的区块高度；-1 表示尚未最终确认
-	CreatedAt      int64
-	UpdatedAt      int64
+	TxHash        string        // 链上交易哈希（幂等键）
+	UserID        int64         // 目标交易所用户
+	Asset         string        // 资产（如 USDT）
+	Amount        float64       // 充值数量
+	Chain         Chain         // 来源链
+	Address       string        // 充值地址（用户专属）
+	Confirmations int           // 当前区块确认数
+	Required      int           // 安全确认数阈值
+	Status        DepositStatus // 当前状态
+	BlockHeight   int           // 达 Credited 时的区块高度；-1 表示尚未最终确认
+	CreatedAt     int64
+	UpdatedAt     int64
 }
 
 // DepositGateway 链上充值网关（可插拔：模拟 / 真实 RPC 实现可互换）。
@@ -106,16 +106,16 @@ type DepositGateway interface {
 // 每经过一个"区块"（interval）为所有待确认充值 +1 确认数；达 Required 后置为
 // Credited 并推送到订阅者。演示与单测使用；生产替换为真实 RPC 实现即可。
 type MockChainGateway struct {
-	mu          sync.RWMutex
-	required    int
-	interval    time.Duration
-	seq         int64
-	pending     map[string]*DepositEvent
-	subs        []chan DepositEvent
+	mu           sync.RWMutex
+	required     int
+	interval     time.Duration
+	seq          int64
+	pending      map[string]*DepositEvent
+	subs         []chan DepositEvent
 	rollbackSubs []chan DepositEvent
-	height      int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
-	stop        chan struct{}
-	started     bool
+	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
+	stop         chan struct{}
+	started      bool
 }
 
 // NewMockChainGateway 创建模拟网关；required<=0 默认 2 确认，interval<=0 默认 2s。
@@ -127,11 +127,11 @@ func NewMockChainGateway(required int, interval time.Duration) *MockChainGateway
 		interval = 2 * time.Second
 	}
 	return &MockChainGateway{
-		required:    required,
-		interval:    interval,
-		pending:     make(map[string]*DepositEvent),
+		required:     required,
+		interval:     interval,
+		pending:      make(map[string]*DepositEvent),
 		rollbackSubs: make([]chan DepositEvent, 0),
-		stop:        make(chan struct{}),
+		stop:         make(chan struct{}),
 	}
 }
 
@@ -462,31 +462,44 @@ func (e WithdrawEvent) MarshalJSON() ([]byte, error) {
 
 // WithdrawEvent 一笔链上提现事件（贯穿状态机生命周期）。
 type WithdrawEvent struct {
-	TxHash        string        // 链上交易哈希（幂等键）
-	UserID        int64         // 发起提现的交易所用户
-	Asset         string        // 资产（如 USDT）
-	Amount        float64       // 提现数量（不含手续费）
-	Fee           float64       // 链上手续费
-	Chain         Chain         // 目标链
-	Address       string        // 提现目标地址
-	Confirmations int           // 当前区块确认数
-	Required      int           // 安全确认数阈值
+	TxHash        string  // 链上交易哈希（幂等键）
+	UserID        int64   // 发起提现的交易所用户
+	Asset         string  // 资产（如 USDT）
+	Amount        float64 // 提现数量（不含手续费）
+	Fee           float64 // 链上手续费
+	Chain         Chain   // 目标链
+	Address       string  // 提现目标地址
+	Confirmations int     // 当前区块确认数
+	Required      int     // 安全确认数阈值
 	Status        WithdrawStatus
-	BlockHeight   int // 达 Credited 时的区块高度；-1 表示尚未最终确认
+	BlockHeight   int  // 达 Credited 时的区块高度；-1 表示尚未最终确认
 	WillFail      bool // 模拟失败（演示/单测用；生产由链上实际结果决定）
 	CreatedAt     int64
 	UpdatedAt     int64
 }
 
 // WithdrawGateway 链上提现网关（可插拔：模拟 / 真实 RPC 实现可互换）。
+// 完整契约：模拟网关（MockWithdrawGateway）与真实 RPC 网关（RPCWithdrawGateway）
+// 均实现之，futures 服务按接口消费，便于生产无缝替换为真实节点广播。
 type WithdrawGateway interface {
-	// SubmitWithdraw 受理一笔用户提现，返回待广播事件（含模拟 TxHash）。
+	// Start 启动后台确认循环（按区块推进提现状态机）。
+	Start()
+	// SubmitWithdraw 受理一笔用户提现，返回待广播事件（含模拟/真实 TxHash）。
 	// willFail 仅用于演示/单测注入失败路径；生产应始终传 false，由链上结果决定成败。
 	SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool) (*WithdrawEvent, error)
 	// WatchWithdraw 订阅"清结算结果"事件流（成功/失败均推送），用于驱动内部账本。
 	WatchWithdraw(ctx context.Context) (<-chan WithdrawEvent, error)
+	// WatchWithdrawRollback 订阅"提现孤块/重组回滚"事件流（已清结算提现被丢弃时推送），
+	// 用于驱动内部账本回拨冻结余额。
+	WatchWithdrawRollback(ctx context.Context) (<-chan WithdrawEvent, error)
 	// WithdrawHistory 返回全部提现事件（供审计/查询）。
 	WithdrawHistory() []WithdrawEvent
+	// WithdrawReorg 模拟提现孤块/重组（演示/单测注入场景）。
+	WithdrawReorg(txHash string) (*WithdrawEvent, error)
+	// WithdrawReorgDepth 按深度触发批量重组。
+	WithdrawReorgDepth(depth int) []WithdrawEvent
+	// Interval 返回确认轮询间隔（前端预估到账时间用）。
+	Interval() time.Duration
 	// Stop 停止后台确认循环。
 	Stop()
 }
@@ -495,16 +508,16 @@ type WithdrawGateway interface {
 // 每经过一个"区块"（interval）：Pending->Broadcasting(确认=1)；Broadcasting 每区块
 // +1 确认，达 Required 置 Credited 推送成功；WillFail 事件在首区块直接转 Failed。
 type MockWithdrawGateway struct {
-	mu          sync.RWMutex
-	required    int
-	interval    time.Duration
-	seq         int64
-	pending     map[string]*WithdrawEvent
-	subs        []chan WithdrawEvent
+	mu           sync.RWMutex
+	required     int
+	interval     time.Duration
+	seq          int64
+	pending      map[string]*WithdrawEvent
+	subs         []chan WithdrawEvent
 	rollbackSubs []chan WithdrawEvent
-	height      int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
-	stop        chan struct{}
-	started     bool
+	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
+	stop         chan struct{}
+	started      bool
 }
 
 // NewMockWithdrawGateway 创建模拟提现网关；required<=0 默认 2 确认，interval<=0 默认 2s。
@@ -516,11 +529,11 @@ func NewMockWithdrawGateway(required int, interval time.Duration) *MockWithdrawG
 		interval = 2 * time.Second
 	}
 	return &MockWithdrawGateway{
-		required:    required,
-		interval:    interval,
-		pending:     make(map[string]*WithdrawEvent),
+		required:     required,
+		interval:     interval,
+		pending:      make(map[string]*WithdrawEvent),
 		rollbackSubs: make([]chan WithdrawEvent, 0),
-		stop:        make(chan struct{}),
+		stop:         make(chan struct{}),
 	}
 }
 
@@ -619,8 +632,16 @@ func (g *MockWithdrawGateway) emit(ev WithdrawEvent) {
 	}
 }
 
-// SubmitWithdraw 受理一笔提现意图。
+// SubmitWithdraw 受理一笔提现意图（使用本地生成的模拟 TxHash）。
 func (g *MockWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool) (*WithdrawEvent, error) {
+	txHash := GenerateTxHash(userID, "W_"+asset, chain, amount, time.Now().UnixNano())
+	return g.SubmitWithdrawWithHash(userID, asset, chain, amount, fee, address, willFail, txHash)
+}
+
+// SubmitWithdrawWithHash 与 SubmitWithdraw 同义，但使用调用方提供的交易哈希
+// （链上 RPC 广播后由节点返回的真实 TxHash）。供 RPCWithdrawGateway 在真实广播
+// 成功后注入真实哈希，使链上记录与内部事件一致。txHash 为空时回退本地生成。
+func (g *MockWithdrawGateway) SubmitWithdrawWithHash(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool, txHash string) (*WithdrawEvent, error) {
 	if userID <= 0 || amount <= 0 {
 		return nil, fmt.Errorf("invalid withdraw params")
 	}
@@ -630,7 +651,9 @@ func (g *MockWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain C
 	if address == "" {
 		address = GenerateAddress(userID, chain)
 	}
-	txHash := GenerateTxHash(userID, "W_"+asset, chain, amount, time.Now().UnixNano())
+	if txHash == "" {
+		txHash = GenerateTxHash(userID, "W_"+asset, chain, amount, time.Now().UnixNano())
+	}
 	g.mu.Lock()
 	ev := &WithdrawEvent{
 		TxHash:        txHash,

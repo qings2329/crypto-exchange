@@ -20,7 +20,7 @@
 |------|------|------|------|----------|
 | T-01 | 鉴权中间件落地 | 网关/服务校验 token 并写入上下文用户身份，按身份做权限与额度控制 | `internal/pkg/middleware/auth.go:30` `// TODO` | **已完成**（HMAC-SHA256 Bearer 校验 + 单测；网关接入） |
 | T-02 | 成交流发布 Kafka 触发清算 | 撮合成交后发布事件到 Kafka，驱动清算服务记账，闭合资金链路 | `internal/matching/engine.go:59` `// TODO` | **已完成**（新增 `internal/pkg/mq`：Publisher 接口 + InMem 降级 + Kafka 实现(build tag)；futures onTrade 已发布） |
-| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC（充值/提现链上回调）仍阻塞**（依赖外部节点+合规，见前述方案 B/C/D） |
+| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 提现广播完成可插拔脚手架**（§27：`ChainRPCConfig`/`JSONRPCClient`/`RPCWithdrawGateway` + `settlement.chain_rpc` 配置，配置驱动真实广播并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**充值回调与真实区块确认轮询、热钱包/离线签名仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
 | T-04 | 数据库 migration 与版本管理 | 当前建表靠首次运行 `CREATE TABLE IF NOT EXISTS`，缺可回滚 migration。新建表须 `ce_` 前缀 | README「待补充」 | **已完成**（新增 `internal/pkg/migrate` 运行器 + `ce_schema_migrations` 版本表；ledger 表改由迁移创建；含集成测试） |
 
 ## 2. P1 — 合约交易完善
@@ -333,7 +333,7 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - 网关层收敛按 **安全子集** 实现（`cmd/gateway` + `configs/config.yaml`）：把 `matching` 纳入 `services` 拓扑（运营看板可探活），并仅在网关暴露其**只读/行情端点**（`/api/v1/matching/{depth,ws,orders,orders/:id,trades,health}`）；其**写端点**（`/order`、`/cancel`、`/match-now`）刻意不代理——订单提交必须仍经 spot/futures，因为 `spot/futures` 的 `handleOrder` 内做资金预冻结（`ledger.Freeze`）与成交账本结算（`ledger.Transfer`），cmd/matching 仅负责撮合（无钱包/账本），若经网关直连会**绕过整套资金安全控制**（资金安全隐患）。
 - 配套健壮性修复：网关的反代 writer 包了一层 `proxyWriter`，安全补全 `http.CloseNotifier`/`http.Flusher`/`http.Hijacker`（gin 的 writer 对 `CloseNotifier` 用「断言后调用」，底层未实现时直接 panic；新版 Go 移除该接口后线上亦可能 panic）。测试见 `cmd/gateway/main_test.go`（锁定「matching 写端点不直连网关」的不变量 + 只读端点正确收敛）。
 - **未做（可选，不建议）**：把 `/api/v1/spot/*order`、`/api/v1/futures/*order` 也直接代理到 cmd/matching 的 `/order`——这需把钱包/账本逻辑搬进撮合引擎，属更大重构且会弱化 spot/futures 业务层边界，当前不采纳。
-- 强平 `MatchNow` 的流动性消耗现已写 WAL（见 §17 已知缺口①已补齐）；T-03 真实链上/预言机 RPC 仍阻塞（依赖外部节点+合规），本轮未实现，仅保留文档留白。
+- 强平 `MatchNow` 的流动性消耗现已写 WAL（见 §17 已知缺口①已补齐）；T-03 预言机半边已由 b1c795d 落地（NewFromConfig 配置驱动真实 REST 喂价），链上 RPC 半边（提现广播）已完成**可插拔脚手架**见 §27（生产填真实节点即生效，未配置回退模拟，fail-degraded）。两侧均以「配置驱动 + 未配置降级」方式落地，剩真实节点/热钱包/离线签名为生产接入的最后一环（依赖外部节点+合规）。
 
 ## 20. 集中式订单管理模块（现货/合约订单 + 成交流水查询 + 管理后台跨用户撤销）
 
@@ -502,3 +502,44 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 **验证**：
 - 新增 `internal/adminapi/handlers_withdraw_test.go` 的 `TestAdminUsersBalanceEnriched`：用 httptest 模拟 futures 的 `/balance` 端点（user 1001→125000.5、user 1002→3400），验证列表返回的用户余额被正确富集、不再是 0。
 - `go build/vet/test ./...` 全绿（无回归，含 §25 全部用例与本轮新增用例，adminapi 测试全绿）。
+
+## 27. 链上提现 RPC 可插拔脚手架（T-03 链上 RPC 半边，2026-08-16，已完成）
+
+**背景**：§18.1 / §25 把提币审核接真实后端（管理员放行时调用 ledger 链上广播、释放冻结）。但底层链上提现网关此前只有 `MockWithdrawGateway`（离线模拟、本地生成**模拟 TxHash**），接口层面虽已是 `WithdrawGateway` 且支持真实 RPC 替身，却没有真实节点的广播实现——生产需要把提现广播到节点并取回**真实 TxHash**，链上记录才能与内部事件对账。T-03 链上 RPC 半边此前阻塞于「依赖外部节点 + 合规」（§1 表格标注「仍阻塞」）。本次以「**配置驱动 + 未配置降级**」方式落地可插拔脚手架（与 §18.1 同一原则）：生产填真实节点 RPC 即生效取回真实哈希，未配置/节点宕机自动回退模拟（fail-degraded），无外部节点也能跑。
+
+**设计**：
+
+- `internal/settlement/withdraw_rpc.go`（新增）：
+  - `ChainRPCConfig`：`Enabled`（是否启用真实广播）、`Endpoints`（链名 ETH/BTC/TRON → RPC URL）、`Required`（`required_confirmations` 阈值，<=0 用默认 2）、`PollSec`（确认轮询间隔，当前仅文档，确认推进由模拟状态机驱动）。
+  - `ChainRPCClient` 接口：`Broadcast(ctx, chain, to, amount) (txHash string, err error)`——抽象单链广播能力，生产直连节点、单测可注入内存假实现验证「真实哈希注入」路径。
+  - `JSONRPCClient`：`ChainRPCClient` 的通用 JSON-RPC 2.0 实现，按链映射到对应节点方法（ETH `eth_sendTransaction` / BTC `sendtoaddress` / TRON `wallet/triggersmartcontract`），负责协议收发与 `result` 解析取 TxHash；节点不可达则按链返回明确错误。
+  - `RPCWithdrawGateway`：嵌入 `MockWithdrawGateway`，**复用其经过验证的确认状态机 / 孤块回滚 / 查询能力**，仅在「广播」环节改为调 `ChainRPCClient` 取得节点返回的真实 TxHash（经 `SubmitWithdrawWithHash` 注入内部事件）；**RPC 不可达时自动回退模拟广播**（fail-degraded），由调用方日志侧记录告警。
+  - `NewWithdrawGateway(conf)`：按配置选择——`Enabled && len(Endpoints)>0` 返回 `RPCWithdrawGateway`，否则返回 `MockWithdrawGateway`。`required` 缺省为 2。
+- `internal/settlement/withdraw_rpc_test.go`（新增）：
+  - `TestNewWithdrawGatewayDisabledReturnsMock`：未启用时回退 Mock、返回本地模拟哈希、行为与改动前一致（零回归）。
+  - `TestRPCWithdrawGatewayInjectsRealHash`：配置 RPC 客户端且广播成功时，内部事件采用节点返回的真实 TxHash，其余字段仍由状态机填充。
+  - `TestRPCWithdrawGatewayFallsBackOnClientError`：RPC 返回错误时自动回退模拟广播（保证无节点可运行）。
+  - `TestNewWithdrawGatewayEnabledUsesRPC`：启用且配端点时工厂产出 `*RPCWithdrawGateway` 且满足 `WithdrawGateway` 契约（编译期接口检查）。
+- `internal/futuresapi/server.go`：
+  - `Server.chainWithdraw` 字段类型由 `*settlement.MockWithdrawGateway` 改为 `settlement.WithdrawGateway`（接口），`startChainWatchers` / 提现受理 / 回滚 / 历史查询全部经接口调用，零回归。
+  - `NewServer` 新增 `chainRPC settlement.ChainRPCConfig` 入参，并以 `settlement.NewWithdrawGateway(chainRPC)` 装配（默认 `enabled:false` 走 Mock，行为与改动前完全一致）。
+- `cmd/futures/main.go`：`NewServer` 调用透传 `cfg.Settlement.ChainRPC`。
+- `internal/pkg/config/config.go`：`Config.Settlement` 新增 `ChainRPC settlement.ChainRPCConfig`（config 已 import oracle，再 import settlement 无循环依赖）。
+- `configs/config.yaml`：`settlement.chain_rpc`（`enabled:false` + ETH/BTC/TRON 空端点 + `required_confirmations:2` + `poll_interval_sec:2`）。
+
+**关键设计点**：
+
+- 确认状态机仍为模拟驱动：`required_confirmations` 与 `PollSec` 配置保留，但确认数推进由 `MockWithdrawGateway` 固定间隔状态机负责（与区块高度脱钩）；**真实区块确认轮询为后续扩展点**——`ChainRPCClient` 可再加 `Confirmations` 方法并由后台 poller 驱动，届时把确认推进从模拟切到真实链。
+- 边界清晰：真实签名 / 热钱包 / Nonce 管理在节点侧或离线签名层；本 JSON-RPC 客户端仅负责协议收发与哈希解析，属脚手架边界，不引入密钥管理。
+- fail-degraded 双保险：未启用、或配置了但节点宕机（`Broadcast` 返回错误），均自动回退模拟广播，无外部节点也能跑，与 §18.1「配置驱动 + 未配置降级」一致。
+
+**验证**：
+
+- `go build/vet/test ./...` 全绿（新增 `withdraw_rpc_test.go` 四类用例通过；`futuresapi` / `settlement` 既有测试零回归——`handler_wallet_test.go` 经 `WithdrawGateway` 接口验证受理/回滚/历史查询路径不变）。
+- 真实广播路径经 `withdraw_rpc_test.go` 的 `fakeRPCClient`（注入确定哈希 / 注入错误）覆盖「真实哈希注入」与「错误回退」两条分支；完整端到端（连真实节点取 TxHash）依赖生产节点 URL + 热钱包/离线签名，原型不连真实链。
+
+**剩余（T-03 收尾，生产接入最后一环）**：
+- 真实区块确认轮询（替换模拟确认状态机，按 `Required` 安全确认数推进到 Credited）。
+- 充值链上回调（当前 `MockChainGateway` 充值侧同样为模拟，需真实节点监听/回调而非仅提现广播）。
+- 真实节点、热钱包或离线签名接入（合规约束，依赖外部节点）。
+- 以上三项与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；当前以「配置驱动 + 未配置降级」脚手架先行落地。
