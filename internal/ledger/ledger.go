@@ -186,6 +186,10 @@ type WithdrawHoldEntry struct {
 	HoldUntil time.Time `json:"hold_until"`
 	Finalized bool      `json:"finalized"`
 	Cancelled bool      `json:"cancelled"`
+	// Broadcasted 标记该 hold 是否已占广播槽（链上 SubmitWithdraw 已发起）。配合 TxHash 实现
+	// finalizeHold 的幂等广播：重试/并发时复用既有 txHash、跳过重复 SubmitWithdraw，杜绝双提现（F1）。
+	Broadcasted bool   `json:"broadcasted"`
+	TxHash      string `json:"tx_hash"`
 }
 
 // WithdrawAddress 一条提现地址白名单条目（按 userID + asset + chain + address 维度）。
@@ -1484,6 +1488,60 @@ func (l *Ledger) CancelWithdrawHold(id string) error {
 		}
 	}
 	e.Cancelled = true
+	return nil
+}
+
+// ClaimWithdrawBroadcast 在链上广播前原子地占有 hold 的广播槽，消除 finalizeHold「先广播后终态」
+// 的 TOCTOU 与失败重试导致的重复链上广播（F1）。在 ledger 锁内完成，返回：
+//   - 已终态/取消：error（与 Finalize 守卫一致）；
+//   - 已广播过（重试/并发）：返回既有 TxHash 且 already=true，上层据此跳过 SubmitWithdraw 复用；
+//   - 首次广播：标记 Broadcasted=true 并返回 already=false，上层随后 SubmitWithdraw 并回填 TxHash。
+func (l *Ledger) ClaimWithdrawBroadcast(id string) (txHash string, already bool, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.withdrawHolds[id]
+	if !ok {
+		return "", false, fmt.Errorf("withdraw hold not found")
+	}
+	if e.Finalized {
+		return "", false, fmt.Errorf("withdraw hold already finalized")
+	}
+	if e.Cancelled {
+		return "", false, fmt.Errorf("withdraw hold cancelled")
+	}
+	if e.Broadcasted {
+		return e.TxHash, true, nil
+	}
+	e.Broadcasted = true
+	return "", false, nil
+}
+
+// SetWithdrawTxHash 广播成功后回填链上 txHash 并固化 Broadcasted（与 ClaimWithdrawBroadcast 配对）。
+func (l *Ledger) SetWithdrawTxHash(id, txHash string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.withdrawHolds[id]
+	if !ok {
+		return fmt.Errorf("withdraw hold not found")
+	}
+	e.TxHash = txHash
+	e.Broadcasted = true
+	return nil
+}
+
+// ResetWithdrawBroadcast 广播失败（SubmitWithdraw 返回 error）时释放广播槽，
+// 允许上层重试重新广播，避免「Broadcasted 已置位但无 txHash」卡死（F1）。
+func (l *Ledger) ResetWithdrawBroadcast(id string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.withdrawHolds[id]
+	if !ok {
+		return fmt.Errorf("withdraw hold not found")
+	}
+	if e.Finalized || e.Cancelled {
+		return nil
+	}
+	e.Broadcasted = false
 	return nil
 }
 
