@@ -88,6 +88,35 @@
 
 ---
 
+## 2026-08-16 — options 资金流动幂等修复（F1：先落终态/持仓再动账本 + 串行化 + 失败回滚）
+
+- **状态**：`internal/options/service.go`（F1 幂等）+ `internal/options/handler.go`（F4 权限护栏）已修复，待提交。
+- **背景**：边界审查发现 options 三条资金路径（`OpenPosition` / `Exercise` / `SettlePosition`）均为
+  **「先动账本资金、后持久化状态」且无锁、ledger 不按 `ref` 去重**，存在与 otc F1 同类的双付/双冻风险：
+  网络重试、进程崩溃（资金已动/状态未落之间）或并发调用都会重复动钱。同时 handler 层管理端点缺 `AdminGuard`。
+
+### 修复要点（与 otc 一致）
+- **F1 幂等**：`Exercise` / `SettlePosition` 先落终态（`StatusExercised` / `StatusExpired`）再 `Transfer`，失败回滚，
+  顶部终态短路；`OpenPosition` 先持久化持仓再扣费，失败回滚；三条路径统一加 `s.mu` 串行化。
+- **F4 权限护栏**：`POST /api/v1/options/contracts`（创建合约）、`GET /api/v1/options/admin/positions`（全量持仓）、
+  `POST /api/v1/options/settle`（强制结算）均加 `middleware.AdminGuard()`，非管理员返回 403。
+  `OpenPosition` / `Exercise` / `ListPositions` / `Quote` 身份取自 token，无需 AdminGuard。
+
+### 契约/行为影响
+- 业务行为不变；金额计算仍用 `AssetAmountFromFloat`（F2 定点化为建议项，本轮未改）。
+- **新增 403 约束**：创建合约、查看全量持仓、手动结算现仅管理员可调用；前端若以普通用户身份调用将收到 403，需改用管理员会话。
+- **残余边界（与 otc F1 同款）**：若进程在「已落终态、但 `Transfer` 尚未成功」之间崩溃，持仓保持终态、资金未动，
+  不会双付，但需运营/对账介入重放（options 的 OpenPosition 在极端崩溃下可能残留一条未出资的 `StatusOpen` 持仓，
+  后续若被 `RunLoop` 结算将产生对账差异，建议后续改为带瞬时 `funding` 状态或客户端幂等键）。
+
+### 验证
+- F1：`TestExerciseIdempotent` / `TestSettleLongIdempotent` / `TestSettleShortIdempotent`（重复调用资金只动一次）、
+  `TestOpenLongTransferFailureRollsBack`（资金不足不残留持仓）。
+- F4：`TestAdminEndpointsRequireAdmin` / `TestCreateContractRequiresAdmin`（非管理员 403、管理员通过护栏）。
+- `go test -race ./internal/options/...` 通过。
+
+---
+
 ## 2026-08-16 — 账本 v1→v2 快照迁移真实数据校验（定点化配套）
 
 - **背景**：账本金额已定点化（`settlement.AssetAmount`）。旧快照（无 `schema_version` 的 float 快照）
