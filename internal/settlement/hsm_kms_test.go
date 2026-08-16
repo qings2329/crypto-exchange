@@ -13,43 +13,21 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
 
-// hsmSignServer 启动一个内存签名服务，对传入的 32 字节 digest 用固定私钥（knownVectorPriv）
-// 做 ECDSA 签名（模拟交易所前置的内部 HSM 签名服务），按 der=true 返回 {signature: DER-hex}
-// 否则返回 {r,s}(hex)。用于验证 remoteHSMKeySigner 两条解析路径与软件后端产出一致。
+// hsmSignServer 启动一个内存签名服务（复用生产 SigningService，按 knownVectorPriv 持有密钥），
+// 按 der=true 返回 {signature: DER-hex} 否则返回 {r,s}(hex)。用于验证 remoteHSMKeySigner
+// 两条解析路径与软件后端产出一致。
 func hsmSignServer(t *testing.T, der bool) *httptest.Server {
 	t.Helper()
-	priv, err := parseSignerKey(knownVectorPriv)
+	svc, err := NewSigningServiceFromKey(knownVectorPriv)
 	if err != nil {
-		t.Fatalf("parseSignerKey: %v", err)
+		t.Fatalf("NewSigningServiceFromKey: %v", err)
 	}
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var in struct {
-			Digest string `json:"digest"`
+	if der {
+		if err := svc.SetResponseMode("der"); err != nil {
+			t.Fatalf("SetResponseMode: %v", err)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		d, err := hex.DecodeString(in.Digest)
-		if err != nil || len(d) != 32 {
-			http.Error(w, "bad digest", http.StatusBadRequest)
-			return
-		}
-		compact := ecdsa.SignCompact(priv, d, false)
-		var modR, modS secp256k1.ModNScalar
-		modR.SetByteSlice(compact[1:33])
-		modS.SetByteSlice(compact[33:65])
-		w.Header().Set("Content-Type", "application/json")
-		if der {
-			sig := ecdsa.NewSignature(&modR, &modS)
-			_ = json.NewEncoder(w).Encode(map[string]string{"signature": hex.EncodeToString(sig.Serialize())})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"r": hex.EncodeToString(compact[1:33]),
-			"s": hex.EncodeToString(compact[33:65]),
-		})
-	}))
+	}
+	return httptest.NewServer(svc.Handler())
 }
 
 // softwareSign 用进程内软件后端对 digest 签名，作为 HSM 路径的对照基准（确定性 nonce，输出一致）。
