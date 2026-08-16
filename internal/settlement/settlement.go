@@ -418,8 +418,21 @@ func (g *MockChainGateway) Pending() []DepositEvent {
 	return out
 }
 
-// GenerateAddress 为用户生成确定性的模拟充值地址。
+// GenerateAddress 为用户生成充值地址。若已配置 HD 充值地址生成器（DepositAddressGenerator，
+// 经 HSM 导出的账户级 xpub 非硬化派生），返回该用户真实的 ETH/BTC/TRON 地址；否则回退确定性的
+// 模拟占位地址（fail-degraded，未配置 HD 派生时仍能运行）。派生失败（含非法 userID）同样回退 mock。
 func GenerateAddress(userID int64, chain Chain) string {
+	if g := depositAddrGen; g != nil {
+		if addr, err := g.Address(userID, chain); err == nil && addr != "" {
+			return addr
+		}
+		// 派生失败（未配置/非法 userID/xpub 不可用）→ 降级到 mock。
+	}
+	return mockDepositAddress(userID, chain)
+}
+
+// mockDepositAddress 生成确定性的模拟充值地址（未配置 HD 派生时的 fail-degraded 占位）。
+func mockDepositAddress(userID int64, chain Chain) string {
 	h := sha256.Sum256([]byte(fmt.Sprintf("%d-%s", userID, chain)))
 	return fmt.Sprintf("%s_%s", chain, hex.EncodeToString(h[:])[:24])
 }
