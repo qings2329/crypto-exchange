@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 
 	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
@@ -139,6 +140,67 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("ADMIN_PASSWORD_HASH"); v != "" {
 		c.Admin.PasswordHash = v
+	}
+	// 链上 RPC：真实节点 URL（常含 API key）与离线签名私钥属敏感信息，生产从环境变量注入，
+	// 不写进 configs/config.yaml（与 AUTH_SECRET 同一模式）。未设置时沿用 YAML 默认值。
+	if v := os.Getenv("CHAIN_RPC_ENABLED"); v != "" {
+		c.Settlement.ChainRPC.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("CHAIN_RPC_ENDPOINT_ETH"); v != "" {
+		if c.Settlement.ChainRPC.Endpoints == nil {
+			c.Settlement.ChainRPC.Endpoints = map[string]string{}
+		}
+		c.Settlement.ChainRPC.Endpoints["ETH"] = v
+	}
+	if v := os.Getenv("CHAIN_RPC_ENDPOINT_BTC"); v != "" {
+		if c.Settlement.ChainRPC.Endpoints == nil {
+			c.Settlement.ChainRPC.Endpoints = map[string]string{}
+		}
+		c.Settlement.ChainRPC.Endpoints["BTC"] = v
+	}
+	if v := os.Getenv("CHAIN_RPC_ENDPOINT_TRON"); v != "" {
+		if c.Settlement.ChainRPC.Endpoints == nil {
+			c.Settlement.ChainRPC.Endpoints = map[string]string{}
+		}
+		c.Settlement.ChainRPC.Endpoints["TRON"] = v
+	}
+	if v := os.Getenv("CHAIN_RPC_REQUIRED_CONFIRMATIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Settlement.ChainRPC.Required = n
+		}
+	}
+	if v := os.Getenv("CHAIN_RPC_POLL_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Settlement.ChainRPC.PollSec = n
+		}
+	}
+	// 离线签名边界（热钱包）：私钥与签名后端 keyID 同样从环境变量注入，不落配置。
+	if v := os.Getenv("HOT_WALLET_ENABLED"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("HOT_WALLET_SIGNER_TYPE"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.SignerType = v
+	}
+	if v := os.Getenv("HOT_WALLET_SIGNER_BACKEND"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.SignerBackend = v
+	}
+	if v := os.Getenv("HOT_WALLET_SIGNER_KEY"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.SignerKey = v
+	}
+	if v := os.Getenv("HOT_WALLET_ETH_CHAIN_ID"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			c.Settlement.ChainRPC.HotWallet.EthChainID = n
+		}
+	}
+	if v := os.Getenv("HOT_WALLET_ETH_GAS_PRICE_WEI"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			c.Settlement.ChainRPC.HotWallet.EthGasPriceWei = n
+		}
+	}
+	if v := os.Getenv("HOT_WALLET_ETH_GAS_LIMIT"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			c.Settlement.ChainRPC.HotWallet.EthGasLimit = n
+		}
 	}
 	return &c, nil
 }
