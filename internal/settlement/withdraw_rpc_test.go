@@ -12,16 +12,34 @@ import (
 )
 
 // fakeRPCClient 是 ChainRPCClient 的内存假实现，用于无节点环境下验证「真实哈希注入」路径。
+// 同时记录走的是离线签名广播(SendRaw)还是节点侧签名广播(Broadcast)。
 type fakeRPCClient struct {
-	hash string
-	err  error
+	hash    string
+	err     error
+	sentRaw bool
+	lastRaw string
 }
 
 func (f *fakeRPCClient) Broadcast(ctx context.Context, chain Chain, to string, amount float64) (string, error) {
-	if f.err != nil {
-		return "", f.err
-	}
-	return f.hash, nil
+	return f.hash, f.err
+}
+
+func (f *fakeRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string) (string, error) {
+	f.sentRaw = true
+	f.lastRaw = rawHex
+	return f.hash, f.err
+}
+
+// fakeSigner 是 Signer 的内存假实现，记录被调用并返回确定性 raw。
+type fakeSigner struct {
+	called bool
+	raw    string
+}
+
+func (f *fakeSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
+	f.called = true
+	f.raw = "0xREALRAW"
+	return f.raw, nil
 }
 
 // fakeConfirmSource 是 ConfirmSource 的内存假实现，用于无节点环境下验证「真实确认数→状态机推进」。
@@ -223,4 +241,57 @@ func TestJSONRPCClientConfirmationsTRON(t *testing.T) {
 	if conf != 6 {
 		t.Fatalf("expected 6 confirmations (100-95+1), got %d", conf)
 	}
+}
+
+// TestRPCWithdrawGatewayUsesOfflineSigner 验证配置了签名器时，提现走「离线签名→SendRaw
+// 广播原始交易」路径（私钥不出域），返回节点给的真实 TxHash；不经过节点侧 Broadcast。
+func TestRPCWithdrawGatewayUsesOfflineSigner(t *testing.T) {
+	fc := &fakeRPCClient{hash: "0xREALHASH"}
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
+		client:              fc,
+		signer:              &fakeSigner{},
+	}
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !fc.sentRaw {
+		t.Fatalf("expected offline-signed raw tx broadcast via SendRaw")
+	}
+	if fc.lastRaw != "0xREALRAW" {
+		t.Fatalf("SendRaw got wrong raw: %q", fc.lastRaw)
+	}
+	if ev.TxHash != "0xREALHASH" {
+		t.Fatalf("expected real tx hash from SendRaw, got %q", ev.TxHash)
+	}
+}
+
+// TestRPCWithdrawGatewaySignerErrorFallsBackToNode 验证离线签名失败时自动回退节点侧签名
+// 广播（fail-degraded）：签名器返回错误 → 走 Broadcast 路径取回哈希。
+func TestRPCWithdrawGatewaySignerErrorFallsBackToNode(t *testing.T) {
+	fc := &fakeRPCClient{hash: "0xNODEHASH"}
+	badSigner := &fakeSignerErr{}
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
+		client:              fc,
+		signer:              badSigner,
+	}
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fc.sentRaw {
+		t.Fatalf("signer errored; must not broadcast raw tx")
+	}
+	if ev.TxHash != "0xNODEHASH" {
+		t.Fatalf("expected node-side hash after signer failure, got %q", ev.TxHash)
+	}
+}
+
+// fakeSignerErr 是始终返回错误的签名器（验证 fail-degraded 回退）。
+type fakeSignerErr struct{}
+
+func (f *fakeSignerErr) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
+	return "", errors.New("signer unavailable")
 }
