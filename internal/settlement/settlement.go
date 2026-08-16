@@ -96,6 +96,18 @@ type DepositGateway interface {
 	SubmitDeposit(userID int64, asset string, chain Chain, amount float64, address string) (*DepositEvent, error)
 	// Watch 订阅"已入账"事件流（确认达标后推送），用于驱动内部账本入账。
 	Watch(ctx context.Context) (<-chan DepositEvent, error)
+	// StartScan 启动链上充值监听（真实 RPC 扫描）；模拟网关为 no-op（充值仅经 SubmitDeposit 注入）。
+	StartScan(ctx context.Context)
+	// Start 启动后台确认循环（模拟网关）。
+	Start()
+	// Interval 返回区块确认间隔（演示预估到账时间用）。
+	Interval() time.Duration
+	// WatchRollback 订阅"孤块/重组回滚"事件流，用于驱动内部账本回拨。
+	WatchRollback(ctx context.Context) (<-chan DepositEvent, error)
+	// Reorg 模拟孤块/重组：根据交易当前状态采取不同动作（待确认安全回退 / 已入账推送回滚）。
+	Reorg(txHash string) (*DepositEvent, error)
+	// ReorgDepth 按给定深度触发批量重组回滚。
+	ReorgDepth(depth int) []DepositEvent
 	// Pending 返回当前所有充值事件（含待确认与已入账，供审计/查询）。
 	Pending() []DepositEvent
 	// Stop 停止后台确认循环。
@@ -168,6 +180,9 @@ func (g *MockChainGateway) Stop() {
 	close(g.stop)
 	g.started = false
 }
+
+// StartScan 模拟网关无外部扫描源，no-op（充值仅经 SubmitDeposit 注入，与改动前一致）。
+func (g *MockChainGateway) StartScan(ctx context.Context) {}
 
 // Interval 返回区块确认间隔（演示预估到账时间用）。
 func (g *MockChainGateway) Interval() time.Duration {

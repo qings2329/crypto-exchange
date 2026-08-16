@@ -47,7 +47,7 @@ type Server struct {
 	client        *client.Client
 	liquidator    *futures.Liquidator
 	feeModel      *settlement.FeeModel
-	chainGateway  *settlement.MockChainGateway
+	chainGateway  settlement.DepositGateway
 	chainWithdraw settlement.WithdrawGateway
 
 	ctx    context.Context
@@ -208,10 +208,11 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	s.feeModel.Register(settlement.ChainBTC, "BTC", 0.0005, 0)
 	s.feeModel.Register(settlement.ChainTRON, "USDT", 1, 0)
 
-	// 链上充提网关及其事件监听。提现网关按配置在「真实 RPC 广播」与「模拟」间切换
+	// 链上充提网关及其事件监听。充值/提现网关均按配置在「真实 RPC」与「模拟」间切换
 	// （T-03 链上 RPC 半边脚手架，fail-degraded：未配置回退模拟）。
-	s.chainGateway = settlement.NewMockChainGateway(2, 2*time.Second)
+	s.chainGateway = settlement.NewDepositGateway(chainRPC)
 	s.chainGateway.Start()
+	s.chainGateway.StartScan(ctx)
 	s.chainWithdraw = settlement.NewWithdrawGateway(chainRPC)
 	s.chainWithdraw.Start()
 	s.startChainWatchers()
