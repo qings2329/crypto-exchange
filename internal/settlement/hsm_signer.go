@@ -33,9 +33,12 @@ func mustHex(s string) []byte {
 //
 // 当前支持：
 //   - ETH（legacy / EIP-155）真实 RLP + Keccak-256 + ECDSA 签名；
-//   - BTC（P2PKH legacy + P2WPKH segwit）UTXO 选择 + 找零 + SIGHASH_ALL 真实签名。
+//   - BTC（P2PKH legacy + P2WPKH segwit）UTXO 选择 + 找零 + SIGHASH_ALL 真实签名；
+//   - TRON（TransferContract 原生 TRX 转账 / TriggerSmartContract TRC20 合约调用）protobuf raw_data
+//     序列化 + SHA256 摘要 + secp256k1 可恢复 65 字节签名 + broadcasttransaction JSON。
 //
-// TRON（合约调用签名）仍为独立生产项；未实现时 Sign 返回错误，由网关回退节点侧签名广播（fail-degraded）。
+// TRON 签名需要 TRONState 源（参考区块/时间戳）；未注入或取块失败时 Sign 返回错误，由网关
+// 回退节点侧签名广播（fail-degraded）。
 type realSigner struct {
 	key            KeySigner // 实际签名原语后端：软件（进程内私钥）或真实 HSM/KMS（私钥不出域）。
 	address        string    // 由公钥派生的 ETH 地址（0x…），仅用于可观测/日志与 Nonce 查询。
@@ -44,6 +47,7 @@ type realSigner struct {
 	ethGasLimit    uint64
 	utxoSource     UTXOSource     // BTC UTXO 来源（可选；为空则用 UnsignedTx.UTXOs 内联提供）。
 	ethState       ETHStateSource // ETH Nonce/Gas 来源（可选；为空则按 UnsignedTx/配置兜底）。
+	tronState      TRONStateSource // TRON 参考区块/时间戳来源（可选；为空则 TRON 签名失败→回退节点侧）。
 	// 本地 pending nonce 计数器：首次签名向节点取当前计数，之后本地递增，避免并发/未确认
 	// 期间重放碰撞。mu 保护；haveNonce=false 表示尚未从节点播种。
 	mu        sync.Mutex
@@ -85,6 +89,7 @@ func newRealSignerWithSource(conf HotWalletConfig, sources SignerSources) (*real
 		ethGasLimit:    conf.EthGasLimit,
 		utxoSource:     sources.UTXOSource,
 		ethState:       sources.ETHState,
+		tronState:      sources.TRONState,
 	}, nil
 }
 
@@ -95,9 +100,10 @@ func (s *realSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
 		return s.signETH(ctx, tx)
 	case ChainBTC:
 		return s.signBTC(ctx, tx)
+	case ChainTRON:
+		return s.signTRON(ctx, tx)
 	default:
-		// TRON 合约调用签名为独立生产项；未实现时由网关回退节点侧签名广播（fail-degraded）。
-		return "", fmt.Errorf("realSigner 暂支持 ETH/BTC；链 %s 的真实签名需独立生产项（TRON 合约调用）", tx.Chain)
+		return "", fmt.Errorf("realSigner 不支持链 %s", tx.Chain)
 	}
 }
 
