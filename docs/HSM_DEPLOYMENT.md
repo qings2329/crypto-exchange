@@ -296,3 +296,19 @@ go test -run TestDeployRealHMSSignAndVerify ./internal/settlement/
 go test -run 'TestSigningServiceHTTPContract|TestDeployment' ./internal/settlement/
 go test -run TestLoadHSMEnvOverride ./internal/pkg/config/
 ```
+
+## 12. 灾备演练（DR Drill）
+
+签名服务无状态，每次签名是一次独立 HTTP 调用；网关只配置一个固定 `HSM_ENDPOINT`（对应生产环境的 LB VIP / 服务发现地址），后端故障转移与恢复对网关完全透明——无需改配置、无需重启。以下测试用「主备切换代理」`failoverProxy` 模拟 LB 在「主用/备用/全断」之间切换，覆盖 HSM_DEPLOYMENT.md 的 DR 不变式（`hsm_dr_drill_test.go`）：
+
+- `TestDRHSMFailoverAndRecovery` — §7.4/§8/§9 主流程：主用在线 → 主用故障切备用（同密钥透明故障转移，地址不变）→ 主备全断（fail-degraded 回退节点侧广播，不产生 HSM 签名 raw）→ 备用恢复（HSM 签名自动恢复）。全程网关不变、endpoint 不变。
+- `TestDRPublicKeyMismatchDetected` — §6：HSM 服务用 K2 签名、网关错配 K1 公钥时，`recoverRecID` 校验不匹配 → `Sign` 报错 → fail-degraded 回退节点侧广播（不产生归属错误地址的链上交易）。证明错配被安全检测并降级。
+- `TestDRKeyLossRekey` — §7.2：K1 丢失前已签出的未确认交易仍有效（可恢复到 K1 公钥）；丢失后用备用 K2 re-key，新交易归属 K2 地址，新旧地址不同。验证轮换窗口内「旧交易有效、新交易用新密钥」的 DR 不变式。
+
+运行：
+
+```bash
+go test -run 'TestDR' -v ./internal/settlement/
+```
+
+> 注：演练中的「主备同密钥」对应生产将同一 HSM 密钥克隆到多台后端/多个 region；「全断」对应 LB 后端池全部健康检查失败；「公钥错配」对应配置注入错误的 `HSM_PUBLIC_KEY`（会被网关在校验时拦截，避免资金发往错误归属地址）。
