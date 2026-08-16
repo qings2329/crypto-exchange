@@ -555,7 +555,7 @@ func (b *btcTxBuilder) serialize() []byte {
 }
 
 // signBTC 构造一笔 BTC 提现：选择 UTXO → 估算手续费 → 生成找零 → 逐输入 SIGHASH_ALL 签名 → 序列化。
-func (s *realSigner) signBTC(tx *UnsignedTx) (string, error) {
+func (s *realSigner) signBTC(ctx context.Context, tx *UnsignedTx) (string, error) {
 	compPub := s.priv.PubKey().SerializeCompressed()
 
 	// 1) 收集候选 UTXO：优先内联，其次 UTXO 源（按自身地址查询）。
@@ -565,7 +565,7 @@ func (s *realSigner) signBTC(tx *UnsignedTx) (string, error) {
 		if addr == "" {
 			addr = deriveP2WPKHAddress(s.priv.PubKey())
 		}
-		src, err := s.utxoSource.ListUTXOs(context.Background(), addr)
+		src, err := s.utxoSource.ListUTXOs(ctx, addr)
 		if err != nil {
 			return "", fmt.Errorf("BTC 查询 UTXO 失败（回退节点侧签名）: %w", err)
 		}
