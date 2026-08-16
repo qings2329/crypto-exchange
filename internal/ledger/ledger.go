@@ -67,6 +67,7 @@ type Entry struct {
 // 两类冻结明确区分，避免资金安全语义混淆：
 //   - Frozen：持仓保证金冻结（开仓/强平时由 futures 引擎锁定，不可提现）；
 //   - WithdrawFrozen：提现冻结（提交提现后由出入金路径锁定，待链上确认达标后划出）。
+//
 // 二者互斥：提现只动 WithdrawFrozen，开仓只动 Frozen，互不干扰，杜绝"提现结算误扣
 // 持仓保证金"或"回滚提现冲掉开仓保证金"的资损路径。
 type Account struct {
@@ -94,11 +95,11 @@ type Ledger struct {
 	log        []Entry
 
 	// 对账巡检（定时对账探针）：reconMu 独立保护巡检状态，避免长持有 l.mu。
-	reconMu       sync.RWMutex
-	reconStats    ReconStats
-	alertHook     func(map[string]float64) // 不平账告警回调（生产可接监控/告警平台）
-	stopRecon     chan struct{}
-	reconRunning  bool
+	reconMu      sync.RWMutex
+	reconStats   ReconStats
+	alertHook    func(map[string]float64) // 不平账告警回调（生产可接监控/告警平台）
+	stopRecon    chan struct{}
+	reconRunning bool
 
 	// 坏账归属：key = "userID:asset" -> 该用户造成的未冲抵坏账额。
 	// 用于"用户级精确解限"——仅当某用户自身的坏账贡献被冲抵后才解除其出金限制，
@@ -114,9 +115,9 @@ type Ledger struct {
 	//   hotWalletCap[asset] = 热钱包风险敞口上限，超过则触发自动归集（sweep）到冷钱包。
 	// 二者之和恒等于 -SysChainClearing[asset]（交易所对用户净负债 = 实际链上持仓），
 	// 属资金安全不变量（偿付能力/储备证明）：InventoryMatchesLiability 校验之。
-	hotWallet     map[string]float64
-	coldWallet    map[string]float64
-	hotWalletCap  map[string]float64
+	hotWallet    map[string]float64
+	coldWallet   map[string]float64
+	hotWalletCap map[string]float64
 
 	// 提现安全冷静期（延时清算）风控：用户提现请求先进入冷静期队列并冻结，期满后运维/定时调度
 	// 才真正链上广播清算。即便账户/热钱包被攻破，冷静期给风控留出冻结止损窗口（与冷热钱包
@@ -140,28 +141,28 @@ type Ledger struct {
 	// 可疑行为风控引擎：把 #18 的"手动全局紧急冻结"与 #16 的白名单升级为自动风控，
 	// 让提现冷静期/白名单/冻结真正形成闭环——检测到异常（提现速率骤增、短时间大量新增地址）
 	// 即自动触发全局冻结并留痕，给风控/运维留出人工介入窗口。
-	riskEnabled        bool      // 风控引擎总开关
-	riskAutoFreeze     bool      // 触发高危规则时是否自动全局冻结
+	riskEnabled        bool          // 风控引擎总开关
+	riskAutoFreeze     bool          // 触发高危规则时是否自动全局冻结
 	riskWindow         time.Duration // 滑动窗口（行为计数/累计的时间范围）
-	riskVelocityAmount float64   // 窗口内单用户提现累计额阈值（跨资产合计）
-	riskVelocityCount  int       // 窗口内单用户提现请求次数阈值
-	riskAddrBurstCount int       // 窗口内单用户新增地址数阈值
-	riskEvents         []*RiskEvent // 风控事件审计轨迹（环形增长，可持久化）
+	riskVelocityAmount float64       // 窗口内单用户提现累计额阈值（跨资产合计）
+	riskVelocityCount  int           // 窗口内单用户提现请求次数阈值
+	riskAddrBurstCount int           // 窗口内单用户新增地址数阈值
+	riskEvents         []*RiskEvent  // 风控事件审计轨迹（环形增长，可持久化）
 	riskEventSeq       int64
 	autoFrozenByRisk   bool // 当前全局冻结是否由风控引擎自动触发（人工 resume 后清零）
 	// 瞬态行为活动（不持久化，重启后自然冷启动）：
-	riskWithdrawActivity map[int64][]riskAct    // uid -> 最近提现活动（at/amount）
-	riskAddrActivity     map[int64][]time.Time  // uid -> 最近新增地址时间
+	riskWithdrawActivity map[int64][]riskAct   // uid -> 最近提现活动（at/amount）
+	riskAddrActivity     map[int64][]time.Time // uid -> 最近新增地址时间
 }
 
 // RiskEvent 一条风控引擎产出的可疑行为事件（审计/告警溯源）。
 type RiskEvent struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`     // withdraw_velocity | address_burst
-	UserID     int64     `json:"user_id"`
-	Severity   string    `json:"severity"` // high | medium | low
-	Message    string    `json:"message"`
-	Action     string    `json:"action"`    // auto_global_freeze | logged
+	ID          string    `json:"id"`
+	Type        string    `json:"type"` // withdraw_velocity | address_burst
+	UserID      int64     `json:"user_id"`
+	Severity    string    `json:"severity"` // high | medium | low
+	Message     string    `json:"message"`
+	Action      string    `json:"action"` // auto_global_freeze | logged
 	TriggeredAt time.Time `json:"triggered_at"`
 }
 
@@ -195,30 +196,30 @@ type WithdrawHoldEntry struct {
 // 攻击者也无法在冷静期内把资金转去未授权的新地址。Verified 为假或仍在验证冷静期内，
 // RequestWithdrawHold 一律拒绝受理。
 type WithdrawAddress struct {
-	UserID     int64     `json:"user_id"`
-	Asset      string    `json:"asset"`
-	Chain      string    `json:"chain"`
-	Address    string    `json:"address"`
-	Label      string    `json:"label"`
-	AddedAt    time.Time `json:"added_at"`
-	Verified   bool      `json:"verified"`     // 是否已通过 2FA/邮件验证
+	UserID      int64     `json:"user_id"`
+	Asset       string    `json:"asset"`
+	Chain       string    `json:"chain"`
+	Address     string    `json:"address"`
+	Label       string    `json:"label"`
+	AddedAt     time.Time `json:"added_at"`
+	Verified    bool      `json:"verified"`     // 是否已通过 2FA/邮件验证
 	VerifyUntil time.Time `json:"verify_until"` // 新地址验证冷静期截止（首次可用于提现的前提）
 }
 
 // New 创建总账。
 func New() *Ledger {
 	return &Ledger{
-		accounts:           make(map[string]*Account),
-		restricted:         make(map[string]bool),
-		badDebtByUser:      make(map[string]float64),
-		socializeProposals: make(map[string]*SocializeProposal),
-		hotWallet:          make(map[string]float64),
-		coldWallet:         make(map[string]float64),
-		hotWalletCap:       make(map[string]float64),
-		withdrawHolds:      make(map[string]*WithdrawHoldEntry),
-		dailyWithdrawLimit: make(map[string]float64),
-		dailyWithdrawUsed:  make(map[string]float64),
-		withdrawAddressBook: make(map[int64]map[string]*WithdrawAddress),
+		accounts:             make(map[string]*Account),
+		restricted:           make(map[string]bool),
+		badDebtByUser:        make(map[string]float64),
+		socializeProposals:   make(map[string]*SocializeProposal),
+		hotWallet:            make(map[string]float64),
+		coldWallet:           make(map[string]float64),
+		hotWalletCap:         make(map[string]float64),
+		withdrawHolds:        make(map[string]*WithdrawHoldEntry),
+		dailyWithdrawLimit:   make(map[string]float64),
+		dailyWithdrawUsed:    make(map[string]float64),
+		withdrawAddressBook:  make(map[int64]map[string]*WithdrawAddress),
 		riskWithdrawActivity: make(map[int64][]riskAct),
 		riskAddrActivity:     make(map[int64][]time.Time),
 	}
@@ -667,12 +668,12 @@ func (l *Ledger) socializeLocked(asset string) (detail map[int64]float64, recove
 
 // SocializeProposal 社会化分摊治理提案（待审批）。
 type SocializeProposal struct {
-	ID        string             // 提案号（唯一）
-	Asset     string             // 标的资产
-	Recovered float64            // 预计回收总额（保险基金冲减 + 用户分摊）
-	Detail    map[int64]float64  // 预计各用户分摊额
-	CreatedAt int64              // 提案时间（纳秒）
-	Status    string             // pending / approved / rejected
+	ID        string            // 提案号（唯一）
+	Asset     string            // 标的资产
+	Recovered float64           // 预计回收总额（保险基金冲减 + 用户分摊）
+	Detail    map[int64]float64 // 预计各用户分摊额
+	CreatedAt int64             // 提案时间（纳秒）
+	Status    string            // pending / approved / rejected
 }
 
 // previewSocializeLocked 在已持锁时只读模拟社会化分摊结果（不改动账本），供提案预览使用。
@@ -1063,13 +1064,13 @@ func (l *Ledger) addWithdrawAddressLocked(userID int64, asset, chain, address, l
 	}
 	now := time.Now()
 	e := &WithdrawAddress{
-		UserID:     userID,
-		Asset:      asset,
-		Chain:      chain,
-		Address:    address,
-		Label:      label,
-		AddedAt:    now,
-		Verified:   false,
+		UserID:      userID,
+		Asset:       asset,
+		Chain:       chain,
+		Address:     address,
+		Label:       label,
+		AddedAt:     now,
+		Verified:    false,
 		VerifyUntil: now.Add(l.addressVerifyPeriod),
 	}
 	inner[k] = e
@@ -1257,11 +1258,11 @@ func (l *Ledger) ClearRiskAutoFreeze() {
 func (l *Ledger) raiseRiskEventLocked(userID int64, typ, severity, msg string) {
 	l.riskEventSeq++
 	e := &RiskEvent{
-		ID:         fmt.Sprintf("rk-%d", l.riskEventSeq),
-		Type:       typ,
-		UserID:     userID,
-		Severity:   severity,
-		Message:    msg,
+		ID:          fmt.Sprintf("rk-%d", l.riskEventSeq),
+		Type:        typ,
+		UserID:      userID,
+		Severity:    severity,
+		Message:     msg,
 		TriggeredAt: time.Now(),
 	}
 	if l.riskAutoFreeze && !l.autoFrozenByRisk {
@@ -1425,6 +1426,29 @@ func (l *Ledger) FinalizeWithdrawHold(id string) (*WithdrawHoldEntry, error) {
 		return nil, fmt.Errorf("withdraw hold in cooling period until %s", e.HoldUntil.Format(time.RFC3339))
 	}
 	// 链上划出：提现冻结 -> 离开系统（借记负债账户）。
+	if err := l.settleWithdrawLocked(e.UserID, e.Asset, e.Amount, e.Fee, e.ID); err != nil {
+		return nil, err
+	}
+	e.Finalized = true
+	return e, nil
+}
+
+// FinalizeWithdrawHoldForce 管理员审批放行专用：跳过冷静期直接清算，
+// 用于管理后台显式授权提现（冷却期是防用户误操作的，不适用于审批场景）。
+// 与 FinalizeWithdrawHold 的区别仅在于不做冷静期守卫。
+func (l *Ledger) FinalizeWithdrawHoldForce(id string) (*WithdrawHoldEntry, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e, ok := l.withdrawHolds[id]
+	if !ok {
+		return nil, fmt.Errorf("withdraw hold not found")
+	}
+	if e.Finalized {
+		return nil, fmt.Errorf("withdraw hold already finalized")
+	}
+	if e.Cancelled {
+		return nil, fmt.Errorf("withdraw hold cancelled")
+	}
 	if err := l.settleWithdrawLocked(e.UserID, e.Asset, e.Amount, e.Fee, e.ID); err != nil {
 		return nil, err
 	}
@@ -1718,26 +1742,26 @@ func (l *Ledger) LastReconcile() ReconStats {
 // 累积，无需恢复。链上充值/提现网关的 pending 事件同样不持久化——真实环境由区块链重新
 // 确认入账，Mock 网关重启后窗口自然清空。
 type LedgerSnapshot struct {
-	Accounts          []*Account                    `json:"accounts"`            // 全部账户（含系统账户）
-	Restricted        []string                      `json:"restricted"`          // 处于出金限制的用户-资产 key 列表
-	BadDebtByUser     map[string]float64            `json:"bad_debt_by_user"`    // 坏账归属：key=userID:asset -> 未冲抵坏账额
-	SocializeProposals map[string]SocializeProposal `json:"socialize_proposals"` // 待审批的社会化分摊治理提案
-	HotWallet          map[string]float64           `json:"hot_wallet"`          // 热钱包链上库存（每资产）
-	ColdWallet         map[string]float64           `json:"cold_wallet"`         // 冷钱包链上库存（每资产）
-	HotWalletCap       map[string]float64           `json:"hot_wallet_cap"`      // 热钱包风险敞口上限（每资产）
-	WithdrawHolds      []*WithdrawHoldEntry         `json:"withdraw_holds"`      // 处于冷静期的提现请求队列
-	WithdrawHoldPeriod time.Duration                `json:"withdraw_hold_period"`// 冷静期时长
-	WithdrawHoldSeq    int64                        `json:"withdraw_hold_seq"`   // 提现请求序列号
-	WithdrawalFrozenGlobal bool                     `json:"withdrawal_frozen_global"` // 全局紧急冻结开关
-	DailyWithdrawLimit map[string]float64           `json:"daily_withdraw_limit"` // 每日提现限额（每资产）
-	DailyWithdrawUsed  map[string]float64           `json:"daily_withdraw_used"`  // 当日已用提现额度（按 uid:asset:date）
-	WithdrawAddresses  []*WithdrawAddress           `json:"withdraw_addresses"`   // 提现地址白名单（防钓鱼/未授权盗提）
-	AddressVerifyPeriod time.Duration               `json:"address_verify_period"` // 新地址验证冷静期时长
-	RiskEvents         []*RiskEvent                 `json:"risk_events"`           // 风控事件审计轨迹
-	RiskEventSeq       int64                        `json:"risk_event_seq"`        // 风控事件序列号
-	AutoFrozenByRisk   bool                         `json:"auto_frozen_by_risk"`   // 当前全局冻结是否由风控自动触发
-	Log                []Entry                      `json:"log"`                 // 资金流水（审计/对账溯源）
-	Seq                int64                        `json:"seq"`                 // 流水序列号（恢复后续写不冲突）
+	Accounts               []*Account                   `json:"accounts"`                 // 全部账户（含系统账户）
+	Restricted             []string                     `json:"restricted"`               // 处于出金限制的用户-资产 key 列表
+	BadDebtByUser          map[string]float64           `json:"bad_debt_by_user"`         // 坏账归属：key=userID:asset -> 未冲抵坏账额
+	SocializeProposals     map[string]SocializeProposal `json:"socialize_proposals"`      // 待审批的社会化分摊治理提案
+	HotWallet              map[string]float64           `json:"hot_wallet"`               // 热钱包链上库存（每资产）
+	ColdWallet             map[string]float64           `json:"cold_wallet"`              // 冷钱包链上库存（每资产）
+	HotWalletCap           map[string]float64           `json:"hot_wallet_cap"`           // 热钱包风险敞口上限（每资产）
+	WithdrawHolds          []*WithdrawHoldEntry         `json:"withdraw_holds"`           // 处于冷静期的提现请求队列
+	WithdrawHoldPeriod     time.Duration                `json:"withdraw_hold_period"`     // 冷静期时长
+	WithdrawHoldSeq        int64                        `json:"withdraw_hold_seq"`        // 提现请求序列号
+	WithdrawalFrozenGlobal bool                         `json:"withdrawal_frozen_global"` // 全局紧急冻结开关
+	DailyWithdrawLimit     map[string]float64           `json:"daily_withdraw_limit"`     // 每日提现限额（每资产）
+	DailyWithdrawUsed      map[string]float64           `json:"daily_withdraw_used"`      // 当日已用提现额度（按 uid:asset:date）
+	WithdrawAddresses      []*WithdrawAddress           `json:"withdraw_addresses"`       // 提现地址白名单（防钓鱼/未授权盗提）
+	AddressVerifyPeriod    time.Duration                `json:"address_verify_period"`    // 新地址验证冷静期时长
+	RiskEvents             []*RiskEvent                 `json:"risk_events"`              // 风控事件审计轨迹
+	RiskEventSeq           int64                        `json:"risk_event_seq"`           // 风控事件序列号
+	AutoFrozenByRisk       bool                         `json:"auto_frozen_by_risk"`      // 当前全局冻结是否由风控自动触发
+	Log                    []Entry                      `json:"log"`                      // 资金流水（审计/对账溯源）
+	Seq                    int64                        `json:"seq"`                      // 流水序列号（恢复后续写不冲突）
 }
 
 // Snapshot 生成账本当前状态的可序列化副本（线程安全，持读锁）。

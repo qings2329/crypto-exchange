@@ -43,7 +43,7 @@
 | T-13 | proto 生成脚本 | gRPC/protobuf 代码生成脚本与 CI 集成 | README「待补充」 | **已完成**（新增 `api/wallet.proto` + `scripts/gen_proto.sh` + Makefile `proto` 目标） |
 | T-14 | 其余业务线服务 | 实现 otc / options / margin / wealth / risk / settlement / notification 业务线 | README「待补充」 | **已完成**：settlement（T-15）、margin 现货杠杆（§7）、notification 站内信（§8）、risk 风控（§9）、options 期权（§10）、otc 场外交易（§11）、wealth 理财资管（§12）均已实现并验证（`go build/vet/test ./...` 全绿）；**T-14 全部 7 子业务线均已跑远程冒烟**（settlement 为纯费用/健康检查 HTTP 服务、无 MySQL 持久化，仅跑 HTTP 冒烟；其余 6 项均跑远程 MySQL 冒烟） |
 | T-15 | settlement 服务化 | `internal/settlement` 模块已存在，需封装为独立服务并接入账本 | 目录现状 | **已完成**（新增 `cmd/settlement` 独立服务：手续费估算/健康端点，`make build` 含 settlement，运行时验证通过） |
-| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **部分接入（Kafka+Redis+InfluxDB 已落地，见 §21/§22/§23）**：Kafka 交易清算（§21）+ **Redis 集群级限流（§22）** + **InfluxDB 行情 K 线持久化（§23）** 已接入；ES 仍仅声明，待各业务接入 |
+| T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **已落地（Kafka+Redis+InfluxDB+ES，见 §21/§22/§23/§24）**：Kafka 交易清算（§21）+ **Redis 集群级限流（§22）** + **InfluxDB 行情 K 线持久化（§23）** + **ES 成交检索（§24）** 均已接入；docker-compose 声明的全部中间件现已实际使用 |
 | T-17 | 对账 / 审计报表 | 基于 `Ledger` 流水做借贷恒等校验、对账与审计看板 | 资金安全闭环延伸 | **已完成**（`Ledger.Reconcile/IsBalanced/RunReconcileOnce` + 定时巡检 + `/wallet/reconcile` 端点 + Prometheus 指标已具备） |
 | T-18 | 安全加固（暂不引入中间件） | 统一安全中间件套件：审计日志、安全响应头、受控 CORS、请求体限制、边缘/入口鉴权与公开端点豁免、TLS 可配置；修复 spot/futures 无鉴权下单漏洞与 market/futures 端口冲突 | 安全审计发现 | **已完成**（见 §13） |
 
@@ -328,8 +328,11 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
   - 独立 WS 客户端连 `cmd/matching /ws` 后下对手卖单，收到 `trade` + `depth` 广播 → 证明行情经 WS 回传 spot/futures 本地 hub 的链路可用。
 - 已知：强平路径 `MatchNow` 现已在接入 `Store` 时同步写 WAL（`EventSubmit`，§17 已知缺口①已补齐——恢复经 `Recover` 重放该成交，且重放不触发 `onTrade` 故不会重复结算）；未接入 `Store` 时行为不变。高级订单类型 IOC/FOK/止盈止损已在 `internal/matching/orderbook.go` 支持并经单测覆盖。
 
-### 18.1 后续（未做）
-- spot/futures 目前仍各自运行一份 `client` 连同一个 `cmd/matching`；要真正「全所单写者容灾」需把网关层（`cmd/gateway` 或 Nginx）把 `/api/v1/spot/*order`、`/api/v1/futures/*order` 也代理到 `cmd/matching`，或让 spot/futures 仅做业务/账本、匹配全权委托——本轮按用户原话完成收敛到 `cmd/matching` 客户端，未进一步合并进程。
+### 18.1 后续（网关层收敛，2026-08-16 已落地安全子集）
+- 「全所单写者容灾」的两种收尾选项中，**「spot/futures 仅做业务/账本、匹配全权委托」已由 §18 通过 `matching.Client` 落地**：spot/futures 不再持有订单簿，全部委托 cmd/matching（单一写者、leader 选举 + 崩溃恢复见 §17），多实例也不会分裂簿。
+- 网关层收敛按 **安全子集** 实现（`cmd/gateway` + `configs/config.yaml`）：把 `matching` 纳入 `services` 拓扑（运营看板可探活），并仅在网关暴露其**只读/行情端点**（`/api/v1/matching/{depth,ws,orders,orders/:id,trades,health}`）；其**写端点**（`/order`、`/cancel`、`/match-now`）刻意不代理——订单提交必须仍经 spot/futures，因为 `spot/futures` 的 `handleOrder` 内做资金预冻结（`ledger.Freeze`）与成交账本结算（`ledger.Transfer`），cmd/matching 仅负责撮合（无钱包/账本），若经网关直连会**绕过整套资金安全控制**（资金安全隐患）。
+- 配套健壮性修复：网关的反代 writer 包了一层 `proxyWriter`，安全补全 `http.CloseNotifier`/`http.Flusher`/`http.Hijacker`（gin 的 writer 对 `CloseNotifier` 用「断言后调用」，底层未实现时直接 panic；新版 Go 移除该接口后线上亦可能 panic）。测试见 `cmd/gateway/main_test.go`（锁定「matching 写端点不直连网关」的不变量 + 只读端点正确收敛）。
+- **未做（可选，不建议）**：把 `/api/v1/spot/*order`、`/api/v1/futures/*order` 也直接代理到 cmd/matching 的 `/order`——这需把钱包/账本逻辑搬进撮合引擎，属更大重构且会弱化 spot/futures 业务层边界，当前不采纳。
 - 强平 `MatchNow` 的流动性消耗现已写 WAL（见 §17 已知缺口①已补齐）；T-03 真实链上/预言机 RPC 仍阻塞（依赖外部节点+合规），本轮未实现，仅保留文档留白。
 
 ## 20. 集中式订单管理模块（现货/合约订单 + 成交流水查询 + 管理后台跨用户撤销）
@@ -375,10 +378,10 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - `go build/vet/test ./...` 全绿（auth 兼容性、admin 角色测试通过）。
 - `../ce-frontend/` 与 `../web-admin/` 各自 `npm run build` 通过，互不耦合。
 
-**已知缺口（后续）**：
-- 风控快照、账本对账、服务健康、运营通知当前是 admin 服务内存只读骨架，应后续接入 futures/settlement 实时强平/穿仓/ADL、结算对账与各微服务健康探测。
-- 用户、交易对、公链、币种、充值提币 CRUD 为内存态，应后续对接 user/settlement 真实持久化（数据库/链上网关）。
-- 管理后台登录为明文凭据（config 内），生产应改为哈希+密钥管理，并可对接真实管理员账号体系。
+**已知缺口（后续，已全部闭合）**：
+- 风控快照、账本对账、服务健康、运营通知——本条记为「内存只读骨架」的提示已过时：实际 `handleRisk` 实时聚合 futures 的 `/liquidations`、`/adl`、`/socialized`、`/wallet`；`handleLedger` 实时拉取 futures 的 `/wallet/reconcile` 与 `/wallet/inventory`；`handleServices` 探活 `cfg.Services` 各上游；`listNotifications` 代理 notification 服务 + 本地公告（CatalogStore）。四类均为真实后端，仅上游不可达时降级为内存示例。
+- 用户、交易对、公链、币种、充值提币 CRUD 此前为内存态，现已全部对接真实持久化：**用户 CRUD→user 服务（§19 后端改造，createUser/updateUser/freezeUser 均代理 user）**；交易对/公链/币种→CatalogStore MySQL（§19）；通知→notification + CatalogStore（§19）；充值列表→futures `/wallet/deposits`、提币列表→futures `/wallet/withdraw/holds`（§19）；**提币审核→futures 的 approve/reject 端点（§25，管理员审批=链上放行/退回，不再仅写内存）；用户列表余额→futures `/wallet/balance` 实时富集 USDT 可用余额（§26，不再恒为 0）**。§19「管理后台接真实后端」目标已整体达成。
+- 管理后台登录明文凭据——本条也已过时：`handleLogin` 已走 bcrypt（`bcrypt.CompareHashAndPassword`）比对 `AdminStore`（MySQL 优先、失败回退内存）中的 `PasswordHash`，并支持可选 TOTP；`config.yaml` 的 `admin.password_hash` 即为 bcrypt 哈希（可由环境变量 `ADMIN_PASSWORD_HASH` 覆盖）；另有 `/admin/password` 改密、`/admins/:id/reset-password` 重置等真实账号管理端点（见 handlers_admin.go）。
 
 ## 21. Kafka 交易清算接入（T-16，2026-08-15，已完成）
 
@@ -442,3 +445,60 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 **验证**：
 - `go build/vet/test ./...` 全绿（新增 influxdb 单测 + market 扩展 Klines 单测通过）。
 - **真·持久化（需 `docker compose up -d influxdb` + 配置 influxdb.url/token/org/bucket）**：起 `cmd/matching`（发布 `exchange.trades`）→ `cmd/market` 消费聚合 → 已收盘 K 线写入 InfluxDB；重启 `cmd/market` 后 `GET /api/v1/market/klines?symbol=BTCUSDT&interval=1m&limit=1000` 可回取内存环形之外的更早历史。无 InfluxDB 时默认内存路径与单测覆盖合并/降级逻辑。
+
+## 24. Elasticsearch 成交检索接入（T-16，2026-08-15，已完成）
+
+**背景**：docker-compose 声明了 Elasticsearch（`elasticsearch:8.13.0`，:9200）但此前从未接入；行情服务的成交仅保存在内存环形缓冲（`recentTradesCap=100`，`internal/market/market.go:23`），进程重启即丢失，且 `/api/v1/market/trades` 只能看最近 100 笔——无法按 symbol/买卖方向/时间窗检索历史成交。
+
+**改动**：把成交检索抽象为 `es.TradeIndexer`，行情服务在每笔成交到达时异步索引，并提供检索端点（未配置/不可达时降级内存，行为不变）：
+
+- `internal/pkg/es/es.go`（新增）：`TradeDoc` 索引文档（字段对齐 `mq.TradeEvent`，附加 `value=price*qty` 与确定性 `id`）+ `TradeQuery`（Symbol/Side/From/To/Limit）+ `TradeIndexer` 接口（`Index`/`Search`/`Close`）；`New(url, index)`——url 为空返回 `memIndexer`（内存实现，单测确定性实现），否则返回 `esIndexer`（经 `github.com/elastic/go-elasticsearch/v8` 写入 index `trades`：symbol/taker_side 为 keyword 便于精确过滤，ts 为时间窗检索与排序字段）。依赖已 `go get` 加入 go.mod。`Search` 用 ES DSL（`bool.filter` 组合 term/range，`ts` 降序，`size`）回读。`doc id` 以 FNV-64a 对成交关键字段哈希得到，保证 ES 重试/at-least-once 下幂等（同笔成交仅存一份）。
+- `internal/market/server.go`：`Server` 增加可选 `indexer es.TradeIndexer`；`NewServer` 按 `cfg.ES.URL` 装配（记日志区分「elasticsearch / in-memory only」）；`applyTrade` 在聚合与 WS 广播后**异步**（goroutine + 3s 超时）把成交索引入 ES（best-effort，失败仅 `log.Warn` 不阻断行情）；新增路由 `GET /api/v1/market/trades/search`。
+- `internal/market/server.go:handleTradeSearch`：按 `symbol`/`side`/`from`/`to`/`limit` 检索成交历史（ES 路径按 ts 降序返回全量历史）；**未配置 ES 时降级**为内存近期成交（按 symbol 过滤；无 symbol 则 400），保证检索端点始终可用（fail-degraded）。
+- `internal/pkg/config/config.go` + `configs/config.yaml`：新增 `es`（url/index，index 空用默认 `trades`）；默认 `url: ""`，即仅内存、不连接 ES（fail-degraded），配置示例见 yaml 注释（docker-compose 的 :9200 实例）。
+
+**设计要点**：
+- 零回归：`es.url` 为空时 `indexer` 为 nil，`applyTrade` 跳过索引、`handleTradeSearch` 走内存降级，行为与改动前一致；既有单测不受影响。
+- 故障可降级：索引为 best-effort（后台 goroutine，错误仅日志），检索失败（ES 不可达）返回 500 由调用方处理；未配置则直接内存降级，行情服务不因 ES 抖动而不可用。
+- 幂等：FNV-64a 确定性 doc id，重复成交仅落一份；内存实现同键覆盖。
+- 落盘异步、读取带超时：索引在 `applyTrade` 锁外后台进行（不阻塞行情聚合与 WS 广播）；检索走请求 context。
+
+**验证**：
+- `go build/vet/test ./...` 全绿（新增 es 单测 + market 索引/降级单测通过）。
+- **真·检索（需 `docker compose up -d elasticsearch` + 配置 es.url/index）**：起 `cmd/matching`（发布 `exchange.trades`）→ `cmd/market` 消费聚合并索引 → `GET /api/v1/market/trades/search?symbol=BTCUSDT&side=buy&limit=50` 可检索历史成交（含重启前的）；无 ES 时默认内存降级路径与单测覆盖索引触发/降级逻辑。
+
+## 25. Admin 提币审核接真实后端（闭合 §19 资金安全缺口，2026-08-16，已完成）
+
+**背景**：§19 管理后台的「充值提币 CRUD 为内存态，应后续对接……真实持久化（数据库/链上网关）」中，提币审核是资金安全关键路径缺口——`approveWithdrawal`/`rejectWithdrawal` 此前只把审批结果写内存会话态 `wdApprovals`，**不调用上游**，管理员的批准/拒绝不会真正放行或退回链上提现。其余 admin 模块（风控快照/对账→futures、用户 CRUD→user、交易对/公链/币种→CatalogStore MySQL、通知→notification、服务健康→探活）此前已接真实后端，本次仅补齐提币审核这一环。
+
+**改造**：让管理员审核真正驱动链上放行/退回。
+
+- `internal/ledger/ledger.go`：新增 `FinalizeWithdrawHoldForce(id)`——与 `FinalizeWithdrawHold` 仅差「不做冷静期守卫」，专供管理员审批放行（冷却期是防用户误操作的，不适用于管理员显式授权放行）。
+- `internal/futuresapi/handler_wallet.go`：
+  - 抽取私有 `finalizeHold(id, requireCooling)` 复用「hold 校验 → 链上广播 → 账本划出」逻辑；`requireCooling` 为真（用户端 `finalize`）保留冷静期守卫，为假（管理员 `approve`）调 `FinalizeWithdrawHoldForce` 跳过冷却。
+  - 新增 `handleWithdrawApprove`（`POST /api/v1/futures/wallet/withdraw/approve/:hold_id`，跳过冷却 `FinalizeWithdrawHold` 放行）与 `handleWithdrawReject`（`POST /api/v1/futures/wallet/withdraw/reject/:hold_id`，`CancelWithdrawHold` 退回冻结）。路径用 `approve/:hold_id` 形式，避免与 `withdraw/` 下既有静态兄弟段冲突（httprouter 不允许同位置静态段与参数段共存）。futures 整体受 `middleware.Auth` 保护、不强制 role，admin 自签 token 可调用，与现有 admin→futures 代理一致。
+- `internal/adminapi/handlers.go`：
+  - `listWithdrawals` 由「已广播历史 `/wallet/withdraws`」改为「待审核 hold 队列 `/wallet/withdraw/holds`」（含真实 `hold_id`、状态、冷却期）；维护 `wdByHoldID`（前端 stableID→futures hold_id）锚点，并把 `finalized/cancelled` 映射为 `approved/rejected` 供列表回显；上游不可达仍可降级为内存示例。
+  - `approveWithdrawal`/`rejectWithdrawal` 改为先由 `wdByHoldID` 反查 `hold_id`，调 futures 的 `approve`/`reject` 端点真正落地，成功回写本会话审批结果；上游失败返回 502（不再只写内存）。移除原仅写内存的 `markWithdrawal`。
+  - 删除已无引用的 `futuresWithdraws` 死类型。
+- `internal/adminapi/store.go`：`Store` 新增 `wdByHoldID map[int64]string`（stableID→hold_id）并在 `NewStore` 初始化。
+- `internal/adminapi/server.go`：提币审核路由挂 `middleware.RequirePerm(PermWithdrawApproval)`（权限字典 `rbac.go:38` 已定义，super_admin 自动获得）；前端 `web-admin` 的提币审核按钮传 stableID，无需改动。
+
+**验证**：
+- 新增 `internal/futuresapi/handler_wallet_test.go`：`TestWithdrawApproveSkipsCooling`（冷却期内用户端 `finalize` 被拒 409、管理员 `approve` 跳过冷却成功放行且 hold 置 finalized）、`TestWithdrawReject`（拒绝退回冻结、hold 置 cancelled）、`TestWithdrawApproveUnknown`（未知 hold→404）。
+- 新增 `internal/adminapi/handlers_withdraw_test.go`：用 httptest 模拟 futures 的 holds/approve/reject 端点，验证 `listWithdrawals` 把 finalized hold 映射为 `approved`、pending 映射为 `pending`；`approve` 真正 POST futures `approve/:hold_id` 且列表回显 `approved`；`reject` 真正 POST futures `reject/:hold_id`；上游 500 时 admin 返回 502。
+- `go build/vet/test ./...` 全绿（无回归）。
+
+## 26. Admin 用户列表余额接真实后端（闭合 §19 用户/账户已知缺口，2026-08-16，已完成）
+
+**背景**：§19 用户与账户管理模块的「余额」字段此前在 `listUsers` 中**硬编码为 0**（`Balance: 0`），管理后台看到的用户余额永远是 0，无法反映真实资金状况。本次把它改为从 futures 钱包实时拉取 USDT 可用余额，并对上游不可达做 fail-degraded（降级回 0，不报错）。
+
+**改造**：
+
+- `internal/adminapi/handlers.go`：
+  - `listUsers` 由 `Balance: 0` 改为对每个用户调 `s.enrichBalance(ctx, &au)` 填充真实余额。
+  - 新增私有 `enrichBalance(ctx, *AdminUser)`：`GET /api/v1/futures/wallet/balance?user_id=<id>&asset=USDT`，取 `Available` 填入 `u.Balance`；上游不可达或该用户无钱包账户时，保持 `Balance: 0`（降级，不阻断列表）。
+
+**验证**：
+- 新增 `internal/adminapi/handlers_withdraw_test.go` 的 `TestAdminUsersBalanceEnriched`：用 httptest 模拟 futures 的 `/balance` 端点（user 1001→125000.5、user 1002→3400），验证列表返回的用户余额被正确富集、不再是 0。
+- `go build/vet/test ./...` 全绿（无回归，含 §25 全部用例与本轮新增用例，adminapi 测试全绿）。

@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -135,13 +136,13 @@ func (s *Server) handleRisk(c *gin.Context) {
 	items := make([]LiquidationItem, 0, len(liq.Liquidations))
 	for _, e := range liq.Liquidations {
 		items = append(items, LiquidationItem{
-			UserID:    e.UserID,
-			Symbol:    e.Symbol,
-			Side:      posSideStr(e.Side),
-			Size:      e.Size,
-			LiqPrice:  e.LiqPrice,
-			Equity:    e.Margin,
-			Detected:  time.Unix(0, e.Time),
+			UserID:   e.UserID,
+			Symbol:   e.Symbol,
+			Side:     posSideStr(e.Side),
+			Size:     e.Size,
+			LiqPrice: e.LiqPrice,
+			Equity:   e.Margin,
+			Detected: time.Unix(0, e.Time),
 		})
 	}
 	adlQ := make([]string, 0, len(adl.ADL))
@@ -188,15 +189,16 @@ func (s *Server) listUsers(c *gin.Context) {
 		if err := s.up.Get(ctx, base, "/api/v1/user/admin/list", &resp); err == nil {
 			out := make([]AdminUser, 0, len(resp.Users))
 			for _, u := range resp.Users {
-				out = append(out, AdminUser{
+				au := AdminUser{
 					ID:        u.ID,
 					Username:  u.Username,
 					Email:     u.Email,
 					Status:    userStatusStr(u.Status),
 					KYC:       kycStr(u.KYCLevel),
-					Balance:   0, // 余额属于钱包/清结算服务，user 服务不暴露
 					CreatedAt: u.CreatedAt,
-				})
+				}
+				s.enrichBalance(ctx, &au) // 接 futures 钱包余额（§25 后续：消除恒为 0）
+				out = append(out, au)
 			}
 			s.ok(c, out)
 			return
@@ -206,6 +208,22 @@ func (s *Server) listUsers(c *gin.Context) {
 	s.store.mu.RLock()
 	defer s.store.mu.RUnlock()
 	s.ok(c, s.store.users)
+}
+
+// enrichBalance 从 futures 钱包服务拉取该用户的 USDT 可用余额填入 AdminUser.Balance，
+// 消除用户列表中余额恒为 0 的问题（§19 已知缺口）。上游不可达/用户无钱包时静默留 0（fail-degraded）。
+func (s *Server) enrichBalance(ctx context.Context, u *AdminUser) {
+	fb := s.serviceURL("futures")
+	if fb == "" {
+		return
+	}
+	var bal struct {
+		Available float64 `json:"available"`
+		Exists    bool    `json:"exists"`
+	}
+	if err := s.up.Get(ctx, fb, "/api/v1/futures/wallet/balance?user_id="+strconv.FormatInt(u.ID, 10)+"&asset=USDT", &bal); err == nil && bal.Exists {
+		u.Balance = bal.Available
+	}
 }
 
 // createUser 经 user 服务 /admin 创建真实用户；password 必填（bcrypt 哈希落库）。
@@ -476,20 +494,6 @@ type futuresDeposits struct {
 	} `json:"deposits"`
 }
 
-type futuresWithdraws struct {
-	Withdraws []struct {
-		TxHash    string  `json:"tx_hash"`
-		UserID    int64   `json:"user_id"`
-		Asset     string  `json:"asset"`
-		Amount    float64 `json:"amount"`
-		Fee       float64 `json:"fee"`
-		Chain     string  `json:"chain"`
-		Address   string  `json:"address"`
-		Status    string  `json:"status"`
-		CreatedAt int64   `json:"created_at"`
-	} `json:"withdraws"`
-}
-
 func (s *Server) listDeposits(c *gin.Context) {
 	ctx := c.Request.Context()
 	if base := s.serviceURL("futures"); base != "" {
@@ -518,32 +522,55 @@ func (s *Server) listDeposits(c *gin.Context) {
 	s.ok(c, s.store.deposits)
 }
 
+// futuresHolds 是 futures 提现冷静期 hold 队列的返回结构（含真实 hold_id，审核的真正锚点）。
+type futuresHolds struct {
+	Holds []struct {
+		ID        string    `json:"id"`
+		UserID    int64     `json:"user_id"`
+		Asset     string    `json:"asset"`
+		Amount    float64   `json:"amount"`
+		Fee       float64   `json:"fee"`
+		Chain     string    `json:"chain"`
+		Address   string    `json:"address"`
+		CreatedAt time.Time `json:"created_at"`
+		HoldUntil time.Time `json:"hold_until"`
+		Finalized bool      `json:"finalized"`
+		Cancelled bool      `json:"cancelled"`
+	} `json:"holds"`
+}
+
 func (s *Server) listWithdrawals(c *gin.Context) {
 	ctx := c.Request.Context()
 	if base := s.serviceURL("futures"); base != "" {
-		var resp futuresWithdraws
-		if err := s.up.Get(ctx, base, "/api/v1/futures/wallet/withdraws", &resp); err == nil {
+		var resp futuresHolds
+		if err := s.up.Get(ctx, base, "/api/v1/futures/wallet/withdraw/holds", &resp); err == nil {
 			s.store.mu.Lock()
-			s.store.wdByID = make(map[int64]Withdrawal, len(resp.Withdraws))
-			out := make([]Withdrawal, 0, len(resp.Withdraws))
-			for _, w := range resp.Withdraws {
-				id := stableID(w.TxHash, strconv.FormatInt(w.UserID, 10), w.Asset, w.Address)
-				status := w.Status
+			s.store.wdByHoldID = make(map[int64]string, len(resp.Holds))
+			out := make([]Withdrawal, 0, len(resp.Holds))
+			for _, h := range resp.Holds {
+				id := stableID(h.ID, strconv.FormatInt(h.UserID, 10), h.Asset, h.Address)
+				status := "pending"
+				if h.Finalized {
+					status = "approved"
+				} else if h.Cancelled {
+					status = "rejected"
+				}
 				if ov, ok := s.store.wdApprovals[id]; ok {
-					status = ov // 应用本会话内的审批结果
+					status = ov // 叠加本会话内的审批结果回显
 				}
 				rec := Withdrawal{
 					ID:      id,
-					UserID:  w.UserID,
-					Coin:    w.Asset,
-					Chain:   w.Chain,
-					Amount:  w.Amount,
-					Address: w.Address,
-					TxHash:  w.TxHash,
+					UserID:  h.UserID,
+					Coin:    h.Asset,
+					Chain:   h.Chain,
+					Amount:  h.Amount,
+					Address: h.Address,
+					TxHash:  h.ID,
 					Status:  status,
-					Time:    time.Unix(w.CreatedAt, 0),
+					Time:    h.CreatedAt,
 				}
 				s.store.wdByID[id] = rec
+				s.store.wdByHoldID[id] = h.ID
 				out = append(out, rec)
 			}
 			s.store.mu.Unlock()
@@ -557,33 +584,46 @@ func (s *Server) listWithdrawals(c *gin.Context) {
 	s.ok(c, s.store.withdrawals)
 }
 
-// approveWithdrawal 记录一笔提现审批（本原型在会话态记录审批结果，并反查链上事件）。
-// 真实的链上清算由 futures 服务的提现冷静期/最终化流程负责（需 HoldID），此处仅做管理侧审核标记。
+// approveWithdrawal 管理员审批通过一笔提现：反查 futures hold_id 后真正调用 futures 审批
+// 端点放行（链上广播 + 账本划出），替代此前仅写内存会话态的伪审批（§25）。
 func (s *Server) approveWithdrawal(c *gin.Context) {
-	id, ok := parseInt64(c, "id")
-	if !ok {
-		s.fail(c, http.StatusBadRequest, "invalid id")
-		return
-	}
-	s.markWithdrawal(c, id, "approved")
+	s.doWithdrawalReview(c, "approved", "/api/v1/futures/wallet/withdraw/approve/")
 }
 
+// rejectWithdrawal 管理员拒绝一笔提现：反查 futures hold_id 后真正调用 futures 拒绝
+// 端点退回冻结资金。
 func (s *Server) rejectWithdrawal(c *gin.Context) {
+	s.doWithdrawalReview(c, "rejected", "/api/v1/futures/wallet/withdraw/reject/")
+}
+
+// doWithdrawalReview 反查前端 stableID 对应的 futures hold_id，调用对应审批端点真正落地，
+// 成功回写本会话审批结果供列表回显；上游不可达或 hold 未找到返回 502/404。
+func (s *Server) doWithdrawalReview(c *gin.Context, status, pathPrefix string) {
 	id, ok := parseInt64(c, "id")
 	if !ok {
 		s.fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
-	s.markWithdrawal(c, id, "rejected")
-}
-
-func (s *Server) markWithdrawal(c *gin.Context, id int64, status string) {
+	base := s.serviceURL("futures")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "futures service not configured")
+		return
+	}
+	s.store.mu.RLock()
+	holdID, found := s.store.wdByHoldID[id]
+	s.store.mu.RUnlock()
+	if !found {
+		s.fail(c, http.StatusNotFound, "withdrawal not found (list withdrawals first)")
+		return
+	}
+	if err := s.up.Post(c.Request.Context(), base, pathPrefix+holdID, nil, nil); err != nil {
+		s.fail(c, http.StatusBadGateway, "withdrawal "+status+" failed: "+err.Error())
+		return
+	}
 	s.store.mu.Lock()
-	_, found := s.store.wdByID[id]
 	s.store.wdApprovals[id] = status
 	s.store.mu.Unlock()
-	// 若索引未建立（未先 list），仍返回已记录的审批结果，下次 list 即生效。
-	s.ok(c, gin.H{"id": id, "status": status, "indexed": found})
+	s.ok(c, gin.H{"id": id, "status": status, "hold_id": holdID})
 }
 
 // --- 运营通知管理（list 实时聚合 notification 服务，本地公告叠加；本地公告持久化于 CatalogStore）---
@@ -762,7 +802,7 @@ func (s *Server) handleLedger(c *gin.Context) {
 		}
 		inv struct {
 			Inventory []struct {
-				Asset       string  `json:"asset"`
+				Asset        string  `json:"asset"`
 				OnchainTotal float64 `json:"onchain_total"`
 			} `json:"inventory"`
 		}

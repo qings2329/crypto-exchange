@@ -28,6 +28,10 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.POST("/api/v1/futures/wallet/withdraw/request", s.handleWithdrawRequest)
 	r.POST("/api/v1/futures/wallet/withdraw/finalize", s.handleWithdrawFinalize)
 	r.POST("/api/v1/futures/wallet/withdraw/cancel", s.handleWithdrawCancel)
+	// 管理员审批/拒绝提现（Admin 后台接真实后端，§25）：approve 跳过冷却期直接放行，
+	// reject 退回冻结；与用户端 finalize/cancel 并存，路径避开 withdraw 下的静态兄弟段以免路由冲突。
+	r.POST("/api/v1/futures/wallet/withdraw/approve/:hold_id", s.handleWithdrawApprove)
+	r.POST("/api/v1/futures/wallet/withdraw/reject/:hold_id", s.handleWithdrawReject)
 	r.POST("/api/v1/futures/wallet/withdraw/emergency/freeze", s.handleEmergencyFreeze)
 	r.POST("/api/v1/futures/wallet/withdraw/emergency/resume", s.handleEmergencyResume)
 	r.POST("/api/v1/futures/wallet/risk/enable", s.handleRiskEnable)
@@ -153,11 +157,11 @@ func (s *Server) handleDepositReorg(c *gin.Context) {
 		return
 	}
 	response.JSON(c, gin.H{
-		"status":    "orphaned",
-		"tx_hash":   ev.TxHash,
-		"user_id":   ev.UserID,
-		"amount":    ev.Amount,
-		"asset":     ev.Asset,
+		"status":  "orphaned",
+		"tx_hash": ev.TxHash,
+		"user_id": ev.UserID,
+		"amount":  ev.Amount,
+		"asset":   ev.Asset,
 	})
 }
 
@@ -353,7 +357,43 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 	})
 }
 
-// handleWithdrawFinalize 清算一笔冷静期提现：先链上广播，成功后账本划出。
+// finalizeHold 清算一笔冷静期提现：先校验 hold 状态，再链上广播 + 账本划出。
+// requireCooling 为真时（用户端 finalize）须等冷静期过后；为假时（管理员审批 approve）
+// 跳过冷静期直接放行——冷却期是防用户误操作的，不适用于管理员显式授权放行。
+// 返回 (hold 记录, 链上 tx_hash, HTTP 状态码, 错误)；status==0 表示成功。
+func (s *Server) finalizeHold(id string, requireCooling bool) (*ledger.WithdrawHoldEntry, string, int, error) {
+	e, ok := s.ledgerSvc.WithdrawHold(id)
+	if !ok {
+		return nil, "", 404, fmt.Errorf("withdraw hold not found")
+	}
+	if e.Finalized {
+		return nil, "", 409, fmt.Errorf("withdraw hold already finalized")
+	}
+	if e.Cancelled {
+		return nil, "", 409, fmt.Errorf("withdraw hold cancelled")
+	}
+	if requireCooling && time.Now().Before(e.HoldUntil) {
+		return nil, "", 409, fmt.Errorf("withdraw hold in cooling period")
+	}
+	ev, berr := s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain), e.Amount, e.Fee, e.Address, false)
+	if berr != nil {
+		return nil, "", 502, fmt.Errorf("broadcast failed: %v", berr)
+	}
+	var ferr error
+	if requireCooling {
+		_, ferr = s.ledgerSvc.FinalizeWithdrawHold(id)
+	} else {
+		// 管理员审批放行：跳过冷静期直接清算（§25）。
+		_, ferr = s.ledgerSvc.FinalizeWithdrawHoldForce(id)
+	}
+	if ferr != nil {
+		return nil, "", 409, ferr
+	}
+	return e, ev.TxHash, 0, nil
+}
+
+// handleWithdrawFinalize 清算一笔冷静期提现（用户端）：先链上广播，成功后账本划出。
+// 受冷静期守卫——冷静期内拒绝放行（防用户误操作/被钓鱼）。
 func (s *Server) handleWithdrawFinalize(c *gin.Context) {
 	var req struct {
 		HoldID string `json:"hold_id"`
@@ -362,7 +402,50 @@ func (s *Server) handleWithdrawFinalize(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
-	e, ok := s.ledgerSvc.WithdrawHold(req.HoldID)
+	e, txHash, status, ferr := s.finalizeHold(req.HoldID, true)
+	if ferr != nil {
+		response.Error(c, status, status, ferr.Error())
+		return
+	}
+	response.JSON(c, gin.H{
+		"status":  "finalized",
+		"hold_id": e.ID,
+		"tx_hash": txHash,
+		"amount":  e.Amount,
+		"fee":     e.Fee,
+	})
+}
+
+// handleWithdrawApprove 管理员审批通过一笔提现：跳过冷静期直接放行（链上广播 + 账本划出）。
+// 这是管理后台提币审核的真正落地闸门（§25），替代此前仅写内存会话态的伪审批。
+func (s *Server) handleWithdrawApprove(c *gin.Context) {
+	id := c.Param("hold_id")
+	if id == "" {
+		response.Error(c, 400, 400, "bad request")
+		return
+	}
+	e, txHash, status, ferr := s.finalizeHold(id, false)
+	if ferr != nil {
+		response.Error(c, status, status, ferr.Error())
+		return
+	}
+	response.JSON(c, gin.H{
+		"status":  "approved",
+		"hold_id": e.ID,
+		"tx_hash": txHash,
+		"amount":  e.Amount,
+		"fee":     e.Fee,
+	})
+}
+
+// handleWithdrawReject 管理员拒绝一笔提现：退回冻结资金到可用（不链上广播）。
+func (s *Server) handleWithdrawReject(c *gin.Context) {
+	id := c.Param("hold_id")
+	if id == "" {
+		response.Error(c, 400, 400, "bad request")
+		return
+	}
+	e, ok := s.ledgerSvc.WithdrawHold(id)
 	if !ok {
 		response.Error(c, 404, 404, "withdraw hold not found")
 		return
@@ -375,26 +458,11 @@ func (s *Server) handleWithdrawFinalize(c *gin.Context) {
 		response.Error(c, 409, 409, "withdraw hold cancelled")
 		return
 	}
-	if time.Now().Before(e.HoldUntil) {
-		response.Error(c, 409, 409, "withdraw hold in cooling period")
+	if err := s.ledgerSvc.CancelWithdrawHold(id); err != nil {
+		response.Error(c, 409, 409, err.Error())
 		return
 	}
-	ev, berr := s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain), e.Amount, e.Fee, e.Address, false)
-	if berr != nil {
-		response.Error(c, 502, 502, "broadcast failed: "+berr.Error())
-		return
-	}
-	if _, ferr := s.ledgerSvc.FinalizeWithdrawHold(req.HoldID); ferr != nil {
-		response.Error(c, 409, 409, ferr.Error())
-		return
-	}
-	response.JSON(c, gin.H{
-		"status":  "finalized",
-		"hold_id": e.ID,
-		"tx_hash": ev.TxHash,
-		"amount":  ev.Amount,
-		"fee":     ev.Fee,
-	})
+	response.JSON(c, gin.H{"status": "rejected", "hold_id": id})
 }
 
 // handleWithdrawCancel 撤销一笔未清算的提现：退回冻结资金到可用。
@@ -496,15 +564,15 @@ func (s *Server) handleWithdrawAddressAdd(c *gin.Context) {
 		return
 	}
 	response.JSON(c, gin.H{
-		"status":          "registered",
-		"user_id":         addr.UserID,
-		"asset":           addr.Asset,
-		"chain":           addr.Chain,
-		"address":         addr.Address,
-		"label":           addr.Label,
-		"verified":        addr.Verified,
-		"verify_until":    addr.VerifyUntil.Unix(),
-		"verify_seconds":  int(addr.VerifyUntil.Sub(time.Now()).Seconds()),
+		"status":         "registered",
+		"user_id":        addr.UserID,
+		"asset":          addr.Asset,
+		"chain":          addr.Chain,
+		"address":        addr.Address,
+		"label":          addr.Label,
+		"verified":       addr.Verified,
+		"verify_until":   addr.VerifyUntil.Unix(),
+		"verify_seconds": int(addr.VerifyUntil.Sub(time.Now()).Seconds()),
 	})
 }
 

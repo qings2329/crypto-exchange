@@ -13,6 +13,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/pkg/es"
 	"github.com/coldlar/crypto-exchange/internal/pkg/influxdb"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 	"github.com/coldlar/crypto-exchange/internal/ws"
@@ -25,6 +26,7 @@ type Server struct {
 	market      *Market
 	hub         *ws.Hub
 	demoSymbols []string
+	indexer     es.TradeIndexer // 可选：成交检索引擎（ES）；nil 时仅用内存
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -53,6 +55,15 @@ func NewServer(cfg *config.Config, log *zap.Logger) *Server {
 			zap.String("url", cfg.InfluxDB.URL), zap.String("bucket", cfg.InfluxDB.Bucket))
 	} else {
 		s.log.Info("market kline persistence: in-memory only (no influxdb configured)")
+	}
+	// 成交检索（T-16）：配置了 ES 则把每笔成交索引入 ES，支持历史成交检索；
+	// 未配置则仅用内存（fail-degraded，检索端点降级为内存近期成交）。
+	if cfg.ES.URL != "" {
+		s.indexer = es.New(cfg.ES.URL, cfg.ES.Index)
+		s.log.Info("market trade search: elasticsearch",
+			zap.String("url", cfg.ES.URL), zap.String("index", cfg.ES.Index))
+	} else {
+		s.log.Info("market trade search: in-memory only (no elasticsearch configured)")
 	}
 	s.startSource()
 	return s
@@ -153,6 +164,26 @@ func (s *Server) applyTrade(ev mq.TradeEvent) {
 			s.hub.Broadcast(ev.Symbol, gin.H{"type": "kline", "symbol": ev.Symbol, "data": c})
 		}
 	}
+	// 成交检索（T-16）：异步把成交索引入 ES（best-effort，失败仅记录不阻断行情）。
+	if s.indexer != nil {
+		doc := es.TradeDoc{
+			Symbol:    ev.Symbol,
+			Price:     ev.Price,
+			Qty:       ev.Qty,
+			TakerID:   ev.TakerID,
+			MakerID:   ev.MakerID,
+			TakerSide: ev.TakerSide,
+			Value:     ev.Price * ev.Qty,
+			Ts:        ev.Ts,
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := s.indexer.Index(ctx, doc); err != nil {
+				s.log.Warn("es index trade failed", zap.String("symbol", ev.Symbol), zap.Error(err))
+			}
+		}()
+	}
 }
 
 // applyDepth 聚合一份深度快照并广播 depth 类 WebSocket 消息。
@@ -199,6 +230,7 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 	r.GET("/api/v1/market/ticker", s.handleTicker)
 	r.GET("/api/v1/market/depth", s.handleDepth)
 	r.GET("/api/v1/market/trades", s.handleTrades)
+	r.GET("/api/v1/market/trades/search", s.handleTradeSearch)
 	r.GET("/api/v1/market/klines", s.handleKlines)
 }
 
@@ -254,6 +286,48 @@ func (s *Server) handleTrades(c *gin.Context) {
 	}
 	limit := atoiDefault(c.Query("limit"), 50)
 	c.JSON(200, s.market.RecentTrades(sym, limit))
+}
+
+// handleTradeSearch 按条件检索成交历史（T-16 / ES）：支持 symbol / 买卖方向 / 时间窗 / 条数。
+// 配置了 ES 时走全量历史检索（按 ts 降序）；未配置时降级为内存近期成交（按 symbol 过滤），
+// 保证检索端点始终可用（fail-degraded）。
+func (s *Server) handleTradeSearch(c *gin.Context) {
+	q := es.TradeQuery{
+		Symbol: c.Query("symbol"),
+		Side:   c.Query("side"),
+		Limit:  atoiDefault(c.Query("limit"), 100),
+	}
+	if v, err := strconv.ParseInt(c.Query("from"), 10, 64); err == nil {
+		q.From = v
+	}
+	if v, err := strconv.ParseInt(c.Query("to"), 10, 64); err == nil {
+		q.To = v
+	}
+
+	if s.indexer == nil {
+		// 降级：未配置 ES 时返回内存近期成交（按 symbol 过滤；无 symbol 则要求必填）。
+		if q.Symbol == "" {
+			c.JSON(400, gin.H{"error": "symbol required (ES not enabled: full search unavailable)"})
+			return
+		}
+		rt := s.market.RecentTrades(q.Symbol, q.Limit)
+		out := make([]es.TradeDoc, 0, len(rt))
+		for _, t := range rt {
+			out = append(out, es.TradeDoc{
+				Symbol: t.Symbol, Price: t.Price, Qty: t.Qty,
+				TakerSide: t.Side, Ts: t.Ts, Value: t.Price * t.Qty,
+			})
+		}
+		c.JSON(200, out)
+		return
+	}
+
+	docs, err := s.indexer.Search(c.Request.Context(), q)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, docs)
 }
 
 // handleKlines 返回某交易对某周期的 K 线序列（已收盘历史 + 当前未收盘根，按 open_time 升序）。

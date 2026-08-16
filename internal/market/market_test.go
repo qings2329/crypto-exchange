@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/coldlar/crypto-exchange/internal/pkg/es"
 	"github.com/coldlar/crypto-exchange/internal/pkg/influxdb"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
+	"github.com/coldlar/crypto-exchange/internal/ws"
 )
 
 func TestApplyTrade(t *testing.T) {
@@ -435,5 +437,99 @@ func TestKlinesNilStoreNoPanic(t *testing.T) {
 	// limit 远超内存上限，但 Store 为 nil -> 仅返回内存 2 根，不报错不阻塞。
 	if got := m.Klines("BTCUSDT", "1m", 100000); len(got) != 2 {
 		t.Fatalf("nil store should return in-memory only, got %d", len(got))
+	}
+}
+
+// fakeTradeIndexer 是内存版 TradeIndexer，用于验证 market 的成交索引触发与检索端点降级。
+type fakeTradeIndexer struct {
+	mu     sync.Mutex
+	indexed []es.TradeDoc
+}
+
+func (f *fakeTradeIndexer) Index(_ context.Context, doc es.TradeDoc) error {
+	f.mu.Lock()
+	f.indexed = append(f.indexed, doc)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeTradeIndexer) Search(_ context.Context, q es.TradeQuery) ([]es.TradeDoc, error) {
+	f.mu.Lock()
+	out := make([]es.TradeDoc, 0, len(f.indexed))
+	for _, d := range f.indexed {
+		if q.Symbol != "" && d.Symbol != q.Symbol {
+			continue
+		}
+		if q.Side != "" && d.TakerSide != q.Side {
+			continue
+		}
+		out = append(out, d)
+	}
+	f.mu.Unlock()
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+func (f *fakeTradeIndexer) Close() error { return nil }
+
+func (f *fakeTradeIndexer) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.indexed)
+}
+
+// TestApplyTradeIndexesToES 验证每笔成交触发 Index（经后台 goroutine），且不影响内存聚合。
+func TestApplyTradeIndexesToES(t *testing.T) {
+	idx := &fakeTradeIndexer{}
+	s := &Server{market: NewMarket(), hub: ws.NewHub(), indexer: idx}
+
+	s.applyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 50000, Qty: 2, TakerSide: "buy", Ts: 1})
+	s.applyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 51000, Qty: 3, TakerSide: "sell", Ts: 2})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if idx.count() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if idx.count() != 2 {
+		t.Fatalf("expected 2 indexed trades, got %d", idx.count())
+	}
+}
+
+// TestHandleTradeSearchDegraded 验证未配置 ES（indexer=nil）时检索端点降级为内存近期成交。
+func TestHandleTradeSearchDegraded(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	m := NewMarket()
+	m.ApplyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 100, Qty: 2, TakerSide: "buy", Ts: 60000})
+	m.ApplyTrade(mq.TradeEvent{Symbol: "BTCUSDT", Price: 120, Qty: 3, TakerSide: "sell", Ts: 61000})
+	s := &Server{market: m} // indexer 为 nil -> 降级
+
+	// 缺 symbol 时应 400。
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/api/v1/market/trades/search", nil)
+	s.handleTradeSearch(c)
+	if w.Code != 400 {
+		t.Fatalf("missing symbol should be 400, got %d", w.Code)
+	}
+
+	// 带 symbol 应返回内存近期成交（2 条）。
+	w2 := httptest.NewRecorder()
+	c2, _ := gin.CreateTestContext(w2)
+	c2.Request, _ = http.NewRequest("GET", "/api/v1/market/trades/search?symbol=BTCUSDT", nil)
+	s.handleTradeSearch(c2)
+	if w2.Code != 200 {
+		t.Fatalf("search degraded should be 200, got %d", w2.Code)
+	}
+	var body []es.TradeDoc
+	if err := json.Unmarshal(w2.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(body) != 2 {
+		t.Fatalf("expected 2 degraded trades, got %d", len(body))
 	}
 }
