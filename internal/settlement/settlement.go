@@ -161,6 +161,7 @@ func (g *MockChainGateway) Start() {
 		return
 	}
 	g.started = true
+	g.stop = make(chan struct{}) // 重建，避免复用 Stop 已关闭的 stop（否则再次 Start 失效、再次 Stop panic）
 	g.mu.Unlock()
 	go func() {
 		ticker := time.NewTicker(g.interval)
@@ -602,6 +603,7 @@ func (g *MockWithdrawGateway) Start() {
 		return
 	}
 	g.started = true
+	g.stop = make(chan struct{}) // 重建，避免复用 Stop 已关闭的 stop（否则再次 Start 失效、再次 Stop panic）
 	g.mu.Unlock()
 	go func() {
 		ticker := time.NewTicker(g.interval)
