@@ -76,6 +76,11 @@ type UnsignedTx struct {
 	UTXOs         []UTXO `yaml:"utxos"`
 	ChangeAddress string `yaml:"change_address"`
 	FeeRatePerKB  uint64 `yaml:"fee_rate_per_kb"`
+	// 以下为 TRON 真实签名所需字段：ContractAddress 非空时走 TriggerSmartContract（TRC20
+	// transfer 合约调用），为空时走 TransferContract（TRX 原生转账）；FeeLimit 为合约调用
+	// 的 energy 费用上限（sun，0→不设）。非 TRON 链忽略这些字段。
+	ContractAddress string `yaml:"contract_address"`
+	FeeLimit        uint64 `yaml:"fee_limit"`
 }
 
 // Signer 离线签名边界：在热钱包 / HSM / 安全 enclave 内对交易签名，返回已签名的 raw
@@ -102,11 +107,18 @@ type ETHStateSource interface {
 	GasPrice(ctx context.Context, chain Chain) (uint64, error)
 }
 
-// SignerSources 是离线签名器可选的「外部状态源」集合：BTC 的 UTXO 源、ETH 的 Nonce/Gas 源。
-// 均为可选；未注入时签名器按 UnsignedTx 内联字段 / 配置默认值兜底（fail-degraded）。
+// SignerSources 是离线签名器可选的「外部状态源」集合：BTC 的 UTXO 源、ETH 的 Nonce/Gas 源、
+// TRON 的参考区块源。均为可选；未注入时签名器按 UnsignedTx 内联字段 / 配置默认值兜底（fail-degraded）。
 type SignerSources struct {
 	UTXOSource UTXOSource     // BTC 真实签名按自身地址向节点查询未花费输出（listunspent）。
 	ETHState   ETHStateSource // ETH 真实 Nonce/Gas 管理（eth_getTransactionCount / eth_gasPrice）。
+	TRONState  TRONStateSource // TRON 真实签名取参考区块/时间戳（getnowblock），签名哈希源。
+}
+
+// TRONStateSource 提供 TRON 真实签名所需的参考区块信息（节点不可达返回错误，由签名器回退
+// 节点侧签名广播，fail-degraded）。NowBlock 返回区块号、区块哈希 hex（32 字节）、区块时间戳(ms)。
+type TRONStateSource interface {
+	NowBlock(ctx context.Context, chain Chain) (blockNum int64, blockID string, timestampMs int64, err error)
 }
 
 // NewSignerWithSource 同 NewSigner，但为真实签名器注入可选外部状态源（BTC UTXO 源 / ETH
@@ -249,10 +261,11 @@ func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, a
 	}
 }
 
-// SendRaw 广播一笔已离线签名的原始交易（raw hex），返回交易哈希（离线签名边界主路径）。
+// SendRaw 广播一笔已离线签名的原始交易，返回交易哈希（离线签名边界主路径）。
 //   - ETH：eth_sendRawTransaction（rawHex）。
 //   - BTC：sendrawtransaction（rawHex）。
-//   - TRON：需带签名的 triggerconstantcontract，脚手架返回错误（生产接离线签名后的合约调用）。
+//   - TRON：POST 整笔已签交易 JSON（含 raw_data / txID / signature）到 /wallet/broadcasttransaction，
+//     解析响应 txid。rawHex 此处为 signTRON 返回的广播 JSON 字符串。
 func (c *JSONRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string) (string, error) {
 	switch chain {
 	case ChainETH:
@@ -268,10 +281,78 @@ func (c *JSONRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string)
 		}
 		return string(bytes.Trim(res, `"`)), nil
 	case ChainTRON:
-		return "", fmt.Errorf("tron offline raw broadcast requires triggerconstantcontract with signature (production)")
+		body := []byte(rawHex)
+		if !json.Valid(body) {
+			return "", fmt.Errorf("tron SendRaw 需要 signTRON 返回的广播 JSON 字符串")
+		}
+		resp, err := c.post(ctx, chain, "/wallet/broadcasttransaction", body)
+		if err != nil {
+			return "", err
+		}
+		var out struct {
+			Result  bool   `json:"result"`
+			Txid    string `json:"txid"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(resp, &out); err != nil {
+			return "", fmt.Errorf("tron 广播响应解析失败: %w", err)
+		}
+		if !out.Result {
+			return "", fmt.Errorf("tron 广播被拒: code=%s message=%s", out.Code, out.Message)
+		}
+		return out.Txid, nil
 	default:
 		return "", fmt.Errorf("unsupported chain %s", chain)
 	}
+}
+
+// post 向链端点（TRON 的 REST 风格路径）发起 JSON 请求体 POST，返回响应体字节。
+// 与 rpc（JSON-RPC POST）互补；TRON 的 getnowblock / broadcasttransaction 用此路径式接口。
+func (c *JSONRPCClient) post(ctx context.Context, chain Chain, path string, body []byte) ([]byte, error) {
+	url := c.endpoints[string(chain)]
+	if url == "" {
+		return nil, fmt.Errorf("no rpc endpoint configured for chain %s", chain)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return io.ReadAll(resp.Body)
+}
+
+// NowBlock 查询 TRON 当前参考区块（getnowblock）：返回区块号、区块哈希（32 字节 hex）、
+// 区块时间戳(ms)。离线签名器据此构造 ref_block_bytes / ref_block_hash / 过期时间。
+func (c *JSONRPCClient) NowBlock(ctx context.Context, chain Chain) (int64, string, int64, error) {
+	if chain != ChainTRON {
+		return 0, "", 0, fmt.Errorf("NowBlock only supported for TRON (got %s)", chain)
+	}
+	resp, err := c.post(ctx, chain, "/wallet/getnowblock", []byte("{}"))
+	if err != nil {
+		return 0, "", 0, err
+	}
+	var r struct {
+		BlockID string `json:"blockID"`
+		BlockHeader struct {
+			RawData struct {
+				Number    int64 `json:"number"`
+				Timestamp int64 `json:"timestamp"`
+			} `json:"raw_data"`
+		} `json:"block_header"`
+	}
+	if err := json.Unmarshal(resp, &r); err != nil {
+		return 0, "", 0, fmt.Errorf("tron 区块解析失败: %w", err)
+	}
+	if r.BlockID == "" {
+		return 0, "", 0, fmt.Errorf("tron 区块 blockID 为空")
+	}
+	return r.BlockHeader.RawData.Number, r.BlockID, r.BlockHeader.RawData.Timestamp, nil
 }
 
 // Nonce 查询 ETH 账户当前交易计数（"pending"：含内存池未确认，避免重放/碰撞）。用于真实
@@ -517,6 +598,9 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 		}
 		if _, ok := conf.Endpoints[string(ChainETH)]; ok {
 			sources.ETHState = client // *JSONRPCClient 实现 ETHStateSource
+		}
+		if _, ok := conf.Endpoints[string(ChainTRON)]; ok {
+			sources.TRONState = client // *JSONRPCClient 实现 TRONStateSource（getnowblock）
 		}
 		return &RPCWithdrawGateway{
 			MockWithdrawGateway: mg,
