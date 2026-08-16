@@ -189,6 +189,94 @@ func TestSettleNotExpiredSkips(t *testing.T) {
 	}
 }
 
+func TestExerciseIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	c := mustContract(svc, 1000, time.Now().Add(time.Hour)) // american, 可随时行权
+	const uid = int64(1)
+	p, _ := svc.OpenPosition(uid, c.ID, SideLong, 1)
+
+	if err := svc.Exercise(uid, p.ID); err != nil {
+		t.Fatalf("exercise#1: %v", err)
+	}
+	// 第二次行权应被终态短路，不重复吐钱。
+	if err := svc.Exercise(uid, p.ID); err != ErrAlreadySettled {
+		t.Fatalf("exercise#2: expected ErrAlreadySettled, got %v", err)
+	}
+	// 收益只结算一次：可用 = 100000 - 1000(权利金) + 9000(payoff) = 108000。
+	avail, _, _ := l.Balance(uid, "USDT")
+	if !eqAmt(avail, 108000, "USDT") {
+		t.Fatalf("exercise not idempotent: avail=%v want 108000", avail)
+	}
+	got, _ := svc.GetPosition(p.ID)
+	if got.Status != StatusExercised {
+		t.Fatalf("expected exercised, got %s", got.Status)
+	}
+}
+
+func TestSettleLongIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	c := mustContract(svc, 1000, time.Now().Add(-time.Hour)) // 已到期
+	const uid = int64(1)
+	p, _ := svc.OpenPosition(uid, c.ID, SideLong, 1)
+
+	settled, err := svc.SettlePosition(p.ID)
+	if err != nil || !settled {
+		t.Fatalf("settle#1: settled=%v err=%v", settled, err)
+	}
+	// 第二次结算应终态短路。
+	settled, err = svc.SettlePosition(p.ID)
+	if err != nil || settled {
+		t.Fatalf("settle#2: expected (false,nil), got settled=%v err=%v", settled, err)
+	}
+	// 收益只结算一次：可用 = 108000。
+	avail, _, _ := l.Balance(uid, "USDT")
+	if !eqAmt(avail, 108000, "USDT") {
+		t.Fatalf("settle not idempotent: avail=%v want 108000", avail)
+	}
+}
+
+func TestSettleShortIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	c := mustContract(svc, 1000, time.Now().Add(-time.Hour)) // 已到期
+	const uid = int64(2)
+	p, _ := svc.OpenPosition(uid, c.ID, SideShort, 1) // margin=12000
+
+	settled, err := svc.SettlePosition(p.ID)
+	if err != nil || !settled {
+		t.Fatalf("settle#1: settled=%v err=%v", settled, err)
+	}
+	settled, err = svc.SettlePosition(p.ID)
+	if err != nil || settled {
+		t.Fatalf("settle#2: expected (false,nil), got settled=%v err=%v", settled, err)
+	}
+	// 只结算一次：可用 = 100000 - 12000(冻结) + 1000(权利金) + 12000(解冻) - 10000(损失) = 91000。
+	avail, frozen, _ := l.Balance(uid, "USDT")
+	if !eqAmt(avail, 91000, "USDT") {
+		t.Fatalf("short settle not idempotent: avail=%v want 91000", avail)
+	}
+	if frozen.Sign() > 0 {
+		t.Fatalf("short margin not released: %v", frozen)
+	}
+}
+
+func TestOpenLongTransferFailureRollsBack(t *testing.T) {
+	svc, l := newTestService()
+	c := mustContract(svc, 1000, time.Now().Add(time.Hour))
+	const uid = int64(1)
+	// 把余额压到不足，触发资金不足路径，验证不残留持仓。
+	if avail, _, _ := l.Balance(uid, "USDT"); avail.Sign() > 0 {
+		_ = l.Transfer(uid, ledger.SysBadDebt, "USDT", avail, "drain", "test-drain")
+	}
+	if _, err := svc.OpenPosition(uid, c.ID, SideLong, 2); err == nil {
+		t.Fatal("expected insufficient balance error")
+	}
+	// 余额不足时不应创建任何持仓。
+	positions, _ := svc.ListPositions(uid)
+	if len(positions) != 0 {
+		t.Fatalf("rollback left %d stale positions: %+v", len(positions), positions)
+	}
+}
+
 func TestQuoteRejectsMissingPrice(t *testing.T) {
 	svc, _ := newTestService()
 	// ETH 不在 priceFn 中（无行情），premium 显式给定以通过创建。

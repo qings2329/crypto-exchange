@@ -134,6 +134,10 @@ func (s *Service) Quote(contractID int64) (premium, delta float64, err error) {
 }
 
 // OpenPosition 开仓：long 买方支付权利金，short 卖方收权利金并冻结保证金。
+//
+// 幂等设计（与 otc 一致）：先持久化持仓（StatusOpen），再动账本资金；
+// 任一资金动作失败则回滚（删除持仓/解冻），确保「不会出现已扣费却无持仓」，
+// 也不会对同一次开仓重复扣费。s.mu 串行化开仓以避免并发重复扣费。
 func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quantity float64) (*OptionPosition, error) {
 	if side != SideLong && side != SideShort {
 		return nil, ErrInvalidSide
@@ -141,61 +145,74 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	if quantity <= 0 {
 		return nil, ErrInvalidQuantity
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	c, err := s.store.GetContract(contractID)
 	if err != nil {
 		return nil, err
 	}
 	quote := c.QuoteAsset
+	dec := settlement.AssetDecimalsByName(quote)
 	premiumTotal := c.Premium * quantity
+	premiumAmt := settlement.AssetAmountFromFloat(premiumTotal, dec)
 
 	if side == SideLong {
 		avail, _, _ := s.ledger.Balance(userID, quote)
-		if avail.Cmp(settlement.AssetAmountFromFloat(premiumTotal, settlement.AssetDecimalsByName(quote))) < 0 {
+		if avail.Cmp(premiumAmt) < 0 {
 			return nil, ErrInsufficientBalance
 		}
-		// 买方支付权利金给系统对手方。
-		ref := fmt.Sprintf("option_open_long uid=%d cid=%d", userID, contractID)
-		if err := s.ledger.Transfer(userID, ledger.SysOptions, quote, settlement.AssetAmountFromFloat(premiumTotal, settlement.AssetDecimalsByName(quote)), "option_premium", ref); err != nil {
-			return nil, fmt.Errorf("pay premium: %w", err)
-		}
-	} else {
-		margin := c.Strike * c.size() * quantity * s.cfg.MarginRatio
-		avail, _, _ := s.ledger.Balance(userID, quote)
-		if avail.Cmp(settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(quote))) < 0 {
-			return nil, ErrInsufficientBalance
-		}
-		// 卖方冻结保证金，并收取权利金（来自系统对手方）。
-		ref := fmt.Sprintf("option_open_short uid=%d cid=%d", userID, contractID)
-		if err := s.ledger.Freeze(userID, quote, settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(quote))); err != nil {
-			return nil, fmt.Errorf("freeze margin: %w", err)
-		}
-		if err := s.ledger.Transfer(ledger.SysOptions, userID, quote, settlement.AssetAmountFromFloat(premiumTotal, settlement.AssetDecimalsByName(quote)), "option_premium", ref); err != nil {
-			_ = s.ledger.Unfreeze(userID, quote, settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(quote)))
-			return nil, fmt.Errorf("receive premium: %w", err)
-		}
-		// 记录保证金（已冻结）。
+		// 先落持仓，再扣权利金；扣费失败回滚删除持仓。
 		p := &OptionPosition{
-			UserID: userID, ContractID: contractID, Side: SideShort, Quantity: quantity,
-			Premium: c.Premium, Margin: margin, Status: StatusOpen,
+			UserID: userID, ContractID: contractID, Side: SideLong, Quantity: quantity,
+			Premium: c.Premium, Margin: 0, Status: StatusOpen,
 		}
 		if err := s.store.UpsertPosition(p); err != nil {
 			return nil, err
 		}
+		ref := fmt.Sprintf("option_open_long uid=%d cid=%d pos=%d", userID, contractID, p.ID)
+		if err := s.ledger.Transfer(userID, ledger.SysOptions, quote, premiumAmt, "option_premium", ref); err != nil {
+			_ = s.store.DeletePosition(p.ID)
+			return nil, fmt.Errorf("pay premium: %w", err)
+		}
 		return p, nil
 	}
 
+	// short：冻结保证金并收取权利金（来自系统对手方）。
+	margin := c.Strike * c.size() * quantity * s.cfg.MarginRatio
+	marginAmt := settlement.AssetAmountFromFloat(margin, dec)
+	avail, _, _ := s.ledger.Balance(userID, quote)
+	if avail.Cmp(marginAmt) < 0 {
+		return nil, ErrInsufficientBalance
+	}
 	p := &OptionPosition{
-		UserID: userID, ContractID: contractID, Side: SideLong, Quantity: quantity,
-		Premium: c.Premium, Margin: 0, Status: StatusOpen,
+		UserID: userID, ContractID: contractID, Side: SideShort, Quantity: quantity,
+		Premium: c.Premium, Margin: margin, Status: StatusOpen,
 	}
 	if err := s.store.UpsertPosition(p); err != nil {
 		return nil, err
+	}
+	ref := fmt.Sprintf("option_open_short uid=%d cid=%d pos=%d", userID, contractID, p.ID)
+	if err := s.ledger.Freeze(userID, quote, marginAmt); err != nil {
+		_ = s.store.DeletePosition(p.ID)
+		return nil, fmt.Errorf("freeze margin: %w", err)
+	}
+	if err := s.ledger.Transfer(ledger.SysOptions, userID, quote, premiumAmt, "option_premium", ref); err != nil {
+		_ = s.ledger.Unfreeze(userID, quote, marginAmt)
+		_ = s.store.DeletePosition(p.ID)
+		return nil, fmt.Errorf("receive premium: %w", err)
 	}
 	return p, nil
 }
 
 // Exercise 由买方（long）主动行权（american 随时；european 需到期）。系统对手方支付内在价值收益。
+//
+// 幂等设计：先落终态（StatusExercised）再动账本资金；Transfer 失败则回滚状态，
+// 重试不会双付。s.mu 串行化以避免并发行权重复吐钱。
 func (s *Service) Exercise(userID, positionID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	p, err := s.store.GetPosition(positionID)
 	if err != nil {
 		return err
@@ -204,7 +221,7 @@ func (s *Service) Exercise(userID, positionID int64) error {
 		return ErrPositionNotFound
 	}
 	if p.Status != StatusOpen {
-		return ErrAlreadySettled
+		return ErrAlreadySettled // 终态短路：幂等
 	}
 	if p.Side != SideLong {
 		return ErrNotExercisable // 仅买方可主动行权，卖方在到期结算时处理
@@ -226,26 +243,40 @@ func (s *Service) Exercise(userID, positionID int64) error {
 	if payoff < 0 {
 		payoff = 0
 	}
+	// 先落终态，再动钱。
+	p.Status = StatusExercised
+	p.UpdatedAt = now
+	if err := s.store.UpsertPosition(p); err != nil {
+		return err
+	}
 	if payoff > 0 {
 		ref := fmt.Sprintf("option_exercise uid=%d pos=%d", userID, positionID)
 		if err := s.ledger.Transfer(ledger.SysOptions, userID, c.QuoteAsset, settlement.AssetAmountFromFloat(payoff, settlement.AssetDecimalsByName(c.QuoteAsset)), "option_payoff", ref); err != nil {
+			// 回滚：恢复 open 状态，等待重试/对账。
+			p.Status = StatusOpen
+			p.UpdatedAt = time.Now()
+			_ = s.store.UpsertPosition(p)
 			return fmt.Errorf("pay payoff: %w", err)
 		}
 	}
-	p.Status = StatusExercised
-	p.UpdatedAt = time.Now()
-	return s.store.UpsertPosition(p)
+	return nil
 }
 
 // SettlePosition 对到期且仍 open 的持仓做结算（long 获收益、short 承担义务）。
 // 未到期或价格缺失时安全跳过（返回 settled=false）。
+//
+// 幂等设计：先落终态（StatusExpired）再动账本资金；资金动作失败则回滚状态，
+// 重试不会双付/双退。s.mu 串行化以避免与手动行权/结算并发重复动钱。
 func (s *Service) SettlePosition(positionID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	p, err := s.store.GetPosition(positionID)
 	if err != nil {
 		return false, err
 	}
 	if p.Status != StatusOpen {
-		return false, nil
+		return false, nil // 终态短路：幂等
 	}
 	c, err := s.store.GetContract(p.ContractID)
 	if err != nil {
@@ -259,6 +290,15 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 		return false, nil // 无价格不结算，等下次循环
 	}
 	itvTotal := c.IntrinsicValue(spot) * p.Quantity
+	quote := c.QuoteAsset
+	dec := settlement.AssetDecimalsByName(quote)
+
+	// 先落终态。
+	p.Status = StatusExpired
+	p.UpdatedAt = time.Now()
+	if err := s.store.UpsertPosition(p); err != nil {
+		return false, err
+	}
 
 	if p.Side == SideLong {
 		payoff := itvTotal - p.PremiumTotal()
@@ -267,31 +307,38 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 		}
 		if payoff > 0 {
 			ref := fmt.Sprintf("option_settle_long pos=%d", positionID)
-			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, c.QuoteAsset, settlement.AssetAmountFromFloat(payoff, settlement.AssetDecimalsByName(c.QuoteAsset)), "option_payoff", ref); err != nil {
+			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, quote, settlement.AssetAmountFromFloat(payoff, dec), "option_payoff", ref); err != nil {
+				// 回滚：恢复 open 状态，等待重试/对账。
+				p.Status = StatusOpen
+				p.UpdatedAt = time.Now()
+				_ = s.store.UpsertPosition(p)
 				return false, fmt.Errorf("pay payoff: %w", err)
 			}
 		}
-	} else {
-		// 卖方：解冻保证金，并在保证金范围内承担内在价值义务（超出由系统已收权利金吸收）。
-		margin := p.Margin
-		if margin > 0 {
-			_ = s.ledger.Unfreeze(p.UserID, c.QuoteAsset, settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(c.QuoteAsset)))
-		}
-		pay := itvTotal
-		if pay > margin {
-			pay = margin
-		}
-		if pay > 0 {
-			ref := fmt.Sprintf("option_settle_short pos=%d", positionID)
-			if err := s.ledger.Transfer(p.UserID, ledger.SysOptions, c.QuoteAsset, settlement.AssetAmountFromFloat(pay, settlement.AssetDecimalsByName(c.QuoteAsset)), "option_loss", ref); err != nil {
-				return false, fmt.Errorf("pay loss: %w", err)
-			}
-		}
+		return true, nil
 	}
-	p.Status = StatusExpired
-	p.UpdatedAt = time.Now()
-	if err := s.store.UpsertPosition(p); err != nil {
-		return false, err
+
+	// 卖方：解冻保证金，并在保证金范围内承担内在价值义务（超出由系统已收权利金吸收）。
+	margin := p.Margin
+	if margin > 0 {
+		_ = s.ledger.Unfreeze(p.UserID, quote, settlement.AssetAmountFromFloat(margin, dec))
+	}
+	pay := itvTotal
+	if pay > margin {
+		pay = margin
+	}
+	if pay > 0 {
+		ref := fmt.Sprintf("option_settle_short pos=%d", positionID)
+		if err := s.ledger.Transfer(p.UserID, ledger.SysOptions, quote, settlement.AssetAmountFromFloat(pay, dec), "option_loss", ref); err != nil {
+			// 回滚：重新冻结保证金并恢复 open 状态。
+			if margin > 0 {
+				_ = s.ledger.Freeze(p.UserID, quote, settlement.AssetAmountFromFloat(margin, dec))
+			}
+			p.Status = StatusOpen
+			p.UpdatedAt = time.Now()
+			_ = s.store.UpsertPosition(p)
+			return false, fmt.Errorf("pay loss: %w", err)
+		}
 	}
 	return true, nil
 }

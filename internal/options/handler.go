@@ -16,14 +16,14 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 	api := r.Group("/api/v1/options")
 	api.Use(middleware.Auth(verifier))
 	{
-		api.POST("/contracts", s.handleCreateContract)
+			api.POST("/contracts", middleware.AdminGuard(), s.handleCreateContract)
 		api.GET("/contracts", s.handleListContracts)
 		api.GET("/quote", s.handleQuote)
 		api.POST("/positions", s.handleOpenPosition)
 		api.GET("/positions", s.handleListPositions)
-		api.GET("/admin/positions", s.handleAdminPositions)
+		api.GET("/admin/positions", middleware.AdminGuard(), s.handleAdminPositions)
 		api.POST("/exercise", s.handleExercise)
-		api.POST("/settle", s.handleSettle)
+		api.POST("/settle", middleware.AdminGuard(), s.handleSettle)
 	}
 }
 
