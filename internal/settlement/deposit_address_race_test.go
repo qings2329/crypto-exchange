@@ -14,6 +14,7 @@ func TestDepositAddrGenConcurrent(t *testing.T) {
 		t.Fatalf("NewDepositAddressGenerator: %v", err)
 	}
 	var wg sync.WaitGroup
+	t.Cleanup(func() { SetDepositAddressGenerator(nil) }) // 并发重配后还原，避免泄漏到后续用例
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {

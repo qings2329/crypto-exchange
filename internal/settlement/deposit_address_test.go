@@ -34,9 +34,10 @@ func deriveTestXPUB(t *testing.T) string {
 
 func setGenForTest(t *testing.T, g *DepositAddressGenerator) {
 	t.Helper()
-	prev := depositAddrGen.Load()
+	// 直接还原为已知的干净状态 nil，而非捕获的 prev：避免前序测试泄漏的全局生成器
+	// 经 prev 透传到后续用例（曾导致 TestGenerateHelpers 偶发失败）。
 	SetDepositAddressGenerator(g)
-	t.Cleanup(func() { SetDepositAddressGenerator(prev) })
+	t.Cleanup(func() { SetDepositAddressGenerator(nil) })
 }
 
 func TestDepositAddressHDDerivation(t *testing.T) {
@@ -141,9 +142,8 @@ func TestGenerateAddressRealWhenConfigured(t *testing.T) {
 
 func TestGenerateAddressFallbackUnconfigured(t *testing.T) {
 	// 确保全局为 nil（无生成器）→ 回退 mock 占位地址（兼容既有 TestGenerateHelpers 的 "ETH" 前缀断言）。
-	prev := depositAddrGen.Load()
 	SetDepositAddressGenerator(nil)
-	t.Cleanup(func() { SetDepositAddressGenerator(prev) })
+	t.Cleanup(func() { SetDepositAddressGenerator(nil) })
 
 	addr := GenerateAddress(1, ChainETH)
 	if len(addr) < 3 || addr[:3] != "ETH" {
@@ -205,8 +205,8 @@ func TestNewDepositAddressGeneratorInvalid(t *testing.T) {
 // TestConfigureDepositAddresses 覆盖配置驱动接线函数的各分支：未启用/空 xpub 不注册；
 // 启用且 xpub 合法→注册；xpub 非法→不 panic、不注册（fail-degraded）。
 func TestConfigureDepositAddresses(t *testing.T) {
-	prev := depositAddrGen.Load()
-	t.Cleanup(func() { SetDepositAddressGenerator(prev) })
+	// 还原为已知的干净状态 nil，避免向后续用例透传泄漏的全局生成器。
+	t.Cleanup(func() { SetDepositAddressGenerator(nil) })
 
 	xpub := deriveTestXPUB(t)
 
