@@ -629,6 +629,7 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
   - ETH：重算待签摘要 `keccak(RLP([nonce,gasPrice,gasLimit,to,value,data,chainID,0,0]))`，用签名 `(r,s)` 反推公钥，断言等于服务导出的公钥（节点据此可恢复发送方地址）；同时断言 `realSigner.address` 等于该公钥派生的 ETH 地址。
   - TRON：`txID==SHA256(raw_data)`；65 字节可恢复签名经 `ecdsa.RecoverCompact(txID)` 恢复出服务公钥；`owner_address` 等于该公钥派生的 TRON 地址。
   - 由此从密码学上证明：签名由该 HSM 密钥签出且有效，私钥始终未离开签名服务（离线签名边界隔离成立）。
+  - 部署与运维细则（构建/启动、环境变量、密钥轮换、监控告警、故障排查、回滚降级、安全 checklist）见独立文档 [HSM_DEPLOYMENT.md](HSM_DEPLOYMENT.md)。
 
 **剩余（T-03 收尾，生产部署动作）**：
 - 真实节点 URL、HSM/KMS 安全模块硬件接入（合规约束，依赖外部节点 + 硬件）：本仓库已内置**软件等价真实签名器**（`realSigner`：ETH/BTC/TRON 真实 secp256k1 签名）并把**实际签名原语抽离为可替换的 `KeySigner` 后端**。生产接入有两种等价路径：① **配置驱动**（推荐）：`SignerBackend="external"` + 环境变量 `HSM_KIND/HSM_ENDPOINT/HSM_API_KEY/HSM_PUBLIC_KEY` 指向内部签名服务，网关启动时按 `HSMConfig` 自动构造并注册真实后端，**无需手写 `RegisterExternalSigner`**；② **代码注入**：对非常规安全模块（aws-kms / pkcs11 等）用 `RegisterExternalSigner(keyID, backend)` 注册自定义 `KeySigner` 后端。两条路径私钥均永不离开安全模块，其余 settlement 代码不变；未配置则回退节点侧签名广播（fail-degraded）。`UnsignedTx` 的 `Data`/`UTXOs`/`ContractAddress`/`FeeLimit` 等已覆盖 ETH 合约调用 / BTC UTXO / TRON 合约调用的真实签名输入。
