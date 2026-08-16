@@ -276,3 +276,23 @@ go test -run TestDeployRealHMSSignAndVerify ./internal/settlement/
 - [ ] 监控覆盖「回退节点侧签名广播」告警；定期地址对账。
 - [ ] 密钥轮换流程（§7.2）演练过，旧实例保留至旧交易全部确认。
 - [ ] 多副本 + LB 高可用已部署（如需要）。
+
+## 11. 配套自动化测试
+
+以下测试使本文档的部署/运维声明可被持续验证（改代码或配置不致文档漂移）：
+
+- `internal/settlement/hsm_deployment_test.go`
+  - `TestSigningServiceHTTPContract` — §3.1 签名服务 HTTP 契约（`/sign` 的 rs/der 响应且均能恢复到服务公钥、`/pubkey`、`/health`、根路径 `/` 受理、非法 digest→400、错误方法→405）。
+  - `TestDeploymentGatewaySignsViaHSMService` — §3/§4/§6 主路径：按 `external`+`HSM_*` 构造网关自动注册后端，提现经「离线签名→SendRaw」，链上 raw 独立恢复到 HSM 公钥。
+  - `TestDeploymentGatewayFailDegradedWhenHSMDown` — §8/§9：HSM 不可达自动回退节点侧广播，提现不中断且不走 SendRaw。
+  - `TestDeploymentHSMUnreachableSignError` — HSM 不可达时 `Sign` 返回错误（驱动 fail-degraded）。
+  - `TestDeploymentKeyRotationChangesAddress` — §7.2：轮换公钥使派生地址改变且各自与公钥对应。
+- `internal/pkg/config/hsm_env_test.go`
+  - `TestLoadHSMEnvOverride` — §4：HSM 相关环境变量覆盖 YAML 默认值。
+
+运行：
+
+```bash
+go test -run 'TestSigningServiceHTTPContract|TestDeployment' ./internal/settlement/
+go test -run TestLoadHSMEnvOverride ./internal/pkg/config/
+```
