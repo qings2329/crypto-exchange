@@ -35,3 +35,53 @@
 
 ### 影响页面
 运营后台「提现审批」「充值/提现记录」相关页面。
+
+---
+
+## 2026-08-16 — admin 充提/用户列表「上游不可达」降级契约固定为「空数组 + X-Degraded 头」
+
+- **提交**：`cf2de73`（`fix(adminapi): listUsers 降级同构为空数组+统一 X-Degraded 头`）
+- **背景**：充提/用户列表实时聚合 futures / user 上游。早期实现在上游不可达时返回
+  `{"degraded":true,"items":[...]}` 的**对象**形态，而正常路径 `data` 是**数组**，前端需两套解析；
+  且曾返回过伪造示例记录（已在上轮修复）。本轮把降级契约统一为与正常路径同构。
+
+### 影响接口
+
+| 接口 | 正常（上游可达） | 降级（上游不可达） |
+|---|---|---|
+| `GET /api/admin/deposits` | `data` 为 `Deposit[]` 数组 | `data` 为 `[]`（空数组）+ 响应头 `X-Degraded: futures-unavailable` |
+| `GET /api/admin/withdrawals` | `data` 为 `Withdrawal[]` 数组 | `data` 为 `[]`（空数组）+ 响应头 `X-Degraded: futures-unavailable` |
+| `GET /api/admin/users` | `data` 为 `AdminUser[]` 数组 | `data` 为 `[]`（空数组）+ 响应头 `X-Degraded: user-unavailable` |
+
+- 降级时 `data` **始终为空数组**（与正常路径同构），不再返回 `degraded`/`items` 对象字段，杜绝前端 object/array 形态切换导致的解析失败。
+- 前端通过读取响应头 `X-Degraded` 判断是否降级，据此展示「数据暂不可用」横幅，而非依赖 body 内的标志位。
+- 降级**绝不返回伪造记录**，避免误导运营资金决策。
+
+### 前端适配要点
+1. 解析列表接口时统一按「`data` 是数组」处理，无需再判断 `degraded` 字段。
+2. 监听响应头 `X-Degraded`：若存在则提示用户上游服务暂不可用（数据可能为空），并禁止基于空列表做出任何资金结论。
+3. `X-Degraded` 仅作「降级提示」信号，不代表错误（HTTP 仍为 200）。
+
+---
+
+## 2026-08-16 — otc 资金安全修复（AdminGuard + 对账按资产拆分 + 定点化）
+
+- **提交**：`1cc89f1`（`fix(otc): 修复充值提币边界审查发现的高危资金安全问题（F1-F5b）`）
+- **背景**：边界审查发现 otc 存在高危资金安全问题，本轮修复：`F4` 争议裁决/管理端点缺鉴权、
+  `F1` 托管释放非幂等（双付/双退）、`F2` crypto 数量 float 派生、`F3` 对账只查默认资产桶、`F5b` 余额用 1e-9 容差。
+
+### 契约/行为影响
+
+| 接口 | 变更 |
+|---|---|
+| `POST /api/v1/otc/orders/:id/resolve` | **新增 `AdminGuard`**：必须由管理员 token 调用，否则返回 403（此前任意登录用户均可移动托管资金） |
+| `GET /api/v1/otc/admin/orders` | 新增 `AdminGuard`（403 若无管理员角色） |
+| `GET /api/v1/otc/admin/reconcile` | 新增 `AdminGuard`；响应 `escrow_balance` 由单个数字改为**按资产拆分的对象** `{ "BTC": 0, "USDT": 100 }` |
+| 订单 `crypto_amount` 字段 | 仍是 JSON 数字（内部改为定点 `AssetAmount` 存储，对外序列化不变） |
+
+- `resolve` 端点现在**仅管理员可调用**；前端若以普通用户身份调用将收到 403，需改用管理员会话。
+- `/admin/reconcile` 的 `escrow_balance` 由 `number` 变为 `map[string]number`（键为资产名），前端需按资产读取。
+- 释放/退回路径已幂等：对已完成订单重复 `resolve`/确认收款将安全短路，不会双付。
+
+### 迁移
+- `ce_otc_orders.crypto_amount` 由 `DOUBLE` 改为 `VARCHAR(64)`（精确存储定点字符串），迁移版本 `9604` 自动执行（向下兼容回退到 DOUBLE）。

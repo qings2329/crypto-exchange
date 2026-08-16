@@ -10,7 +10,8 @@ import (
 )
 
 // RegisterRoutes 在 gin 引擎上注册场外交易路由。
-// 业务路由受 middleware.Auth(verifier) 保护（需合法 HMAC Bearer Token）。
+// 普通业务路由受 middleware.Auth(verifier) 保护（需合法 HMAC Bearer Token）；
+// 争议裁决 /admin/orders /admin/reconcile 另加 middleware.AdminGuard()（仅管理员可调用，见 F4）。
 func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifier) {
 	api := r.Group("/api/v1/otc")
 	api.Use(middleware.Auth(verifier))
