@@ -56,7 +56,7 @@ type Coin struct {
 
 // Deposit 是充值记录（公链入账）。
 type Deposit struct {
-	ID     int64     `json:"id"`
+	ID     string    `json:"id"` // 真实链上标识（tx_hash），作为前端审批/对账锚点
 	UserID int64     `json:"user_id"`
 	Coin   string    `json:"coin"`
 	Chain  string    `json:"chain"`
@@ -68,7 +68,7 @@ type Deposit struct {
 
 // Withdrawal 是提币记录（需审核）。
 type Withdrawal struct {
-	ID      int64     `json:"id"`
+	ID      string    `json:"id"` // 真实 futures hold_id（字符串），审批路由直接以此为锚点
 	UserID  int64     `json:"user_id"`
 	Coin    string    `json:"coin"`
 	Chain   string    `json:"chain"`
@@ -137,23 +137,18 @@ type ServiceHealth struct {
 type Store struct {
 	mu sync.RWMutex
 
-	users       []AdminUser
-	deposits    []Deposit
-	withdrawals []Withdrawal
+	users []AdminUser
 
-	// 会话态：充值提币来自 futures 上游实时数据；下面映射仅用于在审批时把
-	// 前端使用的稳定数字 id（stableID）反查回 futures 的提现 hold_id，并缓存本次会话的审批结果。
-	wdByID      map[int64]Withdrawal
-	wdByHoldID  map[int64]string // stableID -> futures hold_id（审核真正落地到链上放行/退回的锚点，§25）
-	wdApprovals map[int64]string // id -> approved|rejected
+	// 会话态：充值提币来自 futures 上游实时数据。审批锚点直接采用 futures 返回的
+	// 真实 hold_id（字符串），不再经 stableID 哈希与服务端可变 map 反查，杜绝哈希碰撞/TOCTOU 导致的错审。
+	wdByID      map[string]Withdrawal // hold_id -> 记录（仅回显缓存，审批不依赖它）
+	wdApprovals map[string]string     // hold_id -> approved|rejected（本会话审批结果回显 + 终态短路）
 
 	risk   RiskSnapshot
 	ledger LedgerSummary
 	health []ServiceHealth
 
 	seqUser int64
-	seqDep  int64
-	seqWd   int64
 }
 
 // NewStore 构造并 seed 示例数据的管理态。
@@ -167,19 +162,10 @@ func NewStore() *Store {
 		{ID: 1003, Username: "carol", Email: "carol@x.com", Status: "frozen", KYC: "verified", Balance: 0, CreatedAt: now.Add(-24 * time.Hour)},
 	}
 	s.seqUser = 1003
-	// 充值提币（示例降级数据；上游可达时由 listDeposits/listWithdrawals 实时覆盖）。
-	s.deposits = []Deposit{
-		{ID: 1, UserID: 1001, Coin: "BTC", Chain: "Bitcoin", Amount: 0.5, TxHash: "0xabc...", Status: "confirmed", Time: now.Add(-5 * time.Hour)},
-		{ID: 2, UserID: 1002, Coin: "USDT", Chain: "Ethereum", Amount: 1000, TxHash: "0xdef...", Status: "pending", Time: now.Add(-1 * time.Hour)},
-	}
-	s.seqDep = 2
-	s.withdrawals = []Withdrawal{
-		{ID: 1, UserID: 1001, Coin: "BTC", Chain: "Bitcoin", Amount: 0.1, Address: "bc1xyz...", TxHash: "", Status: "pending", Time: now.Add(-30 * time.Minute)},
-	}
-	s.seqWd = 1
-	s.wdByID = map[int64]Withdrawal{}
-	s.wdByHoldID = map[int64]string{}
-	s.wdApprovals = map[int64]string{}
+	// 注意：不再 seed 伪造的充值/提现示例数据（发现 4）。上游 futures 不可达时，
+	// listDeposits/listWithdrawals 返回 degraded 空列表，避免向运营展示不存在的资金记录。
+	s.wdByID = map[string]Withdrawal{}
+	s.wdApprovals = map[string]string{}
 	// 风控快照
 	s.risk = RiskSnapshot{
 		UpdatedAt:      now,
