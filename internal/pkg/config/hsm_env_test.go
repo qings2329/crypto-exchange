@@ -55,3 +55,36 @@ func TestLoadHSMEnvOverride(t *testing.T) {
 		t.Fatalf("hsm.public_key 覆盖失败: %q", hw.HSM.PublicKey)
 	}
 }
+
+// TestLoadDepositXPUBOverride 验证 DEPOSIT_XPUB 环境变量覆盖 YAML 默认值（充值地址 HD 派生用的
+// 账户级 xpub 属敏感信息，经环境变量注入，不写进 configs/config.yaml）。
+func TestLoadDepositXPUBOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `settlement:
+  chain_rpc:
+    enabled: false
+    hot_wallet:
+      enabled: false
+      deposit:
+        enabled: false
+        xpub: ""
+        btc_address_type: "p2wpkh"
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+	t.Setenv("DEPOSIT_XPUB", "xpub6CRoJwNzGxgUQzqExampleDepositXpubForTestOnlyDoNotUseInProd")
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	dep := c.Settlement.ChainRPC.HotWallet.Deposit
+	if dep.XPUB != "xpub6CRoJwNzGxgUQzqExampleDepositXpubForTestOnlyDoNotUseInProd" {
+		t.Fatalf("deposit.xpub 覆盖失败: %q", dep.XPUB)
+	}
+	if dep.BTCAddressType != "p2wpkh" {
+		t.Fatalf("deposit.btc_address_type 应沿用 YAML 默认值 p2wpkh，got %q", dep.BTCAddressType)
+	}
+}

@@ -57,6 +57,10 @@ type HotWalletConfig struct {
 	// 自动构造并注册真实后端，无需部署方手写 RegisterExternalSigner）。敏感字段（endpoint
 	// 含访问凭据、public_key）经环境变量注入，不写进 configs/config.yaml。
 	HSM HSMConfig `yaml:"hsm"`
+	// Deposit 是「给用户生成充值地址」的 HD 派生配置：进程只持账户级 xpub（HSM 导出），
+	// 按 userID 非硬化派生子地址。未配置 → GenerateAddress 回退确定性 mock（fail-degraded）。
+	// 敏感 xpub 经环境变量 DEPOSIT_XPUB 注入，不写进 configs/config.yaml。
+	Deposit DepositConfig `yaml:"deposit"`
 }
 
 // UnsignedTx 是一笔待签名的提现交易（离线签名边界输入）。仅描述「要签什么」，不含私钥；
@@ -612,5 +616,7 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 			signer:              NewSignerWithSource(conf.HotWallet, sources),
 		}
 	}
+	// 离线签名边界未启用（纯 mock 网关）时也尝试装配 HD 充值地址派生（配置驱动）。
+	ConfigureDepositAddresses(conf.HotWallet.Deposit)
 	return NewMockWithdrawGateway(req, interval)
 }

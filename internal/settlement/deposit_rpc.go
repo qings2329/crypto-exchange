@@ -297,10 +297,14 @@ func NewDepositGateway(conf ChainRPCConfig) DepositGateway {
 		client := NewJSONRPCClient(conf.Endpoints)
 		mg := NewMockChainGateway(req, interval)
 		mg.confirmSource = client // 真实区块确认轮询；节点不可达自动回退模拟
+		// 装配 HD 充值地址派生（配置驱动；未配置则 GenerateAddress 回退 mock）。
+		ConfigureDepositAddresses(conf.HotWallet.Deposit)
 		return &RPCDepositGateway{
 			MockChainGateway: mg,
 			scanner:          NewJSONRPCDepositScanner(client, conf.WatchAddresses, interval),
 		}
 	}
+	// 纯 mock 网关也尝试装配 HD 充值地址派生（配置驱动）。
+	ConfigureDepositAddresses(conf.HotWallet.Deposit)
 	return NewMockChainGateway(req, interval)
 }

@@ -217,6 +217,11 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("HSM_PUBLIC_KEY"); v != "" {
 		c.Settlement.ChainRPC.HotWallet.HSM.PublicKey = v
 	}
+	// 充值地址 HD 派生用的账户级 xpub（HSM 内由 xprv 派生后导出）。属敏感信息，从环境变量
+	// 注入，不写进 configs/config.yaml（与 HSM_PUBLIC_KEY 同一模式）。未设置时沿用 YAML 默认值。
+	if v := os.Getenv("DEPOSIT_XPUB"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.Deposit.XPUB = v
+	}
 	return &c, nil
 }
 

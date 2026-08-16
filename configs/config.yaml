@@ -151,6 +151,15 @@ settlement:
         endpoint: ""      # 例：https://hsm.internal/sign（HSM_ENDPOINT 注入，可含鉴权凭据）
         api_key: ""       # 可选：作为 Bearer Token 注入 Authorization 头（HSM_API_KEY 注入）
         public_key: ""    # 设备导出的 secp256k1 公钥 hex（HSM_PUBLIC_KEY 注入）
+      # deposit：给用户生成充值地址的 HD 派生配置（进程只持公钥，私钥留 HSM）。
+      # xpub 是「账户/外部链级」扩展公钥（BIP44: m/44'/coin'/0'/0），由 HSM 内 xprv 经硬化层级
+      # 派生后导出；进程用它按 userID 做非硬化子派生，得到每用户独立的真实 ETH/BTC/TRON 地址。
+      # xpub 属敏感信息，经环境变量 DEPOSIT_XPUB 注入，不写进本文件（见 .env.example）。
+      # 未配置（enabled=false 或 xpub 为空）→ GenerateAddress 回退确定性 mock 占位地址（fail-degraded）。
+      deposit:
+        enabled: false
+        xpub: ""          # 账户/外部链级 xpub（base58，DEPOSIT_XPUB 注入）；空=未配置
+        btc_address_type: "p2wpkh"  # BTC 地址类型："p2wpkh"(bech32 bc1…) 或 "p2pkh"(base58 1…)
 
 # 行情 K 线持久化（T-16）：已收盘 K 线写入 InfluxDB（measurement "kline"），
 # 行情服务在内存环形缓冲（klineCap=500）之外可回取更长历史。
