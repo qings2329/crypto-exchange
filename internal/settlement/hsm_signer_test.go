@@ -85,13 +85,12 @@ func TestNewSignerHSM(t *testing.T) {
 	}
 }
 
-// TestRealSignerUnsupportedChain 验证 BTC/TRON 暂未实现，签名返回错误 → 网关回退节点侧广播。
+// TestRealSignerUnsupportedChain 验证 TRON 暂未实现，签名返回错误 → 网关回退节点侧广播。
+// （ETH/BTC 均已支持真实签名。）
 func TestRealSignerUnsupportedChain(t *testing.T) {
 	s, _ := newRealSigner(HotWalletConfig{SignerKey: knownVectorPriv})
-	for _, ch := range []Chain{ChainBTC, ChainTRON} {
-		if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ch, To: "x", Amount: 1}); err == nil {
-			t.Fatalf("chain %s should not be signable yet", ch)
-		}
+	if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: "x", Amount: 1}); err == nil {
+		t.Fatalf("chain TRON should not be signable yet")
 	}
 }
 

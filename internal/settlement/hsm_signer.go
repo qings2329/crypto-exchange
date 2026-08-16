@@ -31,18 +31,27 @@ func mustHex(s string) []byte {
 // 不出域；生产环境应把 Sign 内部改成调用 HSM/KMS 的签名 API（同样的 Signer 接口），私钥
 // 永不离开安全模块——这正是「离线签名边界」要隔离的东西。
 //
-// 当前支持 ETH（legacy / EIP-155）；BTC（UTXO + Nonce 管理）与 TRON（合约调用签名）为各自
-// 独立生产项，未实现时 Sign 返回错误，由网关回退节点侧签名广播（fail-degraded）。
+// 当前支持：
+//   - ETH（legacy / EIP-155）真实 RLP + Keccak-256 + ECDSA 签名；
+//   - BTC（P2PKH legacy + P2WPKH segwit）UTXO 选择 + 找零 + SIGHASH_ALL 真实签名。
+//
+// TRON（合约调用签名）仍为独立生产项；未实现时 Sign 返回错误，由网关回退节点侧签名广播（fail-degraded）。
 type realSigner struct {
 	priv           *secp256k1.PrivateKey
 	address        string // 由私钥派生的 ETH 地址（0x…），仅用于可观测/日志。
 	ethChainID     uint64
 	ethGasPriceWei uint64
 	ethGasLimit    uint64
+	utxoSource     UTXOSource // BTC UTXO 来源（可选；为空则用 UnsignedTx.UTXOs 内联提供）。
 }
 
 // newRealSigner 从配置解析私钥并构造真实签名器；私钥非法/长度不对返回错误（→ fail-degraded）。
 func newRealSigner(conf HotWalletConfig) (*realSigner, error) {
+	return newRealSignerWithSource(conf, nil)
+}
+
+// newRealSignerWithSource 在 newRealSigner 基础上注入可选 UTXO 源（BTC 真实签名查询用）。
+func newRealSignerWithSource(conf HotWalletConfig, source UTXOSource) (*realSigner, error) {
 	key := strings.TrimPrefix(conf.SignerKey, "0x")
 	b, err := hex.DecodeString(key)
 	if err != nil || len(b) != 32 {
@@ -55,6 +64,7 @@ func newRealSigner(conf HotWalletConfig) (*realSigner, error) {
 		ethChainID:     conf.EthChainID,
 		ethGasPriceWei: conf.EthGasPriceWei,
 		ethGasLimit:    conf.EthGasLimit,
+		utxoSource:     source,
 	}, nil
 }
 
@@ -63,9 +73,11 @@ func (s *realSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
 	switch tx.Chain {
 	case ChainETH:
 		return s.signETH(tx)
+	case ChainBTC:
+		return s.signBTC(tx)
 	default:
-		// BTC/TRON 各自的真实签名（UTXO/Nonce、TRON 合约）为独立生产项；未实现时回退节点侧广播。
-		return "", fmt.Errorf("realSigner 暂仅支持 ETH；链 %s 的真实签名需独立生产项（BTC UTXO/Nonce、TRON 合约）", tx.Chain)
+		// TRON 合约调用签名为独立生产项；未实现时由网关回退节点侧签名广播（fail-degraded）。
+		return "", fmt.Errorf("realSigner 暂支持 ETH/BTC；链 %s 的真实签名需独立生产项（TRON 合约调用）", tx.Chain)
 	}
 }
 
