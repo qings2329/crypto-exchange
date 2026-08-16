@@ -66,6 +66,12 @@ type UnsignedTx struct {
 	GasLimit    uint64 `yaml:"gas_limit"`
 	ChainID     uint64 `yaml:"chain_id"`
 	Data        []byte `yaml:"data"`
+	// 以下为 BTC 真实签名所需字段：UTXOs 为可选内联未花费输出（为空则签名器经 UTXOSource
+	// 按自身地址查询）；ChangeAddress 为找零脚本（hex 或 base58 地址，空→回签名者自身）；
+	// FeeRatePerKB 为手续费率（sat/kvB，0→默认 1000）。非 BTC 链忽略这些字段。
+	UTXOs         []UTXO `yaml:"utxos"`
+	ChangeAddress string `yaml:"change_address"`
+	FeeRatePerKB  uint64 `yaml:"fee_rate_per_kb"`
 }
 
 // Signer 离线签名边界：在热钱包 / HSM / 安全 enclave 内对交易签名，返回已签名的 raw
@@ -109,10 +115,10 @@ func (s *stubSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
 // DepositWatch 是「链上充值监听」的一条观察项：某链某地址归属某用户某资产。真实 RPC
 // 扫描器据此轮询节点，把命中地址的入账解析为 DepositEvent（含 userID 便于账本入账）。
 type DepositWatch struct {
-	Chain   Chain   `yaml:"chain"`
-	Address string  `yaml:"address"`
-	UserID  int64   `yaml:"user_id"`
-	Asset   string  `yaml:"asset"`
+	Chain   Chain  `yaml:"chain"`
+	Address string `yaml:"address"`
+	UserID  int64  `yaml:"user_id"`
+	Asset   string `yaml:"asset"`
 	// Token 是 TRC20 合约地址（仅 chain=TRON 时用于过滤对应代币）；空则默认 USDT-TRC20 主网合约。
 	Token string `yaml:"token"`
 }
@@ -179,6 +185,12 @@ func (c *JSONRPCClient) rpc(ctx context.Context, chain Chain, method string, par
 		return nil, fmt.Errorf("rpc error on %s: %s", method, out.Error.Message)
 	}
 	return out.Result, nil
+}
+
+// Call 是 rpc 的导出包装，供同包内的 UTXO 源等扩展按链发起任意 JSON-RPC 调用并取回
+// result（已剔除引号）；节点不可达/报错时返回错误（由调用方回退）。
+func (c *JSONRPCClient) Call(ctx context.Context, chain Chain, method string, params []interface{}) (json.RawMessage, error) {
+	return c.rpc(ctx, chain, method, params)
 }
 
 // Broadcast 按链映射节点方法广播提现并取回交易哈希。
@@ -248,6 +260,7 @@ type ConfirmSource interface {
 //     二者之差 +1 即确认数（交易未上链 blockNumber 为 null → 返回 0）。
 //   - BTC：getrawtransaction(txid, true) 的 confirmations 字段（未确认为 0）。
 //   - TRON：脚手架暂不支持，返回错误（生产补全）。
+//
 // 节点不可达由调用方回退到模拟确认（fail-degraded）。
 func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash string) (int, error) {
 	switch chain {
