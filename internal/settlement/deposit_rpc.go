@@ -140,11 +140,11 @@ func (s *JSONRPCDepositScanner) scanBTC(ctx context.Context, w DepositWatch) ([]
 	}
 	var body struct {
 		Transactions []struct {
-			TxID       string  `json:"txid"`
-			Address    string  `json:"address"`
-			Amount     float64 `json:"amount"`
-			Category   string  `json:"category"`
-			Confirmed  int     `json:"confirmations"`
+			TxID      string  `json:"txid"`
+			Address   string  `json:"address"`
+			Amount    float64 `json:"amount"`
+			Category  string  `json:"category"`
+			Confirmed int     `json:"confirmations"`
 		} `json:"transactions"`
 	}
 	if err := json.Unmarshal(res, &body); err != nil {
@@ -273,7 +273,7 @@ func (g *RPCDepositGateway) StartScan(ctx context.Context) {
 				if !ok {
 					return
 				}
-				if _, err := g.SubmitDeposit(ev.UserID, ev.Asset, ev.Chain, ev.Amount, ev.Address); err != nil {
+				if _, err := g.SubmitDepositWithHash(ev.UserID, ev.Asset, ev.Chain, ev.Amount, ev.Address, ev.TxHash); err != nil {
 					// 非法参数忽略；节点重复推送由 seen 去重，此处不会重复入账。
 					continue
 				}

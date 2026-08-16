@@ -305,9 +305,44 @@ func TestStartScanFeedsGateway(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("StartScan 应把扫描到的入账喂入网关，pending=%d", len(pending))
 	}
-	// 注意：网关 SubmitDeposit 不接收扫描事件的 TxHash（会自生成哈希），故此处校验业务字段；
-	// 扫描事件的真实 txHash 由扫描器 seen 去重，未透传到网关（设计观察点，见下）。
+	// txHash 透传改进：扫描到的真实链上 txHash 应保留，而非网关自生成哈希。
+	if pending[0].TxHash != "0xethtx1" {
+		t.Fatalf("StartScan 应透传扫描事件的真实 txHash，got %q", pending[0].TxHash)
+	}
 	if pending[0].UserID != 5 || pending[0].Amount != 1.0 || pending[0].Chain != ChainETH || pending[0].Address != "0xw" {
 		t.Fatalf("喂入的入账不符: %+v", pending[0])
+	}
+}
+
+// TestSubmitDepositWithHash 验证真实链上 txHash 透传：传入非空 txHash 时入账保留该哈希
+// （用于链上幂等/对账），为空时回退本地生成；pending 以 txHash 为键故重复提交幂等。
+func TestSubmitDepositWithHash(t *testing.T) {
+	g := NewMockChainGateway(2, time.Hour)
+
+	ev, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, 1.0, "0xw", "0xrealonchainhash")
+	if err != nil {
+		t.Fatalf("SubmitDepositWithHash: %v", err)
+	}
+	if ev.TxHash != "0xrealonchainhash" {
+		t.Fatalf("应保留传入的真实 txHash，got %q", ev.TxHash)
+	}
+
+	// 空 txHash 回退本地生成（非空且区别于传入值）。
+	ev2, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, 1.0, "0xw", "")
+	if err != nil || ev2.TxHash == "" || ev2.TxHash == "0xrealonchainhash" {
+		t.Fatalf("空 txHash 应回退本地生成，got err=%v hash=%q", err, ev2.TxHash)
+	}
+
+	// 重复提交同一 txHash → 幂等（pending 以 txHash 为键，不重复入账）。
+	if _, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, 1.0, "0xw", "0xrealonchainhash"); err != nil {
+		t.Fatalf("重复提交应成功: %v", err)
+	}
+	if len(g.Pending()) != 2 { // 仅两条不同 txHash（真实 + 回退生成）
+		t.Fatalf("重复 txHash 应幂等，pending=%d", len(g.Pending()))
+	}
+
+	// 非法参数仍拒绝。
+	if _, err := g.SubmitDepositWithHash(0, "ETH", ChainETH, 1.0, "0xw", "x"); err == nil {
+		t.Fatalf("zero user 应被拒绝")
 	}
 }
