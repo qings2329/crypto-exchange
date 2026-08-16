@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
 	"net/http"
 	"sort"
@@ -210,8 +209,9 @@ func (s *Server) listUsers(c *gin.Context) {
 	s.ok(c, s.store.users)
 }
 
-// enrichBalance 从 futures 钱包服务拉取该用户的 USDT 可用余额填入 AdminUser.Balance，
-// 消除用户列表中余额恒为 0 的问题（§19 已知缺口）。上游不可达/用户无钱包时静默留 0（fail-degraded）。
+// enrichBalance 从 futures 钱包服务拉取该用户的 USDT 可用余额填入 AdminUser.Balance 展示字段
+// （§19 已知缺口：此前余额恒为 0）。注意：该字段语义仅为「USDT 可用余额」，并非用户总资产；
+// 属展示层、不进入任何资金路径，故硬编码 USDT 无资金安全后果（对应 futuresapi F3 的展示版）。
 func (s *Server) enrichBalance(ctx context.Context, u *AdminUser) {
 	fb := s.serviceURL("futures")
 	if fb == "" {
@@ -238,6 +238,12 @@ func (s *Server) createUser(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		s.fail(c, http.StatusBadRequest, "invalid body")
+		return
+	}
+	// 发现 7：余额初始化不经由本端点（须经受控充值/调账流程且用 AssetAmount 包装），
+	// 显式拒绝携带 balance 的请求，避免静默忽略入参造成「已初始化」的误判。
+	if req.Balance != 0 {
+		s.fail(c, http.StatusBadRequest, "balance initialization not supported via this endpoint")
 		return
 	}
 	target := req.Email
@@ -502,8 +508,8 @@ func (s *Server) listDeposits(c *gin.Context) {
 			out := make([]Deposit, 0, len(resp.Deposits))
 			for _, d := range resp.Deposits {
 				out = append(out, Deposit{
-					ID:     stableID(d.TxHash, strconv.FormatInt(d.UserID, 10), d.Asset, d.Chain),
-					UserID: d.UserID,
+				ID:     d.TxHash, // 真实链上标识直接作锚点，不再经 stableID 哈希
+				UserID: d.UserID,
 					Coin:   d.Asset,
 					Chain:  d.Chain,
 					Amount: d.Amount,
@@ -516,10 +522,8 @@ func (s *Server) listDeposits(c *gin.Context) {
 			return
 		}
 	}
-	// 上游不可达：降级为内存示例数据。
-	s.store.mu.RLock()
-	defer s.store.mu.RUnlock()
-	s.ok(c, s.store.deposits)
+	// 上游不可达：返回 degraded 空列表，不返回伪造记录（发现 4），避免误导运营资金决策。
+	s.ok(c, gin.H{"degraded": true, "items": []Deposit{}, "note": "futures 不可达，充提数据暂不可用"})
 }
 
 // futuresHolds 是 futures 提现冷静期 hold 队列的返回结构（含真实 hold_id，审核的真正锚点）。
@@ -545,10 +549,9 @@ func (s *Server) listWithdrawals(c *gin.Context) {
 		var resp futuresHolds
 		if err := s.up.Get(ctx, base, "/api/v1/futures/wallet/withdraw/holds", &resp); err == nil {
 			s.store.mu.Lock()
-			s.store.wdByHoldID = make(map[int64]string, len(resp.Holds))
 			out := make([]Withdrawal, 0, len(resp.Holds))
 			for _, h := range resp.Holds {
-				id := stableID(h.ID, strconv.FormatInt(h.UserID, 10), h.Asset, h.Address)
+				id := h.ID // 真实 hold_id（字符串），直接作审批锚点，不再经 stableID 哈希/服务端 map 反查
 				status := "pending"
 				if h.Finalized {
 					status = "approved"
@@ -570,7 +573,6 @@ func (s *Server) listWithdrawals(c *gin.Context) {
 					Time:    h.CreatedAt,
 				}
 				s.store.wdByID[id] = rec
-				s.store.wdByHoldID[id] = h.ID
 				out = append(out, rec)
 			}
 			s.store.mu.Unlock()
@@ -578,10 +580,8 @@ func (s *Server) listWithdrawals(c *gin.Context) {
 			return
 		}
 	}
-	// 上游不可达：降级为内存示例数据。
-	s.store.mu.RLock()
-	defer s.store.mu.RUnlock()
-	s.ok(c, s.store.withdrawals)
+	// 上游不可达：返回 degraded 空列表，不返回伪造记录（发现 4），避免误导运营资金决策。
+	s.ok(c, gin.H{"degraded": true, "items": []Withdrawal{}, "note": "futures 不可达，充提数据暂不可用"})
 }
 
 // approveWithdrawal 管理员审批通过一笔提现：反查 futures hold_id 后真正调用 futures 审批
@@ -596,11 +596,11 @@ func (s *Server) rejectWithdrawal(c *gin.Context) {
 	s.doWithdrawalReview(c, "rejected", "/api/v1/futures/wallet/withdraw/reject/")
 }
 
-// doWithdrawalReview 反查前端 stableID 对应的 futures hold_id，调用对应审批端点真正落地，
-// 成功回写本会话审批结果供列表回显；上游不可达或 hold 未找到返回 502/404。
+// doWithdrawalReview 以真实 futures hold_id（前端经列表拿到的 id）直接调用对应审批端点真正落地，
+// 成功回写本会话审批结果供列表回显；支持终态短路实现幂等（发现 1）。上游不可达返回 502。
 func (s *Server) doWithdrawalReview(c *gin.Context, status, pathPrefix string) {
-	id, ok := parseInt64(c, "id")
-	if !ok {
+	id := c.Param("id")
+	if id == "" {
 		s.fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
@@ -609,21 +609,23 @@ func (s *Server) doWithdrawalReview(c *gin.Context, status, pathPrefix string) {
 		s.fail(c, http.StatusBadGateway, "futures service not configured")
 		return
 	}
+	// 终态短路（发现 1）：本会话已审批过该 hold，直接幂等返回，避免前端重放/重试重复转发 futures
+	// （futures 侧 ClaimWithdrawBroadcast 仍是最终审重保证）。审批锚点即真实 hold_id，不再经服务端 map 反查。
 	s.store.mu.RLock()
-	holdID, found := s.store.wdByHoldID[id]
-	s.store.mu.RUnlock()
-	if !found {
-		s.fail(c, http.StatusNotFound, "withdrawal not found (list withdrawals first)")
+	if st, ok := s.store.wdApprovals[id]; ok {
+		s.store.mu.RUnlock()
+		s.ok(c, gin.H{"id": id, "status": st, "hold_id": id, "already": true})
 		return
 	}
-	if err := s.up.Post(c.Request.Context(), base, pathPrefix+holdID, nil, nil); err != nil {
+	s.store.mu.RUnlock()
+	if err := s.up.Post(c.Request.Context(), base, pathPrefix+id, nil, nil); err != nil {
 		s.fail(c, http.StatusBadGateway, "withdrawal "+status+" failed: "+err.Error())
 		return
 	}
 	s.store.mu.Lock()
 	s.store.wdApprovals[id] = status
 	s.store.mu.Unlock()
-	s.ok(c, gin.H{"id": id, "status": status, "hold_id": holdID})
+	s.ok(c, gin.H{"id": id, "status": status, "hold_id": id})
 }
 
 // --- 运营通知管理（list 实时聚合 notification 服务，本地公告叠加；本地公告持久化于 CatalogStore）---
@@ -780,18 +782,10 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// stableID 由若干字符串拼接做 FNV-64a 哈希，得到稳定且非负 int64 的数字 id，
-// 供前端以 row.id 做审批（链上事件仅有 TxHash，无 int 型 id）。
-func stableID(parts ...string) int64 {
-	h := fnv.New64a()
-	for _, p := range parts {
-		_, _ = h.Write([]byte(p))
-		_, _ = h.Write([]byte{0})
-	}
-	return int64(h.Sum64())
-}
-
 // --- 运营看板：账本对账（实时聚合 futures 复式记账对账探针）---
+// 注意（发现 6）：下方 total/disc 为展示层 float64 累加，源数据来自 futures 的 reconcile/inventory
+// 接口（其偏差值本身已是 float64，且 futures 侧对账根因已定点化）。本端点仅做人工看板聚合，
+// 不进入任何资金移动路径；若需自动告警，应以 futures 返回的定点偏差为准，而非在此累加 float。
 func (s *Server) handleLedger(c *gin.Context) {
 	ctx := c.Request.Context()
 	var (

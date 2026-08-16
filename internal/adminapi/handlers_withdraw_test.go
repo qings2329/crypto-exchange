@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -138,7 +137,7 @@ func TestAdminWithdrawalListMapsHoldID(t *testing.T) {
 		t.Fatalf("expected 3 withdrawals, got %d", len(ws))
 	}
 	// 已 finalized 的 h2 应映射为 approved；其余 pending。
-	byID := map[int64]adminapi.Withdrawal{}
+	byID := map[string]adminapi.Withdrawal{}
 	for _, w := range ws {
 		byID[w.ID] = w
 	}
@@ -174,17 +173,17 @@ func TestAdminWithdrawalApproveCallsFutures(t *testing.T) {
 	r, tok := newAdminWithFutures(t, fake.URL)
 
 	ws := getWithdrawals(t, r, tok)
-	var h1 int64
+	var h1 string
 	for _, w := range ws {
 		if w.TxHash == "h1" {
 			h1 = w.ID
 		}
 	}
-	if h1 == 0 {
+	if h1 == "" {
 		t.Fatal("h1 not found in list")
 	}
 	// approve h1
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/withdrawals/"+itoa(h1)+"/approve", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/withdrawals/"+h1+"/approve", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -203,6 +202,53 @@ func TestAdminWithdrawalApproveCallsFutures(t *testing.T) {
 	}
 }
 
+// TestAdminWithdrawalApproveIdempotent 验证重复审批被终态短路（发现 1）：
+// 第二次直接幂等返回 already:true，且不重复调用 futures 审批端点。
+func TestAdminWithdrawalApproveIdempotent(t *testing.T) {
+	st := &fakeFuturesState{}
+	fake := newFakeFutures(t, st)
+	r, tok := newAdminWithFutures(t, fake.URL)
+
+	ws := getWithdrawals(t, r, tok)
+	var h1 string
+	for _, w := range ws {
+		if w.TxHash == "h1" {
+			h1 = w.ID
+		}
+	}
+	if h1 == "" {
+		t.Fatal("h1 not found in list")
+	}
+	approve := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/withdrawals/"+h1+"/approve", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+	if w := approve(); w.Code != http.StatusOK {
+		t.Fatalf("first approve should succeed, got %d %s", w.Code, w.Body.String())
+	}
+	w2 := approve()
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second approve should succeed (idempotent), got %d %s", w2.Code, w2.Body.String())
+	}
+	var resp2 struct {
+		Data struct {
+			Already bool `json:"already"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &resp2); err != nil {
+		t.Fatal(err)
+	}
+	if !resp2.Data.Already {
+		t.Fatalf("second approve should be idempotent (already:true), got %s", w2.Body.String())
+	}
+	if len(st.approved) != 1 {
+		t.Fatalf("futures approve should be called exactly once, got %+v", st.approved)
+	}
+}
+
 // TestAdminWithdrawalRejectCallsFutures 验证 reject 真正调用 futures 拒绝端点。
 func TestAdminWithdrawalRejectCallsFutures(t *testing.T) {
 	st := &fakeFuturesState{}
@@ -210,16 +256,16 @@ func TestAdminWithdrawalRejectCallsFutures(t *testing.T) {
 	r, tok := newAdminWithFutures(t, fake.URL)
 
 	ws := getWithdrawals(t, r, tok)
-	var h3 int64
+	var h3 string
 	for _, w := range ws {
 		if w.TxHash == "h3" {
 			h3 = w.ID
 		}
 	}
-	if h3 == 0 {
+	if h3 == "" {
 		t.Fatal("h3 not found in list")
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/withdrawals/"+itoa(h3)+"/reject", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/withdrawals/"+h3+"/reject", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -238,23 +284,19 @@ func TestAdminWithdrawalApproveUpstreamFailure(t *testing.T) {
 	r, tok := newAdminWithFutures(t, fake.URL)
 
 	ws := getWithdrawals(t, r, tok)
-	var h1 int64
+	var h1 string
 	for _, w := range ws {
 		if w.TxHash == "h1" {
 			h1 = w.ID
 		}
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/withdrawals/"+itoa(h1)+"/approve", nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/withdrawals/"+h1+"/approve", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("approve with failing upstream should be 502, got %d %s", w.Code, w.Body.String())
 	}
-}
-
-func itoa(v int64) string {
-	return strconv.FormatInt(v, 10)
 }
 
 // TestAdminUsersBalanceEnriched 验证用户列表的 Balance 从 futures 钱包余额真实填充（不再恒为 0）。
@@ -293,5 +335,39 @@ func TestAdminUsersBalanceEnriched(t *testing.T) {
 	}
 	if alice.Balance != 125000.5 {
 		t.Fatalf("alice balance should be enriched to 125000.5, got %v", alice.Balance)
+	}
+}
+
+// TestAdminCashflowListDegraded 验证上游 futures 不可达时，充值/提现列表返回 degraded 空列表，
+// 而非伪造的示例记录（发现 4），避免误导运营资金决策。
+func TestAdminCashflowListDegraded(t *testing.T) {
+	st := &fakeFuturesState{}
+	fake := newFakeFutures(t, st)
+	r, tok := newAdminWithFutures(t, fake.URL)
+	fake.Close() // 模拟 futures 不可达
+
+	for _, path := range []string{"/api/admin/deposits", "/api/admin/withdrawals"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s degraded list should still 200, got %d %s", path, w.Code, w.Body.String())
+		}
+		var env struct {
+			Data struct {
+				Degraded bool          `json:"degraded"`
+				Items    []interface{} `json:"items"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatal(err)
+		}
+		if !env.Data.Degraded {
+			t.Fatalf("%s expected degraded:true, got %s", path, w.Body.String())
+		}
+		if len(env.Data.Items) != 0 {
+			t.Fatalf("%s expected empty items (no fake records), got %d: %s", path, len(env.Data.Items), w.Body.String())
+		}
 	}
 }
