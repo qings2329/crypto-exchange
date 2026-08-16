@@ -12,6 +12,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // RegisterRoutes 注册合约交易服务全部 HTTP 路由。
@@ -105,7 +106,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 				mode = futures.Cross
 			}
 			// 资金闭环：开仓前从钱包冻结保证金；余额不足则拒绝开仓。
-			if err := s.ledgerSvc.Freeze(req.UserID, "USDT", margin); err != nil {
+			if err := s.ledgerSvc.Freeze(req.UserID, "USDT", settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName("USDT"))); err != nil {
 				response.Error(c, 400, 400, "insufficient margin: "+err.Error())
 				return
 			}

@@ -5,16 +5,20 @@
 //   - 所有资金变动都落一条 Entry 流水（带符号 Delta），便于审计与对账。
 //   - 跨用户资金转移通过 Transfer 实现，两边各记一条相反数流水，全局借贷恒等。
 //   - 系统账户（资金费中转池、保险基金）也是普通 Account，使"交易所角色"也纳入复式记账。
+//   - 金额一律使用 settlement.AssetAmount（最小单位整数），杜绝 float64 精度漂移（F2）。
 package ledger
 
 import (
 	"encoding/json"
 	"fmt"
-	"math"
+	"math/big"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // 系统账户 ID（与真实用户 ID 区分，使用特殊值）。
@@ -50,15 +54,24 @@ const (
 	SysWealth int64 = -7
 )
 
+// 快照 schema 版本。v2 起金额以 AssetAmount（定点整数）序列化；v0/v1（无 version 字段）
+// 为旧 float64 快照，Load 时按资产 decimals 迁移为 AssetAmount（见 parseSnapshot/migrateV1ToV2）。
+const ledgerSnapshotSchemaVersion = 2
+
+// assetUnit 返回指定小数的 1 最小单位金额。
+func assetUnit(dec int) settlement.AssetAmount {
+	return settlement.NewAssetAmount(big.NewInt(1), dec)
+}
+
 // Entry 一条资金流水（复式记账的单边）。
 type Entry struct {
 	ID      int64
 	UserID  int64 // 账户主体（含系统账户）
 	Asset   string
-	Delta   float64 // + 入账 / - 出账（相对该账户）
-	Balance float64 // 变动后的可用余额（仅记录可用部分变化）
-	BizType string  // 业务类型：open/funding/liquidation/transfer/deposit
-	Ref     string  // 关联单号（订单号 / 结算周期 / 强平用户）
+	Delta   settlement.AssetAmount // + 入账 / - 出账（相对该账户）
+	Balance settlement.AssetAmount // 变动后的可用余额（仅记录可用部分变化）
+	BizType string                 // 业务类型：open/funding/liquidation/transfer/deposit
+	Ref     string                 // 关联单号（订单号 / 结算周期 / 强平用户）
 	Time    int64
 }
 
@@ -73,17 +86,17 @@ type Entry struct {
 type Account struct {
 	UserID         int64
 	Asset          string
-	Available      float64
-	Frozen         float64 // 持仓保证金冻结
-	WithdrawFrozen float64 // 提现冻结
+	Available      settlement.AssetAmount
+	Frozen         settlement.AssetAmount // 持仓保证金冻结
+	WithdrawFrozen settlement.AssetAmount // 提现冻结
 }
 
 // ReconStats 对账巡检的最近一次结果快照（供监控/HTTP 端点展示）。
 type ReconStats struct {
-	LastDeviation  map[string]float64 // 各资产借贷偏差（接近 0 即平衡）
-	LastBalanced   bool               // 最近一次是否全局平衡
-	LastRun        time.Time          // 最近一次巡检时间
-	ImbalanceCount int                // 累计探测到的不平账次数（告警计数）
+	LastDeviation  map[string]settlement.AssetAmount // 各资产借贷偏差（接近 0 即平衡）
+	LastBalanced   bool                              // 最近一次是否全局平衡
+	LastRun        time.Time                         // 最近一次巡检时间
+	ImbalanceCount int                               // 累计探测到的不平账次数（告警计数）
 }
 
 // Ledger 钱包总账（线程安全）。
@@ -97,14 +110,14 @@ type Ledger struct {
 	// 对账巡检（定时对账探针）：reconMu 独立保护巡检状态，避免长持有 l.mu。
 	reconMu      sync.RWMutex
 	reconStats   ReconStats
-	alertHook    func(map[string]float64) // 不平账告警回调（生产可接监控/告警平台）
+	alertHook    func(map[string]settlement.AssetAmount) // 不平账告警回调（生产可接监控/告警平台）
 	stopRecon    chan struct{}
 	reconRunning bool
 
 	// 坏账归属：key = "userID:asset" -> 该用户造成的未冲抵坏账额。
 	// 用于"用户级精确解限"——仅当某用户自身的坏账贡献被冲抵后才解除其出金限制，
 	// 而非全局坏账结清才一刀切解除所有人（避免 A 已补缴却仍被 B 的欠款连坐限制）。
-	badDebtByUser map[string]float64
+	badDebtByUser map[string]settlement.AssetAmount
 
 	// 社会化分摊治理提案（按资产维度，每资产最多一个待审批提案）。
 	socializeProposals map[string]*SocializeProposal
@@ -115,9 +128,9 @@ type Ledger struct {
 	//   hotWalletCap[asset] = 热钱包风险敞口上限，超过则触发自动归集（sweep）到冷钱包。
 	// 二者之和恒等于 -SysChainClearing[asset]（交易所对用户净负债 = 实际链上持仓），
 	// 属资金安全不变量（偿付能力/储备证明）：InventoryMatchesLiability 校验之。
-	hotWallet    map[string]float64
-	coldWallet   map[string]float64
-	hotWalletCap map[string]float64
+	hotWallet    map[string]settlement.AssetAmount
+	coldWallet   map[string]settlement.AssetAmount
+	hotWalletCap map[string]settlement.AssetAmount
 
 	// 提现安全冷静期（延时清算）风控：用户提现请求先进入冷静期队列并冻结，期满后运维/定时调度
 	// 才真正链上广播清算。即便账户/热钱包被攻破，冷静期给风控留出冻结止损窗口（与冷热钱包
@@ -128,8 +141,8 @@ type Ledger struct {
 	// 全局紧急冻结：运维发现异常（私钥疑似泄露/异常大额出金）时一键冻结所有出金受理。
 	withdrawalFrozenGlobal bool
 	// 每日提现限额（按资产维度），与每日累计共同约束单用户单日提现总额。
-	dailyWithdrawLimit map[string]float64
-	dailyWithdrawUsed  map[string]float64 // key = "uid:asset:YYYY-MM-DD" -> 当日累计提现额（含手续费）
+	dailyWithdrawLimit map[string]settlement.AssetAmount
+	dailyWithdrawUsed  map[string]settlement.AssetAmount // key = "uid:asset:YYYY-MM-DD" -> 当日累计提现额（含手续费）
 
 	// 提现地址白名单（防钓鱼/未授权地址盗提）：出金地址须预登记并验证，未验证地址拒绝受理。
 	// 新地址含"验证冷静期"——即便立即验证，首次可用于提现前仍需等待 addressVerifyPeriod，
@@ -138,21 +151,23 @@ type Ledger struct {
 	addressVerifyPeriod time.Duration
 	withdrawAddressBook map[int64]map[string]*WithdrawAddress // uid -> "asset|chain|address" -> 地址条目
 
-	// 可疑行为风控引擎：把 #18 的"手动全局紧急冻结"与 #16 的白名单升级为自动风控，
+	// 可疑行为风控引擎：把 #18 的"手动全局冻结"与 #16 的白名单升级为自动风控，
 	// 让提现冷静期/白名单/冻结真正形成闭环——检测到异常（提现速率骤增、短时间大量新增地址）
 	// 即自动触发全局冻结并留痕，给风控/运维留出人工介入窗口。
 	riskEnabled        bool          // 风控引擎总开关
 	riskAutoFreeze     bool          // 触发高危规则时是否自动全局冻结
 	riskWindow         time.Duration // 滑动窗口（行为计数/累计的时间范围）
-	riskVelocityAmount float64       // 窗口内单用户提现累计额阈值（跨资产合计）
-	riskVelocityCount  int           // 窗口内单用户提现请求次数阈值
-	riskAddrBurstCount int           // 窗口内单用户新增地址数阈值
-	riskEvents         []*RiskEvent  // 风控事件审计轨迹（环形增长，可持久化）
+	// riskVelocityAmount 为风控启发式阈值（窗口内单用户提现累计额阈值，跨资产合计），属
+	// 风控判定用人类单位量，不参与资金精确运算，故保留 float64（跨资产求和无意义，无法定点）。
+	riskVelocityAmount float64
+	riskVelocityCount  int  // 窗口内单用户提现请求次数阈值
+	riskAddrBurstCount int  // 窗口内单用户新增地址数阈值
+	riskEvents         []*RiskEvent
 	riskEventSeq       int64
 	autoFrozenByRisk   bool // 当前全局冻结是否由风控引擎自动触发（人工 resume 后清零）
 	// 瞬态行为活动（不持久化，重启后自然冷启动）：
-	riskWithdrawActivity map[int64][]riskAct   // uid -> 最近提现活动（at/amount）
-	riskAddrActivity     map[int64][]time.Time // uid -> 最近新增地址时间
+	riskWithdrawActivity map[int64][]riskAct // uid -> 最近提现活动（at/amount）
+	riskAddrActivity     map[int64][]time.Time
 }
 
 // RiskEvent 一条风控引擎产出的可疑行为事件（审计/告警溯源）。
@@ -166,7 +181,8 @@ type RiskEvent struct {
 	TriggeredAt time.Time `json:"triggered_at"`
 }
 
-// riskAct 单条提现活动记录（瞬态，用于滑动窗口统计）。
+// riskAct 单条提现活动记录（瞬态，用于滑动窗口统计）。amount 保留 float64：
+// 风控阈值 riskVelocityAmount 为人类单位启发式量，跨资产合计无意义，不定点化。
 type riskAct struct {
 	at     time.Time
 	amount float64
@@ -175,17 +191,17 @@ type riskAct struct {
 // WithdrawHoldEntry 一笔处于冷静期的提现请求。资金已在账本侧冻结（WithdrawFrozen），
 // 但尚未链上广播；HoldUntil 之前不可清算，给风控留出拦截窗口。
 type WithdrawHoldEntry struct {
-	ID        string    `json:"id"`
-	UserID    int64     `json:"user_id"`
-	Asset     string    `json:"asset"`
-	Amount    float64   `json:"amount"` // 净额（到用户外部地址）
-	Fee       float64   `json:"fee"`
-	Chain     string    `json:"chain"`
-	Address   string    `json:"address"`
-	CreatedAt time.Time `json:"created_at"`
-	HoldUntil time.Time `json:"hold_until"`
-	Finalized bool      `json:"finalized"`
-	Cancelled bool      `json:"cancelled"`
+	ID        string                  `json:"id"`
+	UserID    int64                   `json:"user_id"`
+	Asset     string                  `json:"asset"`
+	Amount    settlement.AssetAmount `json:"amount"` // 净额（到用户外部地址）
+	Fee       settlement.AssetAmount `json:"fee"`
+	Chain     string                  `json:"chain"`
+	Address   string                  `json:"address"`
+	CreatedAt time.Time               `json:"created_at"`
+	HoldUntil time.Time               `json:"hold_until"`
+	Finalized bool                    `json:"finalized"`
+	Cancelled bool                    `json:"cancelled"`
 	// Broadcasted 标记该 hold 是否已占广播槽（链上 SubmitWithdraw 已发起）。配合 TxHash 实现
 	// finalizeHold 的幂等广播：重试/并发时复用既有 txHash、跳过重复 SubmitWithdraw，杜绝双提现（F1）。
 	Broadcasted bool   `json:"broadcasted"`
@@ -215,14 +231,14 @@ func New() *Ledger {
 	return &Ledger{
 		accounts:             make(map[string]*Account),
 		restricted:           make(map[string]bool),
-		badDebtByUser:        make(map[string]float64),
+		badDebtByUser:        make(map[string]settlement.AssetAmount),
 		socializeProposals:   make(map[string]*SocializeProposal),
-		hotWallet:            make(map[string]float64),
-		coldWallet:           make(map[string]float64),
-		hotWalletCap:         make(map[string]float64),
+		hotWallet:            make(map[string]settlement.AssetAmount),
+		coldWallet:           make(map[string]settlement.AssetAmount),
+		hotWalletCap:         make(map[string]settlement.AssetAmount),
 		withdrawHolds:        make(map[string]*WithdrawHoldEntry),
-		dailyWithdrawLimit:   make(map[string]float64),
-		dailyWithdrawUsed:    make(map[string]float64),
+		dailyWithdrawLimit:   make(map[string]settlement.AssetAmount),
+		dailyWithdrawUsed:    make(map[string]settlement.AssetAmount),
 		withdrawAddressBook:  make(map[int64]map[string]*WithdrawAddress),
 		riskWithdrawActivity: make(map[int64][]riskAct),
 		riskAddrActivity:     make(map[int64][]time.Time),
@@ -258,17 +274,17 @@ func (l *Ledger) RestrictedCount() int {
 // reconcileRestrictionsLocked 按"用户级精确解限"规则刷新某资产的出金限制（调用方须已持写锁）。
 //
 // 规则：
-//   - 若全局坏账已结清（SysBadDebt≈0，可能因他人补缴/社会化分摊兜底），解除该资产全部限制；
-//   - 否则仅解除"自身坏账贡献已被冲抵（badDebtByUser≈0）"的用户，避免已补缴者被他人欠款连坐。
+//   - 若全局坏账已结清（SysBadDebt>=0，可能因他人补缴/社会化分摊兜底），解除该资产全部限制；
+//   - 否则仅解除"自身坏账贡献已被冲抵（badDebtByUser<=0）"的用户，避免已补缴者被他人欠款连坐。
 func (l *Ledger) reconcileRestrictionsLocked(asset string) {
 	suffix := ":" + asset
 	bd := l.getOrCreateLocked(SysBadDebt, asset)
-	globalCleared := bd.Available >= -1e-9
+	globalCleared := bd.Available.Sign() >= 0
 	for k := range l.restricted {
 		if !strings.HasSuffix(k, suffix) {
 			continue
 		}
-		if globalCleared || l.badDebtByUser[k] <= 1e-9 {
+		if globalCleared || l.badDebtByUser[k].Sign() <= 0 {
 			delete(l.restricted, k)
 		}
 	}
@@ -300,122 +316,122 @@ func (l *Ledger) GetOrCreate(userID int64, asset string) *Account {
 }
 
 // Balance 返回指定账户的可用与冻结余额。
-func (l *Ledger) Balance(userID int64, asset string) (available, frozen float64, ok bool) {
+func (l *Ledger) Balance(userID int64, asset string) (available, frozen settlement.AssetAmount, ok bool) {
 	l.mu.RLock()
 	a, ok := l.accounts[l.key(userID, asset)]
 	l.mu.RUnlock()
 	if !ok {
-		return 0, 0, false
+		return settlement.AssetAmount{}, settlement.AssetAmount{}, false
 	}
 	return a.Available, a.Frozen, true
 }
 
 // Freeze 将可用余额冻结（开仓锁定保证金）。可用不足返回错误。
-func (l *Ledger) Freeze(userID int64, asset string, amount float64) error {
-	if amount < 0 {
+func (l *Ledger) Freeze(userID int64, asset string, amount settlement.AssetAmount) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("freeze amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	if a.Available < amount-1e-9 {
-		return fmt.Errorf("insufficient available balance: have %.8f want %.8f", a.Available, amount)
+	if a.Available.Cmp(amount) < 0 {
+		return fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
 	}
-	a.Available -= amount
-	a.Frozen += amount
+	a.Available = a.Available.Sub(amount)
+	a.Frozen = a.Frozen.Add(amount)
 	return nil
 }
 
 // Unfreeze 解冻到可用余额（平仓释放保证金）。冻结不足返回错误。
-func (l *Ledger) Unfreeze(userID int64, asset string, amount float64) error {
-	if amount < 0 {
+func (l *Ledger) Unfreeze(userID int64, asset string, amount settlement.AssetAmount) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("unfreeze amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	if a.Frozen < amount-1e-9 {
+	if a.Frozen.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient frozen balance")
 	}
-	a.Frozen -= amount
-	a.Available += amount
+	a.Frozen = a.Frozen.Sub(amount)
+	a.Available = a.Available.Add(amount)
 	return nil
 }
 
 // FreezeWithdraw 将可用余额冻结为提现冻结（提交提现受理时锁定，与持仓保证金冻结
 // Frozen 互不干扰）。可用不足返回错误。
-func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount float64) error {
-	if amount < 0 {
+func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("freeze withdraw amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	if a.Available < amount-1e-9 {
-		return fmt.Errorf("insufficient available balance: have %.8f want %.8f", a.Available, amount)
+	if a.Available.Cmp(amount) < 0 {
+		return fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
 	}
-	a.Available -= amount
-	a.WithdrawFrozen += amount
+	a.Available = a.Available.Sub(amount)
+	a.WithdrawFrozen = a.WithdrawFrozen.Add(amount)
 	return nil
 }
 
 // UnfreezeWithdraw 解冻提现冻结到可用余额（提现失败回退或回滚后退回可用）。冻结不足返回错误。
-func (l *Ledger) UnfreezeWithdraw(userID int64, asset string, amount float64) error {
-	if amount < 0 {
+func (l *Ledger) UnfreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("unfreeze withdraw amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	if a.WithdrawFrozen < amount-1e-9 {
+	if a.WithdrawFrozen.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient withdraw frozen balance")
 	}
-	a.WithdrawFrozen -= amount
-	a.Available += amount
+	a.WithdrawFrozen = a.WithdrawFrozen.Sub(amount)
+	a.Available = a.Available.Add(amount)
 	return nil
 }
 
 // WithdrawFrozenBalance 返回指定账户的提现冻结余额（线程安全）。
-func (l *Ledger) WithdrawFrozenBalance(userID int64, asset string) (withdrawFrozen float64, ok bool) {
+func (l *Ledger) WithdrawFrozenBalance(userID int64, asset string) (withdrawFrozen settlement.AssetAmount, ok bool) {
 	l.mu.RLock()
 	a, ok := l.accounts[l.key(userID, asset)]
 	l.mu.RUnlock()
 	if !ok {
-		return 0, false
+		return settlement.AssetAmount{}, false
 	}
 	return a.WithdrawFrozen, true
 }
 
 // CreditAvailable 增加可用余额（入账，如充值、收到资金费、平仓释放盈亏）。
-func (l *Ledger) CreditAvailable(userID int64, asset string, amount float64, biz, ref string) error {
-	if amount < 0 {
+func (l *Ledger) CreditAvailable(userID int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("credit amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	a.Available += amount
-	l.appendLocked(a, +amount, biz, ref)
+	a.Available = a.Available.Add(amount)
+	l.appendLocked(a, amount, biz, ref)
 	return nil
 }
 
 // DebitAvailable 减少可用余额（出账，如支付资金费、提现）。
 // 骨架允许余额转为负数以承载坏账（真实交易所需风控拦截）；生产应在此前做余额校验。
-func (l *Ledger) DebitAvailable(userID int64, asset string, amount float64, biz, ref string) error {
-	if amount < 0 {
+func (l *Ledger) DebitAvailable(userID int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("debit amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	a.Available -= amount
-	l.appendLocked(a, -amount, biz, ref)
+	a.Available = a.Available.Sub(amount)
+	l.appendLocked(a, amount.Neg(), biz, ref)
 	return nil
 }
 
 // Transfer 从 from 可用余额转到 to 可用余额，两边各记一条相反数流水。
-func (l *Ledger) Transfer(from, to int64, asset string, amount float64, biz, ref string) error {
-	if amount < 0 {
+func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("transfer amount must be >= 0")
 	}
 	if from == to {
@@ -426,15 +442,15 @@ func (l *Ledger) Transfer(from, to int64, asset string, amount float64, biz, ref
 	fa := l.getOrCreateLocked(from, asset)
 	ta := l.getOrCreateLocked(to, asset)
 	// 允许 from 余额转负（坏账），保证资金费闭环的借贷恒等
-	fa.Available -= amount
-	ta.Available += amount
-	l.appendSideLocked(fa, -amount, biz, ref, &l.seq)
-	l.appendSideLocked(ta, +amount, biz, ref, &l.seq)
+	fa.Available = fa.Available.Sub(amount)
+	ta.Available = ta.Available.Add(amount)
+	l.appendSideLocked(fa, amount.Neg(), biz, ref, &l.seq)
+	l.appendSideLocked(ta, amount, biz, ref, &l.seq)
 	return nil
 }
 
 // Deposit 充值（演示用；生产充值应来自链上确认/清结算系统）。
-func (l *Ledger) Deposit(userID int64, asset string, amount float64, ref string) error {
+func (l *Ledger) Deposit(userID int64, asset string, amount settlement.AssetAmount, ref string) error {
 	return l.CreditAvailable(userID, asset, amount, "deposit", ref)
 }
 
@@ -444,8 +460,8 @@ func (l *Ledger) Deposit(userID int64, asset string, amount float64, ref string)
 // 坏账自动回收：若此前充值孤块回滚导致交易所垫付了坏账（SysBadDebt 为负），本笔充值会
 // 优先冲抵该坏账——同等金额先"还给"坏账账户，剩余才入用户可用。这样充值回滚产生的
 // 死账变为可循环回收的闭环，且全程借贷恒等。
-func (l *Ledger) ReceiveOnChain(userID int64, asset string, amount float64, txHash string) error {
-	if amount < 0 {
+func (l *Ledger) ReceiveOnChain(userID int64, asset string, amount settlement.AssetAmount, txHash string) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("deposit amount must be >= 0")
 	}
 	l.mu.Lock()
@@ -455,21 +471,21 @@ func (l *Ledger) ReceiveOnChain(userID int64, asset string, amount float64, txHa
 	bd := l.getOrCreateLocked(SysBadDebt, asset)
 	ref := "chain:" + txHash
 	// 标准充值：负债减少、用户可用增加
-	sys.Available -= amount
-	l.appendSideLocked(sys, -amount, "chain_deposit", ref, &l.seq)
-	a.Available += amount
-	l.appendSideLocked(a, +amount, "chain_deposit", ref, &l.seq)
+	sys.Available = sys.Available.Sub(amount)
+	l.appendSideLocked(sys, amount.Neg(), "chain_deposit", ref, &l.seq)
+	a.Available = a.Available.Add(amount)
+	l.appendSideLocked(a, amount, "chain_deposit", ref, &l.seq)
 	// 冷热钱包库存：充值入账 = 交易所热钱包收到链上资金（库存增加），并触发超限自动归集。
-	l.hotWallet[asset] += amount
+	l.hotWallet[asset] = l.hotWallet[asset].Add(amount)
 	l.autoSweepHotLocked(asset)
 	// 坏账回收：用本笔充值优先冲抵交易所垫付坏账
-	if bd.Available < 0 {
-		recovered := math.Min(amount, -bd.Available)
-		if recovered > 0 {
-			a.Available -= recovered
-			bd.Available += recovered
-			l.appendSideLocked(a, -recovered, "bad_debt_recover", ref, &l.seq)
-			l.appendSideLocked(bd, +recovered, "bad_debt_recover", ref, &l.seq)
+	if bd.Available.Sign() < 0 {
+		recovered := amount.Min(bd.Available.Neg())
+		if recovered.Sign() > 0 {
+			a.Available = a.Available.Sub(recovered)
+			bd.Available = bd.Available.Add(recovered)
+			l.appendSideLocked(a, recovered.Neg(), "bad_debt_recover", ref, &l.seq)
+			l.appendSideLocked(bd, recovered, "bad_debt_recover", ref, &l.seq)
 			// 按各债务人坏账归属比例分摊本笔回收（保持"归属之和==全局坏账额"不变量）
 			l.applyRecoveryToAttributionLocked(asset, recovered)
 		}
@@ -480,25 +496,28 @@ func (l *Ledger) ReceiveOnChain(userID int64, asset string, amount float64, txHa
 }
 
 // applyRecoveryToAttributionLocked 将一笔坏账回收额按各债务人当前归属比例冲减，保持
-// badDebtByUser 之和恒等于该资产全局坏账额（调用方须已持写锁）。
-func (l *Ledger) applyRecoveryToAttributionLocked(asset string, recovered float64) {
+// badDebtByUser 之和恒等于该资产全局坏账额（调用方须已持写锁）。整数精确比例分配。
+func (l *Ledger) applyRecoveryToAttributionLocked(asset string, recovered settlement.AssetAmount) {
 	suffix := ":" + asset
-	var total float64
+	var keys []string
+	var weights []settlement.AssetAmount
 	for k, v := range l.badDebtByUser {
-		if strings.HasSuffix(k, suffix) && v > 1e-9 {
-			total += v
+		if strings.HasSuffix(k, suffix) && v.Sign() > 0 {
+			keys = append(keys, k)
+			weights = append(weights, v)
 		}
 	}
-	if total <= 1e-9 {
+	if len(weights) == 0 {
 		return
 	}
-	for k, v := range l.badDebtByUser {
-		if !strings.HasSuffix(k, suffix) || v <= 1e-9 {
+	shares := distributeProportional(recovered, weights)
+	for i, k := range keys {
+		s := shares[i]
+		if s.Sign() <= 0 {
 			continue
 		}
-		share := recovered * (v / total)
-		l.badDebtByUser[k] -= share
-		if l.badDebtByUser[k] <= 1e-9 {
+		l.badDebtByUser[k] = l.badDebtByUser[k].Sub(s)
+		if l.badDebtByUser[k].Sign() <= 0 {
 			delete(l.badDebtByUser, k)
 		}
 	}
@@ -506,41 +525,41 @@ func (l *Ledger) applyRecoveryToAttributionLocked(asset string, recovered float6
 
 // BadDebtTotal 返回某资产交易所未冲抵的坏账总额（SysBadDebt 余额为负值的绝对值，
 // 为 0 表示无坏账）。用于风控/审计展示与回收决策。
-func (l *Ledger) BadDebtTotal(asset string) float64 {
+func (l *Ledger) BadDebtTotal(asset string) settlement.AssetAmount {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	bd := l.getOrCreateLocked(SysBadDebt, asset)
-	if bd.Available < 0 {
-		return -bd.Available
+	if bd.Available.Sign() < 0 {
+		return bd.Available.Neg()
 	}
-	return 0
+	return settlement.AssetAmount{}
 }
 
 // RepayBadDebt 用户主动补缴坏账：从用户可用余额划出 amount 冲抵交易所坏账账户
 // （Debit 用户可用 + Credit SysBadDebt），与充值自动回收同源，保持借贷恒等。
 // 补缴额不得超过未冲抵坏账且不得超过用户可用余额。
-func (l *Ledger) RepayBadDebt(userID int64, asset string, amount float64, ref string) error {
-	if amount <= 0 {
+func (l *Ledger) RepayBadDebt(userID int64, asset string, amount settlement.AssetAmount, ref string) error {
+	if amount.Sign() <= 0 {
 		return fmt.Errorf("repay amount must be > 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	if a.Available < amount-1e-9 {
+	if a.Available.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient available balance to repay bad debt")
 	}
 	bd := l.getOrCreateLocked(SysBadDebt, asset)
-	if bd.Available >= 0 {
+	if bd.Available.Sign() >= 0 {
 		return fmt.Errorf("no outstanding bad debt to repay")
 	}
 	// 补缴不超过剩余坏账
-	if amount > -bd.Available {
-		amount = -bd.Available
+	if amount.Cmp(bd.Available.Neg()) > 0 {
+		amount = bd.Available.Neg()
 	}
-	a.Available -= amount
-	bd.Available += amount
-	l.appendSideLocked(a, -amount, "bad_debt_repay", ref, &l.seq)
-	l.appendSideLocked(bd, +amount, "bad_debt_repay", ref, &l.seq)
+	a.Available = a.Available.Sub(amount)
+	bd.Available = bd.Available.Add(amount)
+	l.appendSideLocked(a, amount.Neg(), "bad_debt_repay", ref, &l.seq)
+	l.appendSideLocked(bd, amount, "bad_debt_repay", ref, &l.seq)
 	// 坏账归属冲减：优先冲抵补缴者自身的坏账贡献，余下按比例分摊给其他债务人
 	l.repayAttributionLocked(userID, asset, amount)
 	// 刷新出金限制（已持锁）
@@ -549,39 +568,42 @@ func (l *Ledger) RepayBadDebt(userID int64, asset string, amount float64, ref st
 }
 
 // repayAttributionLocked 将一笔补缴额先在坏账归属账上冲减补缴者自身贡献，剩余按比例
-// 分摊给其他债务人（调用方须已持写锁）。
-func (l *Ledger) repayAttributionLocked(userID int64, asset string, amount float64) {
+// 分摊给其他债务人（调用方须已持写锁）。整数精确比例分配。
+func (l *Ledger) repayAttributionLocked(userID int64, asset string, amount settlement.AssetAmount) {
 	suffix := ":" + asset
 	k := l.key(userID, asset)
 	owe := l.badDebtByUser[k]
-	if owe > 1e-9 {
-		pay := math.Min(amount, owe)
-		l.badDebtByUser[k] -= pay
-		amount -= pay
-		if l.badDebtByUser[k] <= 1e-9 {
+	if owe.Sign() > 0 {
+		pay := amount.Min(owe)
+		l.badDebtByUser[k] = owe.Sub(pay)
+		amount = amount.Sub(pay)
+		if l.badDebtByUser[k].Sign() <= 0 {
 			delete(l.badDebtByUser, k)
 		}
 	}
-	if amount <= 1e-9 {
+	if amount.Sign() <= 0 {
 		return
 	}
 	// 剩余补缴（如用户自愿多缴替他人兜底）按比例冲减其他债务人
-	var total float64
+	var keys []string
+	var weights []settlement.AssetAmount
 	for kk, vv := range l.badDebtByUser {
-		if strings.HasSuffix(kk, suffix) && vv > 1e-9 {
-			total += vv
+		if strings.HasSuffix(kk, suffix) && vv.Sign() > 0 {
+			keys = append(keys, kk)
+			weights = append(weights, vv)
 		}
 	}
-	if total <= 1e-9 {
+	if len(weights) == 0 {
 		return
 	}
-	for kk, vv := range l.badDebtByUser {
-		if !strings.HasSuffix(kk, suffix) || vv <= 1e-9 {
+	shares := distributeProportional(amount, weights)
+	for i, kk := range keys {
+		s := shares[i]
+		if s.Sign() <= 0 {
 			continue
 		}
-		share := amount * (vv / total)
-		l.badDebtByUser[kk] -= share
-		if l.badDebtByUser[kk] <= 1e-9 {
+		l.badDebtByUser[kk] = l.badDebtByUser[kk].Sub(s)
+		if l.badDebtByUser[kk].Sign() <= 0 {
 			delete(l.badDebtByUser, kk)
 		}
 	}
@@ -589,42 +611,42 @@ func (l *Ledger) repayAttributionLocked(userID int64, asset string, amount float
 
 // SocializeBadDebt 社会化分摊回收（直接执行版）：等价于先 Propose 再 Approve。保留此入口
 // 便于单测与内部调用；对外治理流程建议走 ProposeSocialize + ApproveSocialize 两步审批。
-func (l *Ledger) SocializeBadDebt(asset string) (detail map[int64]float64, recovered float64, err error) {
+func (l *Ledger) SocializeBadDebt(asset string) (detail map[int64]settlement.AssetAmount, recovered settlement.AssetAmount, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.socializeLocked(asset)
 }
 
 // socializeLocked 在已持有写锁时执行社会化分摊（实现见 SocializeBadDebt 说明）。
-func (l *Ledger) socializeLocked(asset string) (detail map[int64]float64, recovered float64, err error) {
+func (l *Ledger) socializeLocked(asset string) (detail map[int64]settlement.AssetAmount, recovered settlement.AssetAmount, err error) {
 	bd := l.getOrCreateLocked(SysBadDebt, asset)
-	if bd.Available >= 0 {
-		return map[int64]float64{}, 0, nil // 无坏账可分摊
+	if bd.Available.Sign() >= 0 {
+		return map[int64]settlement.AssetAmount{}, settlement.AssetAmount{}, nil // 无坏账可分摊
 	}
-	debt := -bd.Available
-	detail = make(map[int64]float64)
+	debt := bd.Available.Neg()
+	detail = make(map[int64]settlement.AssetAmount)
 	ref := fmt.Sprintf("socialize:%s:%d", asset, time.Now().UnixNano())
 
 	// 1) 保险基金优先冲减
 	ins := l.getOrCreateLocked(SysInsurance, asset)
-	if ins.Available > 1e-9 {
-		cov := math.Min(debt, ins.Available)
-		ins.Available -= cov
-		bd.Available += cov
-		l.appendSideLocked(ins, -cov, "bad_debt_socialize", ref, &l.seq)
-		l.appendSideLocked(bd, +cov, "bad_debt_socialize", ref, &l.seq)
-		debt -= cov
-		recovered += cov
+	if ins.Available.Sign() > 0 {
+		cov := debt.Min(ins.Available)
+		ins.Available = ins.Available.Sub(cov)
+		bd.Available = bd.Available.Add(cov)
+		l.appendSideLocked(ins, cov.Neg(), "bad_debt_socialize", ref, &l.seq)
+		l.appendSideLocked(bd, cov, "bad_debt_socialize", ref, &l.seq)
+		debt = debt.Sub(cov)
+		recovered = recovered.Add(cov)
 	}
 
-	// 2) 剩余社会化分摊：按非受限盈利用户可用余额占比
-	if debt > 1e-9 {
+	// 2) 剩余社会化分摊：按非受限盈利用户可用余额占比（整数精确比例分配）
+	if debt.Sign() > 0 {
 		type contrib struct {
 			uid int64
-			av  float64
+			av  settlement.AssetAmount
 		}
 		var pool []contrib
-		var base float64
+		var base settlement.AssetAmount
 		for _, a := range l.accounts {
 			if a.UserID <= 0 {
 				continue // 跳过系统账户
@@ -632,39 +654,40 @@ func (l *Ledger) socializeLocked(asset string) (detail map[int64]float64, recove
 			if l.restricted[l.key(a.UserID, asset)] {
 				continue // 坏账来源方不参与分摊（已是受损方）
 			}
-			if a.Available > 1e-9 {
+			if a.Available.Sign() > 0 {
 				pool = append(pool, contrib{a.UserID, a.Available})
-				base += a.Available
+				base = base.Add(a.Available)
 			}
 		}
 		// 待分摊总额固定，避免后续用户占比因前序扣减而失真
 		toShare := debt
-		if base > 1e-9 {
-			for _, c := range pool {
-				share := toShare * (c.av / base)
-				actual := share
-				if actual > c.av {
-					actual = c.av // cap 在可用余额，不致变负
-				}
-				if actual <= 0 {
+		if base.Sign() > 0 {
+			weights := make([]settlement.AssetAmount, len(pool))
+			for i, c := range pool {
+				weights[i] = c.av
+			}
+			shares := distributeProportional(toShare, weights)
+			for i, c := range pool {
+				actual := shares[i]
+				if actual.Sign() <= 0 {
 					continue
 				}
 				a := l.getOrCreateLocked(c.uid, asset)
-				a.Available -= actual
-				bd.Available += actual
-				l.appendSideLocked(a, -actual, "bad_debt_socialize", ref, &l.seq)
-				l.appendSideLocked(bd, +actual, "bad_debt_socialize", ref, &l.seq)
-				detail[c.uid] += actual
-				recovered += actual
-				debt -= actual
+				a.Available = a.Available.Sub(actual)
+				bd.Available = bd.Available.Add(actual)
+				l.appendSideLocked(a, actual.Neg(), "bad_debt_socialize", ref, &l.seq)
+				l.appendSideLocked(bd, actual, "bad_debt_socialize", ref, &l.seq)
+				detail[c.uid] = detail[c.uid].Add(actual)
+				recovered = recovered.Add(actual)
+				debt = debt.Sub(actual)
 			}
 		}
 		// 基数不足时 debt 仍有残留，保留于 SysBadDebt（余额仍为负），等待后续回收
 	}
 
-	// 坏账结清（含按比例分摊产生的浮点残差归零）则解除该资产全部出金限制
-	if bd.Available >= -1e-9 {
-		bd.Available = 0 // 消除分摊浮点残差，避免微小负值卡住结清判断
+	// 坏账结清（整数精确，无浮点残差）则解除该资产全部出金限制
+	if bd.Available.Sign() >= 0 {
+		bd.Available = settlement.AssetAmount{} // 消除残留（应为已精确结清）
 		l.reconcileRestrictionsLocked(asset)
 	}
 	return detail, recovered, nil
@@ -672,59 +695,60 @@ func (l *Ledger) socializeLocked(asset string) (detail map[int64]float64, recove
 
 // SocializeProposal 社会化分摊治理提案（待审批）。
 type SocializeProposal struct {
-	ID        string            // 提案号（唯一）
-	Asset     string            // 标的资产
-	Recovered float64           // 预计回收总额（保险基金冲减 + 用户分摊）
-	Detail    map[int64]float64 // 预计各用户分摊额
-	CreatedAt int64             // 提案时间（纳秒）
-	Status    string            // pending / approved / rejected
+	ID        string                        // 提案号（唯一）
+	Asset     string                        // 标的资产
+	Recovered settlement.AssetAmount        // 预计回收总额（保险基金冲减 + 用户分摊）
+	Detail    map[int64]settlement.AssetAmount // 预计各用户分摊额
+	CreatedAt int64                         // 提案时间（纳秒）
+	Status    string                        // pending / approved / rejected
 }
 
 // previewSocializeLocked 在已持锁时只读模拟社会化分摊结果（不改动账本），供提案预览使用。
-func (l *Ledger) previewSocializeLocked(asset string) (detail map[int64]float64, recovered float64) {
+func (l *Ledger) previewSocializeLocked(asset string) (detail map[int64]settlement.AssetAmount, recovered settlement.AssetAmount) {
 	bd := l.getOrCreateLocked(SysBadDebt, asset)
-	if bd.Available >= 0 {
-		return map[int64]float64{}, 0
+	if bd.Available.Sign() >= 0 {
+		return map[int64]settlement.AssetAmount{}, settlement.AssetAmount{}
 	}
-	debt := -bd.Available
-	detail = make(map[int64]float64)
+	debt := bd.Available.Neg()
+	detail = make(map[int64]settlement.AssetAmount)
 	ref := fmt.Sprintf("socialize:%s:%d", asset, time.Now().UnixNano())
+	_ = ref
 
 	ins := l.getOrCreateLocked(SysInsurance, asset)
-	if ins.Available > 1e-9 {
-		cov := math.Min(debt, ins.Available)
-		debt -= cov
-		recovered += cov
+	if ins.Available.Sign() > 0 {
+		cov := debt.Min(ins.Available)
+		debt = debt.Sub(cov)
+		recovered = recovered.Add(cov)
 	}
-	_ = ref
-	if debt > 1e-9 {
+	if debt.Sign() > 0 {
 		type contrib struct {
 			uid int64
-			av  float64
+			av  settlement.AssetAmount
 		}
 		var pool []contrib
-		var base float64
+		var base settlement.AssetAmount
 		for _, a := range l.accounts {
-			if a.UserID <= 0 || l.restricted[l.key(a.UserID, asset)] || a.Available <= 1e-9 {
+			if a.UserID <= 0 || l.restricted[l.key(a.UserID, asset)] || a.Available.Sign() <= 0 {
 				continue
 			}
 			pool = append(pool, contrib{a.UserID, a.Available})
-			base += a.Available
+			base = base.Add(a.Available)
 		}
 		toShare := debt
-		if base > 1e-9 {
-			for _, c := range pool {
-				share := toShare * (c.av / base)
-				actual := share
-				if actual > c.av {
-					actual = c.av
-				}
-				if actual <= 0 {
+		if base.Sign() > 0 {
+			weights := make([]settlement.AssetAmount, len(pool))
+			for i, c := range pool {
+				weights[i] = c.av
+			}
+			shares := distributeProportional(toShare, weights)
+			for i, c := range pool {
+				actual := shares[i]
+				if actual.Sign() <= 0 {
 					continue
 				}
-				detail[c.uid] += actual
-				recovered += actual
-				debt -= actual
+				detail[c.uid] = detail[c.uid].Add(actual)
+				recovered = recovered.Add(actual)
+				debt = debt.Sub(actual)
 			}
 		}
 	}
@@ -737,7 +761,7 @@ func (l *Ledger) ProposeSocialize(asset string) (proposalID string, preview Soci
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	bd := l.getOrCreateLocked(SysBadDebt, asset)
-	if bd.Available >= 0 {
+	if bd.Available.Sign() >= 0 {
 		return "", SocializeProposal{}, fmt.Errorf("no outstanding bad debt to socialize")
 	}
 	detail, recovered := l.previewSocializeLocked(asset)
@@ -756,16 +780,16 @@ func (l *Ledger) ProposeSocialize(asset string) (proposalID string, preview Soci
 
 // ApproveSocialize 审批通过并执行社会化分摊：校验提案号匹配后执行 socializeLocked，
 // 执行成功将提案置为 approved。提案号不匹配或提案不存在则返回错误。
-func (l *Ledger) ApproveSocialize(asset, proposalID string) (detail map[int64]float64, recovered float64, err error) {
+func (l *Ledger) ApproveSocialize(asset, proposalID string) (detail map[int64]settlement.AssetAmount, recovered settlement.AssetAmount, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	p, ok := l.socializeProposals[asset]
 	if !ok || p.ID != proposalID || p.Status != "pending" {
-		return nil, 0, fmt.Errorf("no pending socialize proposal matching asset=%s id=%s", asset, proposalID)
+		return nil, settlement.AssetAmount{}, fmt.Errorf("no pending socialize proposal matching asset=%s id=%s", asset, proposalID)
 	}
 	detail, recovered, err = l.socializeLocked(asset)
 	if err != nil {
-		return nil, 0, err
+		return nil, settlement.AssetAmount{}, err
 	}
 	p.Status = "approved"
 	return detail, recovered, nil
@@ -778,9 +802,9 @@ func (l *Ledger) ApproveSocialize(asset, proposalID string) (detail map[int64]fl
 // 坏账风控：若用户已动用该笔资金（可用余额不足以全额回拨），最多扣减其可用余额至 0，
 // 差额由交易所垫付，记入 SysBadDebt 坏账账户（余额转负，表示交易所损失），从而完整保持
 // 借贷恒等。返回 badDebt（交易所垫付额，通常为 0）供上层风控/审计处置（追回或分摊）。
-func (l *Ledger) ReverseOnChain(userID int64, asset string, amount float64, txHash string) (badDebt float64, err error) {
-	if amount < 0 {
-		return 0, fmt.Errorf("reverse amount must be >= 0")
+func (l *Ledger) ReverseOnChain(userID int64, asset string, amount settlement.AssetAmount, txHash string) (badDebt settlement.AssetAmount, err error) {
+	if amount.Sign() < 0 {
+		return settlement.AssetAmount{}, fmt.Errorf("reverse amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -788,29 +812,30 @@ func (l *Ledger) ReverseOnChain(userID int64, asset string, amount float64, txHa
 	ref := "chain:" + txHash
 	// 用户侧：回拨已动用部分（最多扣到 0）
 	recovered := amount
-	if a.Available < recovered {
+	if a.Available.Cmp(recovered) < 0 {
 		recovered = a.Available
 	}
-	if recovered > 0 {
-		a.Available -= recovered
-		l.appendSideLocked(a, -recovered, "chain_rollback", ref, &l.seq)
+	if recovered.Sign() > 0 {
+		a.Available = a.Available.Sub(recovered)
+		l.appendSideLocked(a, recovered.Neg(), "chain_rollback", ref, &l.seq)
 	}
 	// 负债账户：完全抵消之前的充值负债（与 ReceiveOnChain 对称 +amount）
 	sys := l.getOrCreateLocked(SysChainClearing, asset)
-	sys.Available += amount
-	l.appendSideLocked(sys, +amount, "chain_rollback", ref, &l.seq)
+	sys.Available = sys.Available.Add(amount)
+	l.appendSideLocked(sys, amount, "chain_rollback", ref, &l.seq)
 	// 充值被孤块丢弃：交易所实际从未收到该笔链上资金，热钱包库存须等额回拨（与 ReceiveOnChain 对称）。
-	l.hotWallet[asset] -= amount
+	l.hotWallet[asset] = l.hotWallet[asset].Sub(amount)
 	// 坏账：交易所垫付差额（Debit 坏账账户，余额转负）
-	badDebt = amount - recovered
-	if badDebt > 0 {
+	badDebt = amount.Sub(recovered)
+	if badDebt.Sign() > 0 {
 		bd := l.getOrCreateLocked(SysBadDebt, asset)
-		bd.Available -= badDebt
-		l.appendSideLocked(bd, -badDebt, "chain_bad_debt", ref, &l.seq)
+		bd.Available = bd.Available.Sub(badDebt)
+		l.appendSideLocked(bd, badDebt.Neg(), "chain_bad_debt", ref, &l.seq)
 		// 坏账归属：记录该用户造成的坏账额（用于用户级精确解限）
-		l.badDebtByUser[l.key(userID, asset)] += badDebt
+		k := l.key(userID, asset)
+		l.badDebtByUser[k] = l.badDebtByUser[k].Add(badDebt)
 		// 出金限制：产生坏账即限制该用户出金，强制先补缴（已持锁，直接操作 map）
-		l.restricted[l.key(userID, asset)] = true
+		l.restricted[k] = true
 	}
 	return badDebt, nil
 }
@@ -820,9 +845,9 @@ func (l *Ledger) ReverseOnChain(userID int64, asset string, amount float64, txHa
 // 需把该笔资金回拨——重新冻结到用户提现冻结（Debit 负债账户 + Credit 用户 WithdrawFrozen），
 // 与 SettleWithdraw 互逆，复式记账守恒。ref 建议为链上交易哈希。
 // 上层（服务/风控）可随后决定把提现冻结退回可用（重新可提取）或保留冻结待重发。
-func (l *Ledger) ReverseWithdraw(userID int64, asset string, amount, fee float64, txHash string) error {
-	total := amount + fee
-	if total < 0 {
+func (l *Ledger) ReverseWithdraw(userID int64, asset string, amount, fee settlement.AssetAmount, txHash string) error {
+	total := amount.Add(fee)
+	if total.Sign() < 0 {
 		return fmt.Errorf("withdraw amount must be >= 0")
 	}
 	l.mu.Lock()
@@ -830,13 +855,13 @@ func (l *Ledger) ReverseWithdraw(userID int64, asset string, amount, fee float64
 	a := l.getOrCreateLocked(userID, asset)
 	sys := l.getOrCreateLocked(SysChainClearing, asset)
 	// 资金回拨：负债账户减少（回到"尚未划出"状态），用户提现冻结回升（不影响持仓保证金 Frozen）
-	sys.Available -= total
-	a.WithdrawFrozen += total
+	sys.Available = sys.Available.Sub(total)
+	a.WithdrawFrozen = a.WithdrawFrozen.Add(total)
 	ref := "chain:" + txHash
-	l.appendSideLocked(a, +total, "chain_withdraw_revert", ref, &l.seq)
-	l.appendSideLocked(sys, -total, "chain_withdraw_revert", ref, &l.seq)
+	l.appendSideLocked(a, total, "chain_withdraw_revert", ref, &l.seq)
+	l.appendSideLocked(sys, total.Neg(), "chain_withdraw_revert", ref, &l.seq)
 	// 提现被孤块丢弃：资金从未真正离链（广播未最终确认），热钱包库存须回升（与 SettleWithdraw 对称）。
-	l.hotWallet[asset] += total
+	l.hotWallet[asset] = l.hotWallet[asset].Add(total)
 	return nil
 }
 
@@ -844,26 +869,26 @@ func (l *Ledger) ReverseWithdraw(userID int64, asset string, amount, fee float64
 // 真正划出系统，贷记到链上清结算负债账户（SysChainClearing 余额回升，表示交易所对用户
 // 负债减少）。该操作在持锁内原子完成"扣减提现冻结 -> 贷记负债账户"两笔流水，保证借贷恒等。
 // 调用前须已通过 FreezeWithdraw 冻结 (amount+fee)；若提现失败应使用 UnfreezeWithdraw 回退。
-func (l *Ledger) SettleWithdraw(userID int64, asset string, amount, fee float64, txHash string) error {
-	total := amount + fee
-	if total < 0 {
+func (l *Ledger) SettleWithdraw(userID int64, asset string, amount, fee settlement.AssetAmount, txHash string) error {
+	total := amount.Add(fee)
+	if total.Sign() < 0 {
 		return fmt.Errorf("withdraw amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	a := l.getOrCreateLocked(userID, asset)
-	if a.WithdrawFrozen < total-1e-9 {
-		return fmt.Errorf("insufficient withdraw frozen balance: have %.8f want %.8f", a.WithdrawFrozen, total)
+	if a.WithdrawFrozen.Cmp(total) < 0 {
+		return fmt.Errorf("insufficient withdraw frozen balance: have %s want %s", a.WithdrawFrozen.HumanString(), total.HumanString())
 	}
 	// 提现冻结离开系统：提现冻结减少，同时贷记负债账户（交易所对用户负债减少），不影响持仓保证金 Frozen。
-	a.WithdrawFrozen -= total
+	a.WithdrawFrozen = a.WithdrawFrozen.Sub(total)
 	sys := l.getOrCreateLocked(SysChainClearing, asset)
-	sys.Available += total
+	sys.Available = sys.Available.Add(total)
 	ref := "chain:" + txHash
-	l.appendSideLocked(a, -total, "chain_withdraw", ref, &l.seq)
-	l.appendSideLocked(sys, +total, "chain_withdraw", ref, &l.seq)
+	l.appendSideLocked(a, total.Neg(), "chain_withdraw", ref, &l.seq)
+	l.appendSideLocked(sys, total, "chain_withdraw", ref, &l.seq)
 	// 链上库存：提现资金从热钱包划出到用户外部地址（库存减少）。
-	l.hotWallet[asset] -= total
+	l.hotWallet[asset] = l.hotWallet[asset].Sub(total)
 	return nil
 }
 
@@ -893,10 +918,10 @@ func (l *Ledger) Log() []Entry {
 // --- 冷热钱包库存与风险敞口控制 ---
 
 // SetHotWalletCap 设置某资产热钱包风险敞口上限（超过则自动归集冷钱包）。cap<=0 表示不限制。
-func (l *Ledger) SetHotWalletCap(asset string, cap float64) {
+func (l *Ledger) SetHotWalletCap(asset string, cap settlement.AssetAmount) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if cap <= 0 {
+	if cap.Sign() <= 0 {
 		delete(l.hotWalletCap, asset)
 		return
 	}
@@ -905,104 +930,104 @@ func (l *Ledger) SetHotWalletCap(asset string, cap float64) {
 }
 
 // HotWalletBalance 返回某资产热钱包在链上的余额（交易所自有资产，持续暴露于热私钥泄露风险）。
-func (l *Ledger) HotWalletBalance(asset string) float64 {
+func (l *Ledger) HotWalletBalance(asset string) settlement.AssetAmount {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.hotWallet[asset]
 }
 
 // ColdWalletBalance 返回某资产冷钱包在链上的余额（离线多签/空气隙保管，窃取需突破离线防线）。
-func (l *Ledger) ColdWalletBalance(asset string) float64 {
+func (l *Ledger) ColdWalletBalance(asset string) settlement.AssetAmount {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.coldWallet[asset]
 }
 
-// HotWalletCap 返回某资产热钱包敞口上限（0 表示未设限）。
-func (l *Ledger) HotWalletCap(asset string) float64 {
+// HotWalletCap 返回某资产热钱包敞口上限（零值表示未设限）。
+func (l *Ledger) HotWalletCap(asset string) settlement.AssetAmount {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.hotWalletCap[asset]
 }
 
 // HotWalletExcess 返回某资产热钱包超出上限的敞口（<=0 表示未超限）。用于监控告警。
-func (l *Ledger) HotWalletExcess(asset string) float64 {
+func (l *Ledger) HotWalletExcess(asset string) settlement.AssetAmount {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	cap, ok := l.hotWalletCap[asset]
-	if !ok || cap <= 0 {
-		return 0
+	if !ok || cap.Sign() <= 0 {
+		return settlement.AssetAmount{}
 	}
-	ex := l.hotWallet[asset] - cap
-	if ex < 0 {
-		return 0
+	ex := l.hotWallet[asset].Sub(cap)
+	if ex.Sign() < 0 {
+		return settlement.AssetAmount{}
 	}
 	return ex
 }
 
 // SweepToCold 手动/自动将热钱包资金归集到冷钱包（交易所内部转账，不改变对用户负债）。
 // 归集额不超过热钱包实际余额。返回实际归集额。
-func (l *Ledger) SweepToCold(asset string, amount float64) (float64, error) {
-	if amount < 0 {
-		return 0, fmt.Errorf("sweep amount must be >= 0")
+func (l *Ledger) SweepToCold(asset string, amount settlement.AssetAmount) (settlement.AssetAmount, error) {
+	if amount.Sign() < 0 {
+		return settlement.AssetAmount{}, fmt.Errorf("sweep amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	hot := l.hotWallet[asset]
-	if amount > hot {
+	if amount.Cmp(hot) > 0 {
 		amount = hot
 	}
-	if amount <= 0 {
-		return 0, nil
+	if amount.Sign() <= 0 {
+		return settlement.AssetAmount{}, nil
 	}
-	l.hotWallet[asset] -= amount
-	l.coldWallet[asset] += amount
+	l.hotWallet[asset] = hot.Sub(amount)
+	l.coldWallet[asset] = l.coldWallet[asset].Add(amount)
 	return amount, nil
 }
 
 // UnsweepFromCold 从冷钱包调拨资金回热钱包（大额提现前运维拉取，避免热钱包余额不足阻塞出金）。
 // 调拨额不超过冷钱包实际余额。返回实际调拨额。
-func (l *Ledger) UnsweepFromCold(asset string, amount float64) (float64, error) {
-	if amount < 0 {
-		return 0, fmt.Errorf("unsweep amount must be >= 0")
+func (l *Ledger) UnsweepFromCold(asset string, amount settlement.AssetAmount) (settlement.AssetAmount, error) {
+	if amount.Sign() < 0 {
+		return settlement.AssetAmount{}, fmt.Errorf("unsweep amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	cold := l.coldWallet[asset]
-	if amount > cold {
+	if amount.Cmp(cold) > 0 {
 		amount = cold
 	}
-	if amount <= 0 {
-		return 0, nil
+	if amount.Sign() <= 0 {
+		return settlement.AssetAmount{}, nil
 	}
-	l.coldWallet[asset] -= amount
-	l.hotWallet[asset] += amount
+	l.coldWallet[asset] = cold.Sub(amount)
+	l.hotWallet[asset] = l.hotWallet[asset].Add(amount)
 	return amount, nil
 }
 
 // InventoryMatchesLiability 校验某资产"链上实际持仓(hot+cold)"是否等于"对用户净负债(-SysChainClearing)"。
 // 二者恒等即证明交易所链上确实持有对用户负债的足额资产（偿付能力/储备证明不变量）。
-// 返回偏差（接近 0 即一致）；非 0 意味着账本与链上持仓脱节（凭空铸币/链上丢币/记账错漏），属资金安全事故。
-func (l *Ledger) InventoryMatchesLiability(asset string) float64 {
+// 返回偏差（等于 0 即一致）；非 0 意味着账本与链上持仓脱节（凭空铸币/链上丢币/记账错漏），属资金安全事故。
+func (l *Ledger) InventoryMatchesLiability(asset string) settlement.AssetAmount {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	sys := l.getOrCreateLocked(SysChainClearing, asset)
-	inventory := l.hotWallet[asset] + l.coldWallet[asset]
-	expected := -sys.Available
-	return inventory - expected
+	inventory := l.hotWallet[asset].Add(l.coldWallet[asset])
+	expected := sys.Available.Neg()
+	return inventory.Sub(expected)
 }
 
 // autoSweepHotLocked 在已持锁时按上限自动归集热钱包超额到冷钱包（调用方须已持写锁）。
 func (l *Ledger) autoSweepHotLocked(asset string) {
 	cap, ok := l.hotWalletCap[asset]
-	if !ok || cap <= 0 {
+	if !ok || cap.Sign() <= 0 {
 		return
 	}
 	hot := l.hotWallet[asset]
-	if hot > cap+1e-9 {
-		excess := hot - cap
-		l.hotWallet[asset] -= excess
-		l.coldWallet[asset] += excess
+	if hot.Cmp(cap) > 0 {
+		excess := hot.Sub(cap)
+		l.hotWallet[asset] = hot.Sub(excess)
+		l.coldWallet[asset] = l.coldWallet[asset].Add(excess)
 	}
 }
 
@@ -1166,10 +1191,10 @@ func (l *Ledger) isWithdrawAddressAllowedLocked(userID int64, asset, chain, addr
 }
 
 // SetDailyWithdrawLimit 设置某资产单用户每日提现限额（含手续费），limit<=0 表示不限制。
-func (l *Ledger) SetDailyWithdrawLimit(asset string, limit float64) {
+func (l *Ledger) SetDailyWithdrawLimit(asset string, limit settlement.AssetAmount) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if limit <= 0 {
+	if limit.Sign() <= 0 {
 		delete(l.dailyWithdrawLimit, asset)
 		return
 	}
@@ -1210,8 +1235,8 @@ func (l *Ledger) IsRiskEngineEnabled() bool {
 }
 
 // SetRiskThresholds 配置滑动窗口与各阈值：window 为行为计数时间范围；velocityAmount 为
-// 窗口内单用户提现累计额阈值（跨资产合计）；velocityCount 为窗口内提现请求次数阈值；
-// addrBurstCount 为窗口内新增地址数阈值。任一阈值<=0 表示该项不触发（仅记录）。
+// 窗口内单用户提现累计额阈值（跨资产合计，保留 float64 启发式量）；velocityCount 为窗口内
+// 提现请求次数阈值；addrBurstCount 为窗口内新增地址数阈值。任一阈值<=0 表示该项不触发（仅记录）。
 func (l *Ledger) SetRiskThresholds(window time.Duration, velocityAmount float64, velocityCount, addrBurstCount int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1281,12 +1306,14 @@ func (l *Ledger) raiseRiskEventLocked(userID int64, typ, severity, msg string) {
 
 // evaluateWithdrawRiskLocked 在已持锁时记录一次提现活动并判断是否触发提现速率规则。
 // 返回 true 表示触发高危规则（已自动冻结）。调用方须已持 l.mu。
-func (l *Ledger) evaluateWithdrawRiskLocked(userID int64, amount float64) bool {
+// 注意：amount 为 AssetAmount，但风控阈值 riskVelocityAmount 为人类单位 float 启发式量
+// （跨资产合计无意义，不定点），故此处按 HumanFloat 计入滑动窗口求和。
+func (l *Ledger) evaluateWithdrawRiskLocked(userID int64, amount settlement.AssetAmount) bool {
 	if !l.riskEnabled {
 		return false
 	}
 	now := time.Now()
-	l.riskWithdrawActivity[userID] = append(l.riskWithdrawActivity[userID], riskAct{at: now, amount: amount})
+	l.riskWithdrawActivity[userID] = append(l.riskWithdrawActivity[userID], riskAct{at: now, amount: amount.HumanFloat()})
 	// 滑动窗口裁剪 + 统计。
 	cutoff := now.Add(-l.riskWindow)
 	acts := l.riskWithdrawActivity[userID]
@@ -1300,7 +1327,7 @@ func (l *Ledger) evaluateWithdrawRiskLocked(userID int64, amount float64) bool {
 		}
 	}
 	l.riskWithdrawActivity[userID] = kept
-	if (l.riskVelocityAmount > 0 && sum >= l.riskVelocityAmount-1e-9) ||
+	if (l.riskVelocityAmount > 0 && sum >= l.riskVelocityAmount) ||
 		(l.riskVelocityCount > 0 && cnt >= l.riskVelocityCount) {
 		l.raiseRiskEventLocked(userID, "withdraw_velocity", "high",
 			fmt.Sprintf("withdraw velocity: %d requests / %.2f within %s", cnt, sum, l.riskWindow))
@@ -1336,19 +1363,19 @@ func (l *Ledger) evaluateAddressRiskLocked(userID int64) bool {
 	return false
 }
 
-// dailyKey 生成当日累计限额的 key（按用户-资产-日期维度）。
+// withdrawDailyKey 生成当日累计限额的 key（按用户-资产-日期维度）。
 func withdrawDailyKey(userID int64, asset, date string) string {
 	return fmt.Sprintf("%d:%s:%s", userID, asset, date)
 }
 
 // RequestWithdrawHold 受理一笔提现请求进入冷静期：风控校验（全局冻结/坏账限制/余额/每日限额）
 // 通过后冻结资金并入队，返回 holdID 与 HoldUntil。冷静期内不可链上清算。
-func (l *Ledger) RequestWithdrawHold(userID int64, asset string, amount, fee float64, chain, address string) (id string, holdUntil time.Time, err error) {
-	if amount < 0 || fee < 0 {
+func (l *Ledger) RequestWithdrawHold(userID int64, asset string, amount, fee settlement.AssetAmount, chain, address string) (id string, holdUntil time.Time, err error) {
+	if amount.Sign() < 0 || fee.Sign() < 0 {
 		return "", time.Time{}, fmt.Errorf("withdraw amount/fee must be >= 0")
 	}
-	total := amount + fee
-	if total <= 0 {
+	total := amount.Add(fee)
+	if total.Sign() <= 0 {
 		return "", time.Time{}, fmt.Errorf("withdraw total must be > 0")
 	}
 	l.mu.Lock()
@@ -1362,7 +1389,7 @@ func (l *Ledger) RequestWithdrawHold(userID int64, asset string, amount, fee flo
 		return "", time.Time{}, fmt.Errorf("outflow restricted: repay outstanding bad debt first")
 	}
 	a := l.getOrCreateLocked(userID, asset)
-	if a.Available < total-1e-9 {
+	if a.Available.Cmp(total) < 0 {
 		return "", time.Time{}, fmt.Errorf("insufficient available balance")
 	}
 	// 提现地址白名单：出金地址须预登记、已验证且度过验证冷静期，否则拒绝受理
@@ -1376,21 +1403,21 @@ func (l *Ledger) RequestWithdrawHold(userID int64, asset string, amount, fee flo
 		return "", time.Time{}, fmt.Errorf("suspicious withdraw activity detected: global freeze engaged")
 	}
 	// 每日限额：预占当日额度，避免并发超额。
-	if limit, ok := l.dailyWithdrawLimit[asset]; ok && limit > 0 {
+	if limit, ok := l.dailyWithdrawLimit[asset]; ok && limit.Sign() > 0 {
 		today := time.Now().UTC().Format("2006-01-02")
 		k := withdrawDailyKey(userID, asset, today)
-		if l.dailyWithdrawUsed[k]+total > limit+1e-9 {
+		if l.dailyWithdrawUsed[k].Add(total).Cmp(limit) > 0 {
 			return "", time.Time{}, fmt.Errorf("daily withdrawal limit exceeded")
 		}
-		l.dailyWithdrawUsed[k] += total
+		l.dailyWithdrawUsed[k] = l.dailyWithdrawUsed[k].Add(total)
 	}
 	// 冻结资金（离开可用，进入提现冻结），尚未链上划出。
 	if err := l.freezeWithdrawLocked(userID, asset, total); err != nil {
 		// 冻结失败需回退已预占的当日额度。
-		if limit, ok := l.dailyWithdrawLimit[asset]; ok && limit > 0 {
+		if limit, ok := l.dailyWithdrawLimit[asset]; ok && limit.Sign() > 0 {
 			today := time.Now().UTC().Format("2006-01-02")
 			k := withdrawDailyKey(userID, asset, today)
-			l.dailyWithdrawUsed[k] -= total
+			l.dailyWithdrawUsed[k] = l.dailyWithdrawUsed[k].Sub(total)
 		}
 		return "", time.Time{}, err
 	}
@@ -1474,17 +1501,17 @@ func (l *Ledger) CancelWithdrawHold(id string) error {
 	if e.Cancelled {
 		return fmt.Errorf("withdraw hold already cancelled")
 	}
-	total := e.Amount + e.Fee
+	total := e.Amount.Add(e.Fee)
 	if err := l.unfreezeWithdrawLocked(e.UserID, e.Asset, total); err != nil {
 		return err
 	}
 	// 退还当日预占额度。
-	if limit, ok := l.dailyWithdrawLimit[e.Asset]; ok && limit > 0 {
+	if limit, ok := l.dailyWithdrawLimit[e.Asset]; ok && limit.Sign() > 0 {
 		today := time.Now().UTC().Format("2006-01-02")
 		k := withdrawDailyKey(e.UserID, e.Asset, today)
-		l.dailyWithdrawUsed[k] -= total
-		if l.dailyWithdrawUsed[k] < -1e-9 {
-			l.dailyWithdrawUsed[k] = 0
+		l.dailyWithdrawUsed[k] = l.dailyWithdrawUsed[k].Sub(total)
+		if l.dailyWithdrawUsed[k].Sign() < 0 {
+			l.dailyWithdrawUsed[k] = settlement.AssetAmount{}
 		}
 	}
 	e.Cancelled = true
@@ -1589,48 +1616,48 @@ func (l *Ledger) PendingWithdrawHoldCount() int {
 // freezeWithdrawLocked / unfreezeWithdrawLocked / settleWithdrawLocked 是 FreezeWithdraw /
 // UnfreezeWithdraw / SettleWithdraw 的内部无锁版本，调用方须已持 l.mu。供提现冷静期等
 // 已在持锁上下文中的逻辑复用，避免重复加锁死锁。
-func (l *Ledger) freezeWithdrawLocked(userID int64, asset string, amount float64) error {
-	if amount < 0 {
+func (l *Ledger) freezeWithdrawLocked(userID int64, asset string, amount settlement.AssetAmount) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("freeze withdraw amount must be >= 0")
 	}
 	a := l.getOrCreateLocked(userID, asset)
-	if a.Available < amount-1e-9 {
-		return fmt.Errorf("insufficient available balance: have %.8f want %.8f", a.Available, amount)
+	if a.Available.Cmp(amount) < 0 {
+		return fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
 	}
-	a.Available -= amount
-	a.WithdrawFrozen += amount
+	a.Available = a.Available.Sub(amount)
+	a.WithdrawFrozen = a.WithdrawFrozen.Add(amount)
 	return nil
 }
 
-func (l *Ledger) unfreezeWithdrawLocked(userID int64, asset string, amount float64) error {
-	if amount < 0 {
+func (l *Ledger) unfreezeWithdrawLocked(userID int64, asset string, amount settlement.AssetAmount) error {
+	if amount.Sign() < 0 {
 		return fmt.Errorf("unfreeze withdraw amount must be >= 0")
 	}
 	a := l.getOrCreateLocked(userID, asset)
-	if a.WithdrawFrozen < amount-1e-9 {
+	if a.WithdrawFrozen.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient withdraw frozen balance")
 	}
-	a.WithdrawFrozen -= amount
-	a.Available += amount
+	a.WithdrawFrozen = a.WithdrawFrozen.Sub(amount)
+	a.Available = a.Available.Add(amount)
 	return nil
 }
 
-func (l *Ledger) settleWithdrawLocked(userID int64, asset string, amount, fee float64, txHash string) error {
-	total := amount + fee
-	if total < 0 {
+func (l *Ledger) settleWithdrawLocked(userID int64, asset string, amount, fee settlement.AssetAmount, txHash string) error {
+	total := amount.Add(fee)
+	if total.Sign() < 0 {
 		return fmt.Errorf("withdraw amount must be >= 0")
 	}
 	a := l.getOrCreateLocked(userID, asset)
-	if a.WithdrawFrozen < total-1e-9 {
-		return fmt.Errorf("insufficient withdraw frozen balance: have %.8f want %.8f", a.WithdrawFrozen, total)
+	if a.WithdrawFrozen.Cmp(total) < 0 {
+		return fmt.Errorf("insufficient withdraw frozen balance: have %s want %s", a.WithdrawFrozen.HumanString(), total.HumanString())
 	}
-	a.WithdrawFrozen -= total
+	a.WithdrawFrozen = a.WithdrawFrozen.Sub(total)
 	sys := l.getOrCreateLocked(SysChainClearing, asset)
-	sys.Available += total
+	sys.Available = sys.Available.Add(total)
 	ref := "chain:" + txHash
-	l.appendSideLocked(a, -total, "chain_withdraw", ref, &l.seq)
-	l.appendSideLocked(sys, +total, "chain_withdraw", ref, &l.seq)
-	l.hotWallet[asset] -= total
+	l.appendSideLocked(a, total.Neg(), "chain_withdraw", ref, &l.seq)
+	l.appendSideLocked(sys, total, "chain_withdraw", ref, &l.seq)
+	l.hotWallet[asset] = l.hotWallet[asset].Sub(total)
 	return nil
 }
 
@@ -1645,11 +1672,11 @@ func (l *Ledger) getOrCreateLocked(userID int64, asset string) *Account {
 }
 
 // appendLocked 在已持有锁时追加流水（使用账户最新可用余额）。
-func (l *Ledger) appendLocked(a *Account, delta float64, biz, ref string) {
+func (l *Ledger) appendLocked(a *Account, delta settlement.AssetAmount, biz, ref string) {
 	l.appendSideLocked(a, delta, biz, ref, &l.seq)
 }
 
-func (l *Ledger) appendSideLocked(a *Account, delta float64, biz, ref string, seq *int64) {
+func (l *Ledger) appendSideLocked(a *Account, delta settlement.AssetAmount, biz, ref string, seq *int64) {
 	*seq++
 	l.log = append(l.log, Entry{
 		ID:      *seq,
@@ -1673,36 +1700,31 @@ func (l *Ledger) appendSideLocked(a *Account, delta float64, biz, ref string, se
 // 生产资金流动（ReceiveOnChain / SettleWithdraw / ReverseOnChain / ReverseWithdraw /
 // Transfer / SocializeBadDebt / Freeze / FreezeWithdraw 等）均严格复式配对，偏差恒为 0。
 // 注意：演示用 Deposit/CreditAvailable 凭空铸币不配对系统负债，会引入非零偏差——生产
-// 充值必须走 ReceiveOnChain，对账时应以生产路径为准。返回 map 的 value 为偏差（接近 0 即平衡）。
-func (l *Ledger) Reconcile() map[string]float64 {
+// 充值必须走 ReceiveOnChain，对账时应以生产路径为准。返回 map 的 value 为偏差（等于 0 即平衡）。
+func (l *Ledger) Reconcile() map[string]settlement.AssetAmount {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	out := make(map[string]float64)
+	out := make(map[string]settlement.AssetAmount)
 	for _, a := range l.accounts {
-		out[a.Asset] += a.Available + a.Frozen + a.WithdrawFrozen
-	}
-	for k, v := range out {
-		if math.Abs(v) < 1e-9 {
-			out[k] = 0 // 消除浮点残差，便于精确比较
-		}
+		out[a.Asset] = out[a.Asset].Add(a.Available).Add(a.Frozen).Add(a.WithdrawFrozen)
 	}
 	return out
 }
 
-// IsBalanced 返回账本是否全局借贷平衡（所有资产偏差均在容差 1e-6 内）。
+// IsBalanced 返回账本是否全局借贷平衡（所有资产偏差均为 0，整数精确）。
 // 可作为运行时对账探针（如定时任务、HTTP /wallet/reconcile）与测试断言使用。
 func (l *Ledger) IsBalanced() bool {
 	for _, v := range l.Reconcile() {
-		if math.Abs(v) > 1e-6 {
+		if v.Sign() != 0 {
 			return false
 		}
 	}
 	return true
 }
 
-// SetReconcileAlertHook 设置不平账告警回调：当定时巡检探测到借贷偏差超容差时异步调用，
+// SetReconcileAlertHook 设置不平账告警回调：当定时巡检探测到借贷偏差不为 0 时异步调用，
 // 入参为各资产偏差 map。生产可在此推送监控指标/告警平台；传 nil 关闭。
-func (l *Ledger) SetReconcileAlertHook(fn func(map[string]float64)) {
+func (l *Ledger) SetReconcileAlertHook(fn func(map[string]settlement.AssetAmount)) {
 	l.reconMu.Lock()
 	defer l.reconMu.Unlock()
 	l.alertHook = fn
@@ -1751,7 +1773,7 @@ func (l *Ledger) RunReconcileOnce() ReconStats {
 	dev := l.Reconcile()
 	balanced := true
 	for _, v := range dev {
-		if math.Abs(v) > 1e-6 {
+		if v.Sign() != 0 {
 			balanced = false
 			break
 		}
@@ -1781,7 +1803,7 @@ func (l *Ledger) LastReconcile() ReconStats {
 	defer l.reconMu.RUnlock()
 	cp := l.reconStats
 	if cp.LastDeviation != nil {
-		cp.LastDeviation = make(map[string]float64, len(l.reconStats.LastDeviation))
+		cp.LastDeviation = make(map[string]settlement.AssetAmount, len(l.reconStats.LastDeviation))
 		for k, v := range l.reconStats.LastDeviation {
 			cp.LastDeviation[k] = v
 		}
@@ -1799,27 +1821,30 @@ func (l *Ledger) LastReconcile() ReconStats {
 // 流水与序列号）；对账巡检的运行时统计（reconStats/告警计数）属瞬时监控态，重启后重新
 // 累积，无需恢复。链上充值/提现网关的 pending 事件同样不持久化——真实环境由区块链重新
 // 确认入账，Mock 网关重启后窗口自然清空。
+//
+// 金额字段均为 settlement.AssetAmount（定点整数），并带 schema_version 以便旧 float 快照迁移。
 type LedgerSnapshot struct {
-	Accounts               []*Account                   `json:"accounts"`                 // 全部账户（含系统账户）
-	Restricted             []string                     `json:"restricted"`               // 处于出金限制的用户-资产 key 列表
-	BadDebtByUser          map[string]float64           `json:"bad_debt_by_user"`         // 坏账归属：key=userID:asset -> 未冲抵坏账额
-	SocializeProposals     map[string]SocializeProposal `json:"socialize_proposals"`      // 待审批的社会化分摊治理提案
-	HotWallet              map[string]float64           `json:"hot_wallet"`               // 热钱包链上库存（每资产）
-	ColdWallet             map[string]float64           `json:"cold_wallet"`              // 冷钱包链上库存（每资产）
-	HotWalletCap           map[string]float64           `json:"hot_wallet_cap"`           // 热钱包风险敞口上限（每资产）
-	WithdrawHolds          []*WithdrawHoldEntry         `json:"withdraw_holds"`           // 处于冷静期的提现请求队列
-	WithdrawHoldPeriod     time.Duration                `json:"withdraw_hold_period"`     // 冷静期时长
-	WithdrawHoldSeq        int64                        `json:"withdraw_hold_seq"`        // 提现请求序列号
-	WithdrawalFrozenGlobal bool                         `json:"withdrawal_frozen_global"` // 全局紧急冻结开关
-	DailyWithdrawLimit     map[string]float64           `json:"daily_withdraw_limit"`     // 每日提现限额（每资产）
-	DailyWithdrawUsed      map[string]float64           `json:"daily_withdraw_used"`      // 当日已用提现额度（按 uid:asset:date）
-	WithdrawAddresses      []*WithdrawAddress           `json:"withdraw_addresses"`       // 提现地址白名单（防钓鱼/未授权盗提）
-	AddressVerifyPeriod    time.Duration                `json:"address_verify_period"`    // 新地址验证冷静期时长
-	RiskEvents             []*RiskEvent                 `json:"risk_events"`              // 风控事件审计轨迹
-	RiskEventSeq           int64                        `json:"risk_event_seq"`           // 风控事件序列号
-	AutoFrozenByRisk       bool                         `json:"auto_frozen_by_risk"`      // 当前全局冻结是否由风控自动触发
-	Log                    []Entry                      `json:"log"`                      // 资金流水（审计/对账溯源）
-	Seq                    int64                        `json:"seq"`                      // 流水序列号（恢复后续写不冲突）
+	SchemaVersion        int                           `json:"schema_version"`        // 快照 schema 版本（v2 起定点化）
+	Accounts             []*Account                    `json:"accounts"`              // 全部账户（含系统账户）
+	Restricted           []string                      `json:"restricted"`            // 处于出金限制的用户-资产 key 列表
+	BadDebtByUser        map[string]settlement.AssetAmount `json:"bad_debt_by_user"`   // 坏账归属：key=userID:asset -> 未冲抵坏账额
+	SocializeProposals   map[string]SocializeProposal  `json:"socialize_proposals"`   // 待审批的社会化分摊治理提案
+	HotWallet            map[string]settlement.AssetAmount `json:"hot_wallet"`          // 热钱包链上库存（每资产）
+	ColdWallet           map[string]settlement.AssetAmount `json:"cold_wallet"`         // 冷钱包链上库存（每资产）
+	HotWalletCap         map[string]settlement.AssetAmount `json:"hot_wallet_cap"`      // 热钱包风险敞口上限（每资产）
+	WithdrawHolds        []*WithdrawHoldEntry          `json:"withdraw_holds"`        // 处于冷静期的提现请求队列
+	WithdrawHoldPeriod   time.Duration                 `json:"withdraw_hold_period"`  // 冷静期时长
+	WithdrawHoldSeq      int64                         `json:"withdraw_hold_seq"`     // 提现请求序列号
+	WithdrawalFrozenGlobal bool                        `json:"withdrawal_frozen_global"` // 全局紧急冻结开关
+	DailyWithdrawLimit   map[string]settlement.AssetAmount `json:"daily_withdraw_limit"` // 每日提现限额（每资产）
+	DailyWithdrawUsed    map[string]settlement.AssetAmount `json:"daily_withdraw_used"`  // 当日已用提现额度（按 uid:asset:date）
+	WithdrawAddresses    []*WithdrawAddress            `json:"withdraw_addresses"`    // 提现地址白名单（防钓鱼/未授权盗提）
+	AddressVerifyPeriod  time.Duration                 `json:"address_verify_period"` // 新地址验证冷静期时长
+	RiskEvents           []*RiskEvent                  `json:"risk_events"`           // 风控事件审计轨迹
+	RiskEventSeq         int64                         `json:"risk_event_seq"`        // 风控事件序列号
+	AutoFrozenByRisk     bool                          `json:"auto_frozen_by_risk"`   // 当前全局冻结是否由风控自动触发
+	Log                  []Entry                       `json:"log"`                   // 资金流水（审计/对账溯源）
+	Seq                  int64                         `json:"seq"`                   // 流水序列号（恢复后续写不冲突）
 }
 
 // Snapshot 生成账本当前状态的可序列化副本（线程安全，持读锁）。
@@ -1827,15 +1852,16 @@ func (l *Ledger) Snapshot() LedgerSnapshot {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	snap := LedgerSnapshot{
-		BadDebtByUser:      make(map[string]float64, len(l.badDebtByUser)),
-		SocializeProposals: make(map[string]SocializeProposal, len(l.socializeProposals)),
-		HotWallet:          make(map[string]float64, len(l.hotWallet)),
-		ColdWallet:         make(map[string]float64, len(l.coldWallet)),
-		HotWalletCap:       make(map[string]float64, len(l.hotWalletCap)),
-		DailyWithdrawLimit: make(map[string]float64, len(l.dailyWithdrawLimit)),
-		DailyWithdrawUsed:  make(map[string]float64, len(l.dailyWithdrawUsed)),
-		Log:                make([]Entry, len(l.log)),
-		Seq:                l.seq,
+		SchemaVersion:       ledgerSnapshotSchemaVersion,
+		BadDebtByUser:       make(map[string]settlement.AssetAmount, len(l.badDebtByUser)),
+		SocializeProposals:  make(map[string]SocializeProposal, len(l.socializeProposals)),
+		HotWallet:           make(map[string]settlement.AssetAmount, len(l.hotWallet)),
+		ColdWallet:          make(map[string]settlement.AssetAmount, len(l.coldWallet)),
+		HotWalletCap:        make(map[string]settlement.AssetAmount, len(l.hotWalletCap)),
+		DailyWithdrawLimit:  make(map[string]settlement.AssetAmount, len(l.dailyWithdrawLimit)),
+		DailyWithdrawUsed:   make(map[string]settlement.AssetAmount, len(l.dailyWithdrawUsed)),
+		Log:                 make([]Entry, len(l.log)),
+		Seq:                 l.seq,
 	}
 	for _, a := range l.accounts {
 		snap.Accounts = append(snap.Accounts, &Account{
@@ -1922,7 +1948,7 @@ func (l *Ledger) Restore(snap LedgerSnapshot) {
 	for _, k := range snap.Restricted {
 		l.restricted[k] = true
 	}
-	l.badDebtByUser = make(map[string]float64, len(snap.BadDebtByUser))
+	l.badDebtByUser = make(map[string]settlement.AssetAmount, len(snap.BadDebtByUser))
 	for k, v := range snap.BadDebtByUser {
 		l.badDebtByUser[k] = v
 	}
@@ -1932,15 +1958,15 @@ func (l *Ledger) Restore(snap LedgerSnapshot) {
 		l.socializeProposals[k] = &clone
 	}
 	// 链上钱包库存与上限：清空后从快照重建（避免残留旧 key）。
-	l.hotWallet = make(map[string]float64, len(snap.HotWallet))
+	l.hotWallet = make(map[string]settlement.AssetAmount, len(snap.HotWallet))
 	for k, v := range snap.HotWallet {
 		l.hotWallet[k] = v
 	}
-	l.coldWallet = make(map[string]float64, len(snap.ColdWallet))
+	l.coldWallet = make(map[string]settlement.AssetAmount, len(snap.ColdWallet))
 	for k, v := range snap.ColdWallet {
 		l.coldWallet[k] = v
 	}
-	l.hotWalletCap = make(map[string]float64, len(snap.HotWalletCap))
+	l.hotWalletCap = make(map[string]settlement.AssetAmount, len(snap.HotWalletCap))
 	for k, v := range snap.HotWalletCap {
 		l.hotWalletCap[k] = v
 	}
@@ -1956,11 +1982,11 @@ func (l *Ledger) Restore(snap LedgerSnapshot) {
 	l.withdrawHoldPeriod = snap.WithdrawHoldPeriod
 	l.withdrawHoldSeq = snap.WithdrawHoldSeq
 	l.withdrawalFrozenGlobal = snap.WithdrawalFrozenGlobal
-	l.dailyWithdrawLimit = make(map[string]float64, len(snap.DailyWithdrawLimit))
+	l.dailyWithdrawLimit = make(map[string]settlement.AssetAmount, len(snap.DailyWithdrawLimit))
 	for k, v := range snap.DailyWithdrawLimit {
 		l.dailyWithdrawLimit[k] = v
 	}
-	l.dailyWithdrawUsed = make(map[string]float64, len(snap.DailyWithdrawUsed))
+	l.dailyWithdrawUsed = make(map[string]settlement.AssetAmount, len(snap.DailyWithdrawUsed))
 	for k, v := range snap.DailyWithdrawUsed {
 		l.dailyWithdrawUsed[k] = v
 	}
@@ -2020,9 +2046,283 @@ func LoadSnapshotFromFile(path string) (LedgerSnapshot, error) {
 	if err != nil {
 		return LedgerSnapshot{}, fmt.Errorf("read snapshot: %w", err)
 	}
-	var snap LedgerSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return LedgerSnapshot{}, fmt.Errorf("unmarshal snapshot: %w", err)
+	return parseSnapshot(data)
+}
+
+// parseSnapshot 解析快照 JSON，按 schema_version 兼容旧 float 快照（v0/v1）：
+//   - version >= 2：直接反序列化为定点化 LedgerSnapshot；
+//   - 否则（无 version 字段的旧快照）：反序列化为 v1 结构（金额为 float64），再按资产
+//     decimals 迁移为 AssetAmount（见 migrateV1ToV2）。
+//
+// 为何不直接让 AssetAmount.UnmarshalJSON 解析旧 number：其按小数位推断 Decimals，会把
+// 旧 "1.0"（存成 "1"）误判为 Decimals=0、把 "0.30000000000000004" 误判 Decimals=17 放大
+// 10 倍。故旧快照必须先读成 float64 再显式按资产标准 decimals 缩放。
+func parseSnapshot(data []byte) (LedgerSnapshot, error) {
+	var head struct {
+		SchemaVersion int `json:"schema_version"`
 	}
-	return snap, nil
+	if err := json.Unmarshal(data, &head); err != nil {
+		return LedgerSnapshot{}, fmt.Errorf("peek snapshot version: %w", err)
+	}
+	if head.SchemaVersion >= ledgerSnapshotSchemaVersion {
+		var snap LedgerSnapshot
+		if err := json.Unmarshal(data, &snap); err != nil {
+			return LedgerSnapshot{}, fmt.Errorf("unmarshal snapshot: %w", err)
+		}
+		return snap, nil
+	}
+	var v1 ledgerSnapshotV1
+	if err := json.Unmarshal(data, &v1); err != nil {
+		return LedgerSnapshot{}, fmt.Errorf("unmarshal legacy snapshot: %w", err)
+	}
+	return migrateV1ToV2(v1), nil
+}
+
+// --- 旧快照（v0/v1，金额 float64）结构与迁移 ---
+
+type accountV1 struct {
+	UserID         int64
+	Asset          string
+	Available      float64
+	Frozen         float64
+	WithdrawFrozen float64
+}
+
+type entryV1 struct {
+	ID      int64
+	UserID  int64
+	Asset   string
+	Delta   float64
+	Balance float64
+	BizType string
+	Ref     string
+	Time    int64
+}
+
+type withdrawHoldEntryV1 struct {
+	ID        string
+	UserID    int64
+	Asset     string
+	Amount    float64
+	Fee       float64
+	Chain     string
+	Address   string
+	CreatedAt time.Time
+	HoldUntil time.Time
+	Finalized bool
+	Cancelled bool
+	Broadcasted bool
+	TxHash    string
+}
+
+type socializeProposalV1 struct {
+	ID        string
+	Asset     string
+	Recovered float64
+	Detail    map[int64]float64
+	CreatedAt int64
+	Status    string
+}
+
+type ledgerSnapshotV1 struct {
+	Accounts             []*accountV1
+	Restricted           []string
+	BadDebtByUser        map[string]float64
+	SocializeProposals   map[string]socializeProposalV1
+	HotWallet            map[string]float64
+	ColdWallet           map[string]float64
+	HotWalletCap         map[string]float64
+	WithdrawHolds        []*withdrawHoldEntryV1
+	WithdrawHoldPeriod   time.Duration
+	WithdrawHoldSeq      int64
+	WithdrawalFrozenGlobal bool
+	DailyWithdrawLimit   map[string]float64
+	DailyWithdrawUsed    map[string]float64
+	WithdrawAddresses    []*WithdrawAddress
+	AddressVerifyPeriod  time.Duration
+	RiskEvents           []*RiskEvent
+	RiskEventSeq         int64
+	AutoFrozenByRisk     bool
+	Log                  []entryV1
+	Seq                  int64
+}
+
+// migrateV1ToV2 将旧 float64 快照迁移为定点化 LedgerSnapshot：每个金额按资产标准 decimals
+// 用 AssetAmountFromFloat 缩放（丢失的浮点残差在最小单位内截断，可接受）。
+func migrateV1ToV2(v1 ledgerSnapshotV1) LedgerSnapshot {
+	decOf := func(asset string) int { return settlement.AssetDecimalsByName(asset) }
+	snap := LedgerSnapshot{
+		SchemaVersion:        ledgerSnapshotSchemaVersion,
+		Restricted:           v1.Restricted,
+		WithdrawHoldPeriod:   v1.WithdrawHoldPeriod,
+		WithdrawHoldSeq:      v1.WithdrawHoldSeq,
+		WithdrawalFrozenGlobal: v1.WithdrawalFrozenGlobal,
+		AddressVerifyPeriod:  v1.AddressVerifyPeriod,
+		RiskEventSeq:         v1.RiskEventSeq,
+		AutoFrozenByRisk:     v1.AutoFrozenByRisk,
+		Seq:                  v1.Seq,
+	}
+	snap.Accounts = make([]*Account, 0, len(v1.Accounts))
+	for _, a := range v1.Accounts {
+		if a == nil {
+			continue
+		}
+		snap.Accounts = append(snap.Accounts, &Account{
+			UserID:         a.UserID,
+			Asset:          a.Asset,
+			Available:      settlement.AssetAmountFromFloat(a.Available, decOf(a.Asset)),
+			Frozen:         settlement.AssetAmountFromFloat(a.Frozen, decOf(a.Asset)),
+			WithdrawFrozen: settlement.AssetAmountFromFloat(a.WithdrawFrozen, decOf(a.Asset)),
+		})
+	}
+	snap.BadDebtByUser = migrateMap(v1.BadDebtByUser, decOf)
+	snap.HotWallet = migrateMap(v1.HotWallet, decOf)
+	snap.ColdWallet = migrateMap(v1.ColdWallet, decOf)
+	snap.HotWalletCap = migrateMap(v1.HotWalletCap, decOf)
+	snap.DailyWithdrawLimit = migrateMap(v1.DailyWithdrawLimit, decOf)
+	snap.DailyWithdrawUsed = migrateMap(v1.DailyWithdrawUsed, decOf)
+	snap.SocializeProposals = make(map[string]SocializeProposal, len(v1.SocializeProposals))
+	for k, p := range v1.SocializeProposals {
+		dec := decOf(p.Asset)
+		snap.SocializeProposals[k] = SocializeProposal{
+			ID:        p.ID,
+			Asset:     p.Asset,
+			Recovered: settlement.AssetAmountFromFloat(p.Recovered, dec),
+			Detail:    migrateMapInt(p.Detail, dec),
+			CreatedAt: p.CreatedAt,
+			Status:    p.Status,
+		}
+	}
+	snap.WithdrawHolds = make([]*WithdrawHoldEntry, 0, len(v1.WithdrawHolds))
+	for _, e := range v1.WithdrawHolds {
+		if e == nil {
+			continue
+		}
+		snap.WithdrawHolds = append(snap.WithdrawHolds, &WithdrawHoldEntry{
+			ID:        e.ID,
+			UserID:    e.UserID,
+			Asset:     e.Asset,
+			Amount:    settlement.AssetAmountFromFloat(e.Amount, decOf(e.Asset)),
+			Fee:       settlement.AssetAmountFromFloat(e.Fee, decOf(e.Asset)),
+			Chain:     e.Chain,
+			Address:   e.Address,
+			CreatedAt: e.CreatedAt,
+			HoldUntil: e.HoldUntil,
+			Finalized: e.Finalized,
+			Cancelled: e.Cancelled,
+			Broadcasted: e.Broadcasted,
+			TxHash:    e.TxHash,
+		})
+	}
+	snap.WithdrawAddresses = v1.WithdrawAddresses
+	snap.RiskEvents = v1.RiskEvents
+	snap.Log = make([]Entry, 0, len(v1.Log))
+	for _, e := range v1.Log {
+		snap.Log = append(snap.Log, Entry{
+			ID:      e.ID,
+			UserID:  e.UserID,
+			Asset:   e.Asset,
+			Delta:   settlement.AssetAmountFromFloat(e.Delta, decOf(e.Asset)),
+			Balance: settlement.AssetAmountFromFloat(e.Balance, decOf(e.Asset)),
+			BizType: e.BizType,
+			Ref:     e.Ref,
+			Time:    e.Time,
+		})
+	}
+	return snap
+}
+
+// assetOfKey 从快照 map 的 key 中解析资产名以取得正确的 decimals。
+// 复合 key 形如 "userID:asset"（坏账归属）或 "uid:asset:YYYY-MM-DD"（当日提现额），
+// 资产名始终在第 2 段；普通资产 key（如 "USDT"）无 ":"，整体即为资产名。
+func assetOfKey(k string) string {
+	if i := strings.IndexByte(k, ':'); i >= 0 {
+		rest := k[i+1:]
+		if j := strings.IndexByte(rest, ':'); j >= 0 {
+			return rest[:j]
+		}
+		return rest
+	}
+	return k
+}
+
+func migrateMap(m map[string]float64, decOf func(string) int) map[string]settlement.AssetAmount {
+	out := make(map[string]settlement.AssetAmount, len(m))
+	for k, v := range m {
+		out[k] = settlement.AssetAmountFromFloat(v, decOf(assetOfKey(k)))
+	}
+	return out
+}
+
+func migrateMapInt(m map[int64]float64, dec int) map[int64]settlement.AssetAmount {
+	out := make(map[int64]settlement.AssetAmount, len(m))
+	for k, v := range m {
+		out[k] = settlement.AssetAmountFromFloat(v, dec)
+	}
+	return out
+}
+
+// distributeProportional 将 total 按 weights 精确整数比例分配，保证：
+//   - 各份额之和 == min(total, 各 weight 之和)；
+//   - 各份额不超过对应 weight（不超过可用/负债额）；
+//   - 整除余数按 weight 从大到小逐一分配 1 最小单位（出资能力最强者优先承担）。
+//
+// 用于坏账社会化分摊/回收的精确比例分配，消除旧 float 实现的舍入残差归零问题。
+func distributeProportional(total settlement.AssetAmount, weights []settlement.AssetAmount) []settlement.AssetAmount {
+	n := len(weights)
+	shares := make([]settlement.AssetAmount, n)
+	if total.Sign() <= 0 {
+		return shares
+	}
+	var base settlement.AssetAmount
+	for _, w := range weights {
+		base = base.Add(w)
+	}
+	if base.Sign() <= 0 {
+		return shares
+	}
+	for i := range weights {
+		num := new(big.Int).Mul(total.Value, weights[i].Value)
+		v := new(big.Int).Div(num, base.Value)
+		s := settlement.NewAssetAmount(v, total.Decimals)
+		if s.Cmp(weights[i]) > 0 {
+			s = weights[i] // 上限封顶（可用/负债额）
+		}
+		shares[i] = s
+	}
+	var sum settlement.AssetAmount
+	for _, s := range shares {
+		sum = sum.Add(s)
+	}
+	target := total
+	if base.Cmp(total) < 0 {
+		target = base
+	}
+	diff := target.Sub(sum)
+	if diff.Sign() > 0 {
+		order := argsortDesc(weights)
+		d := new(big.Int).Set(diff.Value)
+		for _, idx := range order {
+		if d.Sign() <= 0 {
+			break
+		}
+		if shares[idx].Cmp(weights[idx]) < 0 {
+			shares[idx] = shares[idx].Add(assetUnit(total.Decimals))
+			d.Sub(d, big.NewInt(1))
+		}
+	}
+	}
+	return shares
+}
+
+// argsortDesc 返回按金额从大到小排序的索引（稳定排序）。
+func argsortDesc(ws []settlement.AssetAmount) []int {
+	idx := make([]int, len(ws))
+	for i := range ws {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(i, j int) bool {
+		return ws[idx[i]].Cmp(ws[idx[j]]) > 0
+	})
+	return idx
 }

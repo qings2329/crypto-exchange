@@ -13,6 +13,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/options"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
@@ -40,7 +41,7 @@ func main() {
 	// 钱包总账（复式记账），期权权利金与结算资金流均走它（系统对手方账户 SysOptions）。
 	ledgerSvc := ledger.New()
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = ledgerSvc.Deposit(uid, "USDT", 100000, "seed")
+		_ = ledgerSvc.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 	}
 
 	// 选择 Store：配置了 DSN 则连 MySQL 并跑迁移，否则内存（演示）。

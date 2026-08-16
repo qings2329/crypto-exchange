@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // Config 是期权业务参数。
@@ -149,27 +150,27 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 
 	if side == SideLong {
 		avail, _, _ := s.ledger.Balance(userID, quote)
-		if avail < premiumTotal-1e-9 {
+		if avail.Cmp(settlement.AssetAmountFromFloat(premiumTotal, settlement.AssetDecimalsByName(quote))) < 0 {
 			return nil, ErrInsufficientBalance
 		}
 		// 买方支付权利金给系统对手方。
 		ref := fmt.Sprintf("option_open_long uid=%d cid=%d", userID, contractID)
-		if err := s.ledger.Transfer(userID, ledger.SysOptions, quote, premiumTotal, "option_premium", ref); err != nil {
+		if err := s.ledger.Transfer(userID, ledger.SysOptions, quote, settlement.AssetAmountFromFloat(premiumTotal, settlement.AssetDecimalsByName(quote)), "option_premium", ref); err != nil {
 			return nil, fmt.Errorf("pay premium: %w", err)
 		}
 	} else {
 		margin := c.Strike * c.size() * quantity * s.cfg.MarginRatio
 		avail, _, _ := s.ledger.Balance(userID, quote)
-		if avail < margin-1e-9 {
+		if avail.Cmp(settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(quote))) < 0 {
 			return nil, ErrInsufficientBalance
 		}
 		// 卖方冻结保证金，并收取权利金（来自系统对手方）。
 		ref := fmt.Sprintf("option_open_short uid=%d cid=%d", userID, contractID)
-		if err := s.ledger.Freeze(userID, quote, margin); err != nil {
+		if err := s.ledger.Freeze(userID, quote, settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(quote))); err != nil {
 			return nil, fmt.Errorf("freeze margin: %w", err)
 		}
-		if err := s.ledger.Transfer(ledger.SysOptions, userID, quote, premiumTotal, "option_premium", ref); err != nil {
-			_ = s.ledger.Unfreeze(userID, quote, margin)
+		if err := s.ledger.Transfer(ledger.SysOptions, userID, quote, settlement.AssetAmountFromFloat(premiumTotal, settlement.AssetDecimalsByName(quote)), "option_premium", ref); err != nil {
+			_ = s.ledger.Unfreeze(userID, quote, settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(quote)))
 			return nil, fmt.Errorf("receive premium: %w", err)
 		}
 		// 记录保证金（已冻结）。
@@ -227,7 +228,7 @@ func (s *Service) Exercise(userID, positionID int64) error {
 	}
 	if payoff > 0 {
 		ref := fmt.Sprintf("option_exercise uid=%d pos=%d", userID, positionID)
-		if err := s.ledger.Transfer(ledger.SysOptions, userID, c.QuoteAsset, payoff, "option_payoff", ref); err != nil {
+		if err := s.ledger.Transfer(ledger.SysOptions, userID, c.QuoteAsset, settlement.AssetAmountFromFloat(payoff, settlement.AssetDecimalsByName(c.QuoteAsset)), "option_payoff", ref); err != nil {
 			return fmt.Errorf("pay payoff: %w", err)
 		}
 	}
@@ -266,7 +267,7 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 		}
 		if payoff > 0 {
 			ref := fmt.Sprintf("option_settle_long pos=%d", positionID)
-			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, c.QuoteAsset, payoff, "option_payoff", ref); err != nil {
+			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, c.QuoteAsset, settlement.AssetAmountFromFloat(payoff, settlement.AssetDecimalsByName(c.QuoteAsset)), "option_payoff", ref); err != nil {
 				return false, fmt.Errorf("pay payoff: %w", err)
 			}
 		}
@@ -274,7 +275,7 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 		// 卖方：解冻保证金，并在保证金范围内承担内在价值义务（超出由系统已收权利金吸收）。
 		margin := p.Margin
 		if margin > 0 {
-			_ = s.ledger.Unfreeze(p.UserID, c.QuoteAsset, margin)
+			_ = s.ledger.Unfreeze(p.UserID, c.QuoteAsset, settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName(c.QuoteAsset)))
 		}
 		pay := itvTotal
 		if pay > margin {
@@ -282,7 +283,7 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 		}
 		if pay > 0 {
 			ref := fmt.Sprintf("option_settle_short pos=%d", positionID)
-			if err := s.ledger.Transfer(p.UserID, ledger.SysOptions, c.QuoteAsset, pay, "option_loss", ref); err != nil {
+			if err := s.ledger.Transfer(p.UserID, ledger.SysOptions, c.QuoteAsset, settlement.AssetAmountFromFloat(pay, settlement.AssetDecimalsByName(c.QuoteAsset)), "option_loss", ref); err != nil {
 				return false, fmt.Errorf("pay loss: %w", err)
 			}
 		}

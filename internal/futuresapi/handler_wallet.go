@@ -93,7 +93,7 @@ func (s *Server) handleDeposit(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
-	if err := s.ledgerSvc.Deposit(req.UserID, "USDT", req.Amount, "deposit"); err != nil {
+	if err := s.ledgerSvc.Deposit(req.UserID, "USDT", settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName("USDT")), "deposit"); err != nil {
 		response.Error(c, 500, 500, err.Error())
 		return
 	}
@@ -224,13 +224,13 @@ func (s *Server) handleWithdrawChain(c *gin.Context) {
 		feeAmt = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, amt)
 	}
 	// 冻结额由与链上广播同源的 AssetAmount 派生，确保账本冻结额 == 链上划出额，消除 float 漂移（F2）。
-	total := amt.HumanFloat() + feeAmt.HumanFloat()
+	total := amt.Add(feeAmt)
 	if s.ledgerSvc.IsOutflowRestricted(req.UserID, asset) {
 		response.Error(c, 403, 403, "outflow restricted: repay outstanding bad debt first")
 		return
 	}
 	avail, _, ok := s.ledgerSvc.Balance(req.UserID, asset)
-	if !ok || avail < total-1e-9 {
+	if !ok || avail.Cmp(total) < 0 {
 		response.Error(c, 400, 400, "insufficient available balance")
 		return
 	}
@@ -353,13 +353,13 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 		feeAmt = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, amt)
 	}
 	// 冻结额由与链上广播同源的 AssetAmount 派生，确保账本冻结额 == 链上划出额，消除 float 漂移（F2）。
-	total := amt.HumanFloat() + feeAmt.HumanFloat()
+	total := amt.Add(feeAmt)
 	avail, _, ok := s.ledgerSvc.Balance(req.UserID, asset)
-	if !ok || avail < total-1e-9 {
+	if !ok || avail.Cmp(total) < 0 {
 		response.Error(c, 400, 400, "insufficient available balance")
 		return
 	}
-	id, holdUntil, err := s.ledgerSvc.RequestWithdrawHold(req.UserID, asset, req.Amount, feeAmt.HumanFloat(), req.Chain, req.Address)
+	id, holdUntil, err := s.ledgerSvc.RequestWithdrawHold(req.UserID, asset, amt, feeAmt, req.Chain, req.Address)
 	if err != nil {
 		response.Error(c, 403, 403, err.Error())
 		return
@@ -402,10 +402,9 @@ func (s *Server) finalizeHold(id string, requireCooling bool) (*ledger.WithdrawH
 	if already {
 		txHash = claimedTx
 	} else {
-		dec := settlement.AssetDecimals(settlement.Chain(e.Chain), e.Asset)
 		var ev *settlement.WithdrawEvent
 		ev, berr = s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain),
-			settlement.AssetAmountFromFloat(e.Amount, dec), settlement.AssetAmountFromFloat(e.Fee, dec), e.Address, false)
+			e.Amount, e.Fee, e.Address, false)
 		if berr != nil {
 			_ = s.ledgerSvc.ResetWithdrawBroadcast(id) // 广播失败释放槽，允许重试重新广播
 			return nil, "", 502, fmt.Errorf("broadcast failed: %v", berr)
@@ -744,7 +743,7 @@ func (s *Server) handleBadDebtRepay(c *gin.Context) {
 		req.Asset = "USDT"
 	}
 	ref := fmt.Sprintf("repay:%d", req.UserID)
-	if err := s.ledgerSvc.RepayBadDebt(req.UserID, req.Asset, req.Amount, ref); err != nil {
+	if err := s.ledgerSvc.RepayBadDebt(req.UserID, req.Asset, settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset)), ref); err != nil {
 		response.Error(c, 400, 400, err.Error())
 		return
 	}
@@ -776,7 +775,7 @@ func (s *Server) handleSocializePropose(c *gin.Context) {
 	}
 	shares := make(map[string]float64, len(preview.Detail))
 	for uid, amt := range preview.Detail {
-		shares[fmt.Sprintf("%d", uid)] = amt
+		shares[fmt.Sprintf("%d", uid)] = amt.HumanFloat()
 	}
 	response.JSON(c, gin.H{
 		"proposal_id": id,
@@ -813,7 +812,7 @@ func (s *Server) handleSocializeApprove(c *gin.Context) {
 	}
 	shares := make(map[string]float64, len(detail))
 	for uid, amt := range detail {
-		shares[fmt.Sprintf("%d", uid)] = amt
+		shares[fmt.Sprintf("%d", uid)] = amt.HumanFloat()
 	}
 	resp["shares"] = shares
 	response.JSON(c, resp)
@@ -836,7 +835,7 @@ func (s *Server) handleReconcile(c *gin.Context) {
 	}
 	invDev := make(map[string]float64)
 	for asset := range dev {
-		invDev[asset] = s.ledgerSvc.InventoryMatchesLiability(asset)
+		invDev[asset] = s.ledgerSvc.InventoryMatchesLiability(asset).HumanFloat()
 	}
 	resp["inventory_deviation"] = invDev
 	if !balanced {
@@ -897,7 +896,7 @@ func (s *Server) handleInventory(c *gin.Context) {
 			"cold_wallet":      s.ledgerSvc.ColdWalletBalance(a),
 			"hot_cap":          s.ledgerSvc.HotWalletCap(a),
 			"hot_excess":       s.ledgerSvc.HotWalletExcess(a),
-			"onchain_total":    s.ledgerSvc.HotWalletBalance(a) + s.ledgerSvc.ColdWalletBalance(a),
+			"onchain_total":    s.ledgerSvc.HotWalletBalance(a).Add(s.ledgerSvc.ColdWalletBalance(a)),
 			"inv_vs_liability": s.ledgerSvc.InventoryMatchesLiability(a),
 		})
 	}
@@ -914,8 +913,8 @@ func (s *Server) handleSweep(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request: asset required")
 		return
 	}
-	amount := req.Amount
-	if amount <= 0 {
+	amount := settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset))
+	if amount.Sign() <= 0 {
 		amount = s.ledgerSvc.HotWalletBalance(req.Asset)
 	}
 	swept, err := s.ledgerSvc.SweepToCold(req.Asset, amount)
@@ -942,8 +941,8 @@ func (s *Server) handleUnsweep(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request: asset required")
 		return
 	}
-	amount := req.Amount
-	if amount <= 0 {
+	amount := settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset))
+	if amount.Sign() <= 0 {
 		amount = s.ledgerSvc.ColdWalletBalance(req.Asset)
 	}
 	moved, err := s.ledgerSvc.UnsweepFromCold(req.Asset, amount)
@@ -968,12 +967,12 @@ func (s *Server) handleMetrics(c *gin.Context) {
 	b.WriteString("# HELP crypto_exchange_ledger_deviation 复式记账各资产借贷偏差（应恒为0）\n")
 	b.WriteString("# TYPE crypto_exchange_ledger_deviation gauge\n")
 	for asset, v := range dev {
-		fmt.Fprintf(&b, "crypto_exchange_ledger_deviation{asset=%q} %.8f\n", asset, v)
+		fmt.Fprintf(&b, "crypto_exchange_ledger_deviation{asset=%q} %.8f\n", asset, v.HumanFloat())
 	}
 	b.WriteString("# HELP crypto_exchange_bad_debt_total 各资产未冲抵坏账总额\n")
 	b.WriteString("# TYPE crypto_exchange_bad_debt_total gauge\n")
 	for asset := range dev {
-		fmt.Fprintf(&b, "crypto_exchange_bad_debt_total{asset=%q} %.8f\n", asset, s.ledgerSvc.BadDebtTotal(asset))
+		fmt.Fprintf(&b, "crypto_exchange_bad_debt_total{asset=%q} %.8f\n", asset, s.ledgerSvc.BadDebtTotal(asset).HumanFloat())
 	}
 	b.WriteString("# HELP crypto_exchange_reconcile_imbalance_total 对账巡检累计不平账次数\n")
 	b.WriteString("# TYPE crypto_exchange_reconcile_imbalance_total counter\n")
@@ -984,22 +983,22 @@ func (s *Server) handleMetrics(c *gin.Context) {
 	b.WriteString("# HELP crypto_exchange_hot_wallet_balance 热钱包链上持仓（持续暴露于热私钥泄露风险）\n")
 	b.WriteString("# TYPE crypto_exchange_hot_wallet_balance gauge\n")
 	for _, asset := range []string{"USDT", "ETH", "BTC"} {
-		fmt.Fprintf(&b, "crypto_exchange_hot_wallet_balance{asset=%q} %.8f\n", asset, s.ledgerSvc.HotWalletBalance(asset))
+		fmt.Fprintf(&b, "crypto_exchange_hot_wallet_balance{asset=%q} %.8f\n", asset, s.ledgerSvc.HotWalletBalance(asset).HumanFloat())
 	}
 	b.WriteString("# HELP crypto_exchange_cold_wallet_balance 冷钱包链上持仓（离线多签保管）\n")
 	b.WriteString("# TYPE crypto_exchange_cold_wallet_balance gauge\n")
 	for _, asset := range []string{"USDT", "ETH", "BTC"} {
-		fmt.Fprintf(&b, "crypto_exchange_cold_wallet_balance{asset=%q} %.8f\n", asset, s.ledgerSvc.ColdWalletBalance(asset))
+		fmt.Fprintf(&b, "crypto_exchange_cold_wallet_balance{asset=%q} %.8f\n", asset, s.ledgerSvc.ColdWalletBalance(asset).HumanFloat())
 	}
 	b.WriteString("# HELP crypto_exchange_hot_wallet_excess 热钱包超出风险敞口上限的额度（>0 应告警并归集）\n")
 	b.WriteString("# TYPE crypto_exchange_hot_wallet_excess gauge\n")
 	for _, asset := range []string{"USDT", "ETH", "BTC"} {
-		fmt.Fprintf(&b, "crypto_exchange_hot_wallet_excess{asset=%q} %.8f\n", asset, s.ledgerSvc.HotWalletExcess(asset))
+		fmt.Fprintf(&b, "crypto_exchange_hot_wallet_excess{asset=%q} %.8f\n", asset, s.ledgerSvc.HotWalletExcess(asset).HumanFloat())
 	}
 	b.WriteString("# HELP crypto_exchange_inventory_mismatch 链上持仓与对用户净负债的偏差（应恒为0，否则账本与链脱节）\n")
 	b.WriteString("# TYPE crypto_exchange_inventory_mismatch gauge\n")
 	for _, asset := range []string{"USDT", "ETH", "BTC"} {
-		fmt.Fprintf(&b, "crypto_exchange_inventory_mismatch{asset=%q} %.8f\n", asset, s.ledgerSvc.InventoryMatchesLiability(asset))
+		fmt.Fprintf(&b, "crypto_exchange_inventory_mismatch{asset=%q} %.8f\n", asset, s.ledgerSvc.InventoryMatchesLiability(asset).HumanFloat())
 	}
 	b.WriteString("# HELP crypto_exchange_pending_withdraw_holds 处于冷静期、尚未链上清算的提现请求数\n")
 	b.WriteString("# TYPE crypto_exchange_pending_withdraw_holds gauge\n")

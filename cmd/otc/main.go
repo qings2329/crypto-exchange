@@ -13,6 +13,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/otc"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
@@ -40,8 +41,8 @@ func main() {
 	// 钱包总账（复式记账），OTC 成交的 crypto 托管/释放均走它（中央托管账户 SysOtc）。
 	ledgerSvc := ledger.New()
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = ledgerSvc.Deposit(uid, "BTC", 10, "seed")  // 演示用加密资产
-		_ = ledgerSvc.Deposit(uid, "USDT", 100000, "seed")
+		_ = ledgerSvc.Deposit(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), "seed")  // 演示用加密资产
+		_ = ledgerSvc.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 	}
 
 	// 选择 Store：配置了 DSN 则连 MySQL 并跑迁移，否则内存（演示）。

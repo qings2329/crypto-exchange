@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // Config 是 OTC 业务参数。
@@ -114,11 +115,11 @@ func (s *Service) TakeOrder(adID, takerID int64, fiatAmount float64, paymentMeth
 	}
 	// 校验卖方可用余额并冻结进托管账户。
 	avail, _, _ := s.ledger.Balance(seller, ad.Asset)
-	if avail < cryptoAmount-1e-9 {
+	if avail.Cmp(settlement.AssetAmountFromFloat(cryptoAmount, settlement.AssetDecimalsByName(ad.Asset))) < 0 {
 		return nil, ErrInsufficientBalance
 	}
 	ref := fmt.Sprintf("otc_take ad=%d seller=%d taker=%d", adID, seller, takerID)
-	if err := s.ledger.Transfer(seller, ledger.SysOtc, ad.Asset, cryptoAmount, "otc_escrow", ref); err != nil {
+	if err := s.ledger.Transfer(seller, ledger.SysOtc, ad.Asset, settlement.AssetAmountFromFloat(cryptoAmount, settlement.AssetDecimalsByName(ad.Asset)), "otc_escrow", ref); err != nil {
 		return nil, fmt.Errorf("lock escrow: %w", err)
 	}
 	o := &OtcOrder{
@@ -136,7 +137,7 @@ func (s *Service) TakeOrder(adID, takerID int64, fiatAmount float64, paymentMeth
 	}
 	if err := s.store.CreateOrder(o); err != nil {
 		// 回滚托管冻结。
-		_ = s.ledger.Transfer(ledger.SysOtc, seller, ad.Asset, cryptoAmount, "otc_escrow_rollback", ref)
+		_ = s.ledger.Transfer(ledger.SysOtc, seller, ad.Asset, settlement.AssetAmountFromFloat(cryptoAmount, settlement.AssetDecimalsByName(ad.Asset)), "otc_escrow_rollback", ref)
 		return nil, err
 	}
 	// 标记广告已成交（单笔成交模型，简化）。
@@ -177,7 +178,7 @@ func (s *Service) ConfirmComplete(orderID, userID int64, rating int) error {
 	// 托管释放给买方。
 	buyer := o.BuyerID()
 	ref := fmt.Sprintf("otc_release ad=%d order=%d", o.AdID, orderID)
-	if err := s.ledger.Transfer(ledger.SysOtc, buyer, o.Asset, o.CryptoAmount, "otc_release", ref); err != nil {
+	if err := s.ledger.Transfer(ledger.SysOtc, buyer, o.Asset, settlement.AssetAmountFromFloat(o.CryptoAmount, settlement.AssetDecimalsByName(o.Asset)), "otc_release", ref); err != nil {
 		return fmt.Errorf("release escrow: %w", err)
 	}
 	o.Status = OrderCompleted
@@ -240,7 +241,7 @@ func (s *Service) ResolveDispute(orderID int64, refundToSeller bool, rating int)
 	}
 	buyer := o.BuyerID()
 	ref := fmt.Sprintf("otc_dispute_release ad=%d order=%d", o.AdID, orderID)
-	if err := s.ledger.Transfer(ledger.SysOtc, buyer, o.Asset, o.CryptoAmount, "otc_release", ref); err != nil {
+	if err := s.ledger.Transfer(ledger.SysOtc, buyer, o.Asset, settlement.AssetAmountFromFloat(o.CryptoAmount, settlement.AssetDecimalsByName(o.Asset)), "otc_release", ref); err != nil {
 		return fmt.Errorf("release escrow: %w", err)
 	}
 	o.Status = OrderCompleted
@@ -260,7 +261,7 @@ func (s *Service) ResolveDispute(orderID int64, refundToSeller bool, rating int)
 func (s *Service) returnEscrow(o *OtcOrder, final OrderStatus) error {
 	seller := o.SellerID()
 	ref := fmt.Sprintf("otc_return ad=%d order=%d", o.AdID, o.ID)
-	if err := s.ledger.Transfer(ledger.SysOtc, seller, o.Asset, o.CryptoAmount, "otc_return", ref); err != nil {
+	if err := s.ledger.Transfer(ledger.SysOtc, seller, o.Asset, settlement.AssetAmountFromFloat(o.CryptoAmount, settlement.AssetDecimalsByName(o.Asset)), "otc_return", ref); err != nil {
 		return fmt.Errorf("return escrow: %w", err)
 	}
 	o.Status = final
@@ -308,7 +309,8 @@ func (s *Service) ListCounterparties(userID int64) ([]*OtcCounterparty, error) {
 
 // Reconcile 对账：返回中央托管账户余额（应恒为 0）与仍未释放托管的订单（pending/paid/disputed）。
 func (s *Service) Reconcile() (escrow float64, stuck []*OtcOrder, err error) {
-	escrow, _, _ = s.ledger.Balance(ledger.SysOtc, s.cfg.Asset)
+	escBal, _, _ := s.ledger.Balance(ledger.SysOtc, s.cfg.Asset)
+	escrow = escBal.HumanFloat()
 	all, err := s.store.ListAllOrders()
 	if err != nil {
 		return escrow, nil, err

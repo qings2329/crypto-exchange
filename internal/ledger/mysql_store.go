@@ -137,8 +137,8 @@ func LoadSnapshotFromMySQL(dsn, ledgerID string) (LedgerSnapshot, bool, error) {
 	if err != nil {
 		return LedgerSnapshot{}, false, fmt.Errorf("query snapshot: %w", err)
 	}
-	var snap LedgerSnapshot
-	if err := json.Unmarshal([]byte(data), &snap); err != nil {
+	snap, err := parseSnapshot([]byte(data))
+	if err != nil {
 		return LedgerSnapshot{}, false, fmt.Errorf("unmarshal snapshot: %w", err)
 	}
 	return snap, true, nil

@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // Config 是杠杆业务参数。
@@ -75,16 +76,16 @@ func (s *Service) Borrow(userID int64, asset string, amount float64, leverage in
 
 	// 检查并冻结抵押。
 	avail, _, ok := s.ledger.Balance(userID, s.cfg.CollateralAsset)
-	if !ok || avail < collateral {
+	if !ok || avail.Cmp(settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset))) < 0 {
 		return nil, ErrInsufficientCollateral
 	}
-	if err := s.ledger.Freeze(userID, s.cfg.CollateralAsset, collateral); err != nil {
+	if err := s.ledger.Freeze(userID, s.cfg.CollateralAsset, settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset))); err != nil {
 		return nil, fmt.Errorf("freeze collateral: %w", err)
 	}
 	// 贷出资产记入 ledger 可用余额（复式记账，借出即产生用户可用资产）。
 	ref := fmt.Sprintf("margin_borrow uid=%d asset=%s", userID, asset)
-	if err := s.ledger.CreditAvailable(userID, asset, amount, "margin_borrow", ref); err != nil {
-		_ = s.ledger.Unfreeze(userID, s.cfg.CollateralAsset, collateral)
+	if err := s.ledger.CreditAvailable(userID, asset, settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(asset)), "margin_borrow", ref); err != nil {
+		_ = s.ledger.Unfreeze(userID, s.cfg.CollateralAsset, settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset)))
 		return nil, fmt.Errorf("credit borrowed asset: %w", err)
 	}
 
@@ -129,11 +130,11 @@ func (s *Service) Repay(userID int64, asset string, amount float64) error {
 		repay = total
 	}
 	avail, _, ok := s.ledger.Balance(userID, asset)
-	if !ok || avail < repay {
+	if !ok || avail.Cmp(settlement.AssetAmountFromFloat(repay, settlement.AssetDecimalsByName(asset))) < 0 {
 		return ErrInsufficientBalance
 	}
 	ref := fmt.Sprintf("margin_repay uid=%d asset=%s", userID, asset)
-	if err := s.ledger.DebitAvailable(userID, asset, repay, "margin_repay", ref); err != nil {
+	if err := s.ledger.DebitAvailable(userID, asset, settlement.AssetAmountFromFloat(repay, settlement.AssetDecimalsByName(asset)), "margin_repay", ref); err != nil {
 		return err
 	}
 	principal := repay
@@ -146,7 +147,7 @@ func (s *Service) Repay(userID int64, asset string, amount float64) error {
 		a.InterestAccrued = 0
 	}
 	if a.Debt <= 1e-9 && a.InterestAccrued <= 1e-9 {
-		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, a.CollateralAmount); err != nil {
+		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, settlement.AssetAmountFromFloat(a.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset))); err != nil {
 			return err
 		}
 		a.CollateralAmount = 0
@@ -227,12 +228,12 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 
 	// 收回借出资产（借记用户可用，与借出时的 CreditAvailable 对冲，账本自平衡）。
 	avail, _, ok2 := s.ledger.Balance(userID, asset)
-	seize := a.Debt
-	if !ok2 || avail < seize {
+	seize := settlement.AssetAmountFromFloat(a.Debt, settlement.AssetDecimalsByName(asset))
+	if !ok2 || avail.Cmp(seize) < 0 {
 		seize = avail
 	}
 	ref := fmt.Sprintf("margin_liq uid=%d asset=%s", userID, asset)
-	if seize > 0 {
+	if seize.Sign() > 0 {
 		if err := s.ledger.DebitAvailable(userID, asset, seize, "margin_liquidation", ref); err != nil {
 			return false, err
 		}
@@ -240,12 +241,12 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 	// 先解冻全部抵押回可用，再从可用中罚没部分入保险基金（ledger.Transfer 操作可用余额）。
 	penalty := a.CollateralAmount * s.cfg.LiquidationPenalty
 	if a.CollateralAmount > 0 {
-		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, a.CollateralAmount); err != nil {
+		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, settlement.AssetAmountFromFloat(a.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset))); err != nil {
 			return false, err
 		}
 	}
 	if penalty > 0 {
-		if err := s.ledger.Transfer(userID, ledger.SysInsurance, a.CollateralAsset, penalty,
+		if err := s.ledger.Transfer(userID, ledger.SysInsurance, a.CollateralAsset, settlement.AssetAmountFromFloat(penalty, settlement.AssetDecimalsByName(a.CollateralAsset)),
 			"margin_liq_penalty", ref); err != nil {
 			return false, err
 		}

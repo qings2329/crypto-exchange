@@ -79,17 +79,17 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	}
 
 	// 账本资金安全防线（演示值，生产按资产风险配置）。
-	ledgerSvc.SetHotWalletCap("USDT", 150000)
-	ledgerSvc.SetHotWalletCap("ETH", 50)
-	ledgerSvc.SetHotWalletCap("BTC", 5)
+	ledgerSvc.SetHotWalletCap("USDT", settlement.AssetAmountFromInt64(150000, settlement.AssetDecimalsByName("USDT")))
+	ledgerSvc.SetHotWalletCap("ETH", settlement.AssetAmountFromInt64(50, settlement.AssetDecimalsByName("ETH")))
+	ledgerSvc.SetHotWalletCap("BTC", settlement.AssetAmountFromInt64(5, settlement.AssetDecimalsByName("BTC")))
 	ledgerSvc.SetWithdrawHoldPeriod(30 * time.Second)
-	ledgerSvc.SetDailyWithdrawLimit("USDT", 50000)
-	ledgerSvc.SetDailyWithdrawLimit("ETH", 10)
-	ledgerSvc.SetDailyWithdrawLimit("BTC", 1)
+	ledgerSvc.SetDailyWithdrawLimit("USDT", settlement.AssetAmountFromInt64(50000, settlement.AssetDecimalsByName("USDT")))
+	ledgerSvc.SetDailyWithdrawLimit("ETH", settlement.AssetAmountFromInt64(10, settlement.AssetDecimalsByName("ETH")))
+	ledgerSvc.SetDailyWithdrawLimit("BTC", settlement.AssetAmountFromInt64(1, settlement.AssetDecimalsByName("BTC")))
 	ledgerSvc.SetAddressVerifyPeriod(10 * time.Second)
 	ledgerSvc.EnableRiskEngine(true, true)
 	ledgerSvc.SetRiskThresholds(60*time.Second, 30000, 5, 3)
-	ledgerSvc.SetReconcileAlertHook(func(dev map[string]float64) {
+	ledgerSvc.SetReconcileAlertHook(func(dev map[string]settlement.AssetAmount) {
 		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
 	})
 	ledgerSvc.StartReconciler(15 * time.Second)
@@ -160,14 +160,14 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	s.liquidator.SetPartialRatio(0.5)
 	s.liquidator.SetInsuranceProvider(func() float64 {
 		bal, _, _ := ledgerSvc.Balance(ledger.SysInsurance, "USDT")
-		return bal
+		return bal.HumanFloat()
 	})
 	s.liquidator.SetADLCallback(func(ev futures.ADLEvent) {
 		ref := fmt.Sprintf("adl:%d:%s", ev.UserID, ev.Symbol)
-		if err := ledgerSvc.DebitAvailable(ev.UserID, "USDT", ev.ProfitCovered, "adl", ref); err != nil {
+		if err := ledgerSvc.DebitAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.ProfitCovered, settlement.AssetDecimalsByName("USDT")), "adl", ref); err != nil {
 			log.Error("adl debit failed", zap.Int64("user", ev.UserID), zap.Error(err))
 		}
-		if err := ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", ev.ProfitCovered, "adl", ref); err != nil {
+		if err := ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", settlement.AssetAmountFromFloat(ev.ProfitCovered, settlement.AssetDecimalsByName("USDT")), "adl", ref); err != nil {
 			log.Error("adl insurance credit failed", zap.Error(err))
 		}
 		s.hub.Broadcast(ev.Symbol, ginH{"type": "adl", "data": ev})
@@ -177,17 +177,19 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	})
 	s.liquidator.SetDeficitPayer(func(deficit float64) {
 		ref := fmt.Sprintf("deficit:%d", time.Now().UnixNano())
-		_ = ledgerSvc.DebitAvailable(ledger.SysInsurance, "USDT", deficit, "liquidation_deficit", ref)
-		_ = ledgerSvc.CreditAvailable(ledger.SysLiquidationLoss, "USDT", deficit, "liquidation_deficit", ref)
+		amt := settlement.AssetAmountFromFloat(deficit, settlement.AssetDecimalsByName("USDT"))
+		_ = ledgerSvc.DebitAvailable(ledger.SysInsurance, "USDT", amt, "liquidation_deficit", ref)
+		_ = ledgerSvc.CreditAvailable(ledger.SysLiquidationLoss, "USDT", amt, "liquidation_deficit", ref)
 		log.Warn("liquidation deficit paid by insurance", zap.Float64("deficit", deficit))
 	})
 	s.liquidator.SetSocializeCallback(func(shares []futures.SocializedLossEvent) {
 		for _, sh := range shares {
 			ref := fmt.Sprintf("socialize:%d:%s", sh.UserID, sh.Symbol)
-			if err := ledgerSvc.DebitAvailable(sh.UserID, "USDT", sh.Share, "socialized_loss", ref); err != nil {
+			amt := settlement.AssetAmountFromFloat(sh.Share, settlement.AssetDecimalsByName("USDT"))
+			if err := ledgerSvc.DebitAvailable(sh.UserID, "USDT", amt, "socialized_loss", ref); err != nil {
 				log.Error("socialize debit failed", zap.Int64("user", sh.UserID), zap.Error(err))
 			}
-			if err := ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", sh.Share, "socialized_loss", ref); err != nil {
+			if err := ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", amt, "socialized_loss", ref); err != nil {
 				log.Error("socialize insurance credit failed", zap.Error(err))
 			}
 		}
@@ -239,7 +241,7 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 			case ev := <-ch:
-			if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.TxHash); err != nil {
+			if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash); err != nil {
 				s.log.Error("on-chain credit failed", zap.String("tx", ev.TxHash), zap.Error(err))
 				continue
 			}
@@ -263,15 +265,15 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 			case ev := <-rch:
-			badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.TxHash)
+			badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash)
 			if err != nil {
 				s.log.Error("on-chain rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
 				continue
 			}
-			if badDebt > 0 {
+			if badDebt.Sign() > 0 {
 				s.log.Error("on-chain deposit reverted with BAD DEBT (user already spent funds)",
 					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("bad_debt", badDebt),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("bad_debt", badDebt.HumanFloat()),
 					zap.String("tx", ev.TxHash))
 			} else {
 				s.log.Warn("on-chain deposit reverted (orphan block)",
@@ -295,10 +297,10 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 		case ev := <-wch:
-			total := ev.Amount.HumanFloat() + ev.Fee.HumanFloat()
+			total := ev.Amount.Add(ev.Fee)
 			switch ev.Status {
 			case settlement.WithdrawCredited:
-				if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.Fee.HumanFloat(), ev.TxHash); err != nil {
+				if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
 					s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
 					continue
 				}
@@ -332,8 +334,8 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 		case ev := <-wrh:
-			total := ev.Amount.HumanFloat() + ev.Fee.HumanFloat()
-			if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.Fee.HumanFloat(), ev.TxHash); err != nil {
+			total := ev.Amount.Add(ev.Fee)
+			if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
 				s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
 				continue
 			}
@@ -379,16 +381,16 @@ func (s *Server) onLiquidation(ev futures.LiquidationEvent) {
 	if ev.Partial {
 		if ev.Mode == futures.Cross {
 			if ev.Realized >= 0 {
-				_ = s.ledgerSvc.Freeze(ev.UserID, "USDT", ev.Realized)
+				_ = s.ledgerSvc.Freeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Realized, settlement.AssetDecimalsByName("USDT")))
 			} else {
-				_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", -ev.Realized)
+				_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(-ev.Realized, settlement.AssetDecimalsByName("USDT")))
 			}
 		} else {
-			_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", ev.Margin)
+			_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")))
 			if ev.Realized >= 0 {
-				_ = s.ledgerSvc.CreditAvailable(ev.UserID, "USDT", ev.Realized, "partial_liq", ref)
+				_ = s.ledgerSvc.CreditAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Realized, settlement.AssetDecimalsByName("USDT")), "partial_liq", ref)
 			} else {
-				_ = s.ledgerSvc.DebitAvailable(ev.UserID, "USDT", -ev.Realized, "partial_liq", ref)
+				_ = s.ledgerSvc.DebitAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(-ev.Realized, settlement.AssetDecimalsByName("USDT")), "partial_liq", ref)
 			}
 		}
 		s.log.Info("partial liquidation",
@@ -398,11 +400,11 @@ func (s *Server) onLiquidation(ev futures.LiquidationEvent) {
 		return
 	}
 
-	_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", ev.Margin)
-	if err := s.ledgerSvc.DebitAvailable(ev.UserID, "USDT", ev.Margin, "liquidation", ref); err != nil {
+	_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")))
+	if err := s.ledgerSvc.DebitAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")), "liquidation", ref); err != nil {
 		s.log.Error("liquidation debit failed", zap.Error(err))
 	}
-	if err := s.ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", ev.Margin, "liquidation", ref); err != nil {
+	if err := s.ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")), "liquidation", ref); err != nil {
 		s.log.Error("insurance credit failed", zap.Error(err))
 	}
 	s.log.Info("liquidation settled",
@@ -537,20 +539,22 @@ func (s *Server) fundingLoop() {
 					switch {
 					case p.Payment < 0:
 						pay := -p.Payment
+						payAmt := settlement.AssetAmountFromFloat(pay, settlement.AssetDecimalsByName("USDT"))
 						if s.liquidator.ModeOf(sym, p.UserID) == futures.Cross {
-							_ = s.ledgerSvc.Unfreeze(p.UserID, "USDT", pay)
+							_ = s.ledgerSvc.Unfreeze(p.UserID, "USDT", payAmt)
 							s.liquidator.AdjustCrossBalance(sym, p.UserID, -pay)
 						}
-						if err := s.ledgerSvc.Transfer(p.UserID, ledger.SysFundingPool, "USDT", pay, "funding", ref); err != nil {
+						if err := s.ledgerSvc.Transfer(p.UserID, ledger.SysFundingPool, "USDT", payAmt, "funding", ref); err != nil {
 							s.log.Error("funding debit failed", zap.Int64("user", p.UserID), zap.Error(err))
 						}
 					case p.Payment > 0:
-						if err := s.ledgerSvc.Transfer(ledger.SysFundingPool, p.UserID, "USDT", p.Payment, "funding", ref); err != nil {
+						payAmt := settlement.AssetAmountFromFloat(p.Payment, settlement.AssetDecimalsByName("USDT"))
+						if err := s.ledgerSvc.Transfer(ledger.SysFundingPool, p.UserID, "USDT", payAmt, "funding", ref); err != nil {
 							s.log.Error("funding credit failed", zap.Int64("user", p.UserID), zap.Error(err))
 						}
 						if s.liquidator.ModeOf(sym, p.UserID) == futures.Cross {
 							s.liquidator.AdjustCrossBalance(sym, p.UserID, p.Payment)
-							_ = s.ledgerSvc.Freeze(p.UserID, "USDT", p.Payment)
+							_ = s.ledgerSvc.Freeze(p.UserID, "USDT", payAmt)
 						}
 					}
 				}

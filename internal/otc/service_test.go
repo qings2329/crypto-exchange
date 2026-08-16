@@ -6,14 +6,20 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
+
+// eqAmt 将账本返回的 AssetAmount 与人类单位字面量按资产小数位精确比较（无 epsilon）。
+func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
+	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
+}
 
 func newTestService() (*Service, *ledger.Ledger) {
 	store := NewMemStore()
 	l := ledger.New()
 	for _, uid := range []int64{1, 2} {
-		_ = l.Deposit(uid, "BTC", 10, "seed")
-		_ = l.Deposit(uid, "USDT", 100000, "seed")
+		_ = l.Deposit(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), "seed")
+		_ = l.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 	}
 	svc := NewService(store, l, Config{}, zap.NewNop(), func(string) (float64, bool) { return 0, false })
 	return svc, l
@@ -57,12 +63,12 @@ func TestTakeOrderLocksEscrow(t *testing.T) {
 		t.Fatalf("unexpected order: %+v", o)
 	}
 	avail, _, _ := l.Balance(1, "BTC")
-	if avail < 10-1-1e-9 || avail > 10-1+1e-9 {
-		t.Fatalf("seller btc not reduced: avail=%.4f", avail)
+	if !eqAmt(avail, 9, "BTC") {
+		t.Fatalf("seller btc not reduced: avail=%v", avail)
 	}
 	escrow, _, _ := l.Balance(ledger.SysOtc, "BTC")
-	if escrow < 1-1e-9 || escrow > 1+1e-9 {
-		t.Fatalf("escrow not 1: %.4f", escrow)
+	if !eqAmt(escrow, 1, "BTC") {
+		t.Fatalf("escrow not 1: %v", escrow)
 	}
 }
 
@@ -91,12 +97,12 @@ func TestCompleteFlowReleasesEscrow(t *testing.T) {
 	}
 	// 托管清空，买方获得 1 BTC。
 	escrow, _, _ := l.Balance(ledger.SysOtc, "BTC")
-	if escrow > 1e-9 {
-		t.Fatalf("escrow not cleared: %.4f", escrow)
+	if escrow.Sign() > 0 {
+		t.Fatalf("escrow not cleared: %v", escrow)
 	}
 	buyerAvail, _, _ := l.Balance(2, "BTC")
-	if buyerAvail < 11-1e-9 || buyerAvail > 11+1e-9 {
-		t.Fatalf("buyer btc wrong: %.4f", buyerAvail)
+	if !eqAmt(buyerAvail, 11, "BTC") {
+		t.Fatalf("buyer btc wrong: %v", buyerAvail)
 	}
 	// 对手方信用更新。
 	cp, err := svc.GetCounterparty(1, 2)
@@ -116,19 +122,19 @@ func TestCancelOrderReturnsEscrow(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 	escrow, _, _ := l.Balance(ledger.SysOtc, "BTC")
-	if escrow > 1e-9 {
-		t.Fatalf("escrow not returned: %.4f", escrow)
+	if escrow.Sign() > 0 {
+		t.Fatalf("escrow not returned: %v", escrow)
 	}
 	sellerAvail, _, _ := l.Balance(1, "BTC")
-	if sellerAvail < 10-1e-9 {
-		t.Fatalf("seller btc not restored: %.4f", sellerAvail)
+	if sellerAvail.Cmp(settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC"))) < 0 {
+		t.Fatalf("seller btc not restored: %v", sellerAvail)
 	}
 }
 
 func TestInsufficientBalanceOnTake(t *testing.T) {
 	store := NewMemStore()
 	l := ledger.New()
-	_ = l.Deposit(1, "BTC", 10, "seed") // maker 有 BTC
+	_ = l.Deposit(1, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), "seed") // maker 有 BTC
 	// taker=2 无 BTC；buy 广告：taker 是卖方，需冻结 BTC -> 应失败。
 	svc := NewService(store, l, Config{}, zap.NewNop(), func(string) (float64, bool) { return 0, false })
 	ad := &OtcAdvertisement{
@@ -161,11 +167,11 @@ func TestDisputeResolutionRefundToBuyer(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 	escrow, _, _ := l.Balance(ledger.SysOtc, "BTC")
-	if escrow > 1e-9 {
-		t.Fatalf("escrow not released: %.4f", escrow)
+	if escrow.Sign() > 0 {
+		t.Fatalf("escrow not released: %v", escrow)
 	}
 	buyerAvail, _, _ := l.Balance(2, "BTC")
-	if buyerAvail < 11-1e-9 {
-		t.Fatalf("buyer btc wrong: %.4f", buyerAvail)
+	if buyerAvail.Cmp(settlement.AssetAmountFromFloat(11, settlement.AssetDecimalsByName("BTC"))) < 0 {
+		t.Fatalf("buyer btc wrong: %v", buyerAvail)
 	}
 }
