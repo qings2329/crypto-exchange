@@ -41,6 +41,10 @@ type HotWalletConfig struct {
 	Enabled bool `yaml:"enabled"`
 	// SignerType 签名器类型：生产 "hsm"/"kms" 走真实 secp256k1 签名；脚手架 "stub" 仅演示边界。
 	SignerType string `yaml:"signer_type"`
+	// SignerBackend 指定真实签名后端："software"（默认，用 SignerKey 本地私钥）或
+	// "external"（用 RegisterExternalSigner 注册的 HSM/KMS 后端；SignerKey 此时作为 keyID）。
+	// 生产接入真实安全模块时设 "external" 并事先注册后端，私钥永不离开 HSM/KMS。
+	SignerBackend string `yaml:"signer_backend"`
 	// SignerKey 是软件签名器本地演示用的私钥（hex，可选 0x 前缀）。生产应由 HSM/KMS 注入，
 	// 私钥不出安全域、不落配置；此处仅供离线跑通「真实签名 → SendRaw」链路。
 	SignerKey string `yaml:"signer_key"`

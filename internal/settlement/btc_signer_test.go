@@ -93,7 +93,7 @@ func TestSignBTCP2PKHSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRealSigner: %v", err)
 	}
-	pub := s.priv.PubKey()
+	pub := s.key.Public()
 	recipient := deriveP2PKHAddress(pub) // 收款至自身 P2PKH
 
 	// 仅给 P2PKH 类型的 UTXO（把第 2 个换成 P2PKH）。
@@ -130,7 +130,7 @@ func TestSignBTCP2WPKHSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRealSigner: %v", err)
 	}
-	pub := s.priv.PubKey()
+	pub := s.key.Public()
 	utxos := btcTestUTXOs(t, pub) // 含一个 P2WPKH（bbbb… vout1）
 
 	tx := &UnsignedTx{
@@ -157,7 +157,7 @@ func TestSignBTCP2WPKHSelection(t *testing.T) {
 // TestSignBTCInsufficient 验证余额不足（含手续费）时报错，不签名。
 func TestSignBTCInsufficient(t *testing.T) {
 	s, _ := newRealSigner(HotWalletConfig{SignerKey: btcTestPriv})
-	pub := s.priv.PubKey()
+	pub := s.key.Public()
 	utxos := []UTXO{
 		{TxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Vout: 0, Amount: 0.1, ScriptPubKey: hex.EncodeToString(p2pkhScript(hash160(pub.SerializeCompressed())))},
 	}
@@ -170,7 +170,7 @@ func TestSignBTCInsufficient(t *testing.T) {
 // TestSignBTCNoUTXOs 验证无 UTXO 且无 UTXO 源时报错（网关回退节点侧签名广播）。
 func TestSignBTCNoUTXOs(t *testing.T) {
 	s, _ := newRealSigner(HotWalletConfig{SignerKey: btcTestPriv})
-	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2PKHAddress(s.priv.PubKey()), Amount: 0.1, Asset: "BTC"}
+	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2PKHAddress(s.key.Public()), Amount: 0.1, Asset: "BTC"}
 	if _, err := s.Sign(context.Background(), tx); err == nil {
 		t.Fatalf("expected error when no UTXOs available")
 	}

@@ -556,14 +556,14 @@ func (b *btcTxBuilder) serialize() []byte {
 
 // signBTC 构造一笔 BTC 提现：选择 UTXO → 估算手续费 → 生成找零 → 逐输入 SIGHASH_ALL 签名 → 序列化。
 func (s *realSigner) signBTC(ctx context.Context, tx *UnsignedTx) (string, error) {
-	compPub := s.priv.PubKey().SerializeCompressed()
+	compPub := s.key.Public().SerializeCompressed()
 
 	// 1) 收集候选 UTXO：优先内联，其次 UTXO 源（按自身地址查询）。
 	utxos := tx.UTXOs
 	if len(utxos) == 0 && s.utxoSource != nil {
 		addr := tx.ChangeAddress
 		if addr == "" {
-			addr = deriveP2WPKHAddress(s.priv.PubKey())
+			addr = deriveP2WPKHAddress(s.key.Public())
 		}
 		src, err := s.utxoSource.ListUTXOs(ctx, addr)
 		if err != nil {
@@ -656,7 +656,7 @@ func (s *realSigner) signBTC(ctx context.Context, tx *UnsignedTx) (string, error
 		}
 	}
 	for i := range b.inputs {
-		if err := s.signBTCInput(b, i, compPub); err != nil {
+		if err := s.signBTCInput(ctx, b, i, compPub); err != nil {
 			return "", err
 		}
 	}
@@ -720,13 +720,14 @@ func isSegwitFrom(inputs []btcTxIn) bool {
 }
 
 // signBTCInput 对第 i 个输入做 secp256k1 签名并填入 scriptSig / witness。
-func (s *realSigner) signBTCInput(b *btcTxBuilder, i int, compPub []byte) error {
+func (s *realSigner) signBTCInput(ctx context.Context, b *btcTxBuilder, i int, compPub []byte) error {
 	digest := b.sighashDigest(i, compPub)
 
-	// secp256k1 ECDSA；compact 形式取 R/S，再做低 S 规范化（BTC 标准性要求）。
-	compact := ecdsa.SignCompact(s.priv, digest, false)
-	r := new(big.Int).SetBytes(compact[1:33])
-	ss := new(big.Int).SetBytes(compact[33:65])
+	// secp256k1 ECDSA（经 KeySigner：软件或真实 HSM/KMS 后端，私钥不出域）；做低 S 规范化。
+	r, ss, err := s.key.SignDigest(ctx, digest32(digest))
+	if err != nil {
+		return fmt.Errorf("BTC 输入 %d 签名失败: %w", i, err)
+	}
 	if ss.Cmp(secp256k1HalfN) > 0 {
 		ss = new(big.Int).Sub(secp256k1Order, ss)
 	}
@@ -743,7 +744,7 @@ func (s *realSigner) signBTCInput(b *btcTxBuilder, i int, compPub []byte) error 
 	}
 
 	// 自校验：用同一摘要验证签名（捕获序列化/R/S 错误）。
-	pub := s.priv.PubKey()
+	pub := s.key.Public()
 	parsed, err := ecdsa.ParseDERSignature(der)
 	if err != nil {
 		return fmt.Errorf("BTC 输入 %d DER 解析失败: %w", i, err)

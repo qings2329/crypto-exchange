@@ -10,7 +10,6 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/keccak"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 )
 
 // secp256k1 曲线的阶 N 与其一半（用于 ECDSA 低 S 规范化，满足以太坊对可锻性的要求）。
@@ -38,8 +37,8 @@ func mustHex(s string) []byte {
 //
 // TRON（合约调用签名）仍为独立生产项；未实现时 Sign 返回错误，由网关回退节点侧签名广播（fail-degraded）。
 type realSigner struct {
-	priv           *secp256k1.PrivateKey
-	address        string // 由私钥派生的 ETH 地址（0x…），仅用于可观测/日志与 Nonce 查询。
+	key            KeySigner // 实际签名原语后端：软件（进程内私钥）或真实 HSM/KMS（私钥不出域）。
+	address        string    // 由公钥派生的 ETH 地址（0x…），仅用于可观测/日志与 Nonce 查询。
 	ethChainID     uint64
 	ethGasPriceWei uint64
 	ethGasLimit    uint64
@@ -57,17 +56,30 @@ func newRealSigner(conf HotWalletConfig) (*realSigner, error) {
 	return newRealSignerWithSource(conf, SignerSources{})
 }
 
-// newRealSignerWithSource 在 newRealSigner 基础上注入可选外部状态源（BTC UTXO 源 / ETH Nonce·Gas 源）。
+// newRealSignerWithSource 在 newRealSigner 基础上注入可选外部状态源（BTC UTXO 源 / ETH Nonce·Gas 源），
+// 并按 SignerBackend 选择签名后端：
+//   - "external"（或 "hsm-remote"/"kms"）：从注册表取部署方注入的真实 HSM/KMS 后端（私钥不出域）；
+//     未注册则报错（fail-degraded，网关回退节点侧签名广播）。
+//   - "software"（默认或空）：用 SignerKey（32 字节 hex）构造进程内软件签名后端（开发/演示）。
 func newRealSignerWithSource(conf HotWalletConfig, sources SignerSources) (*realSigner, error) {
-	key := strings.TrimPrefix(conf.SignerKey, "0x")
-	b, err := hex.DecodeString(key)
-	if err != nil || len(b) != 32 {
-		return nil, fmt.Errorf("invalid hot_wallet.signer_key: must be 32-byte hex private key: %w", err)
+	var key KeySigner
+	switch conf.SignerBackend {
+	case "external", "hsm-remote", "kms":
+		backend, ok := lookupExternalSigner(conf.SignerKey)
+		if !ok {
+			return nil, fmt.Errorf("external 签名后端 %q 未注册：请用 settlement.RegisterExternalSigner 注入真实 HSM/KMS 后端", conf.SignerKey)
+		}
+		key = backend
+	default: // "software" 或空
+		priv, err := parseSignerKey(conf.SignerKey)
+		if err != nil {
+			return nil, err
+		}
+		key = &softwareKeySigner{priv: priv}
 	}
-	priv := secp256k1.PrivKeyFromBytes(b)
 	return &realSigner{
-		priv:           priv,
-		address:        deriveETHAddress(priv.PubKey()),
+		key:            key,
+		address:        deriveETHAddress(key.Public()),
 		ethChainID:     conf.EthChainID,
 		ethGasPriceWei: conf.EthGasPriceWei,
 		ethGasLimit:    conf.EthGasLimit,
@@ -150,16 +162,19 @@ func (s *realSigner) signETH(ctx context.Context, tx *UnsignedTx) (string, error
 	}
 	digest := keccak.Sum256(rlpEncodeList(unsignedFields))
 
-	// secp256k1 可恢复签名（compact：1 字节恢复码 + 32 字节 R + 32 字节 S）。
-	compact := ecdsa.SignCompact(s.priv, digest[:], false)
-	recID := int(compact[0]) - 27
-	r := compact[1:33]
-	sBig := new(big.Int).SetBytes(compact[33:65])
-
-	// 低 S 规范化（以太坊要求 S 落在曲线阶的一半以内，抗交易可锻性）：S 过大则取补数并翻转恢复位。
+	// secp256k1 ECDSA 签名（经 KeySigner：软件或真实 HSM/KMS 后端，私钥不出域）。
+	r, sBig, err := s.key.SignDigest(ctx, digest)
+	if err != nil {
+		return "", fmt.Errorf("ETH 签名失败: %w", err)
+	}
+	// 低 S 规范化（以太坊要求 S 落在曲线阶的一半以内，抗交易可锻性）：S 过大则取补数。
+	// recovery id 由公钥匹配推导（见 recoverRecID），无需手动翻转。
 	if sBig.Cmp(secp256k1HalfN) > 0 {
 		sBig = new(big.Int).Sub(secp256k1Order, sBig)
-		recID ^= 1
+	}
+	recID, err := recoverRecID(digest, r, sBig, s.key.Public())
+	if err != nil {
+		return "", err
 	}
 	sBytes := sBig.Bytes()
 	if len(sBytes) < 32 {
@@ -183,7 +198,7 @@ func (s *realSigner) signETH(ctx context.Context, tx *UnsignedTx) (string, error
 		rlpBigInt(valueWei),
 		rlpBytes(tx.Data),
 		rlpBigInt(v),
-		rlpBytes(r),
+		rlpBigInt(r),
 		rlpBytes(sBytes),
 	})
 	return "0x" + hex.EncodeToString(raw), nil
