@@ -77,6 +77,14 @@ var OtcMigrations = []migrate.Migration{
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		Down: `DROP TABLE IF EXISTS ce_otc_counterparties`,
 	},
+	{
+		// F2：crypto_amount 由 DOUBLE 改为 VARCHAR(64)，以字符串精确存储 AssetAmount.HumanString
+		// （最小单位十进制），避免 float64 列截断/精度丢失，使锁与释放使用完全一致的整数金额。
+		Version: 9604,
+		Name:    "alter_ce_otc_orders_crypto_amount_to_varchar",
+		Up: `ALTER TABLE ce_otc_orders MODIFY crypto_amount VARCHAR(64) NOT NULL DEFAULT '0'`,
+		Down: `ALTER TABLE ce_otc_orders MODIFY crypto_amount DOUBLE NOT NULL DEFAULT 0`,
+	},
 }
 
 // NewMySQLStore 打开 MySQL 并跑迁移，返回 MySQL 版 Store。

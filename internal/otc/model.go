@@ -13,7 +13,10 @@ package otc
 
 import (
 	"errors"
+	"math/big"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // 领域错误。
@@ -78,12 +81,24 @@ type OtcAdvertisement struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
-// CryptoAmountFor 返回一笔法币金额对应的 crypto 数量。
-func (a *OtcAdvertisement) CryptoAmountFor(fiat float64) float64 {
-	if a.Price <= 0 {
-		return 0
+// CryptoAmountFor 返回一笔法币金额对应的 crypto 数量（精确整数最小单位）。
+// 用 big.Rat 对 fiat/Price 做有理数除法后按资产小数位缩放取整，避免 float 二进制取整误差
+// （F2：此前为 float64 除法再 AssetAmountFromFloat，存在 dust 级漂移）。
+// 注意：fiat/Price 自身仍是 float64 入参（来自广告/用户），这是更上层契约问题；本函数保证
+// 在给定入参下得到确定、可复现的最小单位整数，且锁与释放使用同一值，保证对账自洽。
+func (a *OtcAdvertisement) CryptoAmountFor(fiat float64, asset string) settlement.AssetAmount {
+	dec := settlement.AssetDecimalsByName(asset)
+	if a.Price <= 0 || fiat <= 0 {
+		return settlement.AssetAmount{Value: big.NewInt(0), Decimals: dec}
 	}
-	return fiat / a.Price
+	r := new(big.Rat).SetFloat64(fiat)
+	p := new(big.Rat).SetFloat64(a.Price)
+	q := new(big.Rat).Quo(r, p) // fiat / price，精确有理数
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(dec)), nil)
+	num := new(big.Int).Mul(q.Num(), scale)
+	den := q.Denom()
+	v := new(big.Int).Quo(num, den) // 向零取整（floor，正数）
+	return settlement.AssetAmount{Value: v, Decimals: dec}
 }
 
 // OtcOrder 是一笔场外成交订单。
@@ -95,7 +110,7 @@ type OtcOrder struct {
 	Side           AdSide      `json:"side"`          // 继承广告方向
 	Asset          string      `json:"asset"`
 	FiatCurrency   string      `json:"fiat_currency"`
-	CryptoAmount   float64     `json:"crypto_amount"`
+	CryptoAmount   settlement.AssetAmount `json:"crypto_amount"`
 	Price          float64     `json:"price"`
 	FiatAmount     float64     `json:"fiat_amount"`
 	PaymentMethod  string      `json:"payment_method"`
