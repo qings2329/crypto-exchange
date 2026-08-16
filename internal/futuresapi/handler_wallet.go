@@ -110,7 +110,8 @@ func (s *Server) handleDepositChain(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
-	ev, err := s.chainGateway.SubmitDeposit(req.UserID, req.Asset, settlement.Chain(req.Chain), req.Amount, req.Address)
+	ev, err := s.chainGateway.SubmitDeposit(req.UserID, req.Asset, settlement.Chain(req.Chain),
+		settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimals(settlement.Chain(req.Chain), req.Asset)), req.Address)
 	if err != nil {
 		response.Error(c, 400, 400, err.Error())
 		return
@@ -211,8 +212,10 @@ func (s *Server) handleWithdrawChain(c *gin.Context) {
 	if asset == "" {
 		asset = "USDT"
 	}
+	dec := settlement.AssetDecimals(settlement.Chain(req.Chain), asset)
 	if req.Fee <= 0 {
-		req.Fee = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, req.Amount)
+		req.Fee = s.feeModel.Estimate(settlement.Chain(req.Chain), asset,
+			settlement.AssetAmountFromFloat(req.Amount, dec)).HumanFloat()
 	}
 	total := req.Amount + req.Fee
 	if s.ledgerSvc.IsOutflowRestricted(req.UserID, asset) {
@@ -228,7 +231,8 @@ func (s *Server) handleWithdrawChain(c *gin.Context) {
 		response.Error(c, 500, 500, err.Error())
 		return
 	}
-	ev, err := s.chainWithdraw.SubmitWithdraw(req.UserID, req.Asset, settlement.Chain(req.Chain), req.Amount, req.Fee, req.Address, req.WillFail)
+	ev, err := s.chainWithdraw.SubmitWithdraw(req.UserID, req.Asset, settlement.Chain(req.Chain),
+		settlement.AssetAmountFromFloat(req.Amount, dec), settlement.AssetAmountFromFloat(req.Fee, dec), req.Address, req.WillFail)
 	if err != nil {
 		_ = s.ledgerSvc.UnfreezeWithdraw(req.UserID, "USDT", total) // 受理失败回退提现冻结
 		response.Error(c, 400, 400, err.Error())
@@ -333,8 +337,10 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 	if asset == "" {
 		asset = "USDT"
 	}
+	dec := settlement.AssetDecimals(settlement.Chain(req.Chain), asset)
 	if req.Fee <= 0 {
-		req.Fee = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, req.Amount)
+		req.Fee = s.feeModel.Estimate(settlement.Chain(req.Chain), asset,
+			settlement.AssetAmountFromFloat(req.Amount, dec)).HumanFloat()
 	}
 	avail, _, ok := s.ledgerSvc.Balance(req.UserID, asset)
 	if !ok || avail < req.Amount+req.Fee-1e-9 {
@@ -375,7 +381,9 @@ func (s *Server) finalizeHold(id string, requireCooling bool) (*ledger.WithdrawH
 	if requireCooling && time.Now().Before(e.HoldUntil) {
 		return nil, "", 409, fmt.Errorf("withdraw hold in cooling period")
 	}
-	ev, berr := s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain), e.Amount, e.Fee, e.Address, false)
+	dec := settlement.AssetDecimals(settlement.Chain(e.Chain), e.Asset)
+	ev, berr := s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain),
+		settlement.AssetAmountFromFloat(e.Amount, dec), settlement.AssetAmountFromFloat(e.Fee, dec), e.Address, false)
 	if berr != nil {
 		return nil, "", 502, fmt.Errorf("broadcast failed: %v", berr)
 	}
@@ -662,7 +670,8 @@ func (s *Server) handleWalletFee(c *gin.Context) {
 	asset := c.DefaultQuery("asset", "USDT")
 	amount, _ := strconv.ParseFloat(c.DefaultQuery("amount", "0"), 64)
 	f, ok := s.feeModel.Lookup(settlement.Chain(chain), asset)
-	est := s.feeModel.Estimate(settlement.Chain(chain), asset, amount)
+	est := s.feeModel.Estimate(settlement.Chain(chain), asset,
+		settlement.AssetAmountFromFloat(amount, settlement.AssetDecimals(settlement.Chain(chain), asset)))
 	response.JSON(c, gin.H{
 		"chain":      chain,
 		"asset":      asset,

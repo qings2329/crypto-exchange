@@ -103,7 +103,7 @@ func TestSignBTCP2PKHSelection(t *testing.T) {
 	tx := &UnsignedTx{
 		Chain:        ChainBTC,
 		To:           recipient,
-		Amount:       0.6,
+		Amount:       amt(ChainBTC, 0.6),
 		Asset:        "BTC",
 		UTXOs:        utxos,
 		FeeRatePerKB: 1000,
@@ -121,7 +121,7 @@ func TestSignBTCP2PKHSelection(t *testing.T) {
 		t.Fatalf("BTC signing not deterministic:\n %s\n %s", raw, raw2)
 	}
 	verifyBTCSignatures(t, raw, utxos, pub.SerializeCompressed())
-	verifyBTCValueConservation(t, raw, utxos, 0.6)
+	verifyBTCValueConservation(t, raw, utxos, amt(ChainBTC, 0.6))
 }
 
 // TestSignBTCP2WPKHSelection 验证 P2WPKH（segwit）UTXO 选择 + 找零 + witness 签名自洽。
@@ -136,7 +136,7 @@ func TestSignBTCP2WPKHSelection(t *testing.T) {
 	tx := &UnsignedTx{
 		Chain:        ChainBTC,
 		To:           deriveP2WPKHAddress(pub),
-		Amount:       0.6,
+		Amount:       amt(ChainBTC, 0.6),
 		Asset:        "BTC",
 		UTXOs:        utxos,
 		FeeRatePerKB: 1000,
@@ -146,7 +146,7 @@ func TestSignBTCP2WPKHSelection(t *testing.T) {
 		t.Fatalf("signBTC: %v", err)
 	}
 	verifyBTCSignatures(t, raw, utxos, pub.SerializeCompressed())
-	verifyBTCValueConservation(t, raw, utxos, 0.6)
+	verifyBTCValueConservation(t, raw, utxos, amt(ChainBTC, 0.6))
 	// segwit 交易应有标记字节（version 后紧跟 0x00 0x01）。
 	b, _ := hex.DecodeString(raw)
 	if !(b[4] == 0x00 && b[5] == 0x01) {
@@ -161,7 +161,7 @@ func TestSignBTCInsufficient(t *testing.T) {
 	utxos := []UTXO{
 		{TxID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Vout: 0, Amount: 0.1, ScriptPubKey: hex.EncodeToString(p2pkhScript(hash160(pub.SerializeCompressed())))},
 	}
-	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2PKHAddress(pub), Amount: 1.0, Asset: "BTC", UTXOs: utxos, FeeRatePerKB: 1000}
+	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2PKHAddress(pub), Amount: amt(ChainBTC, 1.0), Asset: "BTC", UTXOs: utxos, FeeRatePerKB: 1000}
 	if _, err := s.Sign(context.Background(), tx); err == nil {
 		t.Fatalf("expected insufficient funds error")
 	}
@@ -170,7 +170,7 @@ func TestSignBTCInsufficient(t *testing.T) {
 // TestSignBTCNoUTXOs 验证无 UTXO 且无 UTXO 源时报错（网关回退节点侧签名广播）。
 func TestSignBTCNoUTXOs(t *testing.T) {
 	s, _ := newRealSigner(HotWalletConfig{SignerKey: btcTestPriv})
-	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2PKHAddress(s.key.Public()), Amount: 0.1, Asset: "BTC"}
+	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2PKHAddress(s.key.Public()), Amount: amt(ChainBTC, 0.1), Asset: "BTC"}
 	if _, err := s.Sign(context.Background(), tx); err == nil {
 		t.Fatalf("expected error when no UTXOs available")
 	}
@@ -237,7 +237,7 @@ func verifyBTCSignatures(t *testing.T, rawHex string, utxos []UTXO, compPub []by
 }
 
 // verifyBTCValueConservation 校验（实际花费的）inputs = 收款 + 找零 + 手续费（金额守恒）。
-func verifyBTCValueConservation(t *testing.T, rawHex string, utxos []UTXO, targetBTC float64) {
+func verifyBTCValueConservation(t *testing.T, rawHex string, utxos []UTXO, target AssetAmount) {
 	t.Helper()
 	p, err := parseBTCRaw(rawHex)
 	if err != nil {
@@ -266,7 +266,7 @@ func verifyBTCValueConservation(t *testing.T, rawHex string, utxos []UTXO, targe
 	}
 	// 必含收款输出（金额 ≈ target）。
 	var foundRecv bool
-	targetSat := btcToSatoshi(targetBTC)
+	targetSat := btcToSatoshiAmt(target)
 	for _, o := range p.outputs {
 		if o.value == targetSat {
 			foundRecv = true

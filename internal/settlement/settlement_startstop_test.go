@@ -22,7 +22,7 @@ func TestStartStopStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
-	if _, err := g.SubmitDeposit(1, "USDT", ChainETH, 1.0, ""); err != nil {
+	if _, err := g.SubmitDeposit(1, "USDT", ChainETH, amt(ChainETH, 1.0), ""); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	select {

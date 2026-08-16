@@ -89,8 +89,15 @@ func doubleSHA256(b []byte) []byte {
 }
 
 // btcToSatoshi 把以 BTC 为单位的金额转为 satoshi（四舍五入，避免浮点误差累积）。
+// 用于节点返回的 UTXO 金额（float）。
 func btcToSatoshi(amount float64) int64 {
 	return int64(math.Round(amount * 1e8))
+}
+
+// btcToSatoshiAmt 把最小单位金额缩放至 satoshi（8 decimals）的整数（#6，无 float 中间量），
+// 用于提现金额（UnsignedTx.Amount）。
+func btcToSatoshiAmt(a AssetAmount) int64 {
+	return new(big.Int).Mul(a.Value, pow10(max(0, 8-a.Decimals))).Int64()
 }
 
 // le32 / le64 小端编码。
@@ -575,7 +582,7 @@ func (s *realSigner) signBTC(ctx context.Context, tx *UnsignedTx) (string, error
 		return "", fmt.Errorf("BTC 真实签名缺少 UTXO（UnsignedTx.UTXOs 为空且无可用 UTXO 源）")
 	}
 
-	targetSat := btcToSatoshi(tx.Amount)
+	targetSat := btcToSatoshiAmt(tx.Amount)
 	if targetSat <= 0 {
 		return "", fmt.Errorf("BTC 提现金额必须 > 0")
 	}

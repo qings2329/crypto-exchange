@@ -21,7 +21,7 @@ func TestEmitDeliversCreditedEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
-	if _, err := g.SubmitDeposit(1, "USDT", ChainETH, 10, "addr"); err != nil {
+	if _, err := g.SubmitDeposit(1, "USDT", ChainETH, amt(ChainETH, 10), "addr"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	g.Tick() // 达到 required -> credited -> emit
@@ -30,7 +30,7 @@ func TestEmitDeliversCreditedEvent(t *testing.T) {
 		if ev.Status != DepositCredited {
 			t.Fatalf("expected credited, got %s", ev.Status)
 		}
-		if ev.UserID != 1 || ev.Amount != 10 {
+		if ev.UserID != 1 || !amtEq(ev.Amount, 10) {
 			t.Fatalf("event 字段错配: %+v", ev)
 		}
 	case <-time.After(2 * time.Second):
@@ -56,14 +56,14 @@ func TestEmitBackpressureNotSilent(t *testing.T) {
 
 	// 先充满 64 个缓冲（一次性 tick 后全入账并 emit，缓冲恰好吸收，不阻塞）。
 	for i := 0; i < 64; i++ {
-		if _, err := g.SubmitDeposit(int64(i+1), "USDT", ChainETH, 1, "addr"); err != nil {
+		if _, err := g.SubmitDeposit(int64(i+1), "USDT", ChainETH, amt(ChainETH, 1), "addr"); err != nil {
 			t.Fatalf("submit: %v", err)
 		}
 	}
 	g.Tick()
 
 	// 再提交 1 笔并 tick：其 emit 因缓冲已满而阻塞，超时后输出 DROPPED 告警。
-	if _, err := g.SubmitDeposit(999, "USDT", ChainETH, 1, "addr"); err != nil {
+	if _, err := g.SubmitDeposit(999, "USDT", ChainETH, amt(ChainETH, 1), "addr"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	var buf bytes.Buffer

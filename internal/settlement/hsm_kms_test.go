@@ -201,7 +201,7 @@ func TestNewRealSignerExternalAutoRegistersHSM(t *testing.T) {
 	}
 	tx := &UnsignedTx{
 		Chain: ChainETH, To: "0x3535353535353535353535353535353535353535",
-		Amount: 1.0, Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
+		Amount: amt(ChainETH, 1.0), Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
 	}
 	raw, err := s.Sign(context.Background(), tx)
 	if err != nil {

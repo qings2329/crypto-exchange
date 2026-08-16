@@ -201,7 +201,7 @@ func TestDeploymentGatewaySignsViaHSMService(t *testing.T) {
 	}
 
 	to := "0x3535353535353535353535353535353535353535"
-	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, 1.0, 0.001, to, false)
+	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestDeploymentGatewayFailDegradedWhenHSMDown(t *testing.T) {
 			HSM: HSMConfig{Kind: "remote-http", Endpoint: "http://127.0.0.1:1/sign", PublicKey: pubHex},
 		},
 	})
-	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, 1.0, 0.001, "0x3535353535353535353535353535353535353535", false)
+	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0x3535353535353535353535353535353535353535", false)
 	if err != nil {
 		t.Fatalf("fail-degraded 下 SubmitWithdraw 不应报错: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestDeploymentHSMUnreachableSignError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("构造应成功（构造不发起网络调用）: %v", err)
 	}
-	if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: 1.0, Nonce: 9, GasPriceWei: 1, GasLimit: 21000, ChainID: 1}); err == nil {
+	if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: amt(ChainETH, 1.0), Nonce: 9, GasPriceWei: 1, GasLimit: 21000, ChainID: 1}); err == nil {
 		t.Fatalf("HSM 不可达时 Sign 应返回错误")
 	}
 }

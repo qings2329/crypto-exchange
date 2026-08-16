@@ -1,0 +1,218 @@
+package settlement
+
+import (
+	"encoding/json"
+	"fmt"
+	"math/big"
+	"strings"
+)
+
+// AssetAmount 是「按资产最小单位存储的整数金额」。Value 为最小单位整数（如 wei/satoshi/sun），
+// Decimals 为资产小数位（ETH=18、BTC=8、TRON/USDT-TRC20=6）。自描述，避免全局 decimals 表；
+// 运算/渲染时按 Decimals 对齐。用于消除领域金额 float64 精度漂移（#6）。
+//
+// 注意：Value 视为不可变（运算返回新实例），调用方不得原地修改 Value。
+type AssetAmount struct {
+	Value    *big.Int
+	Decimals int
+}
+
+// pow10 返回 10^n（n>=0）。调用方需保证 n 合理，避免溢出 panic。
+func pow10(n int) *big.Int {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
+}
+
+// NewAssetAmount 用最小单位整数与小数位构造（Value 为 nil 时按 0 处理）。
+func NewAssetAmount(value *big.Int, decimals int) AssetAmount {
+	if value == nil {
+		value = big.NewInt(0)
+	}
+	return AssetAmount{Value: new(big.Int).Set(value), Decimals: decimals}
+}
+
+// AssetAmountFromInt64 由人类单位整数（如 1000 个 USDT）按 decimals 缩放为最小单位。
+func AssetAmountFromInt64(human int64, decimals int) AssetAmount {
+	return AssetAmount{Value: new(big.Int).Mul(big.NewInt(human), pow10(decimals)), Decimals: decimals}
+}
+
+// AssetAmountFromFloat 由人类单位浮点（边界/测试用）按 decimals 缩放为最小单位。
+// 仅用于 API/测试边界把 float 转精确整数；领域内部不应再产生 float 金额。
+func AssetAmountFromFloat(human float64, decimals int) AssetAmount {
+	f := new(big.Float).SetPrec(256).SetFloat64(human)
+	f.Mul(f, new(big.Float).SetPrec(256).SetInt(pow10(decimals)))
+	v, _ := f.Int(nil)
+	if v == nil {
+		v = big.NewInt(0)
+	}
+	return AssetAmount{Value: v, Decimals: decimals}
+}
+
+// AssetAmountFromString 解析十进制字符串（人类单位，如 "1.5"）为最小单位整数。
+func AssetAmountFromString(s string, decimals int) (AssetAmount, error) {
+	r, ok := new(big.Rat).SetString(strings.TrimSpace(s))
+	if !ok {
+		return AssetAmount{}, fmt.Errorf("invalid amount %q", s)
+	}
+	v := new(big.Int).Mul(r.Num(), pow10(decimals))
+	v.Quo(v, r.Denom())
+	return AssetAmount{Value: v, Decimals: decimals}, nil
+}
+
+// toDecimals 把金额对齐到目标小数位（放大用乘、缩小用整除截断）。零值（Value 为 nil）
+// 按 0 处理，避免对 nil *big.Int 解引用 panic。
+func (a AssetAmount) toDecimals(dec int) AssetAmount {
+	v := a.Value
+	if v == nil {
+		v = big.NewInt(0)
+	}
+	if a.Decimals == dec {
+		return AssetAmount{Value: new(big.Int).Set(v), Decimals: dec}
+	}
+	d := dec - a.Decimals
+	if d > 0 {
+		return AssetAmount{Value: new(big.Int).Mul(v, pow10(d)), Decimals: dec}
+	}
+	return AssetAmount{Value: new(big.Int).Div(v, pow10(-d)), Decimals: dec}
+}
+
+// Add 返回 a+b（按两者较大 decimals 对齐）。
+func (a AssetAmount) Add(b AssetAmount) AssetAmount {
+	dec := max(a.Decimals, b.Decimals)
+	x := a.toDecimals(dec)
+	y := b.toDecimals(dec)
+	return AssetAmount{Value: new(big.Int).Add(x.Value, y.Value), Decimals: dec}
+}
+
+// Sub 返回 a-b（按两者较大 decimals 对齐，缩小截断）。
+func (a AssetAmount) Sub(b AssetAmount) AssetAmount {
+	dec := max(a.Decimals, b.Decimals)
+	x := a.toDecimals(dec)
+	y := b.toDecimals(dec)
+	return AssetAmount{Value: new(big.Int).Sub(x.Value, y.Value), Decimals: dec}
+}
+
+// Cmp 比较 a 与 b（按较大 decimals 对齐），返回 -1/0/1。
+func (a AssetAmount) Cmp(b AssetAmount) int {
+	dec := max(a.Decimals, b.Decimals)
+	return a.toDecimals(dec).Value.Cmp(b.toDecimals(dec).Value)
+}
+
+// Sign 返回 Value 的符号（-1/0/1）。零值（Value 为 nil）视为 0。
+func (a AssetAmount) Sign() int {
+	if a.Value == nil {
+		return 0
+	}
+	return a.Value.Sign()
+}
+
+// IsPositive 是否为正金额。
+func (a AssetAmount) IsPositive() bool { return a.Value.Sign() > 0 }
+
+// IsZero 是否为零。
+func (a AssetAmount) IsZero() bool { return a.Value.Sign() == 0 }
+
+// HumanString 人类可读十进制（如 "1.5"），去除尾随零与可能的小数点。零值（Value 为 nil）返回 "0"。
+func (a AssetAmount) HumanString() string {
+	v := a.Value
+	if v == nil {
+		v = big.NewInt(0)
+	}
+	if a.Decimals <= 0 {
+		return v.String()
+	}
+	neg := false
+	s := v.String()
+	if strings.HasPrefix(s, "-") {
+		neg = true
+		s = s[1:]
+	}
+	if len(s) <= a.Decimals {
+		s = "0" + strings.Repeat("0", a.Decimals-len(s)) + s
+	}
+	intPart := s[:len(s)-a.Decimals]
+	fracPart := strings.TrimRight(s[len(s)-a.Decimals:], "0")
+	out := intPart
+	if fracPart != "" {
+		out += "." + fracPart
+	}
+	if neg {
+		out = "-" + out
+	}
+	return out
+}
+
+// HumanFloat 人类单位浮点（仅展示/边界用；大数有 float64 精度限制）。零值（Value 为 nil）返回 0。
+func (a AssetAmount) HumanFloat() float64 {
+	if a.Value == nil {
+		return 0
+	}
+	f := new(big.Float).SetPrec(256).SetInt(a.Value)
+	den := new(big.Float).SetPrec(256).SetInt(pow10(a.Decimals))
+	f.Quo(f, den)
+	r, _ := f.Float64()
+	return r
+}
+
+// MarshalJSON 序列化为 JSON 数字（人类可读），保持对外契约为数字而非字符串。
+func (a AssetAmount) MarshalJSON() ([]byte, error) {
+	return []byte(a.HumanString()), nil
+}
+
+// UnmarshalJSON 解析 JSON 数字或字符串为人类单位十进制，按小数位数推断 Decimals，
+// 精确无损（终止小数可原样往返）。
+func (a *AssetAmount) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	s = strings.Trim(s, `"`)
+	if s == "null" || s == "" {
+		*a = AssetAmount{Value: big.NewInt(0), Decimals: 0}
+		return nil
+	}
+	neg := false
+	if strings.HasPrefix(s, "-") {
+		neg = true
+		s = s[1:]
+	}
+	dot := strings.IndexByte(s, '.')
+	var intStr, fracStr string
+	if dot < 0 {
+		intStr = s
+		fracStr = ""
+	} else {
+		intStr = s[:dot]
+		fracStr = s[dot+1:]
+	}
+	digits := intStr + fracStr
+	if digits == "" {
+		digits = "0"
+	}
+	v, ok := new(big.Int).SetString(digits, 10)
+	if !ok {
+		return fmt.Errorf("invalid amount %q", s)
+	}
+	if neg {
+		v.Neg(v)
+	}
+	*a = AssetAmount{Value: v, Decimals: len(fracStr)}
+	return nil
+}
+
+// AssetDecimals 返回某链某资产的标准小数位（与现有扫描器口径一致）：
+// ETH=18(wei)、BTC=8(satoshi)、TRON=6(sun)；其余默认 8。
+func AssetDecimals(chain Chain, asset string) int {
+	switch chain {
+	case ChainBTC:
+		return 8
+	case ChainETH:
+		return 18
+	case ChainTRON:
+		return 6
+	default:
+		return 8
+	}
+}
+
+// 确保 AssetAmount 实现 json.Marshaler/Unmarshaler（编译期检查）。
+var (
+	_ json.Marshaler   = AssetAmount{}
+	_ json.Unmarshaler = (*AssetAmount)(nil)
+)

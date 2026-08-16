@@ -2,6 +2,7 @@ package settlement
 
 import (
 	"context"
+	"math/big"
 	"testing"
 	"time"
 )
@@ -14,13 +15,23 @@ func approx(a, b, eps float64) bool {
 	return d <= eps
 }
 
+// amt 测试便捷：以人类单位按某链标准 decimals 构造最小单位金额（#6 AssetAmount）。
+func amt(chain Chain, human float64) AssetAmount {
+	return AssetAmountFromFloat(human, AssetDecimals(chain, ""))
+}
+
+// amtEq 比较 AssetAmount 与以人类单位表示的目标值（按 a 的 decimals 对齐）是否相等。
+func amtEq(a AssetAmount, human float64) bool {
+	return a.Cmp(AssetAmountFromFloat(human, a.Decimals)) == 0
+}
+
 // 提交充值后经 Required 个区块确认，状态转为 Credited。
 func TestMockGatewayConfirmation(t *testing.T) {
 	g := NewMockChainGateway(2, time.Hour) // 大间隔，手动 Tick
 	g.Start()
 	defer g.Stop()
 
-	ev, err := g.SubmitDeposit(7001, "USDT", ChainETH, 5000, "")
+	ev, err := g.SubmitDeposit(7001, "USDT", ChainETH, amt(ChainETH, 5000), "")
 	if err != nil {
 		t.Fatalf("submit failed: %v", err)
 	}
@@ -58,7 +69,7 @@ func TestMockGatewayRequiredBlocks(t *testing.T) {
 	g := NewMockChainGateway(3, time.Hour)
 	g.Start()
 	defer g.Stop()
-	_, _ = g.SubmitDeposit(7002, "USDT", ChainBTC, 1000, "addr1")
+	_, _ = g.SubmitDeposit(7002, "USDT", ChainBTC, amt(ChainBTC, 1000), "addr1")
 	g.Tick()
 	g.Tick()
 	if p := g.Pending(); p[0].Status != DepositPending {
@@ -80,8 +91,8 @@ func TestGenerateHelpers(t *testing.T) {
 	if len(a1) == 0 || a1[:3] != "ETH" {
 		t.Fatalf("address should be prefixed by chain: %s", a1)
 	}
-	tx1 := GenerateTxHash(1, "USDT", ChainETH, 5000, 1)
-	tx2 := GenerateTxHash(1, "USDT", ChainETH, 5000, 2)
+	tx1 := GenerateTxHash(1, "USDT", ChainETH, amt(ChainETH, 5000), 1)
+	tx2 := GenerateTxHash(1, "USDT", ChainETH, amt(ChainETH, 5000), 2)
 	if tx1 == tx2 {
 		t.Fatalf("different nonce should yield different tx hash")
 	}
@@ -90,10 +101,10 @@ func TestGenerateHelpers(t *testing.T) {
 // 非法参数拒绝。
 func TestSubmitValidation(t *testing.T) {
 	g := NewMockChainGateway(2, time.Hour)
-	if _, err := g.SubmitDeposit(0, "USDT", ChainETH, 100, ""); err == nil {
+	if _, err := g.SubmitDeposit(0, "USDT", ChainETH, amt(ChainETH, 100), ""); err == nil {
 		t.Fatalf("zero user should be rejected")
 	}
-	if _, err := g.SubmitDeposit(1, "USDT", ChainETH, 0, ""); err == nil {
+	if _, err := g.SubmitDeposit(1, "USDT", ChainETH, amt(ChainETH, 0), ""); err == nil {
 		t.Fatalf("zero amount should be rejected")
 	}
 }
@@ -104,7 +115,7 @@ func TestMockWithdrawGatewaySuccess(t *testing.T) {
 	g.Start()
 	defer g.Stop()
 
-	ev, err := g.SubmitWithdraw(8001, "USDT", ChainETH, 1000, 2, "", false)
+	ev, err := g.SubmitWithdraw(8001, "USDT", ChainETH, amt(ChainETH, 1000), amt(ChainETH, 2), "", false)
 	if err != nil {
 		t.Fatalf("submit withdraw failed: %v", err)
 	}
@@ -127,7 +138,7 @@ func TestMockWithdrawGatewaySuccess(t *testing.T) {
 		if got.Status != WithdrawCredited || got.TxHash != ev.TxHash {
 			t.Fatalf("watch event wrong: %+v", got)
 		}
-		if !approx(got.Amount, 1000, 1e-9) || !approx(got.Fee, 2, 1e-9) {
+		if !approx(got.Amount.HumanFloat(), 1000, 1e-9) || !approx(got.Fee.HumanFloat(), 2, 1e-9) {
 			t.Fatalf("amount/fee mismatch: %+v", got)
 		}
 	case <-time.After(2 * time.Second):
@@ -144,7 +155,7 @@ func TestMockWithdrawGatewayFailure(t *testing.T) {
 	g.Start()
 	defer g.Stop()
 
-	_, err := g.SubmitWithdraw(8002, "USDT", ChainTRON, 500, 1, "Txxx", true)
+	_, err := g.SubmitWithdraw(8002, "USDT", ChainTRON, amt(ChainTRON, 500), amt(ChainTRON, 1), "Txxx", true)
 	if err != nil {
 		t.Fatalf("submit withdraw failed: %v", err)
 	}
@@ -173,7 +184,7 @@ func TestMockWithdrawGatewayReorg(t *testing.T) {
 	g.Start()
 	defer g.Stop()
 
-	ev, err := g.SubmitWithdraw(8003, "USDT", ChainETH, 700, 1, "0xaddr3", false)
+	ev, err := g.SubmitWithdraw(8003, "USDT", ChainETH, amt(ChainETH, 700), amt(ChainETH, 1), "0xaddr3", false)
 	if err != nil {
 		t.Fatalf("submit withdraw failed: %v", err)
 	}
@@ -214,7 +225,7 @@ func TestMockWithdrawGatewayReorgGuard(t *testing.T) {
 	g := NewMockWithdrawGateway(2, time.Hour)
 	g.Start()
 	defer g.Stop()
-	ev, _ := g.SubmitWithdraw(8004, "USDT", ChainETH, 100, 0, "0xaddr4", false)
+	ev, _ := g.SubmitWithdraw(8004, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0), "0xaddr4", false)
 	if _, err := g.WithdrawReorg(ev.TxHash); err == nil {
 		t.Fatalf("reorg before credited should be rejected")
 	}
@@ -223,10 +234,10 @@ func TestMockWithdrawGatewayReorgGuard(t *testing.T) {
 // 提现非法参数拒绝。
 func TestWithdrawValidation(t *testing.T) {
 	g := NewMockWithdrawGateway(2, time.Hour)
-	if _, err := g.SubmitWithdraw(0, "USDT", ChainETH, 100, 0, "", false); err == nil {
+	if _, err := g.SubmitWithdraw(0, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0), "", false); err == nil {
 		t.Fatalf("zero user should be rejected")
 	}
-	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, 0, 0, "", false); err == nil {
+	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 0), amt(ChainETH, 0), "", false); err == nil {
 		t.Fatalf("zero amount should be rejected")
 	}
 }
@@ -237,7 +248,7 @@ func TestMockGatewayReorg(t *testing.T) {
 	g.Start()
 	defer g.Stop()
 
-	ev, err := g.SubmitDeposit(7101, "USDT", ChainETH, 3000, "")
+	ev, err := g.SubmitDeposit(7101, "USDT", ChainETH, amt(ChainETH, 3000), "")
 	if err != nil {
 		t.Fatalf("submit failed: %v", err)
 	}
@@ -282,7 +293,7 @@ func TestDepositReorgWindow(t *testing.T) {
 	g.Start()
 	defer g.Stop()
 
-	ev, err := g.SubmitDeposit(7201, "USDT", ChainETH, 3000, "")
+	ev, err := g.SubmitDeposit(7201, "USDT", ChainETH, amt(ChainETH, 3000), "")
 	if err != nil {
 		t.Fatalf("submit failed: %v", err)
 	}
@@ -343,9 +354,9 @@ func TestDepositReorgDepth(t *testing.T) {
 		return DepositEvent{Status: DepositPending}
 	}
 
-	e1, _ := g.SubmitDeposit(7301, "USDT", ChainETH, 1000, "")
+	e1, _ := g.SubmitDeposit(7301, "USDT", ChainETH, amt(ChainETH, 1000), "")
 	g.Tick() // height=1, e1 Credited (BlockHeight=1)
-	e2, _ := g.SubmitDeposit(7302, "USDT", ChainETH, 2000, "")
+	e2, _ := g.SubmitDeposit(7302, "USDT", ChainETH, amt(ChainETH, 2000), "")
 	g.Tick() // height=2, e2 Credited (BlockHeight=2)
 
 	rolled := g.ReorgDepth(1) // cutoff=2，仅回退 BlockHeight>=2 的 e2
@@ -374,7 +385,7 @@ func TestWithdrawReorgWindow(t *testing.T) {
 	g.Start()
 	defer g.Stop()
 
-	ev, _ := g.SubmitWithdraw(8101, "USDT", ChainETH, 500, 1, "0xaddr", false)
+	ev, _ := g.SubmitWithdraw(8101, "USDT", ChainETH, amt(ChainETH, 500), amt(ChainETH, 1), "0xaddr", false)
 
 	// 未广播即重组：拒绝
 	if _, err := g.WithdrawReorg(ev.TxHash); err == nil {
@@ -441,10 +452,10 @@ func TestWithdrawReorgDepth(t *testing.T) {
 		return WithdrawEvent{Status: WithdrawPending}
 	}
 
-	e1, _ := g.SubmitWithdraw(8201, "USDT", ChainETH, 100, 0, "0xa1", false)
+	e1, _ := g.SubmitWithdraw(8201, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0), "0xa1", false)
 	g.Tick()
 	g.Tick() // e1 Credited (height=2, BlockHeight=2)
-	e2, _ := g.SubmitWithdraw(8202, "USDT", ChainETH, 200, 0, "0xa2", false)
+	e2, _ := g.SubmitWithdraw(8202, "USDT", ChainETH, amt(ChainETH, 200), amt(ChainETH, 0), "0xa2", false)
 	g.Tick()
 	g.Tick() // e2 Credited (height=4, BlockHeight=4)
 
@@ -472,26 +483,26 @@ func TestFeeModel(t *testing.T) {
 	if _, ok := m.Lookup(ChainETH, "USDT"); ok {
 		t.Fatal("ETH-USDT should be unregistered initially")
 	}
-	if got := m.Estimate(ChainETH, "USDT", 1000); got != 0 {
-		t.Fatalf("unregistered fee should be 0, got %.4f", got)
+	if got := m.Estimate(ChainETH, "USDT", amt(ChainETH, 1000)); got.HumanFloat() != 0 {
+		t.Fatalf("unregistered fee should be 0, got %.4f", got.HumanFloat())
 	}
 
 	// 基础费 0.1，费率 0.001 -> 1000 提现：0.1 + 1 = 1.1
 	m.Register(ChainETH, "USDT", 0.1, 0.001)
 	f, ok := m.Lookup(ChainETH, "USDT")
-	if !ok || f.Base != 0.1 || f.Rate != 0.001 {
+	if !ok || !amtEq(f.Base, 0.1) || f.Rate.Cmp(new(big.Rat).SetFloat64(0.001)) != 0 {
 		t.Fatalf("lookup mismatch: %+v ok=%v", f, ok)
 	}
-	if !approx(m.Estimate(ChainETH, "USDT", 1000), 1.1, 1e-9) {
-		t.Fatalf("expect 1.1, got %.6f", m.Estimate(ChainETH, "USDT", 1000))
+	if !approx(m.Estimate(ChainETH, "USDT", amt(ChainETH, 1000)).HumanFloat(), 1.1, 1e-9) {
+		t.Fatalf("expect 1.1, got %.6f", m.Estimate(ChainETH, "USDT", amt(ChainETH, 1000)).HumanFloat())
 	}
-	if !approx(m.Estimate(ChainETH, "USDT", 0), 0.1, 1e-12) {
-		t.Fatalf("amount 0 should be base only 0.1, got %.6f", m.Estimate(ChainETH, "USDT", 0))
+	if !approx(m.Estimate(ChainETH, "USDT", amt(ChainETH, 0)).HumanFloat(), 0.1, 1e-12) {
+		t.Fatalf("amount 0 should be base only 0.1, got %.6f", m.Estimate(ChainETH, "USDT", amt(ChainETH, 0)).HumanFloat())
 	}
 
 	// 纯基础费（BTC）：固定 0.0005
 	m.Register(ChainBTC, "BTC", 0.0005, 0)
-	if !approx(m.Estimate(ChainBTC, "BTC", 5000), 0.0005, 1e-12) {
-		t.Fatalf("expect 0.0005, got %.8f", m.Estimate(ChainBTC, "BTC", 5000))
+	if !approx(m.Estimate(ChainBTC, "BTC", amt(ChainBTC, 5000)).HumanFloat(), 0.0005, 1e-12) {
+		t.Fatalf("expect 0.0005, got %.8f", m.Estimate(ChainBTC, "BTC", amt(ChainBTC, 5000)).HumanFloat())
 	}
 }

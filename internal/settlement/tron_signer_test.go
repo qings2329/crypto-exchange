@@ -84,7 +84,7 @@ func TestRealSignerTRONTransferContract(t *testing.T) {
 	}
 	toB58 := deriveTronAddress(parseSignerKeyOrDie(tronTestPrivRecipient).PubKey())
 
-	raw, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: toB58, Amount: 1.5})
+	raw, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: toB58, Amount: amt(ChainTRON, 1.5)})
 	if err != nil {
 		t.Fatalf("sign TRON transfer: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestRealSignerTRONTriggerSmartContract(t *testing.T) {
 	raw, err := s.Sign(context.Background(), &UnsignedTx{
 		Chain:          ChainTRON,
 		To:             toB58,
-		Amount:         1.0, // 1 USDT（人类单位），应缩放为 1e6 基础单位
+		Amount:         amt(ChainTRON, 1.0), // 1 USDT（人类单位），应缩放为 1e6 基础单位
 		ContractAddress: contractB58,
 		FeeLimit:       100_000_000, // 100 TRX 等价 sun
 	})
@@ -227,7 +227,7 @@ func TestRealSignerTRONTriggerSmartContract(t *testing.T) {
 func TestRealSignerTRONRequiresState(t *testing.T) {
 	priv := btcTestKey(t)
 	s := &realSigner{key: &softwareKeySigner{priv: priv}} // 无 tronState
-	_, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: "Txxx", Amount: 1})
+	_, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: "Txxx", Amount: amt(ChainTRON, 1)})
 	if err == nil {
 		t.Fatalf("期望 TRON 签名因缺少 TRONState 而失败")
 	}
@@ -277,7 +277,7 @@ func TestNewWithdrawGatewayTRONUsesOfflineSigner(t *testing.T) {
 	}
 
 	recipient := deriveTronAddress(parseSignerKeyOrDie(tronTestPrivRecipient).PubKey())
-	ev, err := g.SubmitWithdraw(1, "TRX", ChainTRON, 2.0, 0.001, recipient, false)
+	ev, err := g.SubmitWithdraw(1, "TRX", ChainTRON, amt(ChainTRON, 2.0), amt(ChainTRON, 0.001), recipient, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
 	}

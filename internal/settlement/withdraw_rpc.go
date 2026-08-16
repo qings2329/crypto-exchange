@@ -69,7 +69,7 @@ type HotWalletConfig struct {
 type UnsignedTx struct {
 	Chain  Chain
 	To     string
-	Amount float64
+	Amount AssetAmount
 	Asset  string
 	// 以下为 ETH 真实签名所需字段（离线签名边界真实密码学用）：nonce/gas/chainID/data。
 	// BTC/TRON 暂未实现（各自为独立生产项：UTXO/Nonce 管理、TRON 合约调用），缺省时由
@@ -175,7 +175,7 @@ type DepositWatch struct {
 type ChainRPCClient interface {
 	// Broadcast 向链上广播一笔提现（节点侧签名），返回交易哈希。仅用于未启用离线签名
 	// 边界的回退路径（fail-degraded）；生产安全的提现应走 Signer + SendRaw。
-	Broadcast(ctx context.Context, chain Chain, to string, amount float64) (txHash string, err error)
+	Broadcast(ctx context.Context, chain Chain, to string, amount AssetAmount) (txHash string, err error)
 	// SendRaw 广播一笔已离线签名的原始交易（raw hex），返回交易哈希。离线签名边界主路径：
 	// 签名在 Signer（HSM/KMS）内完成，节点仅负责广播。
 	SendRaw(ctx context.Context, chain Chain, rawHex string) (txHash string, err error)
@@ -241,14 +241,12 @@ func (c *JSONRPCClient) Call(ctx context.Context, chain Chain, method string, pa
 }
 
 // Broadcast 按链映射节点方法广播提现并取回交易哈希。
-func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, amount float64) (string, error) {
+func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, amount AssetAmount) (string, error) {
 	switch chain {
 	case ChainETH:
 		// 生产需配合热钱包/解锁账户或离线签名后的 raw tx；此处调用 eth_sendTransaction
-		// （节点侧签名生效时返回真实 TxHash）。value 以 wei 表示（脚手架：amount*1e18）。
-		bf := new(big.Float).SetPrec(256).SetFloat64(amount)
-		bf.Mul(bf, new(big.Float).SetPrec(256).SetInt64(1e18))
-		wei, _ := bf.Int(nil)
+		// （节点侧签名生效时返回真实 TxHash）。value 以 wei 表示：把最小单位金额缩放至 18 decimals（#6）。
+		wei := new(big.Int).Mul(amount.Value, pow10(max(0, 18-amount.Decimals)))
 		res, err := c.rpc(ctx, chain, "eth_sendTransaction", []interface{}{
 			map[string]interface{}{"to": to, "value": fmt.Sprintf("0x%x", wei)},
 		})
@@ -580,7 +578,7 @@ type RPCWithdrawGateway struct {
 
 // SubmitWithdraw 优先走离线签名边界（有 Signer 时：签名→SendRaw 广播并取回真实 TxHash）；
 // 无 Signer 或签名/广播失败时回退节点侧签名广播（Broadcast）；RPC 仍不可达则回退模拟。
-func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool) (*WithdrawEvent, error) {
+func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, willFail bool) (*WithdrawEvent, error) {
 	if g.client != nil {
 		if g.signer != nil {
 			if raw, err := g.signer.Sign(context.Background(), &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset}); err == nil && raw != "" {

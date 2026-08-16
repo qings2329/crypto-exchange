@@ -26,7 +26,7 @@ func TestRealSignerKnownEIP155Vector(t *testing.T) {
 	tx := &UnsignedTx{
 		Chain:       ChainETH,
 		To:          "0x3535353535353535353535353535353535353535",
-		Amount:      1.0,
+		Amount:      amt(ChainETH, 1.0),
 		Asset:       "ETH",
 		Nonce:       9,
 		GasPriceWei: 20000000000, // 20 gwei
@@ -50,7 +50,7 @@ func TestRealSignerRecoversToAddress(t *testing.T) {
 	}
 	tx := &UnsignedTx{
 		Chain: ChainETH, To: "0x3535353535353535353535353535353535353535",
-		Amount: 1.0, Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
+		Amount: amt(ChainETH, 1.0), Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
 	}
 	raw, err := s.Sign(context.Background(), tx)
 	if err != nil {
@@ -89,7 +89,7 @@ func TestNewSignerHSM(t *testing.T) {
 // （ETH/BTC 均已支持真实签名。）
 func TestRealSignerUnsupportedChain(t *testing.T) {
 	s, _ := newRealSigner(HotWalletConfig{SignerKey: knownVectorPriv})
-	if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: "x", Amount: 1}); err == nil {
+	if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: "x", Amount: amt(ChainTRON, 1)}); err == nil {
 		t.Fatalf("chain TRON should not be signable yet")
 	}
 }
@@ -97,7 +97,7 @@ func TestRealSignerUnsupportedChain(t *testing.T) {
 // TestRealSignerRequiresGasPrice 验证缺 gasPrice（tx 与配置均无）时签名失败 → 回退广播。
 func TestRealSignerRequiresGasPrice(t *testing.T) {
 	s, _ := newRealSigner(HotWalletConfig{SignerKey: knownVectorPriv}) // 未配 eth_gas_price_wei
-	if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainETH, To: "0x3535", Amount: 1}); err == nil {
+	if _, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainETH, To: "0x3535", Amount: amt(ChainETH, 1)}); err == nil {
 		t.Fatalf("expected error when gasPrice missing")
 	}
 }
@@ -127,7 +127,7 @@ func TestRealSignerETHResolvesNonceGasFromNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRealSignerWithSource: %v", err)
 	}
-	tx := &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: 1.0, Asset: "ETH"}
+	tx := &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: amt(ChainETH, 1.0), Asset: "ETH"}
 	raw, err := s.Sign(context.Background(), tx)
 	if err != nil {
 		t.Fatalf("sign: %v", err)
@@ -150,7 +150,7 @@ func TestRealSignerETHResolvesNonceGasFromNode(t *testing.T) {
 		t.Fatalf("embedded gasPrice = %d, want 1e9", gp)
 	}
 	// 用嵌入的 nonce/gas 重建校验 tx，恢复签名者地址（证明签名与嵌入字段一致、私钥不出域）。
-	checkTx := &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: 1.0, Nonce: n, GasPriceWei: gp, GasLimit: 21000}
+	checkTx := &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: amt(ChainETH, 1.0), Nonce: n, GasPriceWei: gp, GasLimit: 21000}
 	rec, err := recoverETHAddressFromRaw(raw, checkTx)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -168,7 +168,7 @@ func TestRealSignerETHNonceIncrementsLocally(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newRealSignerWithSource: %v", err)
 	}
-	base := &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: 1.0, GasPriceWei: 1e9, GasLimit: 21000}
+	base := &UnsignedTx{Chain: ChainETH, To: "0x3535353535353535353535353535353535353535", Amount: amt(ChainETH, 1.0), GasPriceWei: 1e9, GasLimit: 21000}
 	raw1, err := s.Sign(context.Background(), base)
 	if err != nil {
 		t.Fatalf("sign1: %v", err)
@@ -199,7 +199,7 @@ func TestRPCWithdrawGatewayUsesRealSigner(t *testing.T) {
 			EthChainID: 1, EthGasPriceWei: 20000000000, EthGasLimit: 21000,
 		}),
 	}
-	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, 1.0, 0.001,
+	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001),
 		"0x3535353535353535353535353535353535353535", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -213,7 +213,7 @@ func TestRPCWithdrawGatewayUsesRealSigner(t *testing.T) {
 	// raw 必须是真实 RLP 列表（首字节 0xf8 或 0xb8… 视长度），且能恢复出签名者地址。
 	if _, err := recoverETHAddressFromRaw(fc.lastRaw, &UnsignedTx{
 		Chain: ChainETH, To: "0x3535353535353535353535353535353535353535",
-		Amount: 1.0, Nonce: 0, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
+		Amount: amt(ChainETH, 1.0), Nonce: 0, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
 	}); err != nil {
 		t.Fatalf("broadcast raw tx not recoverable: %v", err)
 	}
