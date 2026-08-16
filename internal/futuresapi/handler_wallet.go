@@ -696,7 +696,13 @@ func (s *Server) handleWalletBalance(c *gin.Context) {
 func (s *Server) handleWalletFee(c *gin.Context) {
 	chain := c.DefaultQuery("chain", string(settlement.ChainETH))
 	asset := c.DefaultQuery("asset", "USDT")
-	amount, _ := strconv.ParseFloat(c.DefaultQuery("amount", "0"), 64)
+	// 解析失败（非数字）或负数不得静默当 0，否则返回误导性的 fee=0 估算（F5a 修复）。
+	raw := c.DefaultQuery("amount", "0")
+	amount, err := strconv.ParseFloat(raw, 64)
+	if err != nil || amount < 0 {
+		response.Error(c, 400, 400, "bad amount")
+		return
+	}
 	f, ok := s.feeModel.Lookup(settlement.Chain(chain), asset)
 	est := s.feeModel.Estimate(settlement.Chain(chain), asset,
 		settlement.AssetAmountFromFloat(amount, settlement.AssetDecimals(settlement.Chain(chain), asset)))

@@ -97,3 +97,32 @@ func TestWithdrawApproveRequiresAdmin(t *testing.T) {
 		t.Fatalf("admin withdraw/approve should pass guard, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// TestWalletFeeBadAmount 验证 /wallet/fee 对非法 amount 返回 400 而非静默当 0（F5a 修复）。
+// 该端点受全局 Auth 保护，故需携带合法 token 才能越过鉴权、到达参数校验。
+func TestWalletFeeBadAmount(t *testing.T) {
+	_, r, verifier := newF4Server(t)
+	tok := verifier.Issue(1, time.Hour)
+
+	call := func(amount string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodGet,
+			"/api/v1/futures/wallet/fee?chain=Ethereum&asset=USDT&amount="+amount, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	// 非数字 amount 必须被拒绝（400），不得返回误导性的 fee=0 估算。
+	if w := call("abc"); w.Code != http.StatusBadRequest {
+		t.Fatalf("fee with non-numeric amount should be 400, got %d: %s", w.Code, w.Body.String())
+	}
+	// 负数 amount 必须被拒绝（400）。
+	if w := call("-5"); w.Code != http.StatusBadRequest {
+		t.Fatalf("fee with negative amount should be 400, got %d: %s", w.Code, w.Body.String())
+	}
+	// 合法 amount 应正常估算（200）。
+	if w := call("10"); w.Code != http.StatusOK {
+		t.Fatalf("fee with valid amount should be 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
