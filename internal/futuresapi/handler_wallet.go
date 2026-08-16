@@ -213,28 +213,32 @@ func (s *Server) handleWithdrawChain(c *gin.Context) {
 		asset = "USDT"
 	}
 	dec := settlement.AssetDecimals(settlement.Chain(req.Chain), asset)
-	if req.Fee <= 0 {
-		req.Fee = s.feeModel.Estimate(settlement.Chain(req.Chain), asset,
-			settlement.AssetAmountFromFloat(req.Amount, dec)).HumanFloat()
+	amt := settlement.AssetAmountFromFloat(req.Amount, dec)
+	var feeAmt settlement.AssetAmount
+	if req.Fee > 0 {
+		feeAmt = settlement.AssetAmountFromFloat(req.Fee, dec)
+	} else {
+		feeAmt = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, amt)
 	}
-	total := req.Amount + req.Fee
+	// 冻结额由与链上广播同源的 AssetAmount 派生，确保账本冻结额 == 链上划出额，消除 float 漂移（F2）。
+	total := amt.HumanFloat() + feeAmt.HumanFloat()
 	if s.ledgerSvc.IsOutflowRestricted(req.UserID, asset) {
 		response.Error(c, 403, 403, "outflow restricted: repay outstanding bad debt first")
 		return
 	}
-	avail, _, ok := s.ledgerSvc.Balance(req.UserID, "USDT")
+	avail, _, ok := s.ledgerSvc.Balance(req.UserID, asset)
 	if !ok || avail < total-1e-9 {
 		response.Error(c, 400, 400, "insufficient available balance")
 		return
 	}
-	if err := s.ledgerSvc.FreezeWithdraw(req.UserID, "USDT", total); err != nil {
+	if err := s.ledgerSvc.FreezeWithdraw(req.UserID, asset, total); err != nil {
 		response.Error(c, 500, 500, err.Error())
 		return
 	}
-	ev, err := s.chainWithdraw.SubmitWithdraw(req.UserID, req.Asset, settlement.Chain(req.Chain),
-		settlement.AssetAmountFromFloat(req.Amount, dec), settlement.AssetAmountFromFloat(req.Fee, dec), req.Address, req.WillFail)
+	ev, err := s.chainWithdraw.SubmitWithdraw(req.UserID, asset, settlement.Chain(req.Chain),
+		amt, feeAmt, req.Address, req.WillFail)
 	if err != nil {
-		_ = s.ledgerSvc.UnfreezeWithdraw(req.UserID, "USDT", total) // 受理失败回退提现冻结
+		_ = s.ledgerSvc.UnfreezeWithdraw(req.UserID, asset, total) // 受理失败回退提现冻结
 		response.Error(c, 400, 400, err.Error())
 		return
 	}
@@ -338,16 +342,21 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 		asset = "USDT"
 	}
 	dec := settlement.AssetDecimals(settlement.Chain(req.Chain), asset)
-	if req.Fee <= 0 {
-		req.Fee = s.feeModel.Estimate(settlement.Chain(req.Chain), asset,
-			settlement.AssetAmountFromFloat(req.Amount, dec)).HumanFloat()
+	amt := settlement.AssetAmountFromFloat(req.Amount, dec)
+	var feeAmt settlement.AssetAmount
+	if req.Fee > 0 {
+		feeAmt = settlement.AssetAmountFromFloat(req.Fee, dec)
+	} else {
+		feeAmt = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, amt)
 	}
+	// 冻结额由与链上广播同源的 AssetAmount 派生，确保账本冻结额 == 链上划出额，消除 float 漂移（F2）。
+	total := amt.HumanFloat() + feeAmt.HumanFloat()
 	avail, _, ok := s.ledgerSvc.Balance(req.UserID, asset)
-	if !ok || avail < req.Amount+req.Fee-1e-9 {
+	if !ok || avail < total-1e-9 {
 		response.Error(c, 400, 400, "insufficient available balance")
 		return
 	}
-	id, holdUntil, err := s.ledgerSvc.RequestWithdrawHold(req.UserID, asset, req.Amount, req.Fee, req.Chain, req.Address)
+	id, holdUntil, err := s.ledgerSvc.RequestWithdrawHold(req.UserID, asset, req.Amount, feeAmt.HumanFloat(), req.Chain, req.Address)
 	if err != nil {
 		response.Error(c, 403, 403, err.Error())
 		return
@@ -357,7 +366,7 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 		"hold_id":      id,
 		"asset":        asset,
 		"amount":       req.Amount,
-		"fee":          req.Fee,
+		"fee":          feeAmt.HumanFloat(),
 		"hold_until":   holdUntil.Unix(),
 		"hold_seconds": int(holdUntil.Sub(time.Now()).Seconds()),
 	})
@@ -381,11 +390,27 @@ func (s *Server) finalizeHold(id string, requireCooling bool) (*ledger.WithdrawH
 	if requireCooling && time.Now().Before(e.HoldUntil) {
 		return nil, "", 409, fmt.Errorf("withdraw hold in cooling period")
 	}
-	dec := settlement.AssetDecimals(settlement.Chain(e.Chain), e.Asset)
-	ev, berr := s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain),
-		settlement.AssetAmountFromFloat(e.Amount, dec), settlement.AssetAmountFromFloat(e.Fee, dec), e.Address, false)
+	// 原子占有广播槽：已广播（重试/并发）则复用既有 txHash 跳过 SubmitWithdraw，杜绝重复链上广播（F1）。
+	claimedTx, already, berr := s.ledgerSvc.ClaimWithdrawBroadcast(id)
 	if berr != nil {
-		return nil, "", 502, fmt.Errorf("broadcast failed: %v", berr)
+		return nil, "", 409, berr
+	}
+	var txHash string
+	if already {
+		txHash = claimedTx
+	} else {
+		dec := settlement.AssetDecimals(settlement.Chain(e.Chain), e.Asset)
+		var ev *settlement.WithdrawEvent
+		ev, berr = s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain),
+			settlement.AssetAmountFromFloat(e.Amount, dec), settlement.AssetAmountFromFloat(e.Fee, dec), e.Address, false)
+		if berr != nil {
+			_ = s.ledgerSvc.ResetWithdrawBroadcast(id) // 广播失败释放槽，允许重试重新广播
+			return nil, "", 502, fmt.Errorf("broadcast failed: %v", berr)
+		}
+		if err := s.ledgerSvc.SetWithdrawTxHash(id, ev.TxHash); err != nil {
+			return nil, "", 502, err
+		}
+		txHash = ev.TxHash
 	}
 	var ferr error
 	if requireCooling {
@@ -397,7 +422,7 @@ func (s *Server) finalizeHold(id string, requireCooling bool) (*ledger.WithdrawH
 	if ferr != nil {
 		return nil, "", 409, ferr
 	}
-	return e, ev.TxHash, 0, nil
+	return e, txHash, 0, nil
 }
 
 // handleWithdrawFinalize 清算一笔冷静期提现（用户端）：先链上广播，成功后账本划出。

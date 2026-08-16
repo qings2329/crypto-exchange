@@ -2,6 +2,8 @@ package ledger_test
 
 import (
 	"math"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1451,5 +1453,94 @@ func TestRiskEngineAutoFreeze(t *testing.T) {
 	}
 	if !l5.AutoFrozenByRisk() {
 		t.Fatal("auto_frozen_by_risk flag should survive restore")
+	}
+}
+
+// TestWithdrawBroadcastIdempotent 验证 ClaimWithdrawBroadcast 的原子占位语义（F1 防护机制）：
+// 同一 hold 重复 Claim 应仅首次返回 already=false，其余复用既有 txHash，杜绝重复链上广播。
+func TestWithdrawBroadcastIdempotent(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", 10000, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	l.SetAddressVerifyPeriod(0)
+	_, _ = l.AddWithdrawAddress(1, "USDT", "Ethereum", "0xabc", "test")
+	if err := l.ConfirmWithdrawAddress(1, "USDT", "Ethereum", "0xabc"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := l.RequestWithdrawHold(1, "USDT", 100, 1, "Ethereum", "0xabc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 首次 Claim 取得广播权（already=false，txHash 暂空）。
+	tx, already, err := l.ClaimWithdrawBroadcast(id)
+	if err != nil || already || tx != "" {
+		t.Fatalf("first claim: tx=%q already=%v err=%v", tx, already, err)
+	}
+	// 回填链上 txHash 后再次 Claim 应复用。
+	if err := l.SetWithdrawTxHash(id, "0xTX"); err != nil {
+		t.Fatal(err)
+	}
+	tx, already, err = l.ClaimWithdrawBroadcast(id)
+	if err != nil || !already || tx != "0xTX" {
+		t.Fatalf("second claim should reuse: tx=%q already=%v err=%v", tx, already, err)
+	}
+	// 广播失败回退：Reset 后应可再次取得广播权。
+	if err := l.ResetWithdrawBroadcast(id); err != nil {
+		t.Fatal(err)
+	}
+	tx, already, err = l.ClaimWithdrawBroadcast(id)
+	if err != nil || already {
+		t.Fatalf("after reset should reclaim: tx=%q already=%v err=%v", tx, already, err)
+	}
+}
+
+// TestWithdrawBroadcastConcurrent 并发 Claim 同一 hold，恰好一个取得广播权（F1 防并发双提现）。
+func TestWithdrawBroadcastConcurrent(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", 10000, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	l.SetAddressVerifyPeriod(0)
+	_, _ = l.AddWithdrawAddress(1, "USDT", "Ethereum", "0xabc", "test")
+	if err := l.ConfirmWithdrawAddress(1, "USDT", "Ethereum", "0xabc"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := l.RequestWithdrawHold(1, "USDT", 100, 1, "Ethereum", "0xabc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 50
+	var first int32
+	var mu sync.Mutex
+	var errs []error
+	reuses := 0
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			tx, already, e := l.ClaimWithdrawBroadcast(id)
+			mu.Lock()
+			if e != nil {
+				errs = append(errs, e)
+			} else if already {
+				reuses++
+			} else {
+				atomic.AddInt32(&first, 1)
+				_ = tx
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(errs) != 0 {
+		t.Fatalf("unexpected claim errors: %v", errs)
+	}
+	if atomic.LoadInt32(&first) != 1 {
+		t.Fatalf("exactly one first-claim expected, got %d", atomic.LoadInt32(&first))
+	}
+	if reuses != n-1 {
+		t.Fatalf("expected %d reuses, got %d", n-1, reuses)
 	}
 }
