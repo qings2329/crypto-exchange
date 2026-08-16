@@ -53,6 +53,10 @@ type HotWalletConfig struct {
 	EthChainID     uint64 `yaml:"eth_chain_id"`
 	EthGasPriceWei uint64 `yaml:"eth_gas_price_wei"`
 	EthGasLimit    uint64 `yaml:"eth_gas_limit"`
+	// HSM 是生产 HSM/KMS 后端的连接配置（SignerBackend="external" 且注册表未命中时，按此
+	// 自动构造并注册真实后端，无需部署方手写 RegisterExternalSigner）。敏感字段（endpoint
+	// 含访问凭据、public_key）经环境变量注入，不写进 configs/config.yaml。
+	HSM HSMConfig `yaml:"hsm"`
 }
 
 // UnsignedTx 是一笔待签名的提现交易（离线签名边界输入）。仅描述「要签什么」，不含私钥；
