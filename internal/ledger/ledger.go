@@ -2262,6 +2262,68 @@ func migrateMapInt(m map[int64]float64, dec int) map[int64]settlement.AssetAmoun
 	return out
 }
 
+// knownAsset 判断资产是否在标准 decimals 表中（与 AssetDecimalsByName 口径一致）。
+func knownAsset(asset string) bool {
+	switch asset {
+	case "BTC", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20":
+		return true
+	}
+	return false
+}
+
+// ValidateV1SnapshotAssets 在迁移前扫描 v1 快照中所有金额字段的资产名，返回「未知资产」告警列表。
+// 未知资产会回退到默认 8 位小数（AssetDecimalsByName 的 default 分支），可能错配真实精度
+// （如 6 位资产被误按 8 位缩放 100 倍）。供真实快照迁移前的预检使用：运维应先核对告警中的资产，
+// 确认其 decimals 与 AssetDecimalsByName 一致，否则迁移会放大/缩小金额，造成资金账实不符。
+//
+// 注意：仅做「资产是否被识别」的静态检查，不校验金额本身；识别到的资产即按标准 decimals 迁移。
+func ValidateV1SnapshotAssets(v1 ledgerSnapshotV1) []string {
+	var warns []string
+	seen := map[string]bool{}
+	warn := func(asset, ctx string) {
+		if asset == "" || knownAsset(asset) || seen[asset+"|"+ctx] {
+			return
+		}
+		seen[asset+"|"+ctx] = true
+		warns = append(warns, fmt.Sprintf("unknown asset %q in %s (will use default 8 decimals, may mis-scale)", asset, ctx))
+	}
+	for _, a := range v1.Accounts {
+		if a != nil {
+			warn(a.Asset, "account")
+		}
+	}
+	for k := range v1.BadDebtByUser {
+		warn(assetOfKey(k), "bad_debt_by_user")
+	}
+	for k := range v1.HotWallet {
+		warn(assetOfKey(k), "hot_wallet")
+	}
+	for k := range v1.ColdWallet {
+		warn(assetOfKey(k), "cold_wallet")
+	}
+	for k := range v1.HotWalletCap {
+		warn(assetOfKey(k), "hot_wallet_cap")
+	}
+	for k := range v1.DailyWithdrawLimit {
+		warn(assetOfKey(k), "daily_withdraw_limit")
+	}
+	for k := range v1.DailyWithdrawUsed {
+		warn(assetOfKey(k), "daily_withdraw_used")
+	}
+	for _, e := range v1.Log {
+		warn(e.Asset, "log")
+	}
+	for _, e := range v1.WithdrawHolds {
+		if e != nil {
+			warn(e.Asset, "withdraw_hold")
+		}
+	}
+	for _, p := range v1.SocializeProposals {
+		warn(p.Asset, "socialize_proposal")
+	}
+	return warns
+}
+
 // distributeProportional 将 total 按 weights 精确整数比例分配，保证：
 //   - 各份额之和 == min(total, 各 weight 之和)；
 //   - 各份额不超过对应 weight（不超过可用/负债额）；
