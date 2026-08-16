@@ -3,6 +3,8 @@ package settlement
 import (
 	"fmt"
 	"math"
+	"sync"
+	"sync/atomic"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/tyler-smith/go-bip32"
@@ -25,6 +27,7 @@ type DepositConfig struct {
 // DepositAddressGenerator 按 userID 从配置 xpub 非硬化派生每用户真实充值地址（ETH/BTC/TRON）。
 // 仅持公钥，符合「进程不持有私钥」的 HSM 模型。
 type DepositAddressGenerator struct {
+	mu      sync.Mutex  // 保护 master 的并发非硬化派生（go-bip32 的 Key 非线程安全）
 	master  *bip32.Key // 公钥（IsPrivate=false），派生边界在外部链级。
 	btcType string
 }
@@ -52,6 +55,8 @@ func NewDepositAddressGenerator(conf DepositConfig) (*DepositAddressGenerator, e
 // userID 必须是合法 BIP32 非硬化索引（0 ≤ userID ≤ 2^31-1）；越界或派生失败返回 error，
 // 由 GenerateAddress 回退 mock（fail-degraded）。
 func (g *DepositAddressGenerator) Address(userID int64, chain Chain) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if userID < 0 || userID > math.MaxInt32 {
 		return "", fmt.Errorf("userID %d 超出 BIP32 非硬化索引范围 [0, %d]", userID, math.MaxInt32)
 	}
@@ -81,11 +86,11 @@ func (g *DepositAddressGenerator) Address(userID int64, chain Chain) (string, er
 // —— 全局注册表（镜像 HSM 的 RegisterExternalSigner / lookupExternalSigner 模式）——
 // GenerateAddress 命中此生成器时返回真实地址，否则回退 mock。避免改动 Mock 网关构造签名。
 
-var depositAddrGen *DepositAddressGenerator
+var depositAddrGen atomic.Pointer[DepositAddressGenerator]
 
 // SetDepositAddressGenerator 注入（或清空，传 nil）HD 充值地址生成器。测试与生产装配均可用。
 func SetDepositAddressGenerator(g *DepositAddressGenerator) {
-	depositAddrGen = g
+	depositAddrGen.Store(g)
 }
 
 // ConfigureDepositAddresses 按配置装配生成器：Enabled 且 xpub 非空时构建并注册；构建失败则
@@ -95,6 +100,6 @@ func ConfigureDepositAddresses(conf DepositConfig) {
 		return
 	}
 	if g, err := NewDepositAddressGenerator(conf); err == nil {
-		depositAddrGen = g
+		depositAddrGen.Store(g)
 	}
 }
