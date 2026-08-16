@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -245,8 +246,11 @@ func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, a
 	case ChainETH:
 		// 生产需配合热钱包/解锁账户或离线签名后的 raw tx；此处调用 eth_sendTransaction
 		// （节点侧签名生效时返回真实 TxHash）。value 以 wei 表示（脚手架：amount*1e18）。
+		bf := new(big.Float).SetPrec(256).SetFloat64(amount)
+		bf.Mul(bf, new(big.Float).SetPrec(256).SetInt64(1e18))
+		wei, _ := bf.Int(nil)
 		res, err := c.rpc(ctx, chain, "eth_sendTransaction", []interface{}{
-			map[string]interface{}{"to": to, "value": fmt.Sprintf("0x%x", int64(amount*1e18))},
+			map[string]interface{}{"to": to, "value": fmt.Sprintf("0x%x", wei)},
 		})
 		if err != nil {
 			return "", err
