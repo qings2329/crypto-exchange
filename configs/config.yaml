@@ -74,9 +74,10 @@ services:
 # trade_fee_rate 为 taker 手续费率；<=0 用内置默认 0.1%。
 settlement:
   trade_fee_rate: 0.001
-  # 链上提现网关（T-03 链上 RPC 半边脚手架）：enabled=true 且配置了 endpoints 时，
+  # 链上充提网关（T-03 链上 RPC 半边脚手架）：enabled=true 且配置了 endpoints 时，
   # 提现广播走真实节点 RPC 并取回真实 TxHash，确认数仍由模拟状态机推进（脚手架）；
-  # enabled=false 或未配置 endpoints 则回退离线模拟网关（MockWithdrawGateway）。
+  # 充值则按 watch_addresses 轮询节点监听入账并喂入确认状态机。两者未配置/节点宕机
+  # 均自动回退离线模拟（Mock*Gateway，fail-degraded）。
   chain_rpc:
     enabled: false
     endpoints:
@@ -85,6 +86,17 @@ settlement:
       TRON: ""
     required_confirmations: 2
     poll_interval_sec: 2
+    # watch_addresses：充值监听的「地址→用户」映射（生产由热钱包/地址派生服务生成）。
+    # 仅 enabled=true 且配了 endpoints 时生效；空则启用了也无充值可扫（等价于模拟）。
+    watch_addresses:
+      - chain: ETH
+        address: "0x0000000000000000000000000000000000000000"
+        user_id: 1
+        asset: ETH
+      - chain: BTC
+        address: "bc1examplewatchaddress"
+        user_id: 1
+        asset: BTC
 
 # 行情 K 线持久化（T-16）：已收盘 K 线写入 InfluxDB（measurement "kline"），
 # 行情服务在内存环形缓冲（klineCap=500）之外可回取更长历史。

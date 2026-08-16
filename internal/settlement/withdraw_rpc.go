@@ -21,6 +21,19 @@ type ChainRPCConfig struct {
 	Required int `yaml:"required_confirmations"`
 	// PollSec 确认轮询间隔（秒）；当前仅用于文档，确认推进由模拟状态机驱动（见下）。
 	PollSec int `yaml:"poll_interval_sec"`
+	// WatchAddresses 真实充值监听的「地址→用户」映射（生产由热钱包/地址派生服务生成）。
+	// 配置了且启用了 RPC 时，充值网关据此轮询节点检测入账并喂入确认状态机；空则启用了也无
+	// 可扫地址（仅靠 SubmitDeposit 显式注入，等价于模拟行为）。
+	WatchAddresses []DepositWatch `yaml:"watch_addresses"`
+}
+
+// DepositWatch 是「链上充值监听」的一条观察项：某链某地址归属某用户某资产。真实 RPC
+// 扫描器据此轮询节点，把命中地址的入账解析为 DepositEvent（含 userID 便于账本入账）。
+type DepositWatch struct {
+	Chain   Chain   `yaml:"chain"`
+	Address string  `yaml:"address"`
+	UserID  int64   `yaml:"user_id"`
+	Asset   string  `yaml:"asset"`
 }
 
 // ChainRPCClient 抽象单链 RPC 广播能力（T-03 链上 RPC 半边）。生产实现直连节点；
