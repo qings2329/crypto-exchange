@@ -16,6 +16,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/ws"
 )
 
@@ -181,7 +182,7 @@ func (s *Server) reserveOnOpen(userID int64, side matching.Side, price, qty floa
 		asset, amt = base, qty
 	}
 	if amt > 0 {
-		if err := s.ledgerSvc.Freeze(userID, asset, amt); err != nil {
+		if err := s.ledgerSvc.Freeze(userID, asset, settlement.AssetAmountFromFloat(amt, settlement.AssetDecimalsByName(asset))); err != nil {
 			return nil, err
 		}
 	}
@@ -199,10 +200,10 @@ func (s *Server) releaseRemaining(rec *freezeRec) {
 		return
 	}
 	if rec.frozenQuote > 0 {
-		_ = s.ledgerSvc.Unfreeze(rec.user, rec.quote, rec.frozenQuote)
+		_ = s.ledgerSvc.Unfreeze(rec.user, rec.quote, settlement.AssetAmountFromFloat(rec.frozenQuote, settlement.AssetDecimalsByName(rec.quote)))
 	}
 	if rec.frozenBase > 0 {
-		_ = s.ledgerSvc.Unfreeze(rec.user, rec.base, rec.frozenBase)
+		_ = s.ledgerSvc.Unfreeze(rec.user, rec.base, settlement.AssetAmountFromFloat(rec.frozenBase, settlement.AssetDecimalsByName(rec.base)))
 	}
 }
 
@@ -258,26 +259,26 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 
 	// 买方支付计价资产。
 	if buyRec != nil {
-		_ = s.ledgerSvc.Unfreeze(buyer, quote, cost)
+		_ = s.ledgerSvc.Unfreeze(buyer, quote, settlement.AssetAmountFromFloat(cost, settlement.AssetDecimalsByName(quote)))
 		buyRec.frozenQuote -= cost
 		if buyRec.frozenQuote < 0 {
 			buyRec.frozenQuote = 0
 		}
 	}
-	if err := s.ledgerSvc.Transfer(buyer, seller, quote, cost, "spot_trade", ref); err != nil {
+	if err := s.ledgerSvc.Transfer(buyer, seller, quote, settlement.AssetAmountFromFloat(cost, settlement.AssetDecimalsByName(quote)), "spot_trade", ref); err != nil {
 		s.log.Error("spot settle buyer leg failed", zap.Int64("buyer", buyer), zap.Error(err))
 		return err
 	}
 
 	// 卖方支付基础资产。
 	if sellRec != nil {
-		_ = s.ledgerSvc.Unfreeze(seller, base, t.Qty)
+		_ = s.ledgerSvc.Unfreeze(seller, base, settlement.AssetAmountFromFloat(t.Qty, settlement.AssetDecimalsByName(base)))
 		sellRec.frozenBase -= t.Qty
 		if sellRec.frozenBase < 0 {
 			sellRec.frozenBase = 0
 		}
 	}
-	if err := s.ledgerSvc.Transfer(seller, buyer, base, t.Qty, "spot_trade", ref); err != nil {
+	if err := s.ledgerSvc.Transfer(seller, buyer, base, settlement.AssetAmountFromFloat(t.Qty, settlement.AssetDecimalsByName(base)), "spot_trade", ref); err != nil {
 		s.log.Error("spot settle seller leg failed", zap.Int64("seller", seller), zap.Error(err))
 		return err
 	}

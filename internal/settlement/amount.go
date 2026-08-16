@@ -211,6 +211,46 @@ func AssetDecimals(chain Chain, asset string) int {
 	}
 }
 
+// AssetDecimalsByName 按资产名返回标准小数位（不依赖链上下文），供 ledger 等无 chain
+// 信息的模块把 float 金额包装为 AssetAmount，以及旧快照迁移使用。
+// BTC=8、ETH=18、USDT/USDC/TRX/TRON=6，其余默认 8。
+func AssetDecimalsByName(asset string) int {
+	switch asset {
+	case "BTC":
+		return 8
+	case "ETH":
+		return 18
+	case "USDT", "USDC", "TRX", "TRON", "TRC20":
+		return 6
+	default:
+		return 8
+	}
+}
+
+// Neg 返回金额的相反数（Value 取负，Decimals 不变）。
+func (a AssetAmount) Neg() AssetAmount {
+	if a.Value == nil {
+		return AssetAmount{Value: big.NewInt(0), Decimals: a.Decimals}
+	}
+	return AssetAmount{Value: new(big.Int).Neg(a.Value), Decimals: a.Decimals}
+}
+
+// Min 返回 a、b 中较小者（按较大 decimals 对齐后比较）。
+func (a AssetAmount) Min(b AssetAmount) AssetAmount {
+	if a.Cmp(b) <= 0 {
+		return a
+	}
+	return b
+}
+
+// Max 返回 a、b 中较大者（按较大 decimals 对齐后比较）。
+func (a AssetAmount) Max(b AssetAmount) AssetAmount {
+	if a.Cmp(b) >= 0 {
+		return a
+	}
+	return b
+}
+
 // 确保 AssetAmount 实现 json.Marshaler/Unmarshaler（编译期检查）。
 var (
 	_ json.Marshaler   = AssetAmount{}

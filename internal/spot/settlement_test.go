@@ -6,8 +6,14 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/matching"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"go.uber.org/zap"
 )
+
+// eqAmt 将账本返回的 AssetAmount 与人类单位字面量按资产小数位精确比较（无 epsilon）。
+func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
+	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
+}
 
 // newTestServer 构造一个不依赖实时撮合服务的现货 Server，仅用于结算单元测试。
 func newTestServer() *Server {
@@ -21,8 +27,8 @@ func newTestServer() *Server {
 // seed 通过链上充值（复式记账：Debit 负债账户 + Credit 用户）注入余额，保证账本全局平衡，
 // 使 IsBalanced 断言有效。
 func seed(s *Server, uid int64, usdt, btc float64) {
-	_ = s.ledgerSvc.ReceiveOnChain(uid, "USDT", usdt, fmt.Sprintf("seed:%d:USDT", uid))
-	_ = s.ledgerSvc.ReceiveOnChain(uid, "BTC", btc, fmt.Sprintf("seed:%d:BTC", uid))
+	_ = s.ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(usdt, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
+	_ = s.ledgerSvc.ReceiveOnChain(uid, "BTC", settlement.AssetAmountFromFloat(btc, settlement.AssetDecimalsByName("BTC")), fmt.Sprintf("seed:%d:BTC", uid))
 }
 
 // 测试1：限价买单在撮合前预冻结计价资产，账本保持平衡。
@@ -38,7 +44,7 @@ func TestReserveOnOpenBuyLimit(t *testing.T) {
 		t.Fatalf("expect frozenQuote=100, got %v", rec.frozenQuote)
 	}
 	avail, frozen, _ := s.ledgerSvc.Balance(1, "USDT")
-	if avail != 99900 || frozen != 100 {
+	if !eqAmt(avail, 99900, "USDT") || !eqAmt(frozen, 100, "USDT") {
 		t.Fatalf("balance wrong: avail=%v frozen=%v", avail, frozen)
 	}
 	if !s.ledgerSvc.IsBalanced() {
@@ -55,7 +61,7 @@ func TestReserveOnOpenInsufficient(t *testing.T) {
 		t.Fatalf("expect insufficient error")
 	}
 	avail, frozen, _ := s.ledgerSvc.Balance(1, "USDT")
-	if avail != 50 || frozen != 0 {
+	if !eqAmt(avail, 50, "USDT") || !eqAmt(frozen, 0, "USDT") {
 		t.Fatalf("balance should be untouched: avail=%v frozen=%v", avail, frozen)
 	}
 }
@@ -87,18 +93,18 @@ func TestSettleFillLimitBuySell(t *testing.T) {
 
 	// 买方：USDT 100→0（冻结→解冻→划转给卖方），BTC 0→1。
 	bA, bF, _ := s.ledgerSvc.Balance(1, "USDT")
-	if bA != 99900 || bF != 0 {
+	if !eqAmt(bA, 99900, "USDT") || !eqAmt(bF, 0, "USDT") {
 		t.Fatalf("buyer USDT wrong: avail=%v frozen=%v", bA, bF)
 	}
-	if b, _, _ := s.ledgerSvc.Balance(1, "BTC"); b != 1 {
+	if b, _, _ := s.ledgerSvc.Balance(1, "BTC"); !eqAmt(b, 1, "BTC") {
 		t.Fatalf("buyer BTC should be 1, got %v", b)
 	}
 	// 卖方：BTC 10→9，USDT 0→100。
 	sA, sF, _ := s.ledgerSvc.Balance(2, "BTC")
-	if sA != 9 || sF != 0 {
+	if !eqAmt(sA, 9, "BTC") || !eqAmt(sF, 0, "BTC") {
 		t.Fatalf("seller BTC wrong: avail=%v frozen=%v", sA, sF)
 	}
-	if u, _, _ := s.ledgerSvc.Balance(2, "USDT"); u != 100 {
+	if u, _, _ := s.ledgerSvc.Balance(2, "USDT"); !eqAmt(u, 100, "USDT") {
 		t.Fatalf("seller USDT should be 100, got %v", u)
 	}
 	if !s.ledgerSvc.IsBalanced() {
@@ -120,7 +126,7 @@ func TestCancelReleasesFrozen(t *testing.T) {
 
 	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 2, "BTC_USDT") // 冻结 200 USDT
 	s.openOrders[777] = rec
-	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); f != 200 {
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 200, "USDT") {
 		t.Fatalf("expect frozen=200 before cancel, got %v", f)
 	}
 
@@ -134,7 +140,7 @@ func TestCancelReleasesFrozen(t *testing.T) {
 	s.freezeMu.Unlock()
 
 	avail, frozen, _ := s.ledgerSvc.Balance(1, "USDT")
-	if avail != 100000 || frozen != 0 {
+	if !eqAmt(avail, 100000, "USDT") || !eqAmt(frozen, 0, "USDT") {
 		t.Fatalf("after cancel expect avail=100000 frozen=0, got avail=%v frozen=%v", avail, frozen)
 	}
 	if !s.ledgerSvc.IsBalanced() {
@@ -159,7 +165,7 @@ func TestPartialFillThenCancel(t *testing.T) {
 		t.Fatalf("settleFill failed: %v", err)
 	}
 	// 买方已付 100 USDT，剩余冻结应为 100。
-	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); f != 100 {
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 100, "USDT") {
 		t.Fatalf("expect frozen=100 after partial fill, got %v", f)
 	}
 	// 撤单释放剩余 100。
@@ -170,7 +176,7 @@ func TestPartialFillThenCancel(t *testing.T) {
 		delete(s.openOrders, 888)
 	}
 	s.freezeMu.Unlock()
-	if avail, f, _ := s.ledgerSvc.Balance(1, "USDT"); avail != 99900 || f != 0 {
+	if avail, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(avail, 99900, "USDT") || !eqAmt(f, 0, "USDT") {
 		t.Fatalf("after cancel expect avail=99900 frozen=0, got avail=%v frozen=%v", avail, f)
 	}
 	if !s.ledgerSvc.IsBalanced() {

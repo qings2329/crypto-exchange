@@ -14,17 +14,22 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
+// amt 测试用：把人类单位浮点按资产标准小数位包装为 AssetAmount。
+func amt(asset string, human float64) settlement.AssetAmount {
+	return settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))
+}
+
 // newWithdrawServer 构造最小 futures Server（仅钱包提现相关字段），用于提币审批测试。
 // 账户 1 充值 10000 USDT，冷却期 30s、地址验证冷静期 0、每日限额 50000，覆盖 approve/reject 场景。
 func newWithdrawServer(t *testing.T) *Server {
 	t.Helper()
 	l := ledger.New()
-	if err := l.Deposit(1, "USDT", 10000, "seed"); err != nil {
+	if err := l.Deposit(1, "USDT", amt("USDT", 10000), "seed"); err != nil {
 		t.Fatal(err)
 	}
 	l.SetWithdrawHoldPeriod(30 * time.Second)
 	l.SetAddressVerifyPeriod(0) // 测试中确认地址后立即可用
-	l.SetDailyWithdrawLimit("USDT", 50000)
+	l.SetDailyWithdrawLimit("USDT", amt("USDT", 50000))
 	if _, err := l.AddWithdrawAddress(1, "USDT", "Ethereum", "0xabc", "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +88,7 @@ func callReject(s *Server, holdID string) *httptest.ResponseRecorder {
 func TestWithdrawApproveSkipsCooling(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	s := newWithdrawServer(t)
-	holdID, _, err := s.ledgerSvc.RequestWithdrawHold(1, "USDT", 100, 1, "Ethereum", "0xabc")
+	holdID, _, err := s.ledgerSvc.RequestWithdrawHold(1, "USDT", amt("USDT", 100), amt("USDT", 1), "Ethereum", "0xabc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +121,7 @@ func TestWithdrawApproveSkipsCooling(t *testing.T) {
 func TestWithdrawReject(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	s := newWithdrawServer(t)
-	holdID, _, err := s.ledgerSvc.RequestWithdrawHold(1, "USDT", 100, 1, "Ethereum", "0xabc")
+	holdID, _, err := s.ledgerSvc.RequestWithdrawHold(1, "USDT", amt("USDT", 100), amt("USDT", 1), "Ethereum", "0xabc")
 	if err != nil {
 		t.Fatal(err)
 	}

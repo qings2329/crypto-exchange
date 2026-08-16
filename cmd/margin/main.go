@@ -13,6 +13,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/margin"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
@@ -41,7 +42,7 @@ func main() {
 	ledgerSvc := ledger.New()
 	// 演示种子充值：预置部分用户 USDT，供杠杆抵押演示（生产来自链上清结算）。
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = ledgerSvc.Deposit(uid, "USDT", 100000, "seed")
+		_ = ledgerSvc.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 	}
 
 	// 选择 Store：配置了 DSN 则连 MySQL 并跑迁移，否则内存（演示）。

@@ -5,13 +5,19 @@ import (
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
+
+// eqAmt 将账本返回的 AssetAmount 与人类单位字面量按资产小数位精确比较（无 epsilon）。
+func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
+	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
+}
 
 func newTestService() (*Service, *ledger.Ledger) {
 	store := NewMemStore()
 	l := ledger.New()
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = l.Deposit(uid, "USDT", 100000, "seed")
+		_ = l.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 	}
 	cfg := Config{
 		MaxLeverage:      5,
@@ -35,11 +41,11 @@ func TestBorrowAndRepay(t *testing.T) {
 		t.Fatalf("unexpected account: %+v", a)
 	}
 	// 抵押 = 1/5 = 0.2 USDT 应被冻结，BTC 1.0 应进可用。
-	if _, frozen, _ := l.Balance(uid, "USDT"); frozen < 0.199999 {
-		t.Fatalf("collateral not frozen: frozen=%.6f", frozen)
+	if _, frozen, _ := l.Balance(uid, "USDT"); frozen.Cmp(settlement.AssetAmountFromFloat(0.199999, settlement.AssetDecimalsByName("USDT"))) < 0 {
+		t.Fatalf("collateral not frozen: frozen=%v", frozen)
 	}
-	if avail, _, _ := l.Balance(uid, "BTC"); avail < 0.999999 {
-		t.Fatalf("borrowed BTC not credited: avail=%.6f", avail)
+	if avail, _, _ := l.Balance(uid, "BTC"); avail.Cmp(settlement.AssetAmountFromFloat(0.999999, settlement.AssetDecimalsByName("BTC"))) < 0 {
+		t.Fatalf("borrowed BTC not credited: avail=%v", avail)
 	}
 
 	// 全额还币：债务 + 0 利息（刚借未计息）。
@@ -53,8 +59,8 @@ func TestBorrowAndRepay(t *testing.T) {
 	if a.Status != StatusClosed {
 		t.Fatalf("expected closed, got %s", a.Status)
 	}
-	if _, frozen, _ := l.Balance(uid, "USDT"); frozen > 1e-9 {
-		t.Fatalf("collateral not unfrozen: frozen=%.6f", frozen)
+	if _, frozen, _ := l.Balance(uid, "USDT"); frozen.Sign() > 0 {
+		t.Fatalf("collateral not unfrozen: frozen=%v", frozen)
 	}
 }
 
@@ -116,16 +122,16 @@ func TestLiquidationPriceAndLiquidate(t *testing.T) {
 		t.Fatal("expected liquidation to trigger")
 	}
 	// 借出 BTC 应被收回（可用归零）。
-	if avail, _, _ := l.Balance(uid, "BTC"); avail > 1e-9 {
-		t.Fatalf("borrowed BTC not seized: avail=%.6f", avail)
+	if avail, _, _ := l.Balance(uid, "BTC"); avail.Sign() > 0 {
+		t.Fatalf("borrowed BTC not seized: avail=%v", avail)
 	}
 	// 抵押部分罚没入保险基金，剩余应解冻。
-	if _, frozen, _ := l.Balance(uid, "USDT"); frozen > 1e-9 {
-		t.Fatalf("collateral still frozen after liquidation: frozen=%.6f", frozen)
+	if _, frozen, _ := l.Balance(uid, "USDT"); frozen.Sign() > 0 {
+		t.Fatalf("collateral still frozen after liquidation: frozen=%v", frozen)
 	}
 	ins, _, _ := l.Balance(ledger.SysInsurance, "USDT")
-	if ins <= 0 {
-		t.Fatalf("liquidation penalty not transferred to insurance: ins=%.6f", ins)
+	if ins.Sign() <= 0 {
+		t.Fatalf("liquidation penalty not transferred to insurance: ins=%v", ins)
 	}
 	a, _ = svc.Account(uid, "BTC")
 	if a.Status != StatusLiquidated {

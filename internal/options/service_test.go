@@ -5,13 +5,19 @@ import (
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
+
+// eqAmt 将账本返回的 AssetAmount 与人类单位字面量按资产小数位精确比较（无 epsilon）。
+func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
+	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
+}
 
 func newTestService() (*Service, *ledger.Ledger) {
 	store := NewMemStore()
 	l := ledger.New()
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = l.Deposit(uid, "USDT", 100000, "seed")
+		_ = l.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 	}
 	priceFn := func(asset string) (float64, bool) {
 		if asset == "BTC" {
@@ -54,11 +60,11 @@ func TestOpenLongPaysPremium(t *testing.T) {
 		t.Fatalf("unexpected position: %+v", p)
 	}
 	// 用户可用扣 2*1000=2000；系统对手方收 2000。
-	if avail, _, _ := l.Balance(uid, "USDT"); avail > 98000+1e-6 {
-		t.Fatalf("long premium not deducted: avail=%.4f want ~98000", avail)
+	if avail, _, _ := l.Balance(uid, "USDT"); !eqAmt(avail, 98000, "USDT") {
+		t.Fatalf("long premium not deducted: avail=%v want ~98000", avail)
 	}
-	if ins, _, _ := l.Balance(ledger.SysOptions, "USDT"); ins < 1999 {
-		t.Fatalf("system did not receive premium: sys=%.4f", ins)
+	if ins, _, _ := l.Balance(ledger.SysOptions, "USDT"); ins.Cmp(settlement.AssetAmountFromFloat(1999, settlement.AssetDecimalsByName("USDT"))) < 0 {
+		t.Fatalf("system did not receive premium: sys=%v", ins)
 	}
 }
 
@@ -77,11 +83,13 @@ func TestOpenShortFrozenAndReceivesPremium(t *testing.T) {
 	}
 	avail, frozen, _ := l.Balance(uid, "USDT")
 	// 可用 = 100000 - 24000(冻结) + 2000(权利金) = 78000。
-	if avail < 77999 || avail > 78001 {
-		t.Fatalf("short avail wrong: %.4f", avail)
+	if avail.Cmp(settlement.AssetAmountFromFloat(77999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
+		avail.Cmp(settlement.AssetAmountFromFloat(78001, settlement.AssetDecimalsByName("USDT"))) > 0 {
+		t.Fatalf("short avail wrong: %v", avail)
 	}
-	if frozen < 23999 || frozen > 24001 {
-		t.Fatalf("short margin not frozen: %.4f", frozen)
+	if frozen.Cmp(settlement.AssetAmountFromFloat(23999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
+		frozen.Cmp(settlement.AssetAmountFromFloat(24001, settlement.AssetDecimalsByName("USDT"))) > 0 {
+		t.Fatalf("short margin not frozen: %v", frozen)
 	}
 }
 
@@ -99,8 +107,9 @@ func TestExerciseLongPayoff(t *testing.T) {
 		t.Fatalf("exercise: %v", err)
 	}
 	avail, _, _ := l.Balance(uid, "USDT")
-	if avail < 107999 || avail > 108001 {
-		t.Fatalf("exercise payoff wrong: avail=%.4f want ~108000", avail)
+	if avail.Cmp(settlement.AssetAmountFromFloat(107999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
+		avail.Cmp(settlement.AssetAmountFromFloat(108001, settlement.AssetDecimalsByName("USDT"))) > 0 {
+		t.Fatalf("exercise payoff wrong: avail=%v want ~108000", avail)
 	}
 	got, _ := svc.GetPosition(p.ID)
 	if got.Status != StatusExercised {
@@ -122,8 +131,9 @@ func TestSettleExpiryLong(t *testing.T) {
 		t.Fatal("expected settled=true")
 	}
 	avail, _, _ := l.Balance(uid, "USDT")
-	if avail < 107999 || avail > 108001 {
-		t.Fatalf("long settle payoff wrong: avail=%.4f want ~108000", avail)
+	if avail.Cmp(settlement.AssetAmountFromFloat(107999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
+		avail.Cmp(settlement.AssetAmountFromFloat(108001, settlement.AssetDecimalsByName("USDT"))) > 0 {
+		t.Fatalf("long settle payoff wrong: avail=%v want ~108000", avail)
 	}
 	got, _ := svc.GetPosition(p.ID)
 	if got.Status != StatusExpired {
@@ -147,11 +157,12 @@ func TestSettleExpiryShort(t *testing.T) {
 	// 解冻 12000，支付损失 min(ITV=10000, margin=12000)=10000。
 	// 可用 = 100000 - 12000 + 1000(权利金) + 12000(解冻) - 10000(损失) = 91000。
 	avail, frozen, _ := l.Balance(uid, "USDT")
-	if avail < 90999 || avail > 91001 {
-		t.Fatalf("short settle avail wrong: %.4f want ~91000", avail)
+	if avail.Cmp(settlement.AssetAmountFromFloat(90999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
+		avail.Cmp(settlement.AssetAmountFromFloat(91001, settlement.AssetDecimalsByName("USDT"))) > 0 {
+		t.Fatalf("short settle avail wrong: %v want ~91000", avail)
 	}
-	if frozen > 1e-6 {
-		t.Fatalf("short margin not released: frozen=%.4f", frozen)
+	if frozen.Sign() > 0 {
+		t.Fatalf("short margin not released: %v", frozen)
 	}
 	got, _ := svc.GetPosition(p.ID)
 	if got.Status != StatusExpired {

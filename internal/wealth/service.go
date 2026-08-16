@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // Config 是理财资管业务参数。
@@ -97,11 +98,11 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 	}
 	// 校验用户可用余额并转入托管。
 	avail, _, _ := s.ledger.Balance(userID, p.Asset)
-	if avail < amount-1e-9 {
+	if avail.Cmp(settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(p.Asset))) < 0 {
 		return nil, ErrInsufficientBal
 	}
 	ref := fmt.Sprintf("wealth_subscribe product=%d user=%d", productID, userID)
-	if err := s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, amount, "wealth_subscribe", ref); err != nil {
+	if err := s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(p.Asset)), "wealth_subscribe", ref); err != nil {
 		return nil, fmt.Errorf("lock principal: %w", err)
 	}
 	h := &WealthHolding{
@@ -112,7 +113,7 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 	}
 	if err := s.store.CreateHolding(h); err != nil {
 		// 回滚托管转入。
-		_ = s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, amount, "wealth_subscribe_rollback", ref)
+		_ = s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(p.Asset)), "wealth_subscribe_rollback", ref)
 		return nil, err
 	}
 	return h, nil
@@ -181,14 +182,14 @@ func (s *Service) Redeem(userID, holdingID int64) (*WealthHolding, error) {
 	_ = s.accrueHolding(h, p, now) // 赎回前补齐到当前的收益
 	total := h.Principal + h.AccruedYield
 	ref := fmt.Sprintf("wealth_redeem product=%d holding=%d user=%d", h.ProductID, holdingID, userID)
-	if err := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, total, "wealth_redeem", ref); err != nil {
+	if err := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, settlement.AssetAmountFromFloat(total, settlement.AssetDecimalsByName(p.Asset)), "wealth_redeem", ref); err != nil {
 		return nil, fmt.Errorf("redeem payout: %w", err)
 	}
 	h.Status = HoldingRedeemed
 	h.RedeemedAt = now
 	if err := s.store.UpdateHolding(h); err != nil {
 		// 回滚支出（极端情况：store 失败但账本已出金）。
-		_ = s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, total, "wealth_redeem_rollback", ref)
+		_ = s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, settlement.AssetAmountFromFloat(total, settlement.AssetDecimalsByName(p.Asset)), "wealth_redeem_rollback", ref)
 		return nil, err
 	}
 	return h, nil

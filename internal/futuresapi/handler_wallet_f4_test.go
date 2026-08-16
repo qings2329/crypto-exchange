@@ -20,12 +20,12 @@ func newF4Server(t *testing.T) (*Server, *gin.Engine, *middleware.TokenVerifier)
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	l := ledger.New()
-	if err := l.Deposit(1, "USDT", 10000, "seed"); err != nil {
+	if err := l.Deposit(1, "USDT", amt("USDT", 10000), "seed"); err != nil {
 		t.Fatal(err)
 	}
 	l.SetWithdrawHoldPeriod(30 * time.Second)
 	l.SetAddressVerifyPeriod(0)
-	l.SetDailyWithdrawLimit("USDT", 50000)
+	l.SetDailyWithdrawLimit("USDT", amt("USDT", 50000))
 	if _, err := l.AddWithdrawAddress(1, "USDT", "Ethereum", "0xabc", "test"); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestWithdrawApproveRequiresAdmin(t *testing.T) {
 	userTok := verifier.Issue(1, time.Hour)
 	adminTok := verifier.IssueAdmin(1, middleware.RoleAdmin, nil, time.Hour)
 
-	holdID, _, err := s.ledgerSvc.RequestWithdrawHold(1, "USDT", 100, 1, "Ethereum", "0xabc")
+	holdID, _, err := s.ledgerSvc.RequestWithdrawHold(1, "USDT", amt("USDT", 100), amt("USDT", 1), "Ethereum", "0xabc")
 	if err != nil {
 		t.Fatal(err)
 	}

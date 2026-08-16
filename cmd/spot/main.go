@@ -10,6 +10,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/spot"
@@ -36,12 +37,12 @@ func main() {
 	// 演示种子充值：通过链上充值（复式记账）为常用用户预置多资产余额，供现货买卖与结算。
 	// 用 ReceiveOnChain 而非 Deposit，使账本从创世起即全局平衡（对账巡检不会误报）。
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = ledgerSvc.ReceiveOnChain(uid, "USDT", 100000, fmt.Sprintf("seed:%d:USDT", uid))
-		_ = ledgerSvc.ReceiveOnChain(uid, "BTC", 10, fmt.Sprintf("seed:%d:BTC", uid))
-		_ = ledgerSvc.ReceiveOnChain(uid, "ETH", 100, fmt.Sprintf("seed:%d:ETH", uid))
+		_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
+		_ = ledgerSvc.ReceiveOnChain(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), fmt.Sprintf("seed:%d:BTC", uid))
+		_ = ledgerSvc.ReceiveOnChain(uid, "ETH", settlement.AssetAmountFromFloat(100, settlement.AssetDecimalsByName("ETH")), fmt.Sprintf("seed:%d:ETH", uid))
 	}
 	// 对账巡检：探测不平账并告警（演示日志钩子）。
-	ledgerSvc.SetReconcileAlertHook(func(dev map[string]float64) {
+	ledgerSvc.SetReconcileAlertHook(func(dev map[string]settlement.AssetAmount) {
 		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
 	})
 	ledgerSvc.StartReconciler(15 * time.Second)

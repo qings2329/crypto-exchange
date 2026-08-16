@@ -12,6 +12,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/futuresapi"
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 )
@@ -47,7 +48,7 @@ func main() {
 	// 演示种子充值：为常用用户预置 USDT 余额（生产来自链上充值/清结算）。
 	seedDemo := func() {
 		for _, uid := range []int64{1, 2, 3, 4} {
-			_ = ledgerSvc.Deposit(uid, "USDT", 100000, "seed")
+			_ = ledgerSvc.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 		}
 	}
 

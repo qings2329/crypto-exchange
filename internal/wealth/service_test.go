@@ -5,13 +5,19 @@ import (
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
+
+// eqAmt 将账本返回的 AssetAmount 与人类单位字面量按资产小数位精确比较（无 epsilon）。
+func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
+	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
+}
 
 func newTestService() (*Service, *ledger.Ledger) {
 	store := NewMemStore()
 	l := ledger.New()
 	for _, uid := range []int64{1, 2} {
-		_ = l.Deposit(uid, "USDT", 100000, "seed")
+		_ = l.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
 	}
 	return NewService(store, l, Config{}, nil), l
 }
@@ -36,22 +42,22 @@ func TestSubscribeDeductsAndRedeemCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	if avail, _, _ := l.Balance(1, "USDT"); avail < 99000-1e-6 {
-		t.Fatalf("principal not deducted: avail=%.4f", avail)
+	if avail, _, _ := l.Balance(1, "USDT"); avail.Cmp(settlement.AssetAmountFromFloat(99000, settlement.AssetDecimalsByName("USDT"))) < 0 {
+		t.Fatalf("principal not deducted: avail=%v", avail)
 	}
-	if sys, _, _ := l.Balance(ledger.SysWealth, "USDT"); sys < 999-1e-6 {
-		t.Fatalf("custody not credited: sys=%.4f", sys)
+	if sys, _, _ := l.Balance(ledger.SysWealth, "USDT"); sys.Cmp(settlement.AssetAmountFromFloat(999, settlement.AssetDecimalsByName("USDT"))) < 0 {
+		t.Fatalf("custody not credited: sys=%v", sys)
 	}
 
 	// 活期立即赎回：收益≈0，仅回本金。
 	if _, err := svc.Redeem(1, h.ID); err != nil {
 		t.Fatalf("redeem: %v", err)
 	}
-	if avail, _, _ := l.Balance(1, "USDT"); avail < 99999-1e-6 {
-		t.Fatalf("redeem did not return principal: avail=%.4f", avail)
+	if avail, _, _ := l.Balance(1, "USDT"); avail.Cmp(settlement.AssetAmountFromFloat(99999, settlement.AssetDecimalsByName("USDT"))) < 0 {
+		t.Fatalf("redeem did not return principal: avail=%v", avail)
 	}
-	if sys, _, _ := l.Balance(ledger.SysWealth, "USDT"); sys > 1e-6 {
-		t.Fatalf("custody not drained: sys=%.4f", sys)
+	if sys, _, _ := l.Balance(ledger.SysWealth, "USDT"); sys.Sign() > 0 {
+		t.Fatalf("custody not drained: sys=%v", sys)
 	}
 }
 
@@ -72,8 +78,9 @@ func TestRedeemPaysYield(t *testing.T) {
 	}
 	after, _, _ := l.Balance(1, "USDT")
 	// 年化 0.365，持有 1 年，收益≈365；本金 1000 + 收益 ≈1365。
-	if after-before < 1364 || after-before > 1366 {
-		t.Fatalf("yield payout wrong: got %.4f want ~1365 (before=%.2f after=%.2f)", after-before, before, after)
+	diff := after.HumanFloat() - before.HumanFloat()
+	if diff < 1364 || diff > 1366 {
+		t.Fatalf("yield payout wrong: got %.4f want ~1365 (before=%.2f after=%.2f)", diff, before.HumanFloat(), after.HumanFloat())
 	}
 }
 
