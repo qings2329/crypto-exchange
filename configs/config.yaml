@@ -58,6 +58,10 @@ services:
   spot: "http://127.0.0.1:8082"
   market: "http://127.0.0.1:8083"
   futures: "http://127.0.0.1:8084"
+  # matching 是撮合权威（单写者）；网关仅暴露其只读/行情端点，写端点（/order、
+  # /cancel、/match-now）不在此反代，订单提交仍经 spot/futures 以保留资金预冻结与
+  # 账本结算（资金安全，详见 DEVELOPMENT_TASKS.md §18 / §18.1）。另见 matching.url。
+  matching: "http://127.0.0.1:8085"
   margin: "http://127.0.0.1:8087"
   notification: "http://127.0.0.1:8088"
   risk: "http://127.0.0.1:8089"
@@ -85,6 +89,16 @@ influxdb:
   token: ""
   org: ""
   bucket: ""
+
+# 成交检索（T-16）：每笔成交索引入 Elasticsearch（index "trades"），行情服务可检索历史成交
+# （按 symbol / 买卖方向 / 时间窗）。url 为空 → 行情服务仅用内存，不连接 ES（fail-degraded）。
+# 启用时填入 docker-compose 中 elasticsearch:8.13.0（:9200）的实例地址，例如：
+#   es:
+#     url: "http://127.0.0.1:9200"
+#     index: "trades"
+es:
+  url: ""
+  index: ""
 
 # 指数价预言机（internal/oracle）：真实多交易所 REST 喂价。
 # 留空（删除 feeds 或整个 oracle 段）时各服务回退到内置 StaticFeed 演示（futures 默认演示）。

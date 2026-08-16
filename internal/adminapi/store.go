@@ -23,60 +23,60 @@ type AdminUser struct {
 
 // SymbolConfig 是交易对/参数配置（手续费率、杠杆上限、上下线）。
 type SymbolConfig struct {
-	Symbol        string  `json:"symbol"`
-	Base          string  `json:"base"`
-	Quote         string  `json:"quote"`
-	Status        string  `json:"status"` // online | offline
-	FeeRate       float64 `json:"fee_rate"`
-	MaxLeverage   int     `json:"max_leverage"`
-	MinQty        float64 `json:"min_qty"`
+	Symbol      string  `json:"symbol"`
+	Base        string  `json:"base"`
+	Quote       string  `json:"quote"`
+	Status      string  `json:"status"` // online | offline
+	FeeRate     float64 `json:"fee_rate"`
+	MaxLeverage int     `json:"max_leverage"`
+	MinQty      float64 `json:"min_qty"`
 }
 
 // Chain 是公链管理视图。
 type Chain struct {
-	ID               int64     `json:"id"`
-	Name             string    `json:"name"`
-	Symbol           string    `json:"symbol"`
+	ID              int64     `json:"id"`
+	Name            string    `json:"name"`
+	Symbol          string    `json:"symbol"`
 	Confirmations   int       `json:"confirmations"`
-	DepositEnabled   bool      `json:"deposit_enabled"`
-	WithdrawEnabled  bool      `json:"withdraw_enabled"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	DepositEnabled  bool      `json:"deposit_enabled"`
+	WithdrawEnabled bool      `json:"withdraw_enabled"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Coin 是币种管理视图（归属公链、精度、提币手续费）。
 type Coin struct {
-	ID           int64     `json:"id"`
-	Symbol       string    `json:"symbol"`
-	Name         string    `json:"name"`
-	Chain        string    `json:"chain"`
-	Precision    int       `json:"precision"`
-	WithdrawFee  float64   `json:"withdraw_fee"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID          int64     `json:"id"`
+	Symbol      string    `json:"symbol"`
+	Name        string    `json:"name"`
+	Chain       string    `json:"chain"`
+	Precision   int       `json:"precision"`
+	WithdrawFee float64   `json:"withdraw_fee"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Deposit 是充值记录（公链入账）。
 type Deposit struct {
-	ID       int64     `json:"id"`
-	UserID   int64     `json:"user_id"`
-	Coin     string    `json:"coin"`
-	Chain    string    `json:"chain"`
-	Amount   float64   `json:"amount"`
-	TxHash   string    `json:"tx_hash"`
-	Status   string    `json:"status"` // pending | confirmed
-	Time     time.Time `json:"time"`
+	ID     int64     `json:"id"`
+	UserID int64     `json:"user_id"`
+	Coin   string    `json:"coin"`
+	Chain  string    `json:"chain"`
+	Amount float64   `json:"amount"`
+	TxHash string    `json:"tx_hash"`
+	Status string    `json:"status"` // pending | confirmed
+	Time   time.Time `json:"time"`
 }
 
 // Withdrawal 是提币记录（需审核）。
 type Withdrawal struct {
-	ID       int64     `json:"id"`
-	UserID   int64     `json:"user_id"`
-	Coin     string    `json:"coin"`
-	Chain    string    `json:"chain"`
-	Amount   float64   `json:"amount"`
-	Address  string    `json:"address"`
-	TxHash   string    `json:"tx_hash"`
-	Status   string    `json:"status"` // pending | approved | rejected
-	Time     time.Time `json:"time"`
+	ID      int64     `json:"id"`
+	UserID  int64     `json:"user_id"`
+	Coin    string    `json:"coin"`
+	Chain   string    `json:"chain"`
+	Amount  float64   `json:"amount"`
+	Address string    `json:"address"`
+	TxHash  string    `json:"tx_hash"`
+	Status  string    `json:"status"` // pending | approved | rejected
+	Time    time.Time `json:"time"`
 }
 
 // Notification 是运营通知（live=来自通知服务实时数据；local=管理后台本地公告）。
@@ -92,33 +92,33 @@ type Notification struct {
 
 // LiquidationItem 是强平队列中的一条待强平持仓。
 type LiquidationItem struct {
-	UserID    int64     `json:"user_id"`
-	Symbol    string    `json:"symbol"`
-	Side      string    `json:"side"`
-	Size      float64   `json:"size"`
-	LiqPrice  float64   `json:"liq_price"`
-	Equity    float64   `json:"equity"`
-	Detected  time.Time `json:"detected"`
+	UserID   int64     `json:"user_id"`
+	Symbol   string    `json:"symbol"`
+	Side     string    `json:"side"`
+	Size     float64   `json:"size"`
+	LiqPrice float64   `json:"liq_price"`
+	Equity   float64   `json:"equity"`
+	Detected time.Time `json:"detected"`
 }
 
 // RiskSnapshot 是风控与强平监控的只读快照（实时取自 futures 服务）。
 type RiskSnapshot struct {
-	UpdatedAt      time.Time          `json:"updated_at"`
+	UpdatedAt      time.Time         `json:"updated_at"`
 	Liquidations   []LiquidationItem `json:"liquidations"`
-	InsuranceFund  float64            `json:"insurance_fund"`
-	SocializedLoss float64            `json:"socialized_loss"`
-	ADLQueue       []string           `json:"adl_queue"` // 自动化减仓排队（"uid:symbol"）
+	InsuranceFund  float64           `json:"insurance_fund"`
+	SocializedLoss float64           `json:"socialized_loss"`
+	ADLQueue       []string          `json:"adl_queue"` // 自动化减仓排队（"uid:symbol"）
 	// Notes 记录部分上游拉取失败的信息（降级时填充）。
 	Notes string `json:"notes,omitempty"`
 }
 
 // LedgerSummary 是账本对账快照（实时取自 futures 服务的复式记账对账探针）。
 type LedgerSummary struct {
-	UpdatedAt      time.Time `json:"updated_at"`
-	TotalAssets    float64   `json:"total_assets"`
-	SettlementBal  float64   `json:"settlement_balance"`
-	Reconciled     bool      `json:"reconciled"`
-	Discrepancy    float64   `json:"discrepancy"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	TotalAssets   float64   `json:"total_assets"`
+	SettlementBal float64   `json:"settlement_balance"`
+	Reconciled    bool      `json:"reconciled"`
+	Discrepancy   float64   `json:"discrepancy"`
 	// Notes 记录部分上游拉取失败的信息（降级时填充）。
 	Notes string `json:"notes,omitempty"`
 }
@@ -141,9 +141,10 @@ type Store struct {
 	deposits    []Deposit
 	withdrawals []Withdrawal
 
-	// 会话态：充值提币来自 futures 上游实时数据；下面两个映射仅用于在审批时把
-	// 前端使用的稳定数字 id 反查回链上事件（TxHash），并缓存本次会话的审批结果。
+	// 会话态：充值提币来自 futures 上游实时数据；下面映射仅用于在审批时把
+	// 前端使用的稳定数字 id（stableID）反查回 futures 的提现 hold_id，并缓存本次会话的审批结果。
 	wdByID      map[int64]Withdrawal
+	wdByHoldID  map[int64]string // stableID -> futures hold_id（审核真正落地到链上放行/退回的锚点，§25）
 	wdApprovals map[int64]string // id -> approved|rejected
 
 	risk   RiskSnapshot
@@ -177,6 +178,7 @@ func NewStore() *Store {
 	}
 	s.seqWd = 1
 	s.wdByID = map[int64]Withdrawal{}
+	s.wdByHoldID = map[int64]string{}
 	s.wdApprovals = map[int64]string{}
 	// 风控快照
 	s.risk = RiskSnapshot{
@@ -188,11 +190,11 @@ func NewStore() *Store {
 	}
 	// 账本对账
 	s.ledger = LedgerSummary{
-		UpdatedAt:      now,
-		TotalAssets:    18_420_000,
-		SettlementBal:  18_420_000,
-		Reconciled:     true,
-		Discrepancy:    0,
+		UpdatedAt:     now,
+		TotalAssets:   18_420_000,
+		SettlementBal: 18_420_000,
+		Reconciled:    true,
+		Discrepancy:   0,
 	}
 	// 服务健康
 	s.health = []ServiceHealth{

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"flag"
+	"fmt"
+	"net"
+	"net/http"
 	"net/http/httputil"
 	"net/url"
 
@@ -25,6 +29,18 @@ func main() {
 	log, _ := logger.New(cfg.Server.Mode)
 	defer func() { _ = log.Sync() }()
 
+	r := buildRouter(cfg, log)
+
+	addr := ":8080"
+	log.Info("gateway starting", zap.String("addr", addr))
+	if err := cfg.Listen(r, addr); err != nil {
+		log.Fatal("server exited", zap.Error(err))
+	}
+}
+
+// buildRouter 装配网关路由：边缘鉴权 + 业务服务反代 + 撮合服务只读收敛（§18.1）。
+// 抽出以便单测验证「matching 写端点不直连网关」的资金安全不变量。
+func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 	r := gin.New()
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
 	// 边缘鉴权：放行认证与公开行情端点，其余一律强制鉴权；后端服务再做二次校验（零信任）。
@@ -47,26 +63,79 @@ func main() {
 		"/api/v1/market/klines",
 	))...)
 
-	// 简单路由转发：把各业务线路径反代到对应后端服务（含 WebSocket 升级透传）。
+	// 反向代理工厂（含 WebSocket 升级透传）。
 	proxy := func(target string) gin.HandlerFunc {
 		u, err := url.Parse(target)
 		if err != nil {
 			panic(err)
 		}
 		p := httputil.NewSingleHostReverseProxy(u)
+		p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, e error) {
+			log.Error("proxy error", zap.String("target", target), zap.Error(e))
+			rw.WriteHeader(http.StatusBadGateway)
+		}
 		return func(c *gin.Context) {
-			p.ServeHTTP(c.Writer, c.Request)
+			// 包一层 writer：httputil.ReverseProxy 会向 writer 断言 http.CloseNotifier
+			// （以及 websocket 升级时断言 http.Hijacker/http.Flusher）。gin 的 writer 在
+			// 测试环境或新版 Go 下可能未实现 CloseNotifier，直接透传会 panic；proxyWriter
+			// 安全补全这些接口（不支持时降级），既让测试可跑也避免线上潜在 panic。
+			p.ServeHTTP(&proxyWriter{c.Writer}, c.Request)
 		}
 	}
 
+	// 业务服务通用反代：把 /api/v1/<svc>/* 反代到对应后端。matching 不走此通用反代，
+	// 其读写端点单独处理（见下），避免写端点被网关直连绕过 spot/futures 的资金安全层。
 	for svc, target := range cfg.Services {
+		if svc == "matching" {
+			continue
+		}
 		path := "/api/v1/" + svc + "/*path"
 		r.Any(path, proxy(target))
 	}
 
-	addr := ":8080"
-	log.Info("gateway starting", zap.String("addr", addr))
-	if err := cfg.Listen(r, addr); err != nil {
-		log.Fatal("server exited", zap.Error(err))
+	// §18.1 网关层收敛：把撮合权威 cmd/matching 纳入网关统一入口，便于健康检查与
+	// 行情/订单查询的统一寻址；但只暴露只读/行情端点（depth/ws/orders/trades/health）。
+	// /order、/cancel、/match-now 等写端点刻意不代理——订单提交必须经 spot/futures，
+	// 其内做资金预冻结（ledger.Freeze）与成交账本结算（ledger.Transfer），若经网关直连
+	// cmd/matching 会绕过这套资金安全控制（cmd/matching 仅负责撮合，无钱包/账本）。
+	if m := cfg.Services["matching"]; m != "" {
+		mp := proxy(m)
+		r.GET("/api/v1/matching/depth", mp)
+		r.GET("/api/v1/matching/ws", mp)
+		r.GET("/api/v1/matching/orders", mp)
+		r.GET("/api/v1/matching/orders/:id", mp)
+		r.GET("/api/v1/matching/trades", mp)
+		r.GET("/api/v1/matching/health", mp)
 	}
+
+	return r
+}
+
+// proxyWriter 包装 gin 的 ResponseWriter，安全补全 httputil.ReverseProxy 所需的接口。
+// gin 的 writer 对 http.CloseNotifier 采用「断言后调用」实现，若底层 writer（如测试用的
+// httptest.ResponseWriter、或新版 Go 中已移除 CloseNotify 的 *http.response）未实现该接口会
+// 直接 panic；此处改为安全降级，并使 WebSocket 升级（Hijack/Flush）能正确透传到真实 writer。
+type proxyWriter struct {
+	gin.ResponseWriter
+}
+
+func (w *proxyWriter) CloseNotify() <-chan bool {
+	// 不委托给 gin 的 CloseNotify：gin 的 CloseNotify 会以「断言后调用」方式访问底层
+	// writer，若底层未实现 http.CloseNotifier（如测试用 httptest.ResponseWriter、或新版
+	// Go 已移除该方法的 *http.response）会直接 panic。这里返回永不触发的 channel，等价于
+	// 客户端未断开——代价是代理在客户端中途断开时不会取消上游请求（次要，不影响正确性）。
+	return make(chan bool)
+}
+
+func (w *proxyWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *proxyWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("proxyWriter: underlying writer does not support hijacking")
 }

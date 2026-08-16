@@ -86,6 +86,13 @@ type Config struct {
 		Bucket string `yaml:"bucket"` // 目标 bucket（如 market）
 	} `yaml:"influxdb"`
 
+	// ES 是成交检索配置（T-16）：每笔成交索引入 Elasticsearch，支持历史成交检索
+	// （symbol / 买卖方向 / 时间窗）。URL 为空时行情服务仅用内存，不连接 ES（fail-degraded）。
+	ES struct {
+		URL   string `yaml:"url"`   // 如 http://127.0.0.1:9200
+		Index string `yaml:"index"` // 成交索引名；空则用默认 "trades"
+	} `yaml:"es"`
+
 	// Admin 是管理后台后端（cmd/admin）配置。
 	Admin AdminConfig `yaml:"admin"`
 

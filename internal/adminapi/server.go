@@ -4,8 +4,8 @@ import (
 	"log"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
@@ -18,13 +18,13 @@ import (
 // 读类模块（风控/账本/服务健康/通知）通过 UpstreamClient 实时聚合上游微服务，
 // 上游不可达时优雅降级（返回已获取部分 + notes）。
 type Server struct {
-	cfg      *config.Config
-	verifier *middleware.TokenVerifier
-	store    *Store
-	up         *UpstreamClient
+	cfg         *config.Config
+	verifier    *middleware.TokenVerifier
+	store       *Store
+	up          *UpstreamClient
 	matchClient *client.Client // 直连撮合引擎（cmd/matching），用于跨用户订单管理与撤销
-	adminStore AdminStore  // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
-	catalog    CatalogStore // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
+	adminStore  AdminStore     // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
+	catalog     CatalogStore   // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
 }
 
 // NewServer 装配管理后台服务。verifier 使用全局 auth 共享密钥（与用户 token 同一密钥，
@@ -67,13 +67,13 @@ func NewServer(cfg *config.Config) *Server {
 	}
 
 	return &Server{
-		cfg:        cfg,
-		verifier:   verifier,
-		store:      NewStore(),
-		up:         NewUpstreamClient(selfToken),
+		cfg:         cfg,
+		verifier:    verifier,
+		store:       NewStore(),
+		up:          NewUpstreamClient(selfToken),
 		matchClient: client.New(cfg.Matching.URL),
-		adminStore: adminStore,
-		catalog:    catalog,
+		adminStore:  adminStore,
+		catalog:     catalog,
 	}
 }
 
@@ -119,8 +119,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 充值提币记录（实时聚合 futures 链上事件）
 		admin.GET("/deposits", s.listDeposits)
 		admin.GET("/withdrawals", s.listWithdrawals)
-		admin.POST("/withdrawals/:id/approve", s.approveWithdrawal)
-		admin.POST("/withdrawals/:id/reject", s.rejectWithdrawal)
+		admin.POST("/withdrawals/:id/approve", middleware.RequirePerm(PermWithdrawApproval), s.approveWithdrawal)
+		admin.POST("/withdrawals/:id/reject", middleware.RequirePerm(PermWithdrawApproval), s.rejectWithdrawal)
 
 		// 运营通知管理（list 实时聚合 notification 服务）
 		admin.GET("/notifications", s.listNotifications)
