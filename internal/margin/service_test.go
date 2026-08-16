@@ -153,3 +153,69 @@ func TestLiquidateNoPriceSkips(t *testing.T) {
 		t.Fatal("expected no liquidation without price feed")
 	}
 }
+
+// TestBorrowRejectDuplicateActive F1：同一 (user, asset) 已存在活跃账户时拒绝重复开仓，避免覆盖式双借双冻。
+func TestBorrowRejectDuplicateActive(t *testing.T) {
+	svc, _ := newTestService()
+	if _, err := svc.Borrow(1, "BTC", 1.0, 5); err != nil {
+		t.Fatalf("borrow#1: %v", err)
+	}
+	if _, err := svc.Borrow(1, "BTC", 1.0, 5); err != ErrAlreadyBorrowed {
+		t.Fatalf("borrow#2: expected ErrAlreadyBorrowed, got %v", err)
+	}
+	list, _ := svc.Accounts(1)
+	n := 0
+	for _, a := range list {
+		if a.Asset == "BTC" {
+			n++
+			if a.Debt != 1.0 {
+				t.Fatalf("unexpected debt after duplicate borrow: %v", a.Debt)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 BTC account (no overwrite double-borrow), got %d", n)
+	}
+}
+
+// TestRepayIdempotent F1：已还清关闭的账户再次还款应被终态短路，不双扣。
+func TestRepayIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	const uid = int64(1)
+	if _, err := svc.Borrow(uid, "BTC", 1.0, 5); err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	if err := svc.Repay(uid, "BTC", 1.0); err != nil {
+		t.Fatalf("repay#1: %v", err)
+	}
+	if err := svc.Repay(uid, "BTC", 1.0); err != ErrAccountLiquidated {
+		t.Fatalf("repay#2: expected ErrAccountLiquidated, got %v", err)
+	}
+	// BTC 可用回到 0（借入 1.0 后全额还回，无双扣）。
+	if avail, _, _ := l.Balance(uid, "BTC"); avail.Sign() != 0 {
+		t.Fatalf("repay not idempotent: BTC avail=%v", avail)
+	}
+}
+
+// TestLiquidateIdempotent F1：已强平的账户再次强平应被终态短路，不双占双罚。
+func TestLiquidateIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	const uid = int64(3)
+	if _, err := svc.Borrow(uid, "BTC", 1.0, 2); err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	svc.priceFn = func(asset string) (float64, bool) { return 100.0, true }
+	done, err := svc.Liquidate(uid, "BTC")
+	if err != nil || !done {
+		t.Fatalf("liquidate#1: done=%v err=%v", done, err)
+	}
+	done, err = svc.Liquidate(uid, "BTC")
+	if err != nil || done {
+		t.Fatalf("liquidate#2: expected (false,nil), got done=%v err=%v", done, err)
+	}
+	// 保险基金罚没仅一次：抵押 0.5 * 5% = 0.025 USDT。
+	ins, _, _ := l.Balance(ledger.SysInsurance, "USDT")
+	if !eqAmt(ins, 0.025, "USDT") {
+		t.Fatalf("liquidate not idempotent: insurance=%v want 0.025", ins)
+	}
+}

@@ -117,6 +117,39 @@
 
 ---
 
+## 2026-08-16 — margin 资金流动幂等(F1)与权限护栏(F4)审查修复
+
+- **状态**：`internal/margin/service.go` + `internal/margin/handler.go` 已修复，待提交。
+- **背景**：边界审查发现 margin 同 otc/options 同类问题，且 F4 更严重——handler 从**请求体/query 取 `user_id`**
+  而非鉴权 token（IDOR 级越权）：任意登录用户可借/还/清算/计息**他人**账户，读端点泄露全量用户杠杆数据。
+
+### F1 幂等（与 otc/options 一致）
+- `Borrow`：先落账户（`StatusActive`）再冻结抵押+贷出资产；已存在活跃账户则拒绝重复开仓（`ErrAlreadyBorrowed`），
+  避免覆盖式双借双冻；资金失败回滚（删账户/解冻）。
+- `Repay`：先落更新后状态再 `DebitAvailable`，Debit 失败回滚账户；还清则 best-effort 解冻。
+- `Liquidate`：先落终态（`StatusLiquidated`）再扣回借出资产/解冻抵押/罚没保险基金，任一步失败回滚；顶部终态短路幂等。
+- 三条路径统一加 `s.mu` 串行化，避免并发/重试双借、双还、双占双罚。
+
+### F4 权限护栏（IDOR 修复）
+- 用户态端点（`borrow`/`repay`/`accrue`/`account`/`accounts`/`liq-price`）一律改以 `middleware.UserID(c)` token 身份为准，
+  **忽略请求体中的 `user_id`**（防越权）。
+- `POST /api/v1/margin/liquidate`（强制清算）为运营动作，加 `middleware.AdminGuard()`，目标用户由请求体 `user_id` 指定。
+
+### 契约/行为影响（破坏性变更）
+- 请求体不再接受 `user_id`：borrow/repay/accrue 的 `user_id` 字段被忽略，实际身份取自登录 token；前端须移除这些字段。
+- `GET /account`、`GET /accounts`、`GET /liq-price` 的 `user_id` query 参数**被忽略**，只返回调用者自己的数据（如需管理员代查，需另开 admin 端点）。
+- `POST /liquidate` 现仅管理员可调用（403 若无管理员角色），且仍需在 body 提供目标 `user_id` 与 `asset`。
+- **残余边界（与 otc F1 同款）**：若进程在「已落终态/更新、但账本资金未动」之间崩溃，状态已变更、资金未动（不会双付/双占），
+  但需运营/对账介入重放（如 Liquidate 崩溃则抵押保持冻结、借出资产未收回，需人工解冻/重平）。
+- F2 定点化（金额 float 派生）+ `1e-9` 容差（service.go 还清判断）为建议项，本轮未改。
+
+### 验证
+- F1：`TestBorrowRejectDuplicateActive` / `TestRepayIdempotent` / `TestLiquidateIdempotent`（重复调用资金只动一次、不双借）。
+- F4：`TestLiquidateRequiresAdmin`（非管理员 403）、`TestUserEndpointsUseTokenIdentity`（以 token 身份建户、忽略 body user_id）。
+- `go test -race ./internal/margin/...` 通过。
+
+---
+
 ## 2026-08-16 — 账本 v1→v2 快照迁移真实数据校验（定点化配套）
 
 - **背景**：账本金额已定点化（`settlement.AssetAmount`）。旧快照（无 `schema_version` 的 float 快照）

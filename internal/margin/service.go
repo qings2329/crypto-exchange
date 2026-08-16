@@ -62,6 +62,10 @@ func NewService(store Store, ledgerSvc *ledger.Ledger, cfg Config, log *zap.Logg
 }
 
 // Borrow 借入 asset 数量 amount，杠杆 leverage（抵押 = amount/leverage 的抵押资产）。
+//
+// 幂等设计（与 otc/options 一致）：先落账户（StatusActive）再动账本（冻结抵押 + 贷出资产），
+// 任一步失败回滚（删除账户/解冻）；同一 (user, asset) 已存在活跃账户时拒绝重复开仓，避免覆盖式双借。
+// s.mu 串行化开仓以避免并发重复扣费。
 func (s *Service) Borrow(userID int64, asset string, amount float64, leverage int) (*MarginAccount, error) {
 	if amount <= 0 {
 		return nil, ErrAmountMustBePositive
@@ -72,23 +76,25 @@ func (s *Service) Borrow(userID int64, asset string, amount float64, leverage in
 	if leverage > s.cfg.MaxLeverage {
 		return nil, ErrOverMaxLeverage
 	}
-	collateral := amount / float64(leverage)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// 检查并冻结抵押。
+	// 已存在活跃账户则拒绝重复开仓（否则 UpsertAccount 会覆盖，造成双借双冻）。
+	if existing, err := s.store.GetAccount(userID, asset); err == nil && existing.Status == StatusActive {
+		return nil, ErrAlreadyBorrowed
+	}
+
+	collateral := amount / float64(leverage)
+	collAmt := settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset))
+	amt := settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(asset))
+
+	// 检查抵押是否充足。
 	avail, _, ok := s.ledger.Balance(userID, s.cfg.CollateralAsset)
-	if !ok || avail.Cmp(settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset))) < 0 {
+	if !ok || avail.Cmp(collAmt) < 0 {
 		return nil, ErrInsufficientCollateral
 	}
-	if err := s.ledger.Freeze(userID, s.cfg.CollateralAsset, settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset))); err != nil {
-		return nil, fmt.Errorf("freeze collateral: %w", err)
-	}
-	// 贷出资产记入 ledger 可用余额（复式记账，借出即产生用户可用资产）。
-	ref := fmt.Sprintf("margin_borrow uid=%d asset=%s", userID, asset)
-	if err := s.ledger.CreditAvailable(userID, asset, settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(asset)), "margin_borrow", ref); err != nil {
-		_ = s.ledger.Unfreeze(userID, s.cfg.CollateralAsset, settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset)))
-		return nil, fmt.Errorf("credit borrowed asset: %w", err)
-	}
 
+	// 先落账户，再动账本。
 	a := &MarginAccount{
 		UserID:           userID,
 		Asset:            asset,
@@ -105,14 +111,29 @@ func (s *Service) Borrow(userID int64, asset string, amount float64, leverage in
 	if err := s.store.UpsertAccount(a); err != nil {
 		return nil, err
 	}
+	ref := fmt.Sprintf("margin_borrow uid=%d asset=%s", userID, asset)
+	if err := s.ledger.Freeze(userID, s.cfg.CollateralAsset, collAmt); err != nil {
+		_ = s.store.DeleteAccount(userID, asset)
+		return nil, fmt.Errorf("freeze collateral: %w", err)
+	}
+	if err := s.ledger.CreditAvailable(userID, asset, amt, "margin_borrow", ref); err != nil {
+		_ = s.ledger.Unfreeze(userID, s.cfg.CollateralAsset, collAmt)
+		_ = s.store.DeleteAccount(userID, asset)
+		return nil, fmt.Errorf("credit borrowed asset: %w", err)
+	}
 	return a, nil
 }
 
 // Repay 偿还 asset 数量 amount（先冲本金后冲利息）；还清则解冻抵押并关闭账户。
+//
+// 幂等设计：先落更新后的账户状态再 Debit，Debit 失败回滚账户；s.mu 串行化避免并发/重试双还。
 func (s *Service) Repay(userID int64, asset string, amount float64) error {
 	if amount <= 0 {
 		return ErrAmountMustBePositive
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	a, err := s.store.GetAccount(userID, asset)
 	if err != nil {
 		return err
@@ -133,28 +154,44 @@ func (s *Service) Repay(userID int64, asset string, amount float64) error {
 	if !ok || avail.Cmp(settlement.AssetAmountFromFloat(repay, settlement.AssetDecimalsByName(asset))) < 0 {
 		return ErrInsufficientBalance
 	}
-	ref := fmt.Sprintf("margin_repay uid=%d asset=%s", userID, asset)
-	if err := s.ledger.DebitAvailable(userID, asset, settlement.AssetAmountFromFloat(repay, settlement.AssetDecimalsByName(asset)), "margin_repay", ref); err != nil {
-		return err
-	}
+
+	// 计算新状态。
 	principal := repay
 	if principal > a.Debt {
 		principal = a.Debt
 	}
-	a.Debt -= principal
-	a.InterestAccrued -= (repay - principal)
-	if a.InterestAccrued < 0 {
-		a.InterestAccrued = 0
+	newDebt := a.Debt - principal
+	newInterest := a.InterestAccrued - (repay - principal)
+	if newInterest < 0 {
+		newInterest = 0
 	}
-	if a.Debt <= 1e-9 && a.InterestAccrued <= 1e-9 {
-		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, settlement.AssetAmountFromFloat(a.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset))); err != nil {
-			return err
-		}
+	closing := newDebt <= 1e-9 && newInterest <= 1e-9
+
+	// 保存旧快照用于回滚，先落新状态。
+	prev := *a
+	a.Debt = newDebt
+	a.InterestAccrued = newInterest
+	if closing {
 		a.CollateralAmount = 0
 		a.Status = StatusClosed
 	}
 	a.UpdatedAt = time.Now()
-	return s.store.UpsertAccount(a)
+	if err := s.store.UpsertAccount(a); err != nil {
+		return err
+	}
+
+	// 动钱：扣还款。
+	ref := fmt.Sprintf("margin_repay uid=%d asset=%s", userID, asset)
+	if err := s.ledger.DebitAvailable(userID, asset, settlement.AssetAmountFromFloat(repay, settlement.AssetDecimalsByName(asset)), "margin_repay", ref); err != nil {
+		*a = prev
+		_ = s.store.UpsertAccount(a)
+		return err
+	}
+	// 还清则解冻抵押（best-effort，与原实现一致）。
+	if closing && prev.CollateralAmount > 0 {
+		_ = s.ledger.Unfreeze(userID, a.CollateralAsset, settlement.AssetAmountFromFloat(prev.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset)))
+	}
+	return nil
 }
 
 // accrue 按小时利率把利息累计到利息字段（就地修改 a）。
@@ -202,13 +239,20 @@ func (s *Service) LiquidationPrice(userID int64, asset string) (float64, error) 
 
 // Liquidate 评估并在越界时执行强平：收回借出资产、罚没部分抵押入保险基金、剩余解冻。
 // 返回是否执行了强平。
+//
+// 幂等设计：先落终态（StatusLiquidated）再动账本（扣回借出资产/解冻抵押/罚没），
+// 任一步失败回滚账户与抵押；顶部终态短路实现幂等（重复调用不再双占双罚）。s.mu 串行化
+// 避免与后台 RunLoop 并发强平重复动钱。
 func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	a, err := s.store.GetAccount(userID, asset)
 	if err != nil {
 		return false, err
 	}
 	if a.Status != StatusActive {
-		return false, nil
+		return false, nil // 终态短路：幂等
 	}
 	s.accrue(a)
 	if s.priceFn == nil {
@@ -226,31 +270,18 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 		return false, nil // 安全，未越界
 	}
 
-	// 收回借出资产（借记用户可用，与借出时的 CreditAvailable 对冲，账本自平衡）。
+	// 计算强平动作金额。
+	collAmt := settlement.AssetAmountFromFloat(a.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset))
+	penaltyAmt := settlement.AssetAmountFromFloat(a.CollateralAmount*s.cfg.LiquidationPenalty, settlement.AssetDecimalsByName(a.CollateralAsset))
 	avail, _, ok2 := s.ledger.Balance(userID, asset)
 	seize := settlement.AssetAmountFromFloat(a.Debt, settlement.AssetDecimalsByName(asset))
 	if !ok2 || avail.Cmp(seize) < 0 {
 		seize = avail
 	}
 	ref := fmt.Sprintf("margin_liq uid=%d asset=%s", userID, asset)
-	if seize.Sign() > 0 {
-		if err := s.ledger.DebitAvailable(userID, asset, seize, "margin_liquidation", ref); err != nil {
-			return false, err
-		}
-	}
-	// 先解冻全部抵押回可用，再从可用中罚没部分入保险基金（ledger.Transfer 操作可用余额）。
-	penalty := a.CollateralAmount * s.cfg.LiquidationPenalty
-	if a.CollateralAmount > 0 {
-		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, settlement.AssetAmountFromFloat(a.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset))); err != nil {
-			return false, err
-		}
-	}
-	if penalty > 0 {
-		if err := s.ledger.Transfer(userID, ledger.SysInsurance, a.CollateralAsset, settlement.AssetAmountFromFloat(penalty, settlement.AssetDecimalsByName(a.CollateralAsset)),
-			"margin_liq_penalty", ref); err != nil {
-			return false, err
-		}
-	}
+
+	// 先落终态，再动钱。
+	prev := *a
 	a.CollateralAmount = 0
 	a.Debt = 0
 	a.InterestAccrued = 0
@@ -258,6 +289,34 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 	a.UpdatedAt = time.Now()
 	if err := s.store.UpsertAccount(a); err != nil {
 		return false, err
+	}
+
+	if seize.Sign() > 0 {
+		if err := s.ledger.DebitAvailable(userID, asset, seize, "margin_liquidation", ref); err != nil {
+			*a = prev
+			_ = s.store.UpsertAccount(a)
+			return false, err
+		}
+	}
+	if prev.CollateralAmount > 0 {
+		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, collAmt); err != nil {
+			// 解冻失败：恢复抵押与终态。
+			*a = prev
+			_ = s.ledger.Freeze(userID, a.CollateralAsset, collAmt)
+			_ = s.store.UpsertAccount(a)
+			return false, err
+		}
+	}
+	if penaltyAmt.Sign() > 0 {
+		if err := s.ledger.Transfer(userID, ledger.SysInsurance, a.CollateralAsset, penaltyAmt, "margin_liq_penalty", ref); err != nil {
+			// 罚没失败：重新冻结抵押并恢复终态。
+			if prev.CollateralAmount > 0 {
+				_ = s.ledger.Freeze(userID, a.CollateralAsset, collAmt)
+			}
+			*a = prev
+			_ = s.store.UpsertAccount(a)
+			return false, err
+		}
 	}
 	if s.log != nil {
 		s.log.Warn("margin account liquidated",
