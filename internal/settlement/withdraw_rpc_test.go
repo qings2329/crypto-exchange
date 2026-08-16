@@ -2,6 +2,7 @@ package settlement
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -294,4 +295,75 @@ type fakeSignerErr struct{}
 
 func (f *fakeSignerErr) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
 	return "", errors.New("signer unavailable")
+}
+
+// TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath 验证 BTC 提现经网关主路径走
+// 「真实 UTXO 拉取 → 离线签名 → SendRaw 广播」，不再回退节点侧 sendtoaddress：
+// 配置 RPC 端点 + hsm 签名器后，网关先用 listunspent 取 UTXO，做 SIGHASH_ALL 真实签名，
+// 再 sendrawtransaction 广播，返回节点给的真实 TxHash。
+func TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath(t *testing.T) {
+	priv := btcTestKey(t)
+	ownAddr := deriveP2WPKHAddress(priv.PubKey())
+	ownScript, err := addressToScriptPubKey(ownAddr) // 同私钥派生，可被签名器花费
+	if err != nil {
+		t.Fatalf("derive own script: %v", err)
+	}
+	ownScriptHex := hex.EncodeToString(ownScript)
+
+	// 节点同时响应 listunspent（UTXO 源）与 sendrawtransaction（主路径广播）。
+	var sentRaw bool
+	var rawSeen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string              `json:"method"`
+			Params []json.RawMessage   `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "listunspent":
+			res := `[{"txid":"` + strings.Repeat("a", 64) + `","vout":0,"amount":1.0,"scriptPubKey":"` + ownScriptHex + `"}]`
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":` + res + `}`))
+		case "sendrawtransaction":
+			sentRaw = true
+			if len(req.Params) > 0 {
+				rawSeen = strings.Trim(string(req.Params[0]), `"`)
+			}
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"btctxhash"}`))
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":null}`))
+		}
+	}))
+	defer srv.Close()
+
+	g := NewWithdrawGateway(ChainRPCConfig{
+		Enabled:   true,
+		Endpoints: map[string]string{"BTC": srv.URL},
+		HotWallet: HotWalletConfig{
+			Enabled:    true,
+			SignerType: "hsm",
+			SignerKey:  btcTestPriv,
+		},
+	})
+	if _, ok := g.(*RPCWithdrawGateway); !ok {
+		t.Fatalf("enabled gateway should be *RPCWithdrawGateway, got %T", g)
+	}
+
+	ev, err := g.SubmitWithdraw(1, "BTC", ChainBTC, 0.5, 0.0005, deriveP2WPKHAddress(priv.PubKey()), false)
+	if err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if !sentRaw {
+		t.Fatalf("BTC 应走 SendRaw（离线签名后广播）主路径，而非节点侧 sendtoaddress")
+	}
+	if ev.TxHash != "btctxhash" {
+		t.Fatalf("expected real tx hash from SendRaw, got %q", ev.TxHash)
+	}
+	if rawSeen == "" {
+		t.Fatalf("SendRaw 未收到 raw hex")
+	}
+	// 复用独立验证辅助：解析 raw、重算 SIGHASH 摘要交叉比对并校验 ECDSA 签名自洽 + 金额守恒。
+	utxos := []UTXO{{TxID: strings.Repeat("a", 64), Vout: 0, Amount: 1.0, ScriptPubKey: ownScriptHex}}
+	verifyBTCSignatures(t, rawSeen, utxos, priv.PubKey().SerializeCompressed())
+	verifyBTCValueConservation(t, rawSeen, utxos, 0.5)
 }

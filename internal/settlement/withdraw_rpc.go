@@ -86,6 +86,13 @@ type Signer interface {
 //     私钥不可用（未配置/非法）时返回 nil，由网关回退节点侧签名广播（fail-degraded）。
 //   - 未配置/未知类型：返回 nil，回退节点侧签名广播。
 func NewSigner(conf HotWalletConfig) Signer {
+	return NewSignerWithSource(conf, nil)
+}
+
+// NewSignerWithSource 同 NewSigner，但为真实签名器注入可选的 UTXO 源（BTC 真实签名按签名者
+// 自身地址向节点查询未花费输出用，走 listunspent）。stub 签名器忽略 source；未配/非法密钥
+// 返回 nil（网关回退节点侧签名广播，fail-degraded）。
+func NewSignerWithSource(conf HotWalletConfig, source UTXOSource) Signer {
 	if !conf.Enabled {
 		return nil
 	}
@@ -93,7 +100,7 @@ func NewSigner(conf HotWalletConfig) Signer {
 	case "stub":
 		return &stubSigner{}
 	case "hsm", "kms":
-		if s, err := newRealSigner(conf); err == nil {
+		if s, err := newRealSignerWithSource(conf, source); err == nil {
 			return s
 		}
 		return nil // 密钥不可用 → 回退（fail-degraded）
@@ -442,10 +449,16 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 		client := NewJSONRPCClient(conf.Endpoints)
 		mg := NewMockWithdrawGateway(req, interval)
 		mg.confirmSource = client // 真实区块确认轮询；节点不可达自动回退模拟
+		// 离线签名边界（nil→节点侧签名）：配置了 BTC 端点时注入 UTXO 源，使 BTC 提现走
+		// 「真实 UTXO 拉取 → 离线签名 → SendRaw」主路径，而非回退节点侧 sendtoaddress。
+		var source UTXOSource
+		if _, ok := conf.Endpoints[string(ChainBTC)]; ok {
+			source = NewRPCUTXOSource(client)
+		}
 		return &RPCWithdrawGateway{
 			MockWithdrawGateway: mg,
 			client:              client,
-			signer:              NewSigner(conf.HotWallet), // 离线签名边界；nil→节点侧签名
+			signer:              NewSignerWithSource(conf.HotWallet, source),
 		}
 	}
 	return NewMockWithdrawGateway(req, interval)
