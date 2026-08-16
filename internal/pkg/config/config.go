@@ -202,6 +202,21 @@ func Load(path string) (*Config, error) {
 			c.Settlement.ChainRPC.HotWallet.EthGasLimit = n
 		}
 	}
+	// 生产 HSM/KMS 后端连接配置（SignerBackend="external" 时按此自动构造真实签名后端）：
+	// endpoint 常含访问凭据、public_key 是设备导出公钥，均属敏感信息，从环境变量注入，
+	// 不写进 configs/config.yaml（与 AUTH_SECRET 同一模式）。未设置时沿用 YAML 默认值。
+	if v := os.Getenv("HSM_KIND"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.HSM.Kind = v
+	}
+	if v := os.Getenv("HSM_ENDPOINT"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.HSM.Endpoint = v
+	}
+	if v := os.Getenv("HSM_API_KEY"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.HSM.APIKey = v
+	}
+	if v := os.Getenv("HSM_PUBLIC_KEY"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.HSM.PublicKey = v
+	}
 	return &c, nil
 }
 

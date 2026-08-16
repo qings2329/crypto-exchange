@@ -71,7 +71,15 @@ func newRealSignerWithSource(conf HotWalletConfig, sources SignerSources) (*real
 	case "external", "hsm-remote", "kms":
 		backend, ok := lookupExternalSigner(conf.SignerKey)
 		if !ok {
-			return nil, fmt.Errorf("external 签名后端 %q 未注册：请用 settlement.RegisterExternalSigner 注入真实 HSM/KMS 后端", conf.SignerKey)
+			// 注册表未命中：若 HotWalletConfig.HSM 配置齐全，按 HSMConfig 自动构造并注册
+			// 真实后端（无需部署方手写 RegisterExternalSigner）。否则 fail-degraded 回退
+			// 节点侧签名广播。
+			auto, err := newHSMKeySigner(conf)
+			if err != nil {
+				return nil, fmt.Errorf("external 签名后端 %q 未注册且 hsm 配置不可用：%w（可用 settlement.RegisterExternalSigner 注入真实 HSM/KMS 后端）", conf.SignerKey, err)
+			}
+			RegisterExternalSigner(conf.SignerKey, auto)
+			backend = auto // 已注册，更新 case 块作用域的 backend（keyID 命中注册表）
 		}
 		key = backend
 	default: // "software" 或空

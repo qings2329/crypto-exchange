@@ -125,8 +125,10 @@ settlement:
     hot_wallet:
       enabled: true
       signer_type: "hsm"
-      # signer_backend：软件("software"，默认) 或 external("external"，用 HOT_WALLET_SIGNER_KEY 作
-      # keyID 从 RegisterExternalSigner 取真实 HSM/KMS 后端)。生产接 HSM/KMS 时设 "external"。
+      # signer_backend：软件("software"，默认) 或 external("external")。external 时优先从
+      # RegisterExternalSigner 取真实 HSM/KMS 后端；注册表未命中则按下方 hsm 段（环境变量注入）
+      # 自动构造并注册真实后端，无需手写 RegisterExternalSigner。生产接 HSM/KMS 时设 "external"
+      # 并配 HSM_* 环境变量。
       signer_backend: "software"
       # signer_key：软件签名器本地演示用的私钥（32 字节 hex，可选 0x 前缀）。生产应由 HSM/KMS
       # 注入、不落配置；此处留空即关闭真实签名（回退节点侧广播）。切勿在真实环境提交私钥，
@@ -137,6 +139,18 @@ settlement:
       eth_chain_id: 1
       eth_gas_price_wei: 0
       eth_gas_limit: 21000
+      # hsm：生产 HSM/KMS 后端连接配置。signer_backend="external" 且全局注册表未命中时，
+      # 按此自动构造并注册真实签名后端（无需部署方手写 RegisterExternalSigner）。敏感字段
+      # （endpoint 可能含访问凭据、public_key）经环境变量注入，不写进本文件；此处仅列字段说明，
+      # 真实取值见 .env.example（HSM_KIND/HSM_ENDPOINT/HSM_API_KEY/HSM_PUBLIC_KEY）。
+      #   kind: "remote-http" —— 内部签名服务「对 32 字节摘要做 ECDSA」的 HTTPS 端点（私钥永不离开安全模块）。
+      #         （aws-kms / pkcs11 等其它 kind 需自行实现 KeySigner 后用 RegisterExternalSigner 注入。）
+      #   public_key：安全模块导出的 secp256k1 公钥（hex，压缩/非压缩均可），用于派生地址、推导 ETH recovery id、校验签名。
+      hsm:
+        kind: ""          # 例：remote-http（环境变量 HSM_KIND 注入）
+        endpoint: ""      # 例：https://hsm.internal/sign（HSM_ENDPOINT 注入，可含鉴权凭据）
+        api_key: ""       # 可选：作为 Bearer Token 注入 Authorization 头（HSM_API_KEY 注入）
+        public_key: ""    # 设备导出的 secp256k1 公钥 hex（HSM_PUBLIC_KEY 注入）
 
 # 行情 K 线持久化（T-16）：已收盘 K 线写入 InfluxDB（measurement "kline"），
 # 行情服务在内存环形缓冲（klineCap=500）之外可回取更长历史。
