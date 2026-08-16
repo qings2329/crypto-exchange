@@ -22,7 +22,7 @@ type fakeRPCClient struct {
 	lastRaw string
 }
 
-func (f *fakeRPCClient) Broadcast(ctx context.Context, chain Chain, to string, amount float64) (string, error) {
+func (f *fakeRPCClient) Broadcast(ctx context.Context, chain Chain, to string, amount AssetAmount) (string, error) {
 	return f.hash, f.err
 }
 
@@ -58,7 +58,7 @@ func (f *fakeConfirmSource) Confirmations(ctx context.Context, chain Chain, txHa
 // 提现受理返回本地生成的模拟 TxHash，行为与改动前一致（零回归）。
 func TestNewWithdrawGatewayDisabledReturnsMock(t *testing.T) {
 	g := NewWithdrawGateway(ChainRPCConfig{Enabled: false})
-	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0.1), "0xabc", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestRPCWithdrawGatewayInjectsRealHash(t *testing.T) {
 		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
 		client:              &fakeRPCClient{hash: "0xREALHASH"},
 	}
-	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0.1), "0xabc", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestRPCWithdrawGatewayFallsBackOnClientError(t *testing.T) {
 		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
 		client:              &fakeRPCClient{err: errors.New("rpc unreachable")},
 	}
-	ev, err := g.SubmitWithdraw(1, "USDT", ChainBTC, 0.5, 0.0005, "bc1xyz", false)
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), "bc1xyz", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestRPCWithdrawGatewayUsesRealConfirmations(t *testing.T) {
 		client:              &fakeRPCClient{hash: "0xREAL"},
 	}
 	g.MockWithdrawGateway.confirmSource = &fakeConfirmSource{conf: 5} // 节点返回 5 个确认
-	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0.1), "0xabc", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestRPCWithdrawGatewayFallsBackOnConfirmError(t *testing.T) {
 		client:              &fakeRPCClient{hash: "0xREAL"},
 	}
 	g.MockWithdrawGateway.confirmSource = &fakeConfirmSource{err: errors.New("node unreachable")}
-	ev, err := g.SubmitWithdraw(1, "USDT", ChainBTC, 0.5, 0.0005, "bc1xyz", false)
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), "bc1xyz", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestRPCWithdrawGatewayUsesOfflineSigner(t *testing.T) {
 		client:              fc,
 		signer:              &fakeSigner{},
 	}
-	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0.1), "0xabc", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -338,7 +338,7 @@ func TestRPCWithdrawGatewaySignerErrorFallsBackToNode(t *testing.T) {
 		client:              fc,
 		signer:              badSigner,
 	}
-	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, 100, 0.1, "0xabc", false)
+	ev, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 100), amt(ChainETH, 0.1), "0xabc", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -403,7 +403,7 @@ func TestNewWithdrawGatewayETHUsesNodeNonceGas(t *testing.T) {
 	// 取签名者地址用于恢复校验（与网关内签名器同私钥）。
 	sig, _ := newRealSignerWithSource(HotWalletConfig{SignerKey: knownVectorPriv}, SignerSources{})
 	to := "0x3535353535353535353535353535353535353535"
-	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, 1.0, 0.001, to, false)
+	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestNewWithdrawGatewayETHUsesNodeNonceGas(t *testing.T) {
 		t.Fatalf("embedded nonce = %d, want 9", n)
 	}
 	gp, _ := extractETHGasPrice(rawSeen)
-	checkTx := &UnsignedTx{Chain: ChainETH, To: to, Amount: 1.0, Nonce: n, GasPriceWei: gp, GasLimit: 21000, ChainID: 1}
+	checkTx := &UnsignedTx{Chain: ChainETH, To: to, Amount: amt(ChainETH, 1.0), Nonce: n, GasPriceWei: gp, GasLimit: 21000, ChainID: 1}
 	rec, err := recoverETHAddressFromRaw(rawSeen, checkTx)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -487,7 +487,7 @@ func TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath(t *testing.T) {
 		t.Fatalf("enabled gateway should be *RPCWithdrawGateway, got %T", g)
 	}
 
-	ev, err := g.SubmitWithdraw(1, "BTC", ChainBTC, 0.5, 0.0005, deriveP2WPKHAddress(priv.PubKey()), false)
+	ev, err := g.SubmitWithdraw(1, "BTC", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), deriveP2WPKHAddress(priv.PubKey()), false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
 	}
@@ -503,5 +503,5 @@ func TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath(t *testing.T) {
 	// 复用独立验证辅助：解析 raw、重算 SIGHASH 摘要交叉比对并校验 ECDSA 签名自洽 + 金额守恒。
 	utxos := []UTXO{{TxID: strings.Repeat("a", 64), Vout: 0, Amount: 1.0, ScriptPubKey: ownScriptHex}}
 	verifyBTCSignatures(t, rawSeen, utxos, priv.PubKey().SerializeCompressed())
-	verifyBTCValueConservation(t, rawSeen, utxos, 0.5)
+	verifyBTCValueConservation(t, rawSeen, utxos, amt(ChainBTC, 0.5))
 }

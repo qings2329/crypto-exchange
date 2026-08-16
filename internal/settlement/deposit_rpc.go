@@ -117,7 +117,7 @@ func (s *JSONRPCDepositScanner) scanETH(ctx context.Context, w DepositWatch) ([]
 	out := make([]DepositEvent, 0, len(logs))
 	for _, l := range logs {
 		amount := weiToAmount(l.Data)
-		if amount <= 0 {
+		if amount.Sign() <= 0 {
 			continue
 		}
 		out = append(out, DepositEvent{
@@ -152,14 +152,15 @@ func (s *JSONRPCDepositScanner) scanBTC(ctx context.Context, w DepositWatch) ([]
 	}
 	out := make([]DepositEvent, 0)
 	for _, t := range body.Transactions {
-		if t.Category != "receive" || t.Address != w.Address || t.Amount <= 0 {
+		amt := AssetAmountFromFloat(t.Amount, 8) // 节点返回 BTC(float)→satoshi 最小单位
+		if t.Category != "receive" || t.Address != w.Address || amt.Sign() <= 0 {
 			continue
 		}
 		out = append(out, DepositEvent{
 			TxHash:  t.TxID,
 			UserID:  w.UserID,
 			Asset:   w.Asset,
-			Amount:  t.Amount,
+			Amount:  amt,
 			Chain:   ChainBTC,
 			Address: w.Address,
 		})
@@ -167,18 +168,17 @@ func (s *JSONRPCDepositScanner) scanBTC(ctx context.Context, w DepositWatch) ([]
 	return out, nil
 }
 
-// weiToAmount 把 0x 十六进制 wei 字符串转为资产数量（除以 1e18）。
-func weiToAmount(hex string) float64 {
+// weiToAmount 把 0x 十六进制 wei 字符串转为最小单位整数金额（18 decimals，#6，无 float 精度损失）。
+func weiToAmount(hex string) AssetAmount {
 	h := strings.TrimSpace(strings.TrimPrefix(strings.Trim(hex, `"`), "0x"))
 	if h == "" {
-		return 0
+		return AssetAmount{}
 	}
 	v, ok := new(big.Int).SetString(h, 16)
 	if !ok {
-		return 0
+		return AssetAmount{}
 	}
-	f, _ := new(big.Float).SetInt(v).Float64()
-	return f / 1e18
+	return AssetAmount{Value: v, Decimals: 18}
 }
 
 // scanTRON 用 TronGrid 风格 REST 拉取观察地址的 TRC20 转账（充值）：按合约地址过滤、
@@ -217,7 +217,7 @@ func (s *JSONRPCDepositScanner) scanTRON(ctx context.Context, w DepositWatch) ([
 			decimals = 6 // USDT-TRC20 默认 6 位小数
 		}
 		amount := tronAmountToFloat(d.Value, decimals)
-		if amount <= 0 {
+		if amount.Sign() <= 0 {
 			continue
 		}
 		out = append(out, DepositEvent{
@@ -232,17 +232,13 @@ func (s *JSONRPCDepositScanner) scanTRON(ctx context.Context, w DepositWatch) ([
 	return out, nil
 }
 
-// tronAmountToFloat 把 TRC20 value（字符串，最小单位整数）按 decimals 缩放为资产数量。
-func tronAmountToFloat(value string, decimals int) float64 {
+// tronAmountToFloat 把 TRC20 value（字符串，最小单位整数）按 decimals 转为最小单位整数金额（#6）。
+func tronAmountToFloat(value string, decimals int) AssetAmount {
 	v, ok := new(big.Int).SetString(strings.TrimSpace(value), 10)
 	if !ok {
-		return 0
+		return AssetAmount{}
 	}
-	f := new(big.Float).SetInt(v)
-	div := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
-	f.Quo(f, div)
-	r, _ := f.Float64()
-	return r
+	return AssetAmount{Value: v, Decimals: decimals}
 }
 
 // RPCDepositGateway 是 DepositGateway 的真实链上 RPC 实现（T-03 链上 RPC 半边·充值回调脚手架）。

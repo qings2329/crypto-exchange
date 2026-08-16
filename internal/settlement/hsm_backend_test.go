@@ -32,7 +32,7 @@ func TestRealSignerExternalKeySignerMatchesSoftware(t *testing.T) {
 	}
 	tx := &UnsignedTx{
 		Chain: ChainETH, To: "0x3535353535353535353535353535353535353535",
-		Amount: 1.0, Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
+		Amount: amt(ChainETH, 1.0), Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1,
 	}
 	raw, err := s.Sign(context.Background(), tx)
 	if err != nil {
@@ -64,13 +64,13 @@ func TestRealSignerExternalBTC(t *testing.T) {
 	}
 	pub := s.key.Public()
 	utxos := btcTestUTXOs(t, pub)
-	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2WPKHAddress(pub), Amount: 0.6, Asset: "BTC", UTXOs: utxos, FeeRatePerKB: 1000}
+	tx := &UnsignedTx{Chain: ChainBTC, To: deriveP2WPKHAddress(pub), Amount: amt(ChainBTC, 0.6), Asset: "BTC", UTXOs: utxos, FeeRatePerKB: 1000}
 	raw, err := s.Sign(context.Background(), tx)
 	if err != nil {
 		t.Fatalf("sign BTC via external backend: %v", err)
 	}
 	verifyBTCSignatures(t, raw, utxos, pub.SerializeCompressed())
-	verifyBTCValueConservation(t, raw, utxos, 0.6)
+	verifyBTCValueConservation(t, raw, utxos, amt(ChainBTC, 0.6))
 }
 
 // TestRealSignerExternalUnregisteredFails 验证 SignerBackend="external" 但对应后端未注册时

@@ -2,14 +2,15 @@ package settlement
 
 import (
 	"fmt"
+	"math/big"
 	"sync"
 )
 
 // ChainFee 某链某资产的手续费规则：基础费（固定）+ 费率（占提现额比例）。
-// 估算手续费 = Base + Rate*Amount。两者均可为 0（免费）。
+// 估算手续费 = Base + Rate*Amount。两者均可为 0（免费）。金额用 AssetAmount（最小单位整数，#6）。
 type ChainFee struct {
-	Base float64
-	Rate float64
+	Base AssetAmount
+	Rate *big.Rat
 }
 
 // FeeModel 多链/多资产手续费模型。按 (链, 资产) 维度登记费率，供提现受理时估算手续费，
@@ -28,11 +29,15 @@ func feeKey(chain Chain, asset string) string {
 	return fmt.Sprintf("%s:%s", chain, asset)
 }
 
-// Register 登记（覆盖）某链某资产的手续费规则。
+// Register 登记（覆盖）某链某资产的手续费规则。base/rate 以 float 入参，内部转为
+// AssetAmount（按链标准 decimals）与 *big.Rat，保持调用方（futuresapi）无需改动。
 func (m *FeeModel) Register(chain Chain, asset string, base, rate float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.schedule[feeKey(chain, asset)] = ChainFee{Base: base, Rate: rate}
+	m.schedule[feeKey(chain, asset)] = ChainFee{
+		Base: AssetAmountFromFloat(base, AssetDecimals(chain, asset)),
+		Rate: new(big.Rat).SetFloat64(rate),
+	}
 }
 
 // Lookup 查询某链某资产费率，未登记返回 false。
@@ -43,15 +48,23 @@ func (m *FeeModel) Lookup(chain Chain, asset string) (ChainFee, bool) {
 	return f, ok
 }
 
-// Estimate 估算提现手续费：Base + Rate*Amount。未登记该链资产时返回 0（免费），
-// 调用方可据此作为默认费率；amount 为负按 0 处理。
-func (m *FeeModel) Estimate(chain Chain, asset string, amount float64) float64 {
+// Estimate 估算提现手续费：Base + Rate*Amount（按 amount.Decimals 对齐）。未登记该链资产时
+// 返回零金额（免费）；amount 为负按 0 处理。
+func (m *FeeModel) Estimate(chain Chain, asset string, amount AssetAmount) AssetAmount {
 	f, ok := m.Lookup(chain, asset)
 	if !ok {
-		return 0
+		return AssetAmount{}
 	}
-	if amount < 0 {
-		amount = 0
+	if amount.Sign() < 0 {
+		amount = AssetAmount{}
 	}
-	return f.Base + f.Rate*amount
+	dec := amount.Decimals
+	base := f.Base.toDecimals(dec)
+	fee := new(big.Int).Set(base.Value)
+	if f.Rate != nil && f.Rate.Sign() != 0 {
+		scaled := new(big.Int).Mul(amount.Value, f.Rate.Num())
+		scaled.Quo(scaled, f.Rate.Denom())
+		fee.Add(fee, scaled)
+	}
+	return AssetAmount{Value: fee, Decimals: dec}
 }

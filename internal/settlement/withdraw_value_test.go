@@ -23,7 +23,7 @@ func TestBroadcastETHValueNoOverflow(t *testing.T) {
 	defer srv.Close()
 
 	c := NewJSONRPCClient(map[string]string{"ETH": srv.URL})
-	if _, err := c.Broadcast(context.Background(), ChainETH, "0xto", 1e9); err != nil {
+	if _, err := c.Broadcast(context.Background(), ChainETH, "0xto", amt(ChainETH, 1e9)); err != nil {
 		t.Fatalf("broadcast: %v", err)
 	}
 	want := "0x" + new(big.Int).Exp(big.NewInt(10), big.NewInt(27), nil).Text(16)

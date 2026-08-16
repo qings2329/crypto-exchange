@@ -172,7 +172,7 @@ func verifyTronSignature(t *testing.T, rawJSON string, want *secp256k1.PublicKey
 func TestDeployRealHMSSignAndVerify(t *testing.T) {
 	const ethTo = "0x3535353535353535353535353535353535353535"
 	tronTo := deriveTronAddress(parseSignerKeyOrDie(tronTestPrivRecipient).PubKey())
-	ethTx := &UnsignedTx{Chain: ChainETH, To: ethTo, Amount: 1.0, Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1}
+	ethTx := &UnsignedTx{Chain: ChainETH, To: ethTo, Amount: amt(ChainETH, 1.0), Nonce: 9, GasPriceWei: 20000000000, GasLimit: 21000, ChainID: 1}
 
 	run := func(mode string) {
 		svc := NewSigningService()
@@ -213,7 +213,7 @@ func TestDeployRealHMSSignAndVerify(t *testing.T) {
 
 		// TRON 真实离线签名（需参考区块源）+ 独立验证归属 HSM 密钥。
 		s.tronState = &fakeTronState{blockNum: 12345, blockID: strings.Repeat("c0", 32), ts: 1600000000000}
-		tronRaw, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: tronTo, Amount: 1.5})
+		tronRaw, err := s.Sign(context.Background(), &UnsignedTx{Chain: ChainTRON, To: tronTo, Amount: amt(ChainTRON, 1.5)})
 		if err != nil {
 			t.Fatalf("[%s] TRON 签名失败: %v", mode, err)
 		}

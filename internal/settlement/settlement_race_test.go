@@ -43,7 +43,7 @@ func TestWatchConcurrentEmitCancel(t *testing.T) {
 	// 并发提交入账并手动 tick 触发 emit，与 Watch 取消竞争。
 	for i := 0; i < 200; i++ {
 		uid := int64(i + 1)
-		if _, err := g.SubmitDeposit(uid, "USDT", ChainETH, 1.0, "0xw"); err != nil {
+		if _, err := g.SubmitDeposit(uid, "USDT", ChainETH, amt(ChainETH, 1.0), "0xw"); err != nil {
 			t.Fatalf("submit: %v", err)
 		}
 		tickers.Add(1)

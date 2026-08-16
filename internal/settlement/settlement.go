@@ -86,7 +86,7 @@ type DepositEvent struct {
 	TxHash        string        // 链上交易哈希（幂等键）
 	UserID        int64         // 目标交易所用户
 	Asset         string        // 资产（如 USDT）
-	Amount        float64       // 充值数量
+	Amount        AssetAmount   // 充值数量（最小单位整数，#6）
 	Chain         Chain         // 来源链
 	Address       string        // 充值地址（用户专属）
 	Confirmations int           // 当前区块确认数
@@ -100,10 +100,10 @@ type DepositEvent struct {
 // DepositGateway 链上充值网关（可插拔：模拟 / 真实 RPC 实现可互换）。
 type DepositGateway interface {
 	// SubmitDeposit 记录一笔用户充值意图，返回待确认事件（含模拟 TxHash 与地址）。
-	SubmitDeposit(userID int64, asset string, chain Chain, amount float64, address string) (*DepositEvent, error)
+	SubmitDeposit(userID int64, asset string, chain Chain, amount AssetAmount, address string) (*DepositEvent, error)
 	// SubmitDepositWithHash 与 SubmitDeposit 同义，但使用调用方提供的链上 TxHash（真实扫描入账时
 	// 保留节点返回的真实哈希，保证链上幂等/对账一致；空则回退本地生成）。
-	SubmitDepositWithHash(userID int64, asset string, chain Chain, amount float64, address, txHash string) (*DepositEvent, error)
+	SubmitDepositWithHash(userID int64, asset string, chain Chain, amount AssetAmount, address, txHash string) (*DepositEvent, error)
 	// Watch 订阅"已入账"事件流（确认达标后推送），用于驱动内部账本入账。
 	Watch(ctx context.Context) (<-chan DepositEvent, error)
 	// StartScan 启动链上充值监听（真实 RPC 扫描）；模拟网关为 no-op（充值仅经 SubmitDeposit 注入）。
@@ -264,15 +264,15 @@ func (g *MockChainGateway) emit(ev DepositEvent) {
 
 // SubmitDeposit 记录一笔充值意图（无真实链上哈希时回退本地生成哈希）。
 // 委托 SubmitDepositWithHash(txHash="") 实现，避免与透传路径重复。
-func (g *MockChainGateway) SubmitDeposit(userID int64, asset string, chain Chain, amount float64, address string) (*DepositEvent, error) {
+func (g *MockChainGateway) SubmitDeposit(userID int64, asset string, chain Chain, amount AssetAmount, address string) (*DepositEvent, error) {
 	return g.SubmitDepositWithHash(userID, asset, chain, amount, address, "")
 }
 
 // SubmitDepositWithHash 与 SubmitDeposit 同义，但使用调用方提供的链上交易哈希（txHash）。
 // 供 StartScan 在真实扫描后将节点返回的真实 txHash 透传入账（而非自生成模拟哈希），保证链上
 // 幂等与对账一致；txHash 为空时回退本地生成。pending 以 txHash 为键，重复提交同一 txHash 幂等。
-func (g *MockChainGateway) SubmitDepositWithHash(userID int64, asset string, chain Chain, amount float64, address, txHash string) (*DepositEvent, error) {
-	if userID <= 0 || amount <= 0 {
+func (g *MockChainGateway) SubmitDepositWithHash(userID int64, asset string, chain Chain, amount AssetAmount, address, txHash string) (*DepositEvent, error) {
+	if userID <= 0 || amount.Sign() <= 0 {
 		return nil, fmt.Errorf("invalid deposit params")
 	}
 	if asset == "" {
@@ -463,8 +463,8 @@ func mockDepositAddress(userID int64, chain Chain) string {
 }
 
 // GenerateTxHash 生成确定性的模拟交易哈希。
-func GenerateTxHash(userID int64, asset string, chain Chain, amount float64, nonce int64) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d-%s-%s-%.8f-%d", userID, asset, chain, amount, nonce)))
+func GenerateTxHash(userID int64, asset string, chain Chain, amount AssetAmount, nonce int64) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%d-%s-%s-%s-%d", userID, asset, chain, amount.HumanString(), nonce)))
 	return "0x" + hex.EncodeToString(h[:])
 }
 
@@ -532,10 +532,10 @@ func (e WithdrawEvent) MarshalJSON() ([]byte, error) {
 type WithdrawEvent struct {
 	TxHash        string  // 链上交易哈希（幂等键）
 	UserID        int64   // 发起提现的交易所用户
-	Asset         string  // 资产（如 USDT）
-	Amount        float64 // 提现数量（不含手续费）
-	Fee           float64 // 链上手续费
-	Chain         Chain   // 目标链
+	Asset         string     // 资产（如 USDT）
+	Amount        AssetAmount // 提现数量（最小单位整数，不含手续费，#6）
+	Fee           AssetAmount // 链上手续费（最小单位整数，#6）
+	Chain         Chain       // 目标链
 	Address       string  // 提现目标地址
 	Confirmations int     // 当前区块确认数
 	Required      int     // 安全确认数阈值
@@ -554,7 +554,7 @@ type WithdrawGateway interface {
 	Start()
 	// SubmitWithdraw 受理一笔用户提现，返回待广播事件（含模拟/真实 TxHash）。
 	// willFail 仅用于演示/单测注入失败路径；生产应始终传 false，由链上结果决定成败。
-	SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool) (*WithdrawEvent, error)
+	SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, willFail bool) (*WithdrawEvent, error)
 	// WatchWithdraw 订阅"清结算结果"事件流（成功/失败均推送），用于驱动内部账本。
 	WatchWithdraw(ctx context.Context) (<-chan WithdrawEvent, error)
 	// WatchWithdrawRollback 订阅"提现孤块/重组回滚"事件流（已清结算提现被丢弃时推送），
@@ -720,7 +720,7 @@ func (g *MockWithdrawGateway) emit(ev WithdrawEvent) {
 }
 
 // SubmitWithdraw 受理一笔提现意图（使用本地生成的模拟 TxHash）。
-func (g *MockWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool) (*WithdrawEvent, error) {
+func (g *MockWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, willFail bool) (*WithdrawEvent, error) {
 	txHash := GenerateTxHash(userID, "W_"+asset, chain, amount, time.Now().UnixNano())
 	return g.SubmitWithdrawWithHash(userID, asset, chain, amount, fee, address, willFail, txHash)
 }
@@ -728,8 +728,8 @@ func (g *MockWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain C
 // SubmitWithdrawWithHash 与 SubmitWithdraw 同义，但使用调用方提供的交易哈希
 // （链上 RPC 广播后由节点返回的真实 TxHash）。供 RPCWithdrawGateway 在真实广播
 // 成功后注入真实哈希，使链上记录与内部事件一致。txHash 为空时回退本地生成。
-func (g *MockWithdrawGateway) SubmitWithdrawWithHash(userID int64, asset string, chain Chain, amount, fee float64, address string, willFail bool, txHash string) (*WithdrawEvent, error) {
-	if userID <= 0 || amount <= 0 {
+func (g *MockWithdrawGateway) SubmitWithdrawWithHash(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, willFail bool, txHash string) (*WithdrawEvent, error) {
+	if userID <= 0 || amount.Sign() <= 0 {
 		return nil, fmt.Errorf("invalid withdraw params")
 	}
 	if asset == "" {

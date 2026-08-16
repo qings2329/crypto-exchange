@@ -102,7 +102,7 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid amount"})
 			return
 		}
-		fee := feeModel.Estimate(chain, asset, amount)
+		fee := feeModel.Estimate(chain, asset, settlement.AssetAmountFromFloat(amount, settlement.AssetDecimals(chain, asset)))
 		c.JSON(http.StatusOK, gin.H{
 			"chain": chain,
 			"asset": asset,

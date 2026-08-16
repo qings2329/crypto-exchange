@@ -92,21 +92,21 @@ func TestWeiToAmount(t *testing.T) {
 		{`"0xDE0B6B3A7640000"`, 1.0}, // 带引号
 	}
 	for _, c := range cases {
-		if got := weiToAmount(c.in); got != c.want {
-			t.Fatalf("weiToAmount(%q)=%v want %v", c.in, got, c.want)
+		if got := weiToAmount(c.in); got.HumanFloat() != c.want {
+			t.Fatalf("weiToAmount(%q)=%v want %v", c.in, got.HumanFloat(), c.want)
 		}
 	}
 }
 
 func TestTronAmountToFloat(t *testing.T) {
-	if got := tronAmountToFloat("1000000", 6); got != 1.0 {
-		t.Fatalf("tronAmountToFloat(1000000,6)=%v want 1.0", got)
+	if got := tronAmountToFloat("1000000", 6); got.HumanFloat() != 1.0 {
+		t.Fatalf("tronAmountToFloat(1000000,6)=%v want 1.0", got.HumanFloat())
 	}
-	if got := tronAmountToFloat("1", 0); got != 1.0 {
-		t.Fatalf("tronAmountToFloat(1,0)=%v want 1.0", got)
+	if got := tronAmountToFloat("1", 0); got.HumanFloat() != 1.0 {
+		t.Fatalf("tronAmountToFloat(1,0)=%v want 1.0", got.HumanFloat())
 	}
-	if got := tronAmountToFloat("not-int", 6); got != 0 {
-		t.Fatalf("tronAmountToFloat(非法)=%v want 0", got)
+	if got := tronAmountToFloat("not-int", 6); got.HumanFloat() != 0 {
+		t.Fatalf("tronAmountToFloat(非法)=%v want 0", got.HumanFloat())
 	}
 }
 
@@ -124,7 +124,7 @@ func TestScanETH(t *testing.T) {
 		t.Fatalf("应解析出 1 条 ETH 入账，got %d", len(evs))
 	}
 	e := evs[0]
-	if e.Amount != 1.0 || e.TxHash != "0xethtx1" || e.UserID != 7 || e.Chain != ChainETH || e.Asset != "ETH" {
+	if !amtEq(e.Amount, 1.0) || e.TxHash != "0xethtx1" || e.UserID != 7 || e.Chain != ChainETH || e.Asset != "ETH" {
 		t.Fatalf("ETH 入账字段不符: %+v", e)
 	}
 
@@ -146,7 +146,7 @@ func TestScanBTC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scanBTC: %v", err)
 	}
-	if len(evs) != 1 || evs[0].Amount != 0.5 || evs[0].TxHash != "btctx1" {
+	if len(evs) != 1 || !amtEq(evs[0].Amount, 0.5) || evs[0].TxHash != "btctx1" {
 		t.Fatalf("BTC 入账不符: %+v", evs)
 	}
 
@@ -170,7 +170,7 @@ func TestScanTRON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scanTRON: %v", err)
 	}
-	if len(evs) != 1 || evs[0].Amount != 1.0 || evs[0].TxHash != "trx1" || evs[0].Chain != ChainTRON {
+	if len(evs) != 1 || !amtEq(evs[0].Amount, 1.0) || evs[0].TxHash != "trx1" || evs[0].Chain != ChainTRON {
 		t.Fatalf("TRON 入账不符: %+v", evs)
 	}
 
@@ -309,7 +309,7 @@ func TestStartScanFeedsGateway(t *testing.T) {
 	if pending[0].TxHash != "0xethtx1" {
 		t.Fatalf("StartScan 应透传扫描事件的真实 txHash，got %q", pending[0].TxHash)
 	}
-	if pending[0].UserID != 5 || pending[0].Amount != 1.0 || pending[0].Chain != ChainETH || pending[0].Address != "0xw" {
+	if pending[0].UserID != 5 || !amtEq(pending[0].Amount, 1.0) || pending[0].Chain != ChainETH || pending[0].Address != "0xw" {
 		t.Fatalf("喂入的入账不符: %+v", pending[0])
 	}
 }
@@ -319,7 +319,7 @@ func TestStartScanFeedsGateway(t *testing.T) {
 func TestSubmitDepositWithHash(t *testing.T) {
 	g := NewMockChainGateway(2, time.Hour)
 
-	ev, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, 1.0, "0xw", "0xrealonchainhash")
+	ev, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, amt(ChainETH, 1.0), "0xw", "0xrealonchainhash")
 	if err != nil {
 		t.Fatalf("SubmitDepositWithHash: %v", err)
 	}
@@ -328,13 +328,13 @@ func TestSubmitDepositWithHash(t *testing.T) {
 	}
 
 	// 空 txHash 回退本地生成（非空且区别于传入值）。
-	ev2, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, 1.0, "0xw", "")
+	ev2, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, amt(ChainETH, 1.0), "0xw", "")
 	if err != nil || ev2.TxHash == "" || ev2.TxHash == "0xrealonchainhash" {
 		t.Fatalf("空 txHash 应回退本地生成，got err=%v hash=%q", err, ev2.TxHash)
 	}
 
 	// 重复提交同一 txHash → 幂等（pending 以 txHash 为键，不重复入账）。
-	if _, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, 1.0, "0xw", "0xrealonchainhash"); err != nil {
+	if _, err := g.SubmitDepositWithHash(5, "ETH", ChainETH, amt(ChainETH, 1.0), "0xw", "0xrealonchainhash"); err != nil {
 		t.Fatalf("重复提交应成功: %v", err)
 	}
 	if len(g.Pending()) != 2 { // 仅两条不同 txHash（真实 + 回退生成）
@@ -342,7 +342,7 @@ func TestSubmitDepositWithHash(t *testing.T) {
 	}
 
 	// 非法参数仍拒绝。
-	if _, err := g.SubmitDepositWithHash(0, "ETH", ChainETH, 1.0, "0xw", "x"); err == nil {
+	if _, err := g.SubmitDepositWithHash(0, "ETH", ChainETH, amt(ChainETH, 1.0), "0xw", "x"); err == nil {
 		t.Fatalf("zero user 应被拒绝")
 	}
 }

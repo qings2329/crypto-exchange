@@ -239,13 +239,13 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 			case ev := <-ch:
-				if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash); err != nil {
-					s.log.Error("on-chain credit failed", zap.String("tx", ev.TxHash), zap.Error(err))
-					continue
-				}
-				s.log.Info("on-chain deposit credited",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount), zap.String("tx", ev.TxHash))
+			if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.TxHash); err != nil {
+				s.log.Error("on-chain credit failed", zap.String("tx", ev.TxHash), zap.Error(err))
+				continue
+			}
+			s.log.Info("on-chain deposit credited",
+				zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+				zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
 				s.hub.Broadcast("SYS", ginH{"type": "chain_deposit", "data": ev})
 			case <-s.ctx.Done():
 				return
@@ -263,21 +263,21 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 			case ev := <-rch:
-				badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash)
-				if err != nil {
-					s.log.Error("on-chain rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
-					continue
-				}
-				if badDebt > 0 {
-					s.log.Error("on-chain deposit reverted with BAD DEBT (user already spent funds)",
-						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-						zap.Float64("amount", ev.Amount), zap.Float64("bad_debt", badDebt),
-						zap.String("tx", ev.TxHash))
-				} else {
-					s.log.Warn("on-chain deposit reverted (orphan block)",
-						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-						zap.Float64("amount", ev.Amount), zap.String("tx", ev.TxHash))
-				}
+			badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.TxHash)
+			if err != nil {
+				s.log.Error("on-chain rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
+				continue
+			}
+			if badDebt > 0 {
+				s.log.Error("on-chain deposit reverted with BAD DEBT (user already spent funds)",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("bad_debt", badDebt),
+					zap.String("tx", ev.TxHash))
+			} else {
+				s.log.Warn("on-chain deposit reverted (orphan block)",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
+			}
 				s.hub.Broadcast("SYS", ginH{"type": "chain_rollback", "data": ev, "bad_debt": badDebt})
 			case <-s.ctx.Done():
 				return
@@ -294,18 +294,18 @@ func (s *Server) startChainWatchers() {
 		}
 		for {
 			select {
-			case ev := <-wch:
-				total := ev.Amount + ev.Fee
-				switch ev.Status {
-				case settlement.WithdrawCredited:
-					if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
-						s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
-						continue
-					}
-					s.log.Info("on-chain withdraw settled",
-						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-						zap.Float64("amount", ev.Amount), zap.Float64("fee", ev.Fee),
-						zap.String("tx", ev.TxHash))
+		case ev := <-wch:
+			total := ev.Amount.HumanFloat() + ev.Fee.HumanFloat()
+			switch ev.Status {
+			case settlement.WithdrawCredited:
+				if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.Fee.HumanFloat(), ev.TxHash); err != nil {
+					s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				s.log.Info("on-chain withdraw settled",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
+					zap.String("tx", ev.TxHash))
 					s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
 				case settlement.WithdrawFailed:
 					if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
@@ -331,20 +331,20 @@ func (s *Server) startChainWatchers() {
 		}
 		for {
 			select {
-			case ev := <-wrh:
-				total := ev.Amount + ev.Fee
-				if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
-					s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
-					continue
-				}
-				if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
-					s.log.Error("withdraw rollback unfreeze failed", zap.String("tx", ev.TxHash), zap.Error(err))
-					continue
-				}
-				s.log.Warn("on-chain withdraw reverted (orphan block), funds returned",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount), zap.Float64("fee", ev.Fee),
-					zap.String("tx", ev.TxHash))
+		case ev := <-wrh:
+			total := ev.Amount.HumanFloat() + ev.Fee.HumanFloat()
+			if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount.HumanFloat(), ev.Fee.HumanFloat(), ev.TxHash); err != nil {
+				s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
+				continue
+			}
+			if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
+				s.log.Error("withdraw rollback unfreeze failed", zap.String("tx", ev.TxHash), zap.Error(err))
+				continue
+			}
+			s.log.Warn("on-chain withdraw reverted (orphan block), funds returned",
+				zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+				zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
+				zap.String("tx", ev.TxHash))
 				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw_rollback", "data": ev})
 			case <-s.ctx.Done():
 				return

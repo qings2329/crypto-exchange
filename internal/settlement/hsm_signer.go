@@ -245,15 +245,9 @@ func (s *realSigner) resolveNonce(ctx context.Context, tx *UnsignedTx) (uint64, 
 	return 0, nil
 }
 
-// amountToWei 把以 ETH 为单位的金额转换为 wei（big.Int），避免 float64 精度损失。
-func amountToWei(amount float64) *big.Int {
-	f := new(big.Float).SetFloat64(amount)
-	f.Mul(f, new(big.Float).SetInt64(1e18))
-	wei, _ := f.Int(nil)
-	if wei == nil {
-		wei = big.NewInt(0)
-	}
-	return wei
+// amountToWei 把最小单位金额缩放至 wei（18 decimals）的 *big.Int（#6，无 float 中间量）。
+func amountToWei(a AssetAmount) *big.Int {
+	return new(big.Int).Mul(a.Value, pow10(max(0, 18-a.Decimals)))
 }
 
 // parseETHAddress 解析 20 字节 ETH 地址（剥离 0x 前缀）；空字符串表示合约创建。

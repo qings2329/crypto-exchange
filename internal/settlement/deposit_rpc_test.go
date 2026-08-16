@@ -23,7 +23,7 @@ func (f *fakeDepositScanner) Scan(ctx context.Context) (<-chan DepositEvent, err
 // SubmitDeposit 行为不变（零回归）。
 func TestNewDepositGatewayDisabledReturnsMock(t *testing.T) {
 	g := NewDepositGateway(ChainRPCConfig{Enabled: false})
-	ev, err := g.SubmitDeposit(1, "USDT", ChainETH, 100, "0xabc")
+	ev, err := g.SubmitDeposit(1, "USDT", ChainETH, amt(ChainETH, 100), "0xabc")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestRPCDepositGatewayFeedsScannedDeposit(t *testing.T) {
 
 	// 扫描器推送一笔充值入账（模拟节点 eth_getLogs 命中观察地址）。
 	// 注意：MockChainGateway.SubmitDeposit 会自行生成 TxHash，故断言按 userID/amount 匹配。
-	sc.ch <- DepositEvent{UserID: 7, Asset: "ETH", Chain: ChainETH, Amount: 1.5, Address: "0xWATCH", TxHash: "0xSCAN1"}
+	sc.ch <- DepositEvent{UserID: 7, Asset: "ETH", Chain: ChainETH, Amount: amt(ChainETH, 1.5), Address: "0xWATCH", TxHash: "0xSCAN1"}
 
 	// 等待扫描 goroutine 把它 SubmitDeposit 进 pending。
 	deadline := time.Now().Add(3 * time.Second)
@@ -69,7 +69,7 @@ func TestRPCDepositGatewayFeedsScannedDeposit(t *testing.T) {
 	g.Tick()
 	found := false
 	for _, ev := range g.Pending() {
-		if ev.UserID == 7 && ev.Amount == 1.5 && ev.Asset == "ETH" {
+		if ev.UserID == 7 && amtEq(ev.Amount, 1.5) && ev.Asset == "ETH" {
 			found = true
 			if ev.Status != DepositCredited {
 				t.Fatalf("expected Credited, got %s", ev.Status)
@@ -124,7 +124,7 @@ func TestJSONRPCDepositScannerETH(t *testing.T) {
 		if ev.UserID != 9 || ev.Asset != "ETH" || ev.Chain != ChainETH {
 			t.Fatalf("unexpected event identity: %+v", ev)
 		}
-		if ev.Amount != 1.0 {
+		if !amtEq(ev.Amount, 1.0) {
 			t.Fatalf("expected amount 1.0 (1e18 wei), got %v", ev.Amount)
 		}
 		if !strings.EqualFold(ev.TxHash, "0xabc") {
@@ -152,7 +152,7 @@ func TestRPCDepositGatewayUsesRealConfirmations(t *testing.T) {
 		MockChainGateway: NewMockChainGateway(2, time.Second),
 	}
 	g.MockChainGateway.confirmSource = &fakeDepositConfirmSource{conf: 3} // 节点返回 3 个确认
-	ev, err := g.SubmitDeposit(1, "ETH", ChainETH, 1.5, "0xWATCH")
+	ev, err := g.SubmitDeposit(1, "ETH", ChainETH, amt(ChainETH, 1.5), "0xWATCH")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestRPCDepositGatewayFallsBackOnConfirmError(t *testing.T) {
 		MockChainGateway: NewMockChainGateway(2, time.Second),
 	}
 	g.MockChainGateway.confirmSource = &fakeDepositConfirmSource{err: errors.New("node unreachable")}
-	ev, err := g.SubmitDeposit(1, "BTC", ChainBTC, 0.5, "bc1xyz")
+	ev, err := g.SubmitDeposit(1, "BTC", ChainBTC, amt(ChainBTC, 0.5), "bc1xyz")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestJSONRPCDepositScannerTRON(t *testing.T) {
 			if ev.UserID != 3 || ev.Asset != "USDT" || ev.Chain != ChainTRON {
 				t.Fatalf("unexpected event identity: %+v", ev)
 			}
-			if ev.Amount != 1.0 {
+			if !amtEq(ev.Amount, 1.0) {
 				t.Fatalf("expected amount 1.0 (1000000/1e6), got %v", ev.Amount)
 			}
 			return // 命中即成功
