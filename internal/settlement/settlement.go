@@ -133,8 +133,8 @@ type MockChainGateway struct {
 	interval     time.Duration
 	seq          int64
 	pending      map[string]*DepositEvent
-	subs         []chan DepositEvent
-	rollbackSubs []chan DepositEvent
+	subs         subscriberSet[DepositEvent]
+	rollbackSubs subscriberSet[DepositEvent]
 	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
 	stop         chan struct{}
 	started      bool
@@ -152,11 +152,10 @@ func NewMockChainGateway(required int, interval time.Duration) *MockChainGateway
 		interval = 2 * time.Second
 	}
 	return &MockChainGateway{
-		required:     required,
-		interval:     interval,
-		pending:      make(map[string]*DepositEvent),
-		rollbackSubs: make([]chan DepositEvent, 0),
-		stop:         make(chan struct{}),
+		required: required,
+		interval: interval,
+		pending:  make(map[string]*DepositEvent),
+		stop:     make(chan struct{}),
 	}
 }
 
@@ -219,7 +218,7 @@ func (g *MockChainGateway) tick() {
 			continue
 		}
 		// 真实节点可达时用链上确认数推进；否则（未配置/节点宕机）回退模拟 +1。
-		ev.Confirmations = g.realConfirmations(context.Background(), ev.Chain, ev.TxHash, ev.Confirmations)
+		ev.Confirmations = nextConfirmations(g.confirmSource, context.Background(), ev.Chain, ev.TxHash, ev.Confirmations)
 		ev.UpdatedAt = now
 		if ev.Confirmations >= ev.Required {
 			ev.Status = DepositCredited
@@ -235,31 +234,12 @@ func (g *MockChainGateway) tick() {
 	}
 }
 
-// realConfirmations 返回 ev 的新确认数：有 confirmSource 且查询成功→用真实链上确认数；
-// 否则（无 source 或查询失败）→回退模拟「当前 +1」（fail-degraded，行为与纯 Mock 一致）。
-func (g *MockChainGateway) realConfirmations(ctx context.Context, chain Chain, txHash string, current int) int {
-	if g.confirmSource != nil {
-		if c, err := g.confirmSource.Confirmations(ctx, chain, txHash); err == nil {
-			return c
-		}
-	}
-	return current + 1
-}
-
 func (g *MockChainGateway) emit(ev DepositEvent) {
-	g.mu.RLock()
-	subs := make([]chan DepositEvent, len(g.subs))
-	copy(subs, g.subs)
-	g.mu.RUnlock()
-	for _, ch := range subs {
-		select {
-		case ch <- ev:
-		case <-time.After(emitSendTimeout):
-			// 订阅者背压超时：非静默放弃，告警以便对账（状态已持久化于 g.pending）。
-			log.Printf("[settlement] deposit emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
-				ev.TxHash, ev.UserID, ev.Status)
-		}
-	}
+	g.subs.broadcast(ev, func(ev DepositEvent) {
+		// 订阅者背压超时：非静默放弃，告警以便对账（状态已持久化于 g.pending）。
+		log.Printf("[settlement] deposit emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+			ev.TxHash, ev.UserID, ev.Status)
+	})
 }
 
 // SubmitDeposit 记录一笔充值意图（无真实链上哈希时回退本地生成哈希）。
@@ -306,40 +286,14 @@ func (g *MockChainGateway) SubmitDepositWithHash(userID int64, asset string, cha
 // Watch 订阅已入账事件流。
 func (g *MockChainGateway) Watch(ctx context.Context) (<-chan DepositEvent, error) {
 	ch := make(chan DepositEvent, 64)
-	g.mu.Lock()
-	g.subs = append(g.subs, ch)
-	g.mu.Unlock()
-	go func() {
-		<-ctx.Done()
-		g.mu.Lock()
-		for i, s := range g.subs {
-			if s == ch {
-				g.subs = append(g.subs[:i], g.subs[i+1:]...)
-				break
-			}
-		}
-		g.mu.Unlock()
-	}()
+	g.subs.register(ch, ctx)
 	return ch, nil
 }
 
 // WatchRollback 订阅"孤块/重组回滚"事件流（已入账充值被丢弃时推送），用于驱动内部账本回拨。
 func (g *MockChainGateway) WatchRollback(ctx context.Context) (<-chan DepositEvent, error) {
 	ch := make(chan DepositEvent, 64)
-	g.mu.Lock()
-	g.rollbackSubs = append(g.rollbackSubs, ch)
-	g.mu.Unlock()
-	go func() {
-		<-ctx.Done()
-		g.mu.Lock()
-		for i, s := range g.rollbackSubs {
-			if s == ch {
-				g.rollbackSubs = append(g.rollbackSubs[:i], g.rollbackSubs[i+1:]...)
-				break
-			}
-		}
-		g.mu.Unlock()
-	}()
+	g.rollbackSubs.register(ch, ctx)
 	return ch, nil
 }
 
@@ -418,18 +372,10 @@ func (g *MockChainGateway) ReorgDepth(depth int) []DepositEvent {
 }
 
 func (g *MockChainGateway) emitRollback(ev DepositEvent) {
-	g.mu.RLock()
-	subs := make([]chan DepositEvent, len(g.rollbackSubs))
-	copy(subs, g.rollbackSubs)
-	g.mu.RUnlock()
-	for _, ch := range subs {
-		select {
-		case ch <- ev:
-		case <-time.After(emitSendTimeout):
-			log.Printf("[settlement] deposit rollback emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
-				ev.TxHash, ev.UserID, ev.Status)
-		}
-	}
+	g.rollbackSubs.broadcast(ev, func(ev DepositEvent) {
+		log.Printf("[settlement] deposit rollback emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+			ev.TxHash, ev.UserID, ev.Status)
+	})
 }
 
 // Pending 返回所有充值事件快照。
@@ -581,8 +527,8 @@ type MockWithdrawGateway struct {
 	interval     time.Duration
 	seq          int64
 	pending      map[string]*WithdrawEvent
-	subs         []chan WithdrawEvent
-	rollbackSubs []chan WithdrawEvent
+	subs         subscriberSet[WithdrawEvent]
+	rollbackSubs subscriberSet[WithdrawEvent]
 	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
 	stop         chan struct{}
 	started      bool
@@ -600,11 +546,10 @@ func NewMockWithdrawGateway(required int, interval time.Duration) *MockWithdrawG
 		interval = 2 * time.Second
 	}
 	return &MockWithdrawGateway{
-		required:     required,
-		interval:     interval,
-		pending:      make(map[string]*WithdrawEvent),
-		rollbackSubs: make([]chan WithdrawEvent, 0),
-		stop:         make(chan struct{}),
+		required: required,
+		interval: interval,
+		pending:  make(map[string]*WithdrawEvent),
+		stop:     make(chan struct{}),
 	}
 }
 
@@ -676,7 +621,7 @@ func (g *MockWithdrawGateway) tick() {
 			}
 		case WithdrawBroadcasting:
 			// 真实节点可达时用链上确认数推进；否则（未配置/节点宕机）回退模拟 +1。
-			ev.Confirmations = g.realConfirmations(context.Background(), ev.Chain, ev.TxHash, ev.Confirmations)
+			ev.Confirmations = nextConfirmations(g.confirmSource, context.Background(), ev.Chain, ev.TxHash, ev.Confirmations)
 			ev.UpdatedAt = now
 			if ev.Confirmations >= ev.Required {
 				ev.Status = WithdrawCredited
@@ -693,30 +638,11 @@ func (g *MockWithdrawGateway) tick() {
 	}
 }
 
-// realConfirmations 返回 ev 的新确认数：有 confirmSource 且查询成功→用真实链上确认数；
-// 否则（无 source 或查询失败）→回退模拟「当前 +1」（fail-degraded，行为与纯 Mock 一致）。
-func (g *MockWithdrawGateway) realConfirmations(ctx context.Context, chain Chain, txHash string, current int) int {
-	if g.confirmSource != nil {
-		if c, err := g.confirmSource.Confirmations(ctx, chain, txHash); err == nil {
-			return c
-		}
-	}
-	return current + 1
-}
-
 func (g *MockWithdrawGateway) emit(ev WithdrawEvent) {
-	g.mu.RLock()
-	subs := make([]chan WithdrawEvent, len(g.subs))
-	copy(subs, g.subs)
-	g.mu.RUnlock()
-	for _, ch := range subs {
-		select {
-		case ch <- ev:
-		case <-time.After(emitSendTimeout):
-			log.Printf("[settlement] withdraw emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
-				ev.TxHash, ev.UserID, ev.Status)
-		}
-	}
+	g.subs.broadcast(ev, func(ev WithdrawEvent) {
+		log.Printf("[settlement] withdraw emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+			ev.TxHash, ev.UserID, ev.Status)
+	})
 }
 
 // SubmitWithdraw 受理一笔提现意图（使用本地生成的模拟 TxHash）。
@@ -765,20 +691,7 @@ func (g *MockWithdrawGateway) SubmitWithdrawWithHash(userID int64, asset string,
 // WatchWithdraw 订阅清结算结果事件流。
 func (g *MockWithdrawGateway) WatchWithdraw(ctx context.Context) (<-chan WithdrawEvent, error) {
 	ch := make(chan WithdrawEvent, 64)
-	g.mu.Lock()
-	g.subs = append(g.subs, ch)
-	g.mu.Unlock()
-	go func() {
-		<-ctx.Done()
-		g.mu.Lock()
-		for i, s := range g.subs {
-			if s == ch {
-				g.subs = append(g.subs[:i], g.subs[i+1:]...)
-				break
-			}
-		}
-		g.mu.Unlock()
-	}()
+	g.subs.register(ch, ctx)
 	return ch, nil
 }
 
@@ -786,20 +699,7 @@ func (g *MockWithdrawGateway) WatchWithdraw(ctx context.Context) (<-chan Withdra
 // 用于驱动内部账本回拨冻结余额。
 func (g *MockWithdrawGateway) WatchWithdrawRollback(ctx context.Context) (<-chan WithdrawEvent, error) {
 	ch := make(chan WithdrawEvent, 64)
-	g.mu.Lock()
-	g.rollbackSubs = append(g.rollbackSubs, ch)
-	g.mu.Unlock()
-	go func() {
-		<-ctx.Done()
-		g.mu.Lock()
-		for i, s := range g.rollbackSubs {
-			if s == ch {
-				g.rollbackSubs = append(g.rollbackSubs[:i], g.rollbackSubs[i+1:]...)
-				break
-			}
-		}
-		g.mu.Unlock()
-	}()
+	g.rollbackSubs.register(ch, ctx)
 	return ch, nil
 }
 
@@ -881,18 +781,10 @@ func (g *MockWithdrawGateway) WithdrawReorgDepth(depth int) []WithdrawEvent {
 }
 
 func (g *MockWithdrawGateway) emitWithdrawRollback(ev WithdrawEvent) {
-	g.mu.RLock()
-	subs := make([]chan WithdrawEvent, len(g.rollbackSubs))
-	copy(subs, g.rollbackSubs)
-	g.mu.RUnlock()
-	for _, ch := range subs {
-		select {
-		case ch <- ev:
-		case <-time.After(emitSendTimeout):
-			log.Printf("[settlement] withdraw rollback emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
-				ev.TxHash, ev.UserID, ev.Status)
-		}
-	}
+	g.rollbackSubs.broadcast(ev, func(ev WithdrawEvent) {
+		log.Printf("[settlement] withdraw rollback emit DROPPED: tx=%s user=%d status=%s (subscriber backpressure)",
+			ev.TxHash, ev.UserID, ev.Status)
+	})
 }
 
 // WithdrawHistory 返回所有提现事件快照。
