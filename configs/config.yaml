@@ -103,12 +103,21 @@ settlement:
         asset: USDT
         token: "TR7NHqjiehqjqTD9QgQsrQUDsV7qxXWm1f" # TRC20 合约地址（USDT-TRC20 主网）；空则默认此值
     # hot_wallet：离线签名边界（T-03 热钱包/离线签名）。enabled=true 且 signer_type 配了
-    # 时，提现走「离线签名→SendRaw 广播原始交易」（私钥不出域，生产接 HSM/KMS）；当前脚手架
-    # 仅 "stub" 演示边界（非真实密码学），生产应实现 HSM/KMS 签名器。未启用→回退节点侧签名
-    # 广播（fail-degraded）。
+    # 时，提现走「离线签名→SendRaw 广播原始交易」（私钥不出域）。生产接 HSM/KMS 时，Sign 内部
+    # 改为调用安全模块的签名 API（同一 Signer 接口），私钥永不离开安全域；当前仓库内的
+    # "hsm"/"kms" 为软件等价实现（真实 secp256k1 签名，仅用于离线跑通链路）。"stub" 仍保留作
+    # 纯边界演示（标记化 raw hex，非真实密码学）。未启用/私钥缺失 → 回退节点侧签名广播（fail-degraded）。
     hot_wallet:
       enabled: false
       signer_type: ""
+      # signer_key：软件签名器本地演示用的私钥（32 字节 hex，可选 0x 前缀）。生产应由 HSM/KMS
+      # 注入、不落配置。此处留空即关闭真实签名。切勿在真实环境提交私钥。
+      signer_key: ""
+      # ETH 真实签名的兜底默认值（UnsignedTx 未显式填时采用）；生产主网建议填对应 chainID
+      # 走 EIP-155，gas_price_wei 按节点建议值填（不能为 0，否则签名失败回退广播）。
+      eth_chain_id: 1
+      eth_gas_price_wei: 0
+      eth_gas_limit: 21000
 
 # 行情 K 线持久化（T-16）：已收盘 K 线写入 InfluxDB（measurement "kline"），
 # 行情服务在内存环形缓冲（klineCap=500）之外可回取更长历史。

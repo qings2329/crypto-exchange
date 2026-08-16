@@ -4,6 +4,7 @@ go 1.25
 
 require (
 	github.com/IBM/sarama v1.42.1
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/elastic/go-elasticsearch/v8 v8.19.7
 	github.com/gin-gonic/gin v1.10.0
 	github.com/go-sql-driver/mysql v1.7.1

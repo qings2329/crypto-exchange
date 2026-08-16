@@ -39,8 +39,16 @@ type ChainRPCConfig struct {
 type HotWalletConfig struct {
 	// Enabled 是否启用离线签名边界（false → 网关回退节点侧签名广播）。
 	Enabled bool `yaml:"enabled"`
-	// SignerType 签名器类型：生产 "hsm"/"kms"；脚手架 "stub" 仅演示「签名→SendRaw」链路。
+	// SignerType 签名器类型：生产 "hsm"/"kms" 走真实 secp256k1 签名；脚手架 "stub" 仅演示边界。
 	SignerType string `yaml:"signer_type"`
+	// SignerKey 是软件签名器本地演示用的私钥（hex，可选 0x 前缀）。生产应由 HSM/KMS 注入，
+	// 私钥不出安全域、不落配置；此处仅供离线跑通「真实签名 → SendRaw」链路。
+	SignerKey string `yaml:"signer_key"`
+	// 以下为 ETH 真实签名的兜底默认值（UnsignedTx 未显式填时采用）。ChainID 为 0 表示
+	// 用 pre-EIP-155（legacy v=27/28）；生产主网应填对应 chainID 走 EIP-155。
+	EthChainID     uint64 `yaml:"eth_chain_id"`
+	EthGasPriceWei uint64 `yaml:"eth_gas_price_wei"`
+	EthGasLimit    uint64 `yaml:"eth_gas_limit"`
 }
 
 // UnsignedTx 是一笔待签名的提现交易（离线签名边界输入）。仅描述「要签什么」，不含私钥；
@@ -50,6 +58,14 @@ type UnsignedTx struct {
 	To     string
 	Amount float64
 	Asset  string
+	// 以下为 ETH 真实签名所需字段（离线签名边界真实密码学用）：nonce/gas/chainID/data。
+	// BTC/TRON 暂未实现（各自为独立生产项：UTXO/Nonce 管理、TRON 合约调用），缺省时由
+	// 真实签名器按 HotWalletConfig 兜底，仍缺则签名失败 → 网关回退节点侧签名广播（fail-degraded）。
+	Nonce       uint64 `yaml:"nonce"`
+	GasPriceWei uint64 `yaml:"gas_price_wei"`
+	GasLimit    uint64 `yaml:"gas_limit"`
+	ChainID     uint64 `yaml:"chain_id"`
+	Data        []byte `yaml:"data"`
 }
 
 // Signer 离线签名边界：在热钱包 / HSM / 安全 enclave 内对交易签名，返回已签名的 raw
@@ -58,13 +74,26 @@ type Signer interface {
 	Sign(ctx context.Context, tx *UnsignedTx) (rawHex string, err error)
 }
 
-// NewSigner 按配置构造签名器：仅 "stub" 返回演示签名器；其余（含未配置/生产类型未实现）
-// 返回 nil，由网关回退节点侧签名广播（fail-degraded）。
+// NewSigner 按配置构造签名器：
+//   - "stub"：演示签名器（标记化 raw hex，非真实密码学）。
+//   - "hsm"/"kms"：真实 secp256k1 签名器（软件等价实现，私钥不出域；生产替换为 HSM/KMS 客户端）。
+//     私钥不可用（未配置/非法）时返回 nil，由网关回退节点侧签名广播（fail-degraded）。
+//   - 未配置/未知类型：返回 nil，回退节点侧签名广播。
 func NewSigner(conf HotWalletConfig) Signer {
-	if conf.Enabled && conf.SignerType == "stub" {
-		return &stubSigner{}
+	if !conf.Enabled {
+		return nil
 	}
-	return nil
+	switch conf.SignerType {
+	case "stub":
+		return &stubSigner{}
+	case "hsm", "kms":
+		if s, err := newRealSigner(conf); err == nil {
+			return s
+		}
+		return nil // 密钥不可用 → 回退（fail-degraded）
+	default:
+		return nil
+	}
 }
 
 // stubSigner 仅用于演示「离线签名边界」：真实场景签名在 HSM/KMS 内完成、私钥不出域，

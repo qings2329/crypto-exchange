@@ -20,7 +20,7 @@
 |------|------|------|------|----------|
 | T-01 | 鉴权中间件落地 | 网关/服务校验 token 并写入上下文用户身份，按身份做权限与额度控制 | `internal/pkg/middleware/auth.go:30` `// TODO` | **已完成**（HMAC-SHA256 Bearer 校验 + 单测；网关接入） |
 | T-02 | 成交流发布 Kafka 触发清算 | 撮合成交后发布事件到 Kafka，驱动清算服务记账，闭合资金链路 | `internal/matching/engine.go:59` `// TODO` | **已完成**（新增 `internal/pkg/mq`：Publisher 接口 + InMem 降级 + Kafka 实现(build tag)；futures onTrade 已发布） |
-| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向 + 真实区块确认轮询 + TRC20 充值过滤 + TRC20 确认数查询 + 热钱包离线签名边界完成可插拔脚手架**（§27：提现广播 `RPCWithdrawGateway`(+`Signer`/`SendRaw` 离线签名边界) + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner` + `ConfirmSource`/`JSONRPCClient.Confirmations`，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听/确认/离线签名并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**真实 HSM/KMS 签名器、BTC UTXO/Nonce、TRON 带签名合约调用仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
+| T-03 | 真实链上 / 预言机 RPC 接入 | 接入真实节点与预言机（充值/提现链上回调、指数价喂价）；依赖外部节点/密钥，受合规约束 | architecture.md §16/§21 留白 | **预言机实时喂价已可配置接入**（新增 `internal/oracle.NewFromConfig` + `configs/config.yaml` 的 `oracle` 段，支持 Binance/OKX/Coinbase 真实 REST 源并经单测；cmd/{margin,otc,options,futures} 已接线，无配置时回退内置演示）；**链上 RPC 充提双向 + 真实区块确认轮询 + TRC20 充值过滤 + TRC20 确认数查询 + 热钱包离线签名边界 + 真实 HSM 签名器（ETH）完成可插拔脚手架/软件实现**（§27：提现广播 `RPCWithdrawGateway`(+`Signer`/`SendRaw` 离线签名边界 + `realSigner` 真实 secp256k1 签名) + 充值回调 `RPCDepositGateway`/`JSONRPCDepositScanner` + `ConfirmSource`/`JSONRPCClient.Confirmations`，共用 `ChainRPCConfig`+`JSONRPCClient`，配置驱动真实广播/监听/确认/离线签名并取回真实 TxHash、未配置/节点宕机自动回退模拟，fail-degraded）；**真实 HSM/KMS 安全模块接入、BTC UTXO/Nonce、TRON 带签名合约调用仍为生产最后一环**（依赖外部节点+合规，见 §27「剩余」） |
 | T-04 | 数据库 migration 与版本管理 | 当前建表靠首次运行 `CREATE TABLE IF NOT EXISTS`，缺可回滚 migration。新建表须 `ce_` 前缀 | README「待补充」 | **已完成**（新增 `internal/pkg/migrate` 运行器 + `ce_schema_migrations` 版本表；ledger 表改由迁移创建；含集成测试） |
 
 ## 2. P1 — 合约交易完善
@@ -566,14 +566,15 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - 真实广播路径经 `withdraw_rpc_test.go` 的 `fakeRPCClient`（注入确定哈希 / 注入错误）覆盖「真实哈希注入」与「错误回退」；真实充值扫描路径经 `deposit_rpc_test.go` 的 `TestJSONRPCDepositScannerETH`（httptest 模拟 `eth_getLogs`）覆盖「节点监听→解析入账」；真实确认轮询经 `Confirmations` 的 ETH/BTC httptest 用例与注入确认数用例覆盖「节点确认数→状态机推进」与「错误回退」；完整端到端（连真实节点广播/监听/确认）依赖生产节点 URL + 热钱包/离线签名，原型不连真实链。
 
 **剩余（T-03 收尾，生产接入最后一环）**：
-- 真实节点、热钱包或离线签名接入（合规约束，依赖外部节点）。
-- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播、充值回调、真实区块确认轮询、TRC20 充值事件过滤、**TRC20 确认数查询**、**热钱包离线签名边界**的**脚手架**均已落地（配置驱动 + 未配置降级），生产填真实节点即生效。
+- 真实节点、HSM/KMS 安全模块接入（合规约束，依赖外部节点 + 硬件）；本仓库已内置**软件等价真实签名器**（`realSigner`：真实 secp256k1 + Keccak-256），生产仅需把 `Sign` 内部替换为 HSM/KMS 调用（同一 `Signer` 接口）。
+- 以上与 §1 T-03「依赖外部节点+合规」一致，仍为生产最后一环；提现广播、充值回调、真实区块确认轮询、TRC20 充值事件过滤、**TRC20 确认数查询**、**热钱包离线签名边界**、**真实 HSM 签名器（ETH）**的**脚手架/软件实现**均已落地（配置驱动 + 未配置降级），生产填真实节点/安全模块即生效。BTC UTXO/Nonce 管理、TRON 带签名合约调用仍为独立生产项（当前 `realSigner` 对 BTC/TRON 返回错误并回退节点侧广播）。
 
-**设计（热钱包离线签名边界，§27 续五）**：把「签名」从节点侧解耦到安全域（HSM/KMS/离线签名机），私钥不出域——这是 T-03 收尾的合规关键项，脚手架先把**边界与 fail-degraded 回退**落地。
+**设计（真实 HSM 签名器，§27 续六）**：在 §27 续五「离线签名边界」基础上，把 `"hsm"`/`"kms"` 从占位推进为**真实 secp256k1 ECDSA 签名**（软件等价实现，私钥仅驻留本进程内存安全域），产出可直接 `eth_sendRawTransaction` 广播的原始交易 hex——私钥不出域的边界与 fail-degraded 回退不变。
 
-- `Signer` 接口（`withdraw_rpc.go`）：`Sign(ctx, *UnsignedTx) (rawHex string, err error)`——在热钱包/HSM/安全 enclave 内对交易签名，返回已签名的 raw transaction hex；真实序列化（ETH RLP / BTC UTXO / TRON 合约）与 ECDSA 在安全域内完成，本仓库不持有私钥。`UnsignedTx` 仅描述「要签什么」（Chain/To/Amount/Asset），不含私钥。
-- `HotWalletConfig` + `ChainRPCConfig.HotWallet`：`Enabled` + `SignerType`（生产 `"hsm"`/`"kms"`；脚手架 `"stub"` 仅演示边界）。`NewSigner(conf)` 仅 `"stub"` 返回演示签名器，其余返回 nil → 网关回退节点侧签名广播（fail-degraded）。
-- `JSONRPCClient.SendRaw`：`ChainRPCClient` 新增方法，广播已签名的原始交易——ETH `eth_sendRawTransaction`、BTC `sendrawtransaction`（TRON 脚手架返回错误，待生产接带签名的 `triggerconstantcontract`）。
-- `RPCWithdrawGateway` 新增可选 `signer`：`SubmitWithdraw` 有签名器时走「`Signer.Sign` → `SendRaw`」取回真实 TxHash；**签名/广播失败自动回退节点侧 `Broadcast`**（fail-degraded）；节点仍不可达回退模拟广播。未配签名器时行为与改动前一致（零回归）。
-- 测试（`withdraw_rpc_test.go` 续）：`TestRPCWithdrawGatewayUsesOfflineSigner`（配置签名器→走 `SendRaw` 广播 raw、取回真实哈希、不经 `Broadcast`）、`TestRPCWithdrawGatewaySignerErrorFallsBackToNode`（签名器报错→自动回退节点侧 `Broadcast`）。`fakeRPCClient` 同时实现 `Broadcast`/`SendRaw` 并记录路径。
-- 生产落地需补（均为合规/外部依赖，非本仓库范围）：`HSMWalletSigner`（接 HSM/KMS 做真实 ECDSA + 按链序列化）、BTC UTXO 选择/找零、Nonce/Gas 管理、TRON 带签名合约调用；`config.hot_wallet.signer_type` 配 `"hsm"` 即启用。脚手架 `stubSigner` 仅返回标记化 raw，明确非真实密码学。
+- `Signer` 接口（`withdraw_rpc.go`）+ `UnsignedTx`：新增 ETH 真实签名所需字段 `Nonce`/`GasPriceWei`/`GasLimit`/`ChainID`/`Data`；`Sign` 在签名器域内完成「RLP 编码 → Keccak-256 摘要（自研 `internal/pkg/keccak`，以太坊 0x01 填充变体，非 SHA3）→ secp256k1 可恢复 ECDSA 签名（decred `ecdsa.SignCompact`）→ 低 S 规范化 → EIP-155(或 legacy) v → RLP 编码完整交易」全流程。
+- `HotWalletConfig` + `ChainRPCConfig.HotWallet`：`SignerType` 支持 `"stub"`（演示边界）、`"hsm"`/`"kms"`（真实签名）；新增 `SignerKey`（软件演示私钥 hex，生产由 HSM/KMS 注入、不落配置）与 `EthChainID`/`EthGasPriceWei`/`EthGasLimit`（ETH 真实签名兜底默认值）。`NewSigner`：`"hsm"`/`"kms"` 私钥有效返回 `realSigner`、私钥缺失/非法返回 nil → 回退节点侧 `Broadcast`（fail-degraded）。
+- `realSigner`（`hsm_signer.go`）：当前仅实现 ETH（legacy / EIP-155）；`Sign` 对 BTC/TRON 返回错误 → 网关回退节点侧广播（fail-degraded）。BTC/TRON 各自的真实签名（UTXO/Nonce 管理、TRON 合约调用签名）为独立生产项。
+- `internal/pkg/keccak`：自研 Keccak-256（纯 Go，移植自 Keccak 参考实现的 `keccakF1600` 内核 + 以太坊 0x01 填充），经已知测试向量（`""`/`"abc"`/`"hello"`）验证；用于 ETH 交易摘要与地址派生，避免依赖外部 `cskr/keccak`（网络受限下载失败）。
+- `RPCWithdrawGateway`：有 `realSigner` 时 `SubmitWithdraw` 走「`Signer.Sign`（真实签名）→ `SendRaw`」取回真实 TxHash；签名/广播失败自动回退节点侧 `Broadcast`（fail-degraded）；节点仍不可达回退模拟广播。
+- 测试：`hsm_signer_test.go`/`keccak_test.go`——`TestRealSignerKnownEIP155Vector`（以太坊官方 EIP-155 测试向量精确匹配：`f86c09…3b6d83`）、`TestRealSignerRecoversToAddress`（广播 raw 可恢复出签名者地址，自洽）、`TestNewSignerHSM`（hsm 私钥有效返回 `realSigner`、缺失/非法返回 nil）、`TestRealSignerUnsupportedChain`/`TestRealSignerRequiresGasPrice`（未实现链 / 缺 gasPrice 回退）、`TestRPCWithdrawGatewayUsesRealSigner`（网关经真实签名器 `Sign`→`SendRaw` 广播真实可解析 ETH raw）。
+- 生产落地仍需补（合规/外部依赖，非本仓库范围）：接**真实 HSM/KMS** 的 `Sign` 实现（同 `Signer` 接口，把 `ecdsa.SignCompact` 替换为安全模块签名调用，私钥永不离开安全域）、BTC UTXO 选择/找零、Nonce/Gas 管理（当前 nonce 由 `UnsignedTx`/配置提供，生产需向节点查询并递增）、TRON 带签名合约调用。脚手架 `stubSigner` 仍保留作纯边界演示（标记化 raw，非真实密码学）。
