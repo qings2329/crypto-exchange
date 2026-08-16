@@ -94,6 +94,9 @@ type DepositEvent struct {
 type DepositGateway interface {
 	// SubmitDeposit 记录一笔用户充值意图，返回待确认事件（含模拟 TxHash 与地址）。
 	SubmitDeposit(userID int64, asset string, chain Chain, amount float64, address string) (*DepositEvent, error)
+	// SubmitDepositWithHash 与 SubmitDeposit 同义，但使用调用方提供的链上 TxHash（真实扫描入账时
+	// 保留节点返回的真实哈希，保证链上幂等/对账一致；空则回退本地生成）。
+	SubmitDepositWithHash(userID int64, asset string, chain Chain, amount float64, address, txHash string) (*DepositEvent, error)
 	// Watch 订阅"已入账"事件流（确认达标后推送），用于驱动内部账本入账。
 	Watch(ctx context.Context) (<-chan DepositEvent, error)
 	// StartScan 启动链上充值监听（真实 RPC 扫描）；模拟网关为 no-op（充值仅经 SubmitDeposit 注入）。
@@ -247,8 +250,16 @@ func (g *MockChainGateway) emit(ev DepositEvent) {
 	}
 }
 
-// SubmitDeposit 记录一笔充值意图。
+// SubmitDeposit 记录一笔充值意图（无真实链上哈希时回退本地生成哈希）。
+// 委托 SubmitDepositWithHash(txHash="") 实现，避免与透传路径重复。
 func (g *MockChainGateway) SubmitDeposit(userID int64, asset string, chain Chain, amount float64, address string) (*DepositEvent, error) {
+	return g.SubmitDepositWithHash(userID, asset, chain, amount, address, "")
+}
+
+// SubmitDepositWithHash 与 SubmitDeposit 同义，但使用调用方提供的链上交易哈希（txHash）。
+// 供 StartScan 在真实扫描后将节点返回的真实 txHash 透传入账（而非自生成模拟哈希），保证链上
+// 幂等与对账一致；txHash 为空时回退本地生成。pending 以 txHash 为键，重复提交同一 txHash 幂等。
+func (g *MockChainGateway) SubmitDepositWithHash(userID int64, asset string, chain Chain, amount float64, address, txHash string) (*DepositEvent, error) {
 	if userID <= 0 || amount <= 0 {
 		return nil, fmt.Errorf("invalid deposit params")
 	}
@@ -258,7 +269,9 @@ func (g *MockChainGateway) SubmitDeposit(userID int64, asset string, chain Chain
 	if address == "" {
 		address = GenerateAddress(userID, chain)
 	}
-	txHash := GenerateTxHash(userID, asset, chain, amount, time.Now().UnixNano())
+	if txHash == "" {
+		txHash = GenerateTxHash(userID, asset, chain, amount, time.Now().UnixNano())
+	}
 	g.mu.Lock()
 	ev := &DepositEvent{
 		TxHash:        txHash,
