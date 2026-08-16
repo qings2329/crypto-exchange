@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -242,6 +243,65 @@ func TestJSONRPCClientConfirmationsTRON(t *testing.T) {
 	if conf != 6 {
 		t.Fatalf("expected 6 confirmations (100-95+1), got %d", conf)
 	}
+}
+
+// TestJSONRPCClientConfirmationsClampsNegative 模拟链重组/节点时间偏差使交易所在区块高于链头
+// （差值+1 为负），验证确认数被钳制为 0（≡尚未确认），避免状态机误判已确认提前入账（#10）。
+func TestJSONRPCClientConfirmationsClampsNegative(t *testing.T) {
+	tests := []struct {
+		name  string
+		chain Chain
+		// handler 返回：链头区块号、交易所在区块号。
+		headHex, txHex   string // ETH/TRON 用十六进制；BTC 走 confirmations 字段
+		btcConfirmations int    // BTC 节点直接给的 confirmations（可为负）
+	}{
+		{name: "ETH reorg", chain: ChainETH, headHex: "0x9", txHex: "0x10"},
+		{name: "TRON reorg", chain: ChainTRON, headHex: "0x5f", txHex: "0x64"}, // 95 vs 100
+		{name: "BTC negative", chain: ChainBTC, btcConfirmations: -3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				var req struct {
+					Method string `json:"method"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				switch {
+				case strings.HasPrefix(r.URL.Path, "/v1/blocks"):
+					_, _ = w.Write([]byte(`{"data":[{"number":` + parseHexToDec(tc.headHex) + `}]}`))
+				case strings.HasPrefix(r.URL.Path, "/v1/transactions/"):
+					_, _ = w.Write([]byte(`{"data":[{"blockNumber":` + parseHexToDec(tc.txHex) + `}]}`))
+				case req.Method == "eth_blockNumber":
+					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"` + tc.headHex + `"}`))
+				case req.Method == "eth_getTransactionByHash":
+					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"blockNumber":"` + tc.txHex + `"}}`))
+				case req.Method == "getrawtransaction":
+					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"confirmations":` + strconv.Itoa(tc.btcConfirmations) + `}}`))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+
+			c := NewJSONRPCClient(map[string]string{string(tc.chain): srv.URL})
+			conf, err := c.Confirmations(context.Background(), tc.chain, "txhash")
+			if err != nil {
+				t.Fatalf("confirmations failed: %v", err)
+			}
+			if conf != 0 {
+				t.Fatalf("expected negative conf clamped to 0, got %d", conf)
+			}
+		})
+	}
+}
+
+// parseHexToDec 把 "0x.." 转为十进制字符串（仅测试用），供 TronGrid 十进制区块号响应构造。
+func parseHexToDec(h string) string {
+	if n, err := strconv.ParseInt(strings.TrimPrefix(h, "0x"), 16, 64); err == nil {
+		return strconv.FormatInt(n, 10)
+	}
+	return "0"
 }
 
 // TestRPCWithdrawGatewayUsesOfflineSigner 验证配置了签名器时，提现走「离线签名→SendRaw
