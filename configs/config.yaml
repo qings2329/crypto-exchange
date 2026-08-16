@@ -79,10 +79,24 @@ settlement:
   # 充值则按 watch_addresses 轮询节点监听入账并喂入确认状态机。两者未配置/节点宕机
   # 均自动回退离线模拟（Mock*Gateway，fail-degraded）。
   chain_rpc:
-    enabled: false
+    # 生产部署：置 true 并填入真实节点 URL（见下 endpoints）。enabled=true 但 endpoints 为空、
+    # 或节点宕机时，自动回退离线模拟网关（fail-degraded），不会因配置缺失而崩溃。
+    # 真实节点 URL（常含 API key）与签名私钥属敏感信息，建议经环境变量注入，不写进本文件：
+    #   CHAIN_RPC_ENABLED=true
+    #   CHAIN_RPC_ENDPOINT_ETH=https://eth-mainnet.g.alchemy.com/v2/<KEY>
+    #   CHAIN_RPC_ENDPOINT_BTC=http://<rpcuser>:<rpcpass>@127.0.0.1:8332
+    #   CHAIN_RPC_ENDPOINT_TRON=https://api.trongrid.io
+    # 设置了环境变量则覆盖此处的值（与 AUTH_SECRET 同一模式）。
+    enabled: true
     endpoints:
+      # ETH：自建 geth `http://127.0.0.1:8545`；或 Infura/Alchemy/TronGrid 等托管节点
+      # （key 嵌在 URL 路径里，如 https://eth-mainnet.g.alchemy.com/v2/<KEY>）。
       ETH: ""
+      # BTC：bitcoind RPC（默认 8332），Basic Auth 由 URL 的 user:pass 自动注入，
+      # 形如 http://<rpcuser>:<rpcpass>@127.0.0.1:8332；或通过环境变量注入避免暴露口令。
       BTC: ""
+      # TRON：java-tron 全节点 HTTP（默认 8090）`http://127.0.0.1:8090`，或 TronGrid
+      # 公网 `https://api.trongrid.io`（免费额度无需 key，高频需 API key header）。
       TRON: ""
     required_confirmations: 2
     poll_interval_sec: 2
@@ -107,11 +121,16 @@ settlement:
     # 改为调用安全模块的签名 API（同一 Signer 接口），私钥永不离开安全域；当前仓库内的
     # "hsm"/"kms" 为软件等价实现（真实 secp256k1 签名，仅用于离线跑通链路）。"stub" 仍保留作
     # 纯边界演示（标记化 raw hex，非真实密码学）。未启用/私钥缺失 → 回退节点侧签名广播（fail-degraded）。
+    # 私钥与签名后端 keyID 经环境变量注入：HOT_WALLET_SIGNER_KEY、HOT_WALLET_SIGNER_BACKEND。
     hot_wallet:
-      enabled: false
-      signer_type: ""
+      enabled: true
+      signer_type: "hsm"
+      # signer_backend：软件("software"，默认) 或 external("external"，用 HOT_WALLET_SIGNER_KEY 作
+      # keyID 从 RegisterExternalSigner 取真实 HSM/KMS 后端)。生产接 HSM/KMS 时设 "external"。
+      signer_backend: "software"
       # signer_key：软件签名器本地演示用的私钥（32 字节 hex，可选 0x 前缀）。生产应由 HSM/KMS
-      # 注入、不落配置。此处留空即关闭真实签名。切勿在真实环境提交私钥。
+      # 注入、不落配置；此处留空即关闭真实签名（回退节点侧广播）。切勿在真实环境提交私钥，
+      # 生产改用环境变量 HOT_WALLET_SIGNER_KEY 注入。
       signer_key: ""
       # ETH 真实签名的兜底默认值（UnsignedTx 未显式填时采用）；生产主网建议填对应 chainID
       # 走 EIP-155，gas_price_wei 按节点建议值填（不能为 0，否则签名失败回退广播）。
