@@ -16,12 +16,12 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 )
 
-	// cmd/futures 是合约交易服务的「装配层」，仅负责：
-	//   - 读配置、建日志、建账本；
-	//   - 账本快照的 MySQL 持久化生命周期（恢复 / 种子 / 信号落库 / 退出落库）；
-	//   - 调用 futuresapi.NewServer 完成业务装配，注册路由并启动 HTTP 服务。
-	//
-	// 所有引擎接线、回调、后台循环与 HTTP 路由均在 internal/futuresapi 内，本文件不含业务逻辑。
+// cmd/futures 是合约交易服务的「装配层」，仅负责：
+//   - 读配置、建日志、建账本；
+//   - 账本快照的 MySQL 持久化生命周期（恢复 / 种子 / 信号落库 / 退出落库）；
+//   - 调用 futuresapi.NewServer 完成业务装配，注册路由并启动 HTTP 服务。
+//
+// 所有引擎接线、回调、后台循环与 HTTP 路由均在 internal/futuresapi 内，本文件不含业务逻辑。
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
 	// --mysql-dsn：账本持久化快照的 MySQL DSN。指定则覆盖 configs 中的 mysql.dsn。
@@ -74,7 +74,7 @@ func main() {
 
 	// 装配合约交易服务（引擎/预言机/网关/资金费循环/账本风控），不含业务逻辑。
 	// matchingURL 指向 cmd/matching 服务，撮合收敛为单一权威（见 DEVELOPMENT_TASKS §18）。
-	server := futuresapi.NewServer(ledgerSvc, log, dsn, cfg.Matching.URL, cfg.Oracle)
+	server := futuresapi.NewServer(ledgerSvc, log, dsn, cfg.Matching.URL, cfg.Oracle, cfg.Settlement.ChainRPC)
 	defer server.Close()
 
 	// 进程退出前持久化账本状态到 MySQL（正常返回或 Ctrl+C/kill 触发），保证资金安全态不丢失。
