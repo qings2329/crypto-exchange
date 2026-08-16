@@ -22,11 +22,11 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 		api.POST("/orders/:id/complete", s.handleConfirmComplete)
 		api.POST("/orders/:id/cancel", s.handleCancelOrder)
 		api.POST("/orders/:id/dispute", s.handleOpenDispute)
-		api.POST("/orders/:id/resolve", s.handleResolveDispute)
+		api.POST("/orders/:id/resolve", middleware.AdminGuard(), s.handleResolveDispute)
 		api.GET("/orders", s.handleListOrders)
-		api.GET("/admin/orders", s.handleAdminOrders)
+		api.GET("/admin/orders", middleware.AdminGuard(), s.handleAdminOrders)
 		api.GET("/counterparties", s.handleListCounterparties)
-		api.GET("/admin/reconcile", s.handleReconcile)
+		api.GET("/admin/reconcile", middleware.AdminGuard(), s.handleReconcile)
 	}
 }
 
@@ -255,15 +255,24 @@ func (s *Service) handleListCounterparties(c *gin.Context) {
 }
 
 func (s *Service) handleReconcile(c *gin.Context) {
-	escrow, stuck, err := s.Reconcile()
+	escrows, stuck, err := s.Reconcile()
 	if err != nil {
 		response.Error(c, 500, 5000, err.Error())
 		return
 	}
+	// F5b：用 AssetAmount.IsZero 判断余额是否清零，不引入 1e-9 浮点容差。
+	balanced := true
+	eb := make(map[string]float64, len(escrows))
+	for a, bal := range escrows {
+		eb[a] = bal.HumanFloat()
+		if !bal.IsZero() {
+			balanced = false
+		}
+	}
 	response.JSON(c, gin.H{
-		"escrow_balance": escrow,
+		"escrow_balance": eb,
 		"stuck_orders":   stuck,
-		"balanced":       escrow < 1e-9,
+		"balanced":       balanced,
 	})
 }
 

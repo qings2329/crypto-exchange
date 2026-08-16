@@ -58,6 +58,10 @@ func AssetAmountFromString(s string, decimals int) (AssetAmount, error) {
 	return AssetAmount{Value: v, Decimals: decimals}, nil
 }
 
+// ToDecimals 返回对齐到目标小数位的等价金额（放大用乘、缩小用整除截断）。
+// 供跨包把已有的 AssetAmount 重新标定到某资产的标准小数位（如从存储字符串解析后归一化）。
+func (a AssetAmount) ToDecimals(dec int) AssetAmount { return a.toDecimals(dec) }
+
 // toDecimals 把金额对齐到目标小数位（放大用乘、缩小用整除截断）。零值（Value 为 nil）
 // 按 0 处理，避免对 nil *big.Int 解引用 panic。
 func (a AssetAmount) toDecimals(dec int) AssetAmount {
@@ -108,8 +112,8 @@ func (a AssetAmount) Sign() int {
 // IsPositive 是否为正金额。
 func (a AssetAmount) IsPositive() bool { return a.Value.Sign() > 0 }
 
-// IsZero 是否为零。
-func (a AssetAmount) IsZero() bool { return a.Value.Sign() == 0 }
+// IsZero 是否为零（Value 为 nil 时视为 0，与 Sign 一致）。
+func (a AssetAmount) IsZero() bool { return a.Sign() == 0 }
 
 // HumanString 人类可读十进制（如 "1.5"），去除尾随零与可能的小数点。零值（Value 为 nil）返回 "0"。
 func (a AssetAmount) HumanString() string {

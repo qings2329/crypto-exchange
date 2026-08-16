@@ -2,7 +2,10 @@ package otc
 
 import (
 	"database/sql"
+	"math/big"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // mysqlStore 是 MySQL 版 Store。表名 ce_otc_advertisements / ce_otc_orders / ce_otc_counterparties 已遵守 ce_ 前缀约定。
@@ -89,7 +92,7 @@ func (s *mysqlStore) CreateOrder(o *OtcOrder) error {
 		INSERT INTO ce_otc_orders
 			(ad_id, maker_id, taker_id, side, asset, fiat_currency, crypto_amount, price, fiat_amount, payment_method, status, rating, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		o.AdID, o.MakerID, o.TakerID, string(o.Side), o.Asset, o.FiatCurrency, o.CryptoAmount,
+		o.AdID, o.MakerID, o.TakerID, string(o.Side), o.Asset, o.FiatCurrency, o.CryptoAmount.HumanString(),
 		o.Price, o.FiatAmount, o.PaymentMethod, string(o.Status), o.Rating, o.CreatedAt, o.UpdatedAt)
 	if err != nil {
 		return err
@@ -114,7 +117,7 @@ func (s *mysqlStore) UpdateOrder(o *OtcOrder) error {
 			ad_id=?, maker_id=?, taker_id=?, side=?, asset=?, fiat_currency=?, crypto_amount=?, price=?, fiat_amount=?,
 			payment_method=?, status=?, rating=?, paid_at=?, completed_at=?, updated_at=?
 		WHERE id = ?`,
-		o.AdID, o.MakerID, o.TakerID, string(o.Side), o.Asset, o.FiatCurrency, o.CryptoAmount, o.Price,
+		o.AdID, o.MakerID, o.TakerID, string(o.Side), o.Asset, o.FiatCurrency, o.CryptoAmount.HumanString(), o.Price,
 		o.FiatAmount, o.PaymentMethod, string(o.Status), o.Rating,
 		toNullTime(o.PaidAt), toNullTime(o.CompletedAt), o.UpdatedAt, o.ID)
 	return err
@@ -238,9 +241,10 @@ func scanAds(rows *sql.Rows) ([]*OtcAdvertisement, error) {
 func scanOrder(row *sql.Row) (*OtcOrder, error) {
 	var o OtcOrder
 	var side, status string
+	var cryptoAmount string
 	var paidAt, completedAt sql.NullTime
 	err := row.Scan(&o.ID, &o.AdID, &o.MakerID, &o.TakerID, &side, &o.Asset, &o.FiatCurrency,
-		&o.CryptoAmount, &o.Price, &o.FiatAmount, &o.PaymentMethod, &status, &o.Rating,
+		&cryptoAmount, &o.Price, &o.FiatAmount, &o.PaymentMethod, &status, &o.Rating,
 		&o.CreatedAt, &paidAt, &completedAt, &o.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrOrderNotFound
@@ -250,6 +254,7 @@ func scanOrder(row *sql.Row) (*OtcOrder, error) {
 	}
 	o.Side = AdSide(side)
 	o.Status = OrderStatus(status)
+	o.CryptoAmount = parseCryptoAmount(cryptoAmount, o.Asset)
 	if paidAt.Valid {
 		o.PaidAt = paidAt.Time
 	}
@@ -264,14 +269,16 @@ func scanOrders(rows *sql.Rows) ([]*OtcOrder, error) {
 	for rows.Next() {
 		var o OtcOrder
 		var side, status string
+		var cryptoAmount string
 		var paidAt, completedAt sql.NullTime
 		if err := rows.Scan(&o.ID, &o.AdID, &o.MakerID, &o.TakerID, &side, &o.Asset, &o.FiatCurrency,
-			&o.CryptoAmount, &o.Price, &o.FiatAmount, &o.PaymentMethod, &status, &o.Rating,
+			&cryptoAmount, &o.Price, &o.FiatAmount, &o.PaymentMethod, &status, &o.Rating,
 			&o.CreatedAt, &paidAt, &completedAt, &o.UpdatedAt); err != nil {
 			return nil, err
 		}
 		o.Side = AdSide(side)
 		o.Status = OrderStatus(status)
+		o.CryptoAmount = parseCryptoAmount(cryptoAmount, o.Asset)
 		if paidAt.Valid {
 			o.PaidAt = paidAt.Time
 		}
@@ -281,6 +288,17 @@ func scanOrders(rows *sql.Rows) ([]*OtcOrder, error) {
 		out = append(out, &o)
 	}
 	return out, rows.Err()
+}
+
+// parseCryptoAmount 把存储的 crypto_amount 字符串（AssetAmount.HumanString）解析为 AssetAmount，
+// 并按资产标准小数位归一化，确保锁与释放使用完全一致的最小单位值。
+func parseCryptoAmount(s, asset string) settlement.AssetAmount {
+	dec := settlement.AssetDecimalsByName(asset)
+	aa, err := settlement.AssetAmountFromString(s, dec)
+	if err != nil {
+		return settlement.AssetAmount{Value: big.NewInt(0), Decimals: dec}
+	}
+	return aa.ToDecimals(dec)
 }
 
 func scanCounterparty(row *sql.Row) (*OtcCounterparty, error) {

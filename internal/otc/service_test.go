@@ -59,7 +59,7 @@ func TestTakeOrderLocksEscrow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("take order: %v", err)
 	}
-	if o.SellerID() != 1 || o.BuyerID() != 2 || o.CryptoAmount != 1 {
+	if o.SellerID() != 1 || o.BuyerID() != 2 || o.CryptoAmount.Cmp(settlement.AssetAmountFromInt64(1, settlement.AssetDecimalsByName("BTC"))) != 0 {
 		t.Fatalf("unexpected order: %+v", o)
 	}
 	avail, _, _ := l.Balance(1, "BTC")
@@ -173,5 +173,98 @@ func TestDisputeResolutionRefundToBuyer(t *testing.T) {
 	buyerAvail, _, _ := l.Balance(2, "BTC")
 	if buyerAvail.Cmp(settlement.AssetAmountFromFloat(11, settlement.AssetDecimalsByName("BTC"))) < 0 {
 		t.Fatalf("buyer btc wrong: %v", buyerAvail)
+	}
+}
+
+// TestConfirmCompleteIdempotent 验证 F1：重复确认收款（模拟重试/崩溃后重放）不会双付/双释放。
+func TestConfirmCompleteIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	ad := mustSellAd(svc)
+	o, err := svc.TakeOrder(ad.ID, 2, 60000, "bank")
+	if err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	if err := svc.MarkPaid(o.ID, 2); err != nil {
+		t.Fatalf("mark paid: %v", err)
+	}
+	if err := svc.ConfirmComplete(o.ID, 1, 5); err != nil {
+		t.Fatalf("complete#1: %v", err)
+	}
+	// 重放同一笔确认（终态短路，应成功且不重复转账）。
+	if err := svc.ConfirmComplete(o.ID, 1, 5); err != nil {
+		t.Fatalf("complete#2 (idempotent): %v", err)
+	}
+	// 买方应恰好获得 1 BTC，托管清零（不得为 2 BTC / 非零托管）。
+	buyerAvail, _, _ := l.Balance(2, "BTC")
+	if !eqAmt(buyerAvail, 11, "BTC") {
+		t.Fatalf("buyer btc double-released: %v", buyerAvail)
+	}
+	escrow, _, _ := l.Balance(ledger.SysOtc, "BTC")
+	if escrow.Sign() != 0 {
+		t.Fatalf("escrow not cleared after idempotent complete: %v", escrow)
+	}
+}
+
+// TestResolveDisputeIdempotent 验证 F1：管理员重复裁决不会双付/双退。
+func TestResolveDisputeIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	ad := mustSellAd(svc)
+	o, err := svc.TakeOrder(ad.ID, 2, 60000, "bank")
+	if err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	if err := svc.MarkPaid(o.ID, 2); err != nil {
+		t.Fatalf("mark paid: %v", err)
+	}
+	if err := svc.OpenDispute(o.ID, 1); err != nil {
+		t.Fatalf("dispute: %v", err)
+	}
+	if err := svc.ResolveDispute(o.ID, false, 4); err != nil {
+		t.Fatalf("resolve#1: %v", err)
+	}
+	if err := svc.ResolveDispute(o.ID, false, 4); err != nil {
+		t.Fatalf("resolve#2 (idempotent): %v", err)
+	}
+	buyerAvail, _, _ := l.Balance(2, "BTC")
+	if !eqAmt(buyerAvail, 11, "BTC") {
+		t.Fatalf("buyer btc double-released by dispute: %v", buyerAvail)
+	}
+	escrow, _, _ := l.Balance(ledger.SysOtc, "BTC")
+	if escrow.Sign() != 0 {
+		t.Fatalf("escrow not cleared after idempotent resolve: %v", escrow)
+	}
+}
+
+// TestReconcilePerAsset 验证 F3：对账按订单实际资产分别核对托管余额，多资产不漏检。
+func TestReconcilePerAsset(t *testing.T) {
+	svc, _ := newTestService()
+	// 建一个 USDT 资产的卖方广告并吃单（托管 USDT），与默认 BTC 并存。
+	ad := &OtcAdvertisement{
+		UserID: 1, Side: SideSell, Asset: "USDT", FiatCurrency: "CNY",
+		Price: 7, MinAmount: 10, MaxAmount: 5000, PaymentMethods: "bank",
+	}
+	if err := svc.CreateAdvertisement(ad); err != nil {
+		t.Fatalf("create ad: %v", err)
+	}
+	if _, err := svc.TakeOrder(ad.ID, 2, 700, "bank"); err != nil { // 100 USDT
+		t.Fatalf("take: %v", err)
+	}
+	escrow, stuck, err := svc.Reconcile()
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	// 默认 BTC 无订单也应被核对（恒为 0），USDT 托管 100 也应被核对。
+	if _, ok := escrow["BTC"]; !ok {
+		t.Fatalf("BTC escrow missing from reconcile: %v", escrow)
+	}
+	usdt, ok := escrow["USDT"]
+	if !ok {
+		t.Fatalf("USDT escrow missing from reconcile (F3 misbucket): %v", escrow)
+	}
+	if !eqAmt(usdt, 100, "USDT") {
+		t.Fatalf("USDT escrow wrong: %v", usdt)
+	}
+	if len(stuck) != 1 {
+		t.Fatalf("expected 1 stuck order (pending), got %d", len(stuck))
 	}
 }
