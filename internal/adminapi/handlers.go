@@ -180,7 +180,8 @@ type userListResp struct {
 	} `json:"users"`
 }
 
-// listUsers 代理 user 服务 /api/v1/user/admin/list；上游不可达时降级为内存示例数据。
+// listUsers 代理 user 服务 /api/v1/user/admin/list；上游不可达时降级为空列表（data 始终为数组，
+// 不返回伪造示例用户，发现 4 对称项），并经 X-Degraded 响应头告知前端上游不可用。
 func (s *Server) listUsers(c *gin.Context) {
 	ctx := c.Request.Context()
 	if base := s.serviceURL("user"); base != "" {
@@ -203,10 +204,10 @@ func (s *Server) listUsers(c *gin.Context) {
 			return
 		}
 	}
-	// 上游不可达：降级为内存示例数据，保证 UI 仍可渲染。
-	s.store.mu.RLock()
-	defer s.store.mu.RUnlock()
-	s.ok(c, s.store.users)
+	// 上游不可达：返回空列表（与正常路径同构，data 始终为数组），不返回伪造的示例用户
+	// （发现 4 对称项）；经 X-Degraded 响应头告知前端上游不可用，便于展示「数据暂不可用」横幅。
+	c.Header("X-Degraded", "user-unavailable")
+	s.ok(c, []AdminUser{})
 }
 
 // enrichBalance 从 futures 钱包服务拉取该用户的 USDT 可用余额填入 AdminUser.Balance 展示字段
@@ -483,7 +484,7 @@ func (s *Server) updateCoin(c *gin.Context) {
 	s.ok(c, out)
 }
 
-// --- 充值提币记录（实时聚合 futures 链上事件；上游不可达时降级为内存示例）---
+// --- 充值提币记录（实时聚合 futures 链上事件；上游不可达时返回空列表而非伪造数据）---
 
 type futuresDeposits struct {
 	Deposits []struct {
@@ -522,8 +523,10 @@ func (s *Server) listDeposits(c *gin.Context) {
 			return
 		}
 	}
-	// 上游不可达：返回 degraded 空列表，不返回伪造记录（发现 4），避免误导运营资金决策。
-	s.ok(c, gin.H{"degraded": true, "items": []Deposit{}, "note": "futures 不可达，充提数据暂不可用"})
+	// 上游不可达：返回空列表（与正常路径同构，data 始终为数组），不返回伪造记录（发现 4），
+	// 避免误导运营资金决策；经 X-Degraded 响应头告知前端上游不可用。
+	c.Header("X-Degraded", "futures-unavailable")
+	s.ok(c, []Deposit{})
 }
 
 // futuresHolds 是 futures 提现冷静期 hold 队列的返回结构（含真实 hold_id，审核的真正锚点）。
@@ -580,8 +583,10 @@ func (s *Server) listWithdrawals(c *gin.Context) {
 			return
 		}
 	}
-	// 上游不可达：返回 degraded 空列表，不返回伪造记录（发现 4），避免误导运营资金决策。
-	s.ok(c, gin.H{"degraded": true, "items": []Withdrawal{}, "note": "futures 不可达，充提数据暂不可用"})
+	// 上游不可达：返回空列表（与正常路径同构，data 始终为数组），不返回伪造记录（发现 4），
+	// 避免误导运营资金决策；经 X-Degraded 响应头告知前端上游不可用。
+	c.Header("X-Degraded", "futures-unavailable")
+	s.ok(c, []Withdrawal{})
 }
 
 // approveWithdrawal 管理员审批通过一笔提现：反查 futures hold_id 后真正调用 futures 审批

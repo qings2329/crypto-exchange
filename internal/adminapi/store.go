@@ -133,11 +133,10 @@ type ServiceHealth struct {
 
 // Store 是管理后台的内存管理态，所有写操作受锁保护。
 // 注意：交易对/公链/币种/本地通知等管理员自有配置已迁至 CatalogStore（见 store_catalog.go），
-// 本 Store 仅保留用户/充值提币示例与风控/账本/健康等只读快照、以及提现审批会话态。
+// 本 Store 仅保留风控/账本/健康等只读快照、以及提现审批会话态。用户与充值提币均来自上游
+// 实时数据，不在此 seed 任何示例（上游不可达时列表返回空数组而非伪造记录，见 handlers.go）。
 type Store struct {
 	mu sync.RWMutex
-
-	users []AdminUser
 
 	// 会话态：充值提币来自 futures 上游实时数据。审批锚点直接采用 futures 返回的
 	// 真实 hold_id（字符串），不再经 stableID 哈希与服务端可变 map 反查，杜绝哈希碰撞/TOCTOU 导致的错审。
@@ -147,23 +146,15 @@ type Store struct {
 	risk   RiskSnapshot
 	ledger LedgerSummary
 	health []ServiceHealth
-
-	seqUser int64
 }
 
-// NewStore 构造并 seed 示例数据的管理态。
+// NewStore 构造管理态（无示例 seed：用户与充值提币均来自上游实时数据，
+// 上游不可达时列表返回空数组而非伪造记录，见 handlers.go）。
 func NewStore() *Store {
 	s := &Store{}
 	now := time.Now()
-	// 用户
-	s.users = []AdminUser{
-		{ID: 1001, Username: "alice", Email: "alice@x.com", Status: "active", KYC: "verified", Balance: 125000.5, CreatedAt: now.Add(-72 * time.Hour)},
-		{ID: 1002, Username: "bob", Email: "bob@x.com", Status: "active", KYC: "pending", Balance: 3400.0, CreatedAt: now.Add(-48 * time.Hour)},
-		{ID: 1003, Username: "carol", Email: "carol@x.com", Status: "frozen", KYC: "verified", Balance: 0, CreatedAt: now.Add(-24 * time.Hour)},
-	}
-	s.seqUser = 1003
-	// 注意：不再 seed 伪造的充值/提现示例数据（发现 4）。上游 futures 不可达时，
-	// listDeposits/listWithdrawals 返回 degraded 空列表，避免向运营展示不存在的资金记录。
+	// 注意：不再 seed 伪造的充值/提现/用户示例数据（发现 4 及其对称项）。上游不可达时，
+	// listDeposits/listWithdrawals/listUsers 返回 degraded 空列表，避免向运营展示不存在的资金/账户记录。
 	s.wdByID = map[string]Withdrawal{}
 	s.wdApprovals = map[string]string{}
 	// 风控快照

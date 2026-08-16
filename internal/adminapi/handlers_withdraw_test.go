@@ -70,13 +70,30 @@ func newFakeFutures(t *testing.T, st *fakeFuturesState) *httptest.Server {
 	return srv
 }
 
+// newFakeUser 起一个模拟 user 服务的 httptest 服务，实现管理员用户列表端点，
+// 供 listUsers 成功路径（经 futures 余额端点 enrich 余额）测试使用。
+func newFakeUser(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.ServeMux{}
+	mux.HandleFunc("/api/v1/user/admin/list", func(w http.ResponseWriter, r *http.Request) {
+		users := []map[string]interface{}{
+			{"id": 1001, "username": "alice", "email": "alice@x.com", "phone": "", "status": 0, "kyc_level": 2, "created_at": "2026-08-16T00:00:00Z"},
+		}
+		writeEnvelope(w, gin.H{"users": users})
+	})
+	srv := httptest.NewServer(&mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func writeEnvelope(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(gin.H{"code": 0, "data": data, "message": ""})
 }
 
 // newAdminWithFutures 构造 admin 路由，并把 futures 上游指向 fake 服务，返回 admin token。
-func newAdminWithFutures(t *testing.T, futuresURL string) (*gin.Engine, string) {
+// userURL 非空时同时把 user 上游指向 fake 服务（用于走 listUsers 成功路径）。
+func newAdminWithFutures(t *testing.T, futuresURL, userURL string) (*gin.Engine, string) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{}
@@ -85,6 +102,9 @@ func newAdminWithFutures(t *testing.T, futuresURL string) (*gin.Engine, string) 
 	cfg.Admin.Password = "admin123"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"futures": futuresURL}
+	if userURL != "" {
+		cfg.Services["user"] = userURL
+	}
 	r := gin.New()
 	adminapi.NewServer(cfg).RegisterRoutes(r)
 
@@ -130,7 +150,7 @@ func getWithdrawals(t *testing.T, r *gin.Engine, tok string) []adminapi.Withdraw
 func TestAdminWithdrawalListMapsHoldID(t *testing.T) {
 	st := &fakeFuturesState{}
 	fake := newFakeFutures(t, st)
-	r, tok := newAdminWithFutures(t, fake.URL)
+	r, tok := newAdminWithFutures(t, fake.URL, "")
 
 	ws := getWithdrawals(t, r, tok)
 	if len(ws) != 3 {
@@ -170,7 +190,7 @@ func TestAdminWithdrawalListMapsHoldID(t *testing.T) {
 func TestAdminWithdrawalApproveCallsFutures(t *testing.T) {
 	st := &fakeFuturesState{}
 	fake := newFakeFutures(t, st)
-	r, tok := newAdminWithFutures(t, fake.URL)
+	r, tok := newAdminWithFutures(t, fake.URL, "")
 
 	ws := getWithdrawals(t, r, tok)
 	var h1 string
@@ -207,7 +227,7 @@ func TestAdminWithdrawalApproveCallsFutures(t *testing.T) {
 func TestAdminWithdrawalApproveIdempotent(t *testing.T) {
 	st := &fakeFuturesState{}
 	fake := newFakeFutures(t, st)
-	r, tok := newAdminWithFutures(t, fake.URL)
+	r, tok := newAdminWithFutures(t, fake.URL, "")
 
 	ws := getWithdrawals(t, r, tok)
 	var h1 string
@@ -253,7 +273,7 @@ func TestAdminWithdrawalApproveIdempotent(t *testing.T) {
 func TestAdminWithdrawalRejectCallsFutures(t *testing.T) {
 	st := &fakeFuturesState{}
 	fake := newFakeFutures(t, st)
-	r, tok := newAdminWithFutures(t, fake.URL)
+	r, tok := newAdminWithFutures(t, fake.URL, "")
 
 	ws := getWithdrawals(t, r, tok)
 	var h3 string
@@ -281,7 +301,7 @@ func TestAdminWithdrawalRejectCallsFutures(t *testing.T) {
 func TestAdminWithdrawalApproveUpstreamFailure(t *testing.T) {
 	st := &fakeFuturesState{failApprove: true}
 	fake := newFakeFutures(t, st)
-	r, tok := newAdminWithFutures(t, fake.URL)
+	r, tok := newAdminWithFutures(t, fake.URL, "")
 
 	ws := getWithdrawals(t, r, tok)
 	var h1 string
@@ -300,12 +320,12 @@ func TestAdminWithdrawalApproveUpstreamFailure(t *testing.T) {
 }
 
 // TestAdminUsersBalanceEnriched 验证用户列表的 Balance 从 futures 钱包余额真实填充（不再恒为 0）。
-// 注意：listUsers 在 user 服务不可达时降级为内存示例用户（alice=1001 等），
-// 余额仍由 futures 余额端点 enrich。
+// 走 listUsers 成功路径（user 服务可达 + futures 余额端点 enrich）。
 func TestAdminUsersBalanceEnriched(t *testing.T) {
 	st := &fakeFuturesState{}
 	fake := newFakeFutures(t, st)
-	r, tok := newAdminWithFutures(t, fake.URL)
+	userFake := newFakeUser(t)
+	r, tok := newAdminWithFutures(t, fake.URL, userFake.URL)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/admin/users", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -323,7 +343,7 @@ func TestAdminUsersBalanceEnriched(t *testing.T) {
 	if len(env.Data) == 0 {
 		t.Fatal("expected at least one user")
 	}
-	// 找到 alice（id=1001），其余额应被 enrich 为 125000.5。
+	// 找到 alice（id=1001），其余额应被 futures 余额端点 enrich 为 125000.5。
 	var alice *adminapi.AdminUser
 	for i := range env.Data {
 		if env.Data[i].ID == 1001 {
@@ -338,12 +358,13 @@ func TestAdminUsersBalanceEnriched(t *testing.T) {
 	}
 }
 
-// TestAdminCashflowListDegraded 验证上游 futures 不可达时，充值/提现列表返回 degraded 空列表，
-// 而非伪造的示例记录（发现 4），避免误导运营资金决策。
+// TestAdminCashflowListDegraded 验证上游 futures 不可达时，充值/提现列表返回与正常路径同构的
+// 空数组（data 始终为数组，不返回伪造记录，发现 4），并经 X-Degraded 响应头告知前端上游不可用。
+// 注意：data 在降级与正常路径下均为数组，避免前端因 object/array 形态切换而解析失败。
 func TestAdminCashflowListDegraded(t *testing.T) {
 	st := &fakeFuturesState{}
 	fake := newFakeFutures(t, st)
-	r, tok := newAdminWithFutures(t, fake.URL)
+	r, tok := newAdminWithFutures(t, fake.URL, "")
 	fake.Close() // 模拟 futures 不可达
 
 	for _, path := range []string{"/api/admin/deposits", "/api/admin/withdrawals"} {
@@ -354,20 +375,47 @@ func TestAdminCashflowListDegraded(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("%s degraded list should still 200, got %d %s", path, w.Code, w.Body.String())
 		}
+		// X-Degraded 响应头必须存在，告知前端上游不可用。
+		if got := w.Header().Get("X-Degraded"); got != "futures-unavailable" {
+			t.Fatalf("%s expected X-Degraded: futures-unavailable header, got %q", path, got)
+		}
+		// data 必须是空数组（与正常路径同构），而非伪造记录。
 		var env struct {
-			Data struct {
-				Degraded bool          `json:"degraded"`
-				Items    []interface{} `json:"items"`
-			} `json:"data"`
+			Data []interface{} `json:"data"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s body should decode as data array, got %s", path, w.Body.String())
 		}
-		if !env.Data.Degraded {
-			t.Fatalf("%s expected degraded:true, got %s", path, w.Body.String())
+		if len(env.Data) != 0 {
+			t.Fatalf("%s expected empty data array (no fake records), got %d: %s", path, len(env.Data), w.Body.String())
 		}
-		if len(env.Data.Items) != 0 {
-			t.Fatalf("%s expected empty items (no fake records), got %d: %s", path, len(env.Data.Items), w.Body.String())
-		}
+	}
+}
+
+// TestAdminUsersListDegraded 验证上游 user 服务不可达时，用户列表返回与正常路径同构的空数组
+// （data 始终为数组，不返回伪造的示例用户，发现 4 对称项），并经 X-Degraded 响应头告知前端。
+func TestAdminUsersListDegraded(t *testing.T) {
+	fake := newFakeFutures(t, &fakeFuturesState{})
+	// 仅配置 futures，不配置 user → 走 user 降级分支。
+	r, tok := newAdminWithFutures(t, fake.URL, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/users", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("users degraded list should still 200, got %d %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Degraded"); got != "user-unavailable" {
+		t.Fatalf("expected X-Degraded: user-unavailable header, got %q", got)
+	}
+	var env struct {
+		Data []interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("users body should decode as data array, got %s", w.Body.String())
+	}
+	if len(env.Data) != 0 {
+		t.Fatalf("expected empty users data array (no fake users), got %d: %s", len(env.Data), w.Body.String())
 	}
 }
