@@ -65,6 +65,40 @@ make run-user
 make run-gateway
 ```
 
+## 部署与配置
+
+所有服务共用 `configs/config.yaml` 的 `server` 段。下面是与线上归因/限流直接相关、部署时**必须确认**的一项。
+
+### ⚠️ 受信任代理 `server.trusted_proxies`（上线前必查）
+
+生产网络拓扑通常为：`客户端 → 网关/LB/CDN → 各业务服务`。该配置控制 gin 如何解析客户端真实 IP（`c.ClientIP()`）：
+
+- **留空（默认）**：不信任任何代理，直接使用直连对端 IP（`RemoteAddr`）。仅适用于服务**直连公网**、前面没有反向代理的场景。
+- **填写网关/LB/CDN 的地址（IP 或 CIDR）**：服务位于反向代理之后时**必须填写**，否则 `c.ClientIP()` 会把上游（网关）IP 当成客户端，引发：
+  - 全局限流（`middleware.Common` 的每 IP 限流）将所有请求误判为同一来源，**可能整体被限流甚至误伤全体用户**；
+  - 审计日志 / 安全日志中的客户端 IP 全部失真，事后无法溯源；
+  - admin 登录的「基于 IP 限流」失效——限的是网关 IP 而非真实来源。
+
+> 网关服务（`cmd/gateway`）用 `httputil.ReverseProxy` 反代，标准库会自动注入 `X-Forwarded-For`；后端把网关地址列入 `trusted_proxies` 后，即可从 `X-Forwarded-For` 读到真实客户端 IP，整条归因链路自洽。
+> 若网关自身也位于 CDN/LB 之后，网关自身的 `trusted_proxies` 同样需填入其上游地址。
+
+配置示例：
+
+```yaml
+server:
+  trusted_proxies: []                       # 直连公网：保持留空
+  # 位于网关/LB/CDN 之后：填入其地址，例如
+  # trusted_proxies: ["10.0.0.0/8", "192.168.1.10"]
+```
+
+### 其它 `server` 段配置
+
+- `rate_limit_per_sec`：单实例每 IP 请求速率上限。
+- `allowed_origins`：CORS 跨域白名单；为空则拒绝一切跨域。
+- `max_body_bytes`：请求体大小上限（默认 1 MiB）。
+- `tls`：`cert_file` 与 `key_file` 同时配置才启用 HTTPS。
+- `mode`：`debug | release`。
+
 ## 约定
 
 - 全院子使用 Go，统一 gofmt / go vet。
