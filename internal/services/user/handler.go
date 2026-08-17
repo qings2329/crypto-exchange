@@ -52,14 +52,18 @@ func (h *Handler) Register(r *gin.Engine) {
 	auth.POST("/tfa/disable", h.tfaDisable)
 	auth.POST("/kyc/submit", h.kycSubmit)
 	auth.GET("/kyc", h.kycGet)
-	auth.POST("/kyc/review", h.kycReview)
 
-	// 管理后台聚合接口（cmd/admin 以 admin token 调用；上游 Auth 不强制 role）。
-	auth.GET("/admin/list", h.adminList)
-	auth.POST("/admin", h.adminCreate)
-	auth.PUT("/admin/:id", h.adminUpdate)
-	auth.POST("/admin/:id/freeze", h.adminFreeze)
-	auth.POST("/admin/:id/unfreeze", h.adminUnfreeze)
+	// 管理后台聚合接口（仅管理员；cmd/admin 以 admin token 代理调用）。
+	// 此处再叠加 AdminGuard 作为纵深防御：即便上游网关漏配，普通用户也无法越权操作他人账户 / 审核 KYC。
+	// adminapi 转发的是 role=admin 的 selfToken，故不影响既有管理后台流程。
+	adminG := g.Group("")
+	adminG.Use(middleware.Auth(h.verifier), middleware.AdminGuard())
+	adminG.POST("/kyc/review", h.kycReview) // F4：审核他人 KYC 必须管理员
+	adminG.GET("/admin/list", h.adminList)
+	adminG.POST("/admin", h.adminCreate)
+	adminG.PUT("/admin/:id", h.adminUpdate)
+	adminG.POST("/admin/:id/freeze", h.adminFreeze)
+	adminG.POST("/admin/:id/unfreeze", h.adminUnfreeze)
 }
 
 func (h *Handler) register(c *gin.Context) {
@@ -355,8 +359,6 @@ func (h *Handler) kycGet(c *gin.Context) {
 }
 
 func (h *Handler) kycReview(c *gin.Context) {
-	uid, _ := middleware.UserID(c)
-	_ = uid
 	var req struct {
 		UserID       int64  `json:"user_id"`
 		Approve      bool   `json:"approve"`
