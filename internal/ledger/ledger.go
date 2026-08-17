@@ -52,6 +52,16 @@ const (
 	// 赎回时本金+应计收益从此账户支出；账户余额恒等于「在管本金 - 用户应计收益负债」，
 	// 即 余额 = Σ本金 - Σ已计收益。系统账户允许透支，复式记账自动守恒。
 	SysWealth int64 = -7
+	// SysMarginInterest 杠杆借币利息账户：Repay 时利息部分从此账户 Credit（余额为正，
+	// 表示平台已累计收取的利息），本金部分经用户可用 Debit 后不再经此账户。
+	// 与本金（用户可用↔SysFundingPool/借出方）拆分记账，避免利息被当作本金"凭空消失"，
+	// 保持复式记账借贷恒等（见 margin F3-1，#24）。
+	SysMarginInterest int64 = -8
+	// SysWealthYieldPayable 理财应计收益负债账户：Accrue 时应计收益同时 Debit SysWealth、
+	// Credit 本账户（余额为正，表示平台对用户累计欠付的收益负债）；Redeem 时收益部分
+	// 经本账户 Debit 支出，本金仍经 SysWealth。账户余额恒等于「Σ已计收益 - Σ已兑付收益」，
+	// 即 用户应计收益负债。与 SysWealth 拆分记账，赎回时 SysWealth 不再静默透支（见 wealth F3-1，#24）。
+	SysWealthYieldPayable int64 = -9
 )
 
 // 快照 schema 版本。v2 起金额以 AssetAmount（定点整数）序列化；v0/v1（无 version 字段）
