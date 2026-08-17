@@ -5,7 +5,7 @@
 
 - **OTC 场外交易**：服务 `cmd/otc`，前缀 `/api/v1/otc`（见 [OTC 模块](#otc)）。
 - **用户个人设置**：服务 `internal/services/user`，前缀 `/api/v1/user`（见 [用户设置模块](#user)）。
-- **公告模块**：服务 `internal/announcement`（挂载于用户服务 `cmd/user`，共用同一数据库），前缀 `/api/v1/announcement`（见 [公告模块](#ann)）。
+- **公告模块**：服务 `internal/announcement`（挂载于用户服务 `cmd/user`，共用同一数据库；亦经独立管理后端 `cmd/admin` 以 `/api/admin/announcements` 暴露），前缀 `/api/v1/announcement`（见 [公告模块](#ann)）。
 - **理财资管**：服务 `internal/wealth`（独立二进制 `cmd/wealth`，监听 `:8092`），前缀 `/api/v1/wealth`（见 [理财模块](#wealth)）。
 - **钱包与资金流水**：服务 `internal/futuresapi`（合约钱包服务），前缀 `/api/v1/futures/wallet`（见 [钱包与资金流水](#wallet)）。
 
@@ -425,6 +425,78 @@ go build -o bin/otc ./cmd/otc
 - 与用户模块共用同一数据库实例，因此两者共享 `ce_schema_migrations`；版本号 9401 与用户的 9101–9106 互不重叠，迁移幂等、可重入。
 - 在 `cmd/user` 中：`cfg.MySQL.DSN` 非空时分别开 `user.NewMySQLStore(dsn)` 与 `announcement.NewMySQLStore(dsn)`（各自运行自己的迁移）；DSN 缺失则两者均降级为内存实现。
 
+<a id="ann-admin-backend"></a>
+## 管理后端（cmd/admin）接入
+
+独立管理后端 `cmd/admin`（监听 `:8090`，路由前缀 `/api/admin`）同样承载公告管理，复用同一套 `internal/announcement` 的 `Handler`/`Service`/`Store`，与 `cmd/user` 共享 `ce_announcements` 表（迁移版本 9401）。
+
+- 注册位置：`adminapi.Server.RegisterRoutes` 在已套 `middleware.Auth + middleware.AdminGuard` 的 `admin` 分组下调用 `annH.RegisterAdminRoutes(admin)`，无需重复鉴权。
+- 存储：与 `cmd/admin` 其他模块一致——`cfg.MySQL.DSN` 非空时开 `announcement.NewMySQLStore(dsn)`，否则降级为内存实现。
+- 接口（前缀 `/api/admin`，均 Admin 鉴权）：
+
+| 方法 | 路径 | 说明 | 响应 |
+| --- | --- | --- | --- |
+| GET | `/api/admin/announcements` | 全量列表（含草稿） | `{ "announcements": [...] }` |
+| POST | `/api/admin/announcements` | 创建 | `data` = `Announcement`（**直接返回对象**，非 `announcements` 数组） |
+| PUT | `/api/admin/announcements/:id` | 部分更新 | `data` = `Announcement` |
+| DELETE | `/api/admin/announcements/:id` | 删除 | `{ "ok": true }` |
+
+> 说明：`cmd/admin` 与管理接口前缀不同（`/api/admin/announcements` vs `cmd/user` 的 `/api/v1/announcement/admin`），但底层 `Handler` 与错误映射（`fail()`）完全一致；两者数据互通，运维可任选一端维护。
+
+<a id="admin-ledger"></a>
+## 运营账本与结算实时账本（cmd/admin）
+
+`GET /api/admin/ledger` 返回账本对账快照 `LedgerSummary`，实时聚合来自上游服务：
+
+- **futures 合约钱包对账**（若配置了 `services.futures`）：调用 `/api/v1/futures/wallet/reconcile` 与 `/api/v1/futures/wallet/inventory`，汇总 `total_assets` / `settlement_balance`（链上总量）、`reconciled`（是否平衡）、`discrepancy`（各类偏差绝对值之和）。
+- **settlement 清算聚合**（若配置了 `services.settlement`）：调用 `/api/v1/settlement/stats` 与 `/api/v1/settlement/cleared?limit=10`，填充 `settlement` 块（`enabled` / `total_trades` / `total_volume` / `total_commission` / `by_symbol` / `recent[]`）。`recent` 中每笔 `ClearedTradeView` 的 `ts` 为 Unix **毫秒**，前端直接 `new Date(ts)` 格式化。
+
+任一上游未配置或拉取失败时降级：`settlement.enabled=false`、对应 `notes` 说明原因，并由顶层 `notes` 汇总。`settlement` 服务健康检查走 `/healthz`（其余上游走 `/health`，见服务健康接口 `GET /api/admin/services`）。
+
+<a id="admin-orders"></a>
+## 订单与成交查询（cmd/admin）
+
+`GET /api/admin/orders`（需 `trade:read`）与 `GET /api/admin/trades`（需 `trade:read`）提供跨用户订单/成交流水查询（运营风控用）：
+
+- **过滤**：`user_id`（不传=全部用户）、`symbol`、`market`（`spot`|`futures`）、`margin`（杠杆标识）；订单另支持 `status`（`open`/`partial`/`filled`/`canceled`/`rejected`）。
+- **分页**：`limit`（默认 50，上限 500）、`offset`（默认 0）。响应统一为 `{ "orders"|"trades": [...], "total": n }`，`total` 为过滤后总条数（不受分页截断影响），前端 `Orders.tsx` 据此接入 `Pager`。
+- 撤销任意用户订单：`POST /api/admin/orders/:id/cancel`（需 `trade:manage`，危险操作），请求体 `{ "symbol": "BTCUSDT" }`（撮合引擎按 symbol 定位订单簿）。
+
+<a id="admin-audit"></a>
+## 审计日志（cmd/admin）
+
+管理后台在 `admin` 分组上挂审计中间件，对所有**变更类**请求（POST/PUT/DELETE，GET 不记）落审计记录（仅元数据：方法/路由/状态码/IP/时间，不记录请求体以防泄露口令）。存储同其他模块（`cfg.MySQL.DSN` 非空时 `ce_admin_audit_logs` 表，迁移版本 9801；否则内存回退）。
+
+| 方法 | 路径 | 说明 | 权限 | 响应 |
+| --- | --- | --- | --- | --- |
+| GET | `/api/admin/audit-logs` | 审计日志（按时间倒序），支持 `limit`/`offset` 分页 | `audit:read` | `{ "logs": [...], "total": n }` |
+
+> 审计中间件在服务端 `c.Next()` 之后记录，故同时覆盖成功与失败（含 4xx/5xx）的变更尝试；`audit:read` 已纳入 `super_admin` 默认角色。
+
+<a id="admin-paging"></a>
+## 列表分页约定（cmd/admin）
+
+`users` / `symbols` / `chains` / `coins` / `notifications` / `announcements` / `admins` / `roles` 等列表接口支持 `limit`（默认 50，上限 500）与 `offset` 分页，响应统一包络 `{ "items": [...], "total": n }`（公告为 `{ "announcements": [...], "total": n }`）。上游聚合类列表同样支持分页：`orders`/`trades` 返回 `{ orders|trades: [...], total }`；`deposits`/`withdrawals` 返回 `{ deposits|withdrawals: [...], total }`，并可在服务端按 `user_id` / `coin` / `status` 过滤（充值/提币列表的 `total` 为过滤后总数，不受分页截断影响）。
+
+<a id="admin-rbac"></a>
+## 角色与权限管理（cmd/admin）
+
+角色与权限管理接口统一受 `role:manage` 守卫，管理员账户管理接口受 `admin:manage` 守卫：
+
+| 方法 | 路径 | 说明 | 权限 |
+| --- | --- | --- | --- |
+| GET | `/api/admin/roles` | 角色列表（含各自权限），分页包络 `{ "items": [...], "total": n }` | `role:manage` |
+| POST | `/api/admin/roles` | 新建角色（初始无权限），`{ "name", "description" }` | `role:manage` |
+| PUT | `/api/admin/roles/:id` | 编辑角色名/描述，`{ "name", "description?" }`，改名与已有角色重名返回 409 | `role:manage` |
+| PUT | `/api/admin/roles/:id/permissions` | 全量覆盖角色权限，`{ "permissions": string[] }`（非法的 key 会被 `ValidatePermissions` 过滤） | `role:manage` |
+| DELETE | `/api/admin/roles/:id` | 删除角色；仍被管理员引用时返回 409 `ErrRoleInUse` | `role:manage` |
+| GET | `/api/admin/permissions` | 全部可授予权限字典（供权限分配 UI 按 group 分组） | `role:manage` |
+| GET | `/api/admin/admins` | 管理员列表（分页包络） | `admin:manage` |
+| POST | `/api/admin/admins` | 新建管理员（需指定 `role_id`，初始 `pending`） | `admin:manage` |
+| PUT | `/api/admin/admins/:id` | 改派角色 / 改状态，`{ "role_id"?, "status"?" }` | `admin:manage` |
+| POST | `/api/admin/admins/:id/activate` · `/disable` · `/reset-password` | 激活 / 禁用 / 重置密码 | `admin:manage` |
+
+
 <a id="ann-frontend"></a>
 ## 公告前端对接
 
@@ -434,6 +506,15 @@ go build -o bin/otc ./cmd/otc
   - `src/pages/Announcements.tsx` 公告管理：增删改查（需 admin 角色；无权限时列表接口返回 403，由错误提示展示）。
 - 导航栏新增「首页 /home」「公告 /announcements」。
 - 公告等级 badge 样式（`info` 绿 / `warning` 黄 / `maintenance` 蓝）见 `src/styles.css` 的 `.ann-badge.*`。
+
+<a id="ann-admin-frontend"></a>
+## 管理后台前端（ce-admin-web）对接
+
+独立管理前端 `ce-admin-web`（Vite，开发端口 `:5174`，代理 `/api/admin -> cmd/admin :8095`）提供公告管理页：
+
+- API 封装见 `ce-admin-web/src/api/client.ts`：`listAnnouncements()`、`createAnnouncement(payload)`、`updateAnnouncement(id, payload)`、`deleteAnnouncement(id)`（与 `cmd/admin/announcements` 一一对应）。
+- 页面 `ce-admin-web/src/pages/Announcements.tsx`：新建/编辑（同一表单按 `editing` 态切换 POST/PUT）、删除（确认后 DELETE）、等级徽标与「已发布/草稿」状态展示。
+- 路由 `#/announcements`，导航栏新增「公告管理」项（无权限门槛，整体受 `Auth+AdminGuard` 保护）。
 
 > 面向运维/管理员的「操作示例（curl）与字段校验」见 [`announcement_guide.md`](./announcement_guide.md)。
 > 单元测试运行方式与用例清单见 [`announcement_test.md`](./announcement_test.md)。

@@ -139,12 +139,15 @@ func getWithdrawals(t *testing.T, r *gin.Engine, tok string) []adminapi.Withdraw
 		t.Fatalf("list withdrawals failed: %d %s", w.Code, w.Body.String())
 	}
 	var env struct {
-		Data []adminapi.Withdrawal `json:"data"`
+		Data struct {
+			Withdrawals []adminapi.Withdrawal `json:"withdrawals"`
+			Total       int                   `json:"total"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
 		t.Fatal(err)
 	}
-	return env.Data
+	return env.Data.Withdrawals
 }
 
 func TestAdminWithdrawalListMapsHoldID(t *testing.T) {
@@ -335,23 +338,26 @@ func TestAdminUsersBalanceEnriched(t *testing.T) {
 		t.Fatalf("list users failed: %d %s", w.Code, w.Body.String())
 	}
 	var env struct {
-		Data []adminapi.AdminUser `json:"data"`
+		Data struct {
+			Items []adminapi.AdminUser `json:"items"`
+			Total int64                `json:"total"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
 		t.Fatal(err)
 	}
-	if len(env.Data) == 0 {
+	if len(env.Data.Items) == 0 {
 		t.Fatal("expected at least one user")
 	}
 	// 找到 alice（id=1001），其余额应被 futures 余额端点 enrich 为 125000.5。
 	var alice *adminapi.AdminUser
-	for i := range env.Data {
-		if env.Data[i].ID == 1001 {
-			alice = &env.Data[i]
+	for i := range env.Data.Items {
+		if env.Data.Items[i].ID == 1001 {
+			alice = &env.Data.Items[i]
 		}
 	}
 	if alice == nil {
-		t.Fatalf("alice (id=1001) not found in users: %+v", env.Data)
+		t.Fatalf("alice (id=1001) not found in users: %+v", env.Data.Items)
 	}
 	if alice.Balance != 125000.5 {
 		t.Fatalf("alice balance should be enriched to 125000.5, got %v", alice.Balance)
@@ -359,8 +365,9 @@ func TestAdminUsersBalanceEnriched(t *testing.T) {
 }
 
 // TestAdminCashflowListDegraded 验证上游 futures 不可达时，充值/提现列表返回与正常路径同构的
-// 空数组（data 始终为数组，不返回伪造记录，发现 4），并经 X-Degraded 响应头告知前端上游不可用。
-// 注意：data 在降级与正常路径下均为数组，避免前端因 object/array 形态切换而解析失败。
+// 空包络（data.deposits/data.withdrawals 为空数组，total=0，不返回伪造记录，发现 4），并经
+// X-Degraded 响应头告知前端上游不可用。注意：data 在降级与正常路径下均为同一对象形态
+// {deposits|withdrawals:[],total}，避免前端因 object/array 形态切换而解析失败。
 func TestAdminCashflowListDegraded(t *testing.T) {
 	st := &fakeFuturesState{}
 	fake := newFakeFutures(t, st)
@@ -379,15 +386,22 @@ func TestAdminCashflowListDegraded(t *testing.T) {
 		if got := w.Header().Get("X-Degraded"); got != "futures-unavailable" {
 			t.Fatalf("%s expected X-Degraded: futures-unavailable header, got %q", path, got)
 		}
-		// data 必须是空数组（与正常路径同构），而非伪造记录。
+		// data.deposits / data.withdrawals 必须是空数组（与正常路径同构），而非伪造记录。
 		var env struct {
-			Data []interface{} `json:"data"`
+			Data struct {
+				Deposits    []interface{} `json:"deposits"`
+				Withdrawals []interface{} `json:"withdrawals"`
+				Total       int           `json:"total"`
+			} `json:"data"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
-			t.Fatalf("%s body should decode as data array, got %s", path, w.Body.String())
+			t.Fatalf("%s body should decode as data envelope, got %s", path, w.Body.String())
 		}
-		if len(env.Data) != 0 {
-			t.Fatalf("%s expected empty data array (no fake records), got %d: %s", path, len(env.Data), w.Body.String())
+		if n := len(env.Data.Deposits) + len(env.Data.Withdrawals); n != 0 {
+			t.Fatalf("%s expected empty list (no fake records), got %d: %s", path, n, w.Body.String())
+		}
+		if env.Data.Total != 0 {
+			t.Fatalf("%s expected total=0, got %d", path, env.Data.Total)
 		}
 	}
 }
@@ -410,12 +424,15 @@ func TestAdminUsersListDegraded(t *testing.T) {
 		t.Fatalf("expected X-Degraded: user-unavailable header, got %q", got)
 	}
 	var env struct {
-		Data []interface{} `json:"data"`
+		Data struct {
+			Items []interface{} `json:"items"`
+			Total int64         `json:"total"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
-		t.Fatalf("users body should decode as data array, got %s", w.Body.String())
+		t.Fatalf("users body should decode as data object with items, got %s", w.Body.String())
 	}
-	if len(env.Data) != 0 {
-		t.Fatalf("expected empty users data array (no fake users), got %d: %s", len(env.Data), w.Body.String())
+	if len(env.Data.Items) != 0 {
+		t.Fatalf("expected empty users items (no fake users), got %d: %s", len(env.Data.Items), w.Body.String())
 	}
 }

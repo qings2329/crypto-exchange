@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/coldlar/crypto-exchange/internal/announcement"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -25,6 +26,8 @@ type Server struct {
 	matchClient *client.Client // 直连撮合引擎（cmd/matching），用于跨用户订单管理与撤销
 	adminStore  AdminStore     // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
 	catalog     CatalogStore   // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
+	annH       *announcement.Handler // 公告管理（与用户服务共用同一份 ce_announcements 表与迁移版本 9401）
+	auditStore AuditStore    // 管理员操作审计日志（MySQL 优先，失败回退内存）
 }
 
 // NewServer 装配管理后台服务。verifier 使用全局 auth 共享密钥（与用户 token 同一密钥，
@@ -66,6 +69,32 @@ func NewServer(cfg *config.Config) *Server {
 		log.Printf("[admin] seed catalog failed: %v", err)
 	}
 
+	// 公告管理：与用户服务共用同一数据库（同一份 ce_schema_migrations，版本号 9401 已错开）。
+	// 优先 MySQL；DSN 缺失则降级为内存实现（重启即丢，仅开发用）。
+	var annStore announcement.Store
+	if cfg.MySQL.DSN != "" {
+		st, annErr := announcement.NewMySQLStore(cfg.MySQL.DSN)
+		if annErr != nil {
+			log.Printf("[admin] announcement store: falling back to in-memory (mysql unavailable: %v)", annErr)
+		} else {
+			annStore = st
+		}
+	}
+	if annStore == nil {
+		annStore = announcement.NewMemStore()
+	}
+	annSvc := announcement.NewService(annStore)
+	annH := announcement.NewHandler(annSvc)
+
+	// 审计日志存储：优先 MySQL；DSN 缺失或连接/迁移失败则降级为内存实现。
+	auditStore, isMemAudit, auditErr := NewAuditStore(cfg.MySQL.DSN)
+	if auditErr != nil {
+		log.Printf("[admin] audit store: falling back to in-memory (mysql unavailable: %v)", auditErr)
+	}
+	if isMemAudit {
+		log.Printf("[admin] WARNING: audit logs persisted in memory only; restart resets them. Configure mysql.dsn for real persistence.")
+	}
+
 	return &Server{
 		cfg:         cfg,
 		verifier:    verifier,
@@ -74,6 +103,8 @@ func NewServer(cfg *config.Config) *Server {
 		matchClient: client.New(cfg.Matching.URL),
 		adminStore:  adminStore,
 		catalog:     catalog,
+		annH:        annH,
+		auditStore:  auditStore,
 	}
 }
 
@@ -90,6 +121,7 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 	r.GET("/api/admin/health", s.handleHealth)
 
 	admin := r.Group("/api/admin", middleware.Auth(s.verifier), middleware.AdminGuard())
+	admin.Use(s.auditMiddleware()) // 记录所有变更类操作（GET 不记）
 	{
 		// 风控与强平监控（实时聚合 futures）
 		admin.GET("/risk", s.handleRisk)
@@ -126,6 +158,9 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		admin.GET("/notifications", s.listNotifications)
 		admin.POST("/notifications", s.createNotification)
 		admin.DELETE("/notifications/:id", s.deleteNotification)
+
+		// 公告管理（与用户服务共用同一份 ce_announcements 数据；管理组已套 Auth+AdminGuard）。
+		s.annH.RegisterAdminRoutes(admin)
 
 		// 运营看板：账本对账（实时聚合 futures）+ 服务健康（探活各服务）
 		admin.GET("/ledger", s.handleLedger)
@@ -165,9 +200,13 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		{
 			roles.GET("", s.listRoles)
 			roles.POST("", s.createRole)
+			roles.PUT("/:id", s.updateRole)
 			roles.PUT("/:id/permissions", s.setRolePermissions)
 			roles.DELETE("/:id", s.deleteRole)
 		}
 		admin.GET("/permissions", middleware.RequirePerm(PermRoleManage), s.listPermissionDict)
+
+		// 审计日志（需 audit:read 权限）
+		admin.GET("/audit-logs", middleware.RequirePerm(PermAuditRead), s.handleAuditLogs)
 	}
 }

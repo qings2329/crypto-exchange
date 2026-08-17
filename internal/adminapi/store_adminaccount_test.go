@@ -44,3 +44,41 @@ func TestMemAdminStoreDeleteRoleInUse(t *testing.T) {
 		t.Fatal("被引用角色删除失败后应当仍然存在")
 	}
 }
+
+// TestMemAdminStoreUpdateRole 锁定角色编辑行为：
+//  1. 改名/改描述生效；
+//  2. 改名与已有角色冲突返回 ErrRoleExists；
+//  3. 编辑不存在的角色返回 ErrAdminNotFound。
+func TestMemAdminStoreUpdateRole(t *testing.T) {
+	s := NewMemAdminStore()
+	a := &Role{Name: "role_a", Description: "desc_a"}
+	if err := s.CreateRole(a); err != nil {
+		t.Fatalf("CreateRole: %v", err)
+	}
+	b := &Role{Name: "role_b", Description: "desc_b"}
+	if err := s.CreateRole(b); err != nil {
+		t.Fatalf("CreateRole: %v", err)
+	}
+
+	// 1) 改名 + 改描述
+	if err := s.UpdateRole(&Role{ID: a.ID, Name: "role_a", Description: "updated"}); err != nil {
+		t.Fatalf("UpdateRole desc: %v", err)
+	}
+	got, err := s.GetRoleByID(a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Description != "updated" {
+		t.Fatalf("description 未更新, got %q", got.Description)
+	}
+
+	// 2) 改名为已存在的角色名 -> ErrRoleExists
+	if err := s.UpdateRole(&Role{ID: a.ID, Name: "role_b"}); err != ErrRoleExists {
+		t.Fatalf("重名应返回 ErrRoleExists, got %v", err)
+	}
+
+	// 3) 编辑不存在的角色 -> ErrAdminNotFound
+	if err := s.UpdateRole(&Role{ID: 9999, Name: "ghost"}); err != ErrAdminNotFound {
+		t.Fatalf("不存在角色应返回 ErrAdminNotFound, got %v", err)
+	}
+}

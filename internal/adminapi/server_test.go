@@ -61,6 +61,23 @@ func getJSON(t *testing.T, r *gin.Engine, path, token string) (int, interface{})
 	return w.Code, env.Data
 }
 
+// deleteJSON 发送 DELETE 并解析 {code,data} 信封。
+func deleteJSON(t *testing.T, r *gin.Engine, path, token string) (int, interface{}) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var env struct {
+		Code int         `json:"code"`
+		Data interface{} `json:"data"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	return w.Code, env.Data
+}
+
 func TestAdminLoginAndRoleGuard(t *testing.T) {
 	r, _ := newTestServer(t)
 

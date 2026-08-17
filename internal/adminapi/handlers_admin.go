@@ -232,7 +232,8 @@ func (s *Server) listAdmins(c *gin.Context) {
 	for _, a := range accounts {
 		out = append(out, s.toAdminView(a))
 	}
-	s.ok(c, out)
+	limit, offset := parsePage(c)
+	s.ok(c, pageEnvelope(out, limit, offset))
 }
 
 // createAdmin 新增管理员（设定初始密码与角色），默认状态 pending（待激活）。
@@ -399,7 +400,8 @@ func (s *Server) listRoles(c *gin.Context) {
 	for _, r := range roles {
 		out = append(out, s.toRoleView(r))
 	}
-	s.ok(c, out)
+	limit, offset := parsePage(c)
+	s.ok(c, pageEnvelope(out, limit, offset))
 }
 
 // createRole 新建自定义角色（初始无权限，需再调用 setRolePermissions 分配）。
@@ -467,6 +469,38 @@ func (s *Server) deleteRole(c *gin.Context) {
 		return
 	}
 	s.ok(c, gin.H{"deleted": true})
+}
+
+// updateRole 编辑角色名与描述（权限分配走 setRolePermissions，避免混用）。
+func (s *Server) updateRole(c *gin.Context) {
+	id, ok := parseInt64(c, "id")
+	if !ok {
+		s.fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Name == "" {
+		s.fail(c, http.StatusBadRequest, "name required")
+		return
+	}
+	r := &Role{ID: id, Name: req.Name, Description: req.Description}
+	if err := s.adminStore.UpdateRole(r); err != nil {
+		if err == ErrRoleExists {
+			s.fail(c, http.StatusConflict, "role name already exists")
+			return
+		}
+		if err == ErrAdminNotFound {
+			s.fail(c, http.StatusNotFound, "role not found")
+			return
+		}
+		s.fail(c, http.StatusInternalServerError, "update failed")
+		return
+	}
+	updated, _ := s.adminStore.GetRoleByID(id)
+	s.ok(c, s.toRoleView(updated))
 }
 
 // listPermissionDict 返回全部可授予的权限字典（供权限分配 UI）。
