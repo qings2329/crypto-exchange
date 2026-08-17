@@ -252,3 +252,28 @@
 
 ### 升级注意
 - 上线前须执行迁移 `9404`；旧 `DOUBLE` 行自动转 `VARCHAR(64)`（如 `1000`→`"1000"`），按 `asset` 列小数位解析为定点数，金额语义无损。全新部署无此问题。
+
+---
+
+## 2026-08-17 — 接入 risk 到提现强制路径
+
+- **状态**：`internal/risk` 的 `CheckWithdraw` 已接入真实提现受理路径（`futuresapi.handleWithdrawRequest` → `ledger.RequestWithdrawHold` 之前）。提交待推送（见下）。
+- **背景**：此前 risk 仅自闭环（`cmd/risk` HTTP 服务）。现进程内依赖 risk 库（与 `cmd/risk` 共享同一 MySQL 的 `ce_risk_*` 表），在冻结资金前先跑风控网关。
+
+### 行为变更（前端/调用方需知）
+- `POST /api/v1/futures/wallet/withdraw/request` 现在先经 `risk.CheckWithdraw`：
+  - 命中**用户/地址黑名单** → `403`（`user blacklisted` / `address blacklisted`）。
+  - 超过**单日限额**（`max_amount_per_day`，按资产）→ `403`（`exceeds withdraw limit`）。
+  - **KYC 等级不足**（规则 `min_kyc_level`）→ `403`（`kyc level too low`）。
+  - **负/零金额** → `400`（handler 输入校验）+ risk 双重保险。
+  - `reason` 透出在响应 `message` 字段，前端可直接展示。
+  - **user 服务不可达** → `503` fail-closed（资金安全优先，宁可阻断也不放过）。
+- 限额针对**提现本金**（`amount`），不含手续费（`fee`）。
+
+### 配置要求
+- 必须在 `config.Services["user"]` 配置 user 服务基址，否则 KYC 子项视为最高级、恒过（限额/黑名单仍生效）；生产必须配置以使 KYC 校验生效。
+- 与 ledger 既有内部风控（`evaluateWithdrawRiskLocked`：全局冻结/坏账/余额/每日限额/地址白名单）互补，互不冲突。
+
+### 备注
+- 仅接入提现路径；下单（`CheckOrder`）本轮未接入。
+- 既有 `req.UserID` 取自请求体、与 token 不一定一致属既有问题（潜在 IDOR），本轮不修；`/me` 返回调用方自身 kyc，正常自提场景等价。

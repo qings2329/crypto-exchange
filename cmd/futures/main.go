@@ -1,20 +1,23 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/gin-gonic/gin"
+	_ "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/futuresapi"
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
-	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+	"github.com/coldlar/crypto-exchange/internal/risk"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // cmd/futures 是合约交易服务的「装配层」，仅负责：
@@ -73,9 +76,35 @@ func main() {
 		seedDemo()
 	}
 
+	// 风控服务：与 cmd/risk 共享同一 MySQL 的 ce_risk_* 表（进程内依赖 risk 库），
+	// 接入提现强制路径前先校验黑名单/限额/KYC/负金额。MySQL 不可用时降级内存（仅演示）。
+	var riskSvc *risk.Service
+	if dsn != "" {
+		if db, derr := sql.Open("mysql", dsn); derr == nil {
+			if perr := db.Ping(); perr == nil {
+				if ms, merr := risk.NewMySQLStore(db); merr == nil {
+					riskSvc = risk.New(ms)
+					log.Info("risk store: mysql")
+				} else {
+					log.Warn("risk mysql migrate failed, fallback to mem", zap.Error(merr))
+					_ = db.Close()
+				}
+			} else {
+				log.Warn("risk mysql ping failed, fallback to mem", zap.Error(perr))
+				_ = db.Close()
+			}
+		} else {
+			log.Warn("risk sql.Open failed, fallback to mem", zap.Error(derr))
+		}
+	}
+	if riskSvc == nil {
+		riskSvc = risk.New(risk.NewMemStore())
+		log.Info("risk store: in-memory (no MySQL)")
+	}
+
 	// 装配合约交易服务（引擎/预言机/网关/资金费循环/账本风控），不含业务逻辑。
 	// matchingURL 指向 cmd/matching 服务，撮合收敛为单一权威（见 DEVELOPMENT_TASKS §18）。
-	server := futuresapi.NewServer(ledgerSvc, log, dsn, cfg.Matching.URL, cfg.Oracle, cfg.Settlement.ChainRPC)
+	server := futuresapi.NewServer(ledgerSvc, log, dsn, cfg.Matching.URL, cfg.Oracle, cfg.Settlement.ChainRPC, riskSvc, cfg.Services["user"])
 	defer server.Close()
 
 	// 进程退出前持久化账本状态到 MySQL（正常返回或 Ctrl+C/kill 触发），保证资金安全态不丢失。
