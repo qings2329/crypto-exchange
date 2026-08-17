@@ -61,6 +61,8 @@ type Server struct {
 	clientOIDMap map[string]int64    // "uid:client_oid" -> orderID（下单幂等，避免重试双冻）
 	settledRefs map[string]bool      // 成交去重键 -> 已结算（避免重放双付）
 
+	store Store // 订单持久化：重启后据此恢复 clientOIDMap（防重启+重试双冻）。nil 表示不持久化。
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -205,9 +207,18 @@ func (s *Server) handleOrder(c *gin.Context) {
 	}
 	s.openOrders[o.ID] = rec
 	if req.ClientOID != "" {
+		rec.clientOID = req.ClientOID // 透传到 freezeRec，落库与后续递减重 Upsert 时保留幂等键。
 		s.clientOIDMap[fmt.Sprintf("%d:%s", uid, req.ClientOID)] = o.ID
 	}
+	// 落库（锁外）：重启后据此恢复 clientOIDMap，使同 client_oid 重试仍被判重、不再双冻。
+	persistRec := freezeRecToRecord(o.ID, rec, req.ClientOID)
 	s.freezeMu.Unlock()
+
+	if s.store != nil {
+		if err := s.store.UpsertOrder(persistRec); err != nil {
+			s.log.Warn("spot upsert order failed", zap.Int64("order_id", o.ID), zap.Error(err))
+		}
+	}
 
 	response.JSON(c, gin.H{"order_id": o.ID, "status": "accepted"})
 }
@@ -287,6 +298,9 @@ func (s *Server) handleCancel(c *gin.Context) {
 		delete(s.openOrders, req.OrderID)
 		s.cleanupClientOIDLocked(req.OrderID)
 		s.freezeMu.Unlock()
+		if s.store != nil {
+			_ = s.store.DeleteOrder(req.OrderID) // 撤单终态：清理持久化记录，避免无界增长。
+		}
 	} else {
 		s.freezeMu.Unlock()
 		// 本地记录缺失（已成交清理/从未见）：向撮合引擎核验归属，避免越权撤他人订单。
@@ -329,10 +343,10 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 	ref := tradeRef(symbol, t)
 
 	s.freezeMu.Lock()
-	defer s.freezeMu.Unlock()
 
 	// F1 重放去重：已结算则跳过（临界区内检查+置位，保证仅结算一次）。
 	if s.settledRefs[ref] {
+		s.freezeMu.Unlock()
 		return nil
 	}
 
@@ -381,8 +395,39 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 		sellRec.frozenBase = sellRec.frozenBase.Sub(baseAmt)
 	}
 	s.settledRefs[ref] = true
+
+	// 收集持久化动作（临界区内读取，此时冻结额已递减），锁外执行 DB I/O 避免阻塞成交串行化。
+	type orderPersist struct {
+		orderID int64
+		rec     *freezeRec // 终态已清理则为 nil，需 Delete
+	}
+	persist := make([]orderPersist, 0, 2)
+	for _, oid := range []int64{t.TakerOID, t.MakerOID} {
+		if oid == 0 {
+			continue
+		}
+		if rec, ok := s.openOrders[oid]; ok {
+			persist = append(persist, orderPersist{orderID: oid, rec: rec})
+		} else {
+			persist = append(persist, orderPersist{orderID: oid, rec: nil})
+		}
+	}
 	s.maybeCleanupLocked(t.TakerOID)
 	s.maybeCleanupLocked(t.MakerOID)
+	s.freezeMu.Unlock()
+
+	// 锁外落库：剩余未完结则更新递减后的冻结额；终态已清理则删除记录，避免重启后误判。
+	if s.store != nil {
+		for _, p := range persist {
+			if p.rec != nil {
+				if err := s.store.UpsertOrder(freezeRecToRecord(p.orderID, p.rec, p.rec.clientOID)); err != nil {
+					s.log.Warn("spot upsert order after fill failed", zap.Int64("order_id", p.orderID), zap.Error(err))
+				}
+			} else {
+				_ = s.store.DeleteOrder(p.orderID)
+			}
+		}
+	}
 	return nil
 }
 
@@ -571,4 +616,10 @@ func (s *Server) handleReconcile(c *gin.Context) {
 // Close 停止行情订阅。
 func (s *Server) Close() {
 	s.cancel()
+}
+
+// SetStore 注入订单持久化实现（可选）。cmd/spot 配置了 MySQL DSN 时注入；
+// 不调用则为 nil（纯内存），重启间隙幂等映射清零，重启+重试双冻防护失效（仅演示）。
+func (s *Server) SetStore(store Store) {
+	s.store = store
 }
