@@ -95,9 +95,7 @@ func main() {
 	// 配置受信任代理后，c.ClientIP() 从 X-Forwarded-For 取真实客户端 IP；
 	// 留空则不信任任何代理，使用直连对端 IP（RemoteAddr）。这让审计 IP、全局限流
 	// 都能正确归因到真实来源（避免经网关/LB 转发时所有请求被误判为同一上游 IP）。
-	if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
-		log.Fatal("set trusted proxies", zap.Error(err))
-	}
+	middleware.ConfigureTrustedProxies(r, cfg, log)
 	r.Use(middleware.Common(log, cfg)...)
 	svc.RegisterRoutes(r, verifier)
 
