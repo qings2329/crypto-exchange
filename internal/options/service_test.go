@@ -111,10 +111,14 @@ func TestExerciseLongPayoff(t *testing.T) {
 		avail.Cmp(settlement.AssetAmountFromFloat(109001, settlement.AssetDecimalsByName("USDT"))) > 0 {
 		t.Fatalf("exercise payoff wrong: avail=%v want ~109000", avail)
 	}
-	// 净收益对账（F3-1）：long 净收益 = 内在价值 - 已付权利金 = 10000 - 1000 = 9000；
-	// 仅有多头、无空头对冲时，SysOptions 承担 CCP 损失 -(ITV-premium) = -9000（系统账户允许透支）。
-	if ins, _, _ := l.Balance(ledger.SysOptions, "USDT"); !eqAmt(ins, -9000, "USDT") {
-		t.Fatalf("SysOptions CCP net wrong: %v want -9000", ins)
+	// 净收益对账（F3-1 + F3-4 偿付能力护栏）：long 净收益 = 内在价值 - 已付权利金 = 10000 - 1000 = 9000，
+	// 用户足额收到。CCP（SysOptions）仅收过 1000 权利金、需付 10000，缺口 9000 在护栏下
+	// 不再击穿 CCP 为负，而是付尽 CCP（→0）后由穿仓损失账户（SysLiquidationLoss）垫付（本测试未注入保险基金）。
+	if ins, _, _ := l.Balance(ledger.SysOptions, "USDT"); !eqAmt(ins, 0, "USDT") {
+		t.Fatalf("SysOptions CCP should be drained to 0 (not negative): %v", ins)
+	}
+	if loss, _, _ := l.Balance(ledger.SysLiquidationLoss, "USDT"); !eqAmt(loss, -9000, "USDT") {
+		t.Fatalf("CCP deficit should be absorbed by liquidation-loss account: %v want -9000", loss)
 	}
 	got, _ := svc.GetPosition(p.ID)
 	if got.Status != StatusExercised {
@@ -382,5 +386,42 @@ func TestOpenPositionRejectsUnsupportedAsset(t *testing.T) {
 	}
 	if _, err := svc.OpenPosition(1, c.ID, SideLong, 1); err != ErrUnsupportedAsset {
 		t.Fatalf("expected ErrUnsupportedAsset, got %v", err)
+	}
+}
+
+// TestExerciseCCPSolvencyGuard F3-4：行权收益超过 CCP（SysOptions）现有余额时，
+// CCP 被付尽（不为负），缺口由保险基金（SysInsurance）垫付，用户仍足额收到。
+func TestExerciseCCPSolvencyGuard(t *testing.T) {
+	svc, l := newTestService()
+	// 保险基金注入 20000，足以覆盖缺口。
+	ins := settlement.AssetAmountFromFloat(20000, settlement.AssetDecimalsByName("USDT"))
+	if err := l.CreditAvailable(ledger.SysInsurance, "USDT", ins, "seed_ins", ""); err != nil {
+		t.Fatalf("seed insurance: %v", err)
+	}
+	const uid = int64(1)
+	c := mustContract(svc, 1000, time.Now().Add(time.Hour))
+	p, err := svc.OpenPosition(uid, c.ID, SideLong, 2)
+	if err != nil {
+		t.Fatalf("open long: %v", err)
+	}
+	// 开仓付权利金 2*1000=2000 入 CCP；CCP 余额=2000。
+	if ccp, _, _ := l.Balance(ledger.SysOptions, "USDT"); !eqAmt(ccp, 2000, "USDT") {
+		t.Fatalf("CCP before exercise %v want 2000", ccp)
+	}
+	// 美式期权随时可行权；BTC=50000、行权价 40000、数量 2 → 内在价值 payoff=20000。
+	if err := svc.Exercise(uid, p.ID); err != nil {
+		t.Fatalf("exercise: %v", err)
+	}
+	// 用户收到全额 20000（账户 = 100000 - 2000 权利金 + 20000 收益 = 118000）。
+	if avail, _, _ := l.Balance(uid, "USDT"); !eqAmt(avail, 118000, "USDT") {
+		t.Fatalf("user after exercise %v want 118000 (full payoff)", avail)
+	}
+	// CCP 被付尽，不为负（下限护栏 = 0）。
+	if ccp, _, _ := l.Balance(ledger.SysOptions, "USDT"); ccp.Sign() != 0 {
+		t.Fatalf("CCP after exercise %v want 0 (drained, not negative)", ccp)
+	}
+	// 缺口 20000-2000=18000 由保险基金承担：保险剩 20000-18000=2000。
+	if insAfter, _, _ := l.Balance(ledger.SysInsurance, "USDT"); !eqAmt(insAfter, 2000, "USDT") {
+		t.Fatalf("insurance after exercise %v want 2000 (backstop 18000)", insAfter)
 	}
 }

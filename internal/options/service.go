@@ -237,6 +237,58 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	return p, nil
 }
 
+// payoffFromCCP 从中性 CCP（SysOptions）向用户支付收益（行权/结算内在价值）。
+//
+// 偿付能力护栏（F3-4）：CCP 采用中性模型，理论上"收的权利金 ≈ 付的内在价值"，但在极端行情下
+// 内在价值可能超过 CCP 现有余额。为避免 CCP 被击穿为负（资不抵债），本方法：
+//  1) 若 CCP 现有余额足以覆盖，直接全额支付；
+//  2) 否则 CCP 付尽现有余额，缺口依次由保险基金（SysInsurance）、穿仓损失账户
+//     （SysLiquidationLoss，平台承担、后续社会化分摊）垫付，保证用户足额收到、
+//     且 CCP 余额不为负（下限护栏为 0）。
+// 全部步骤经账本 Batch 原子执行（任一子步失败整体回滚），并使用同一 ref 保证可重试幂等。
+func (s *Service) payoffFromCCP(userID int64, asset string, amount settlement.AssetAmount, ref string) error {
+	if amount.Sign() <= 0 {
+		return nil
+	}
+	ccpBal, _, _ := s.ledger.Balance(ledger.SysOptions, asset)
+	if ccpBal.Cmp(amount) >= 0 {
+		return s.ledger.Transfer(ledger.SysOptions, userID, asset, amount, "option_payoff", ref)
+	}
+	// 缺口：CCP 付尽现有余额，保险基金补缺口，仍不足则记穿仓损失。
+	shortfall := amount.Sub(ccpBal)
+	insBal, _, _ := s.ledger.Balance(ledger.SysInsurance, asset)
+	var fromIns settlement.AssetAmount
+	if insBal.Cmp(shortfall) >= 0 {
+		fromIns = shortfall
+		shortfall = settlement.AssetAmount{Decimals: shortfall.Decimals}
+	} else {
+		fromIns = insBal
+		shortfall = shortfall.Sub(insBal)
+	}
+	ops := []ledger.Op{}
+	if ccpBal.Sign() > 0 {
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: ledger.SysOptions, To: userID, Asset: asset, Amount: ccpBal, Biz: "option_payoff", Ref: ref})
+	}
+	if fromIns.Sign() > 0 {
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: ledger.SysInsurance, To: userID, Asset: asset, Amount: fromIns, Biz: "option_insurance_backstop", Ref: ref})
+	}
+	if shortfall.Sign() > 0 {
+		// 保险仍不足以覆盖：缺口记为平台穿仓损失，用户仍足额收到（后续社会化分摊消化）。
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: ledger.SysLiquidationLoss, To: userID, Asset: asset, Amount: shortfall, Biz: "option_ccp_insolvency", Ref: ref})
+	}
+	if err := s.ledger.Batch(ops); err != nil {
+		return err
+	}
+	if s.log != nil {
+		s.log.Warn("options CCP payoff backstopped by insurance/loss",
+			zap.Int64("user_id", userID), zap.String("asset", asset),
+			zap.String("ccp_paid", ccpBal.HumanString()),
+			zap.String("insurance_paid", fromIns.HumanString()),
+			zap.String("loss_paid", shortfall.HumanString()))
+	}
+	return nil
+}
+
 // Exercise 由买方（long）主动行权（american 随时；european 需到期）。系统对手方支付内在价值收益。
 //
 // 幂等设计：先落终态（StatusExercised）再动账本资金；Transfer 失败则回滚状态，
@@ -284,7 +336,7 @@ func (s *Service) Exercise(userID, positionID int64) error {
 	}
 	if payoff.Sign() > 0 {
 		ref := fmt.Sprintf("option_exercise uid=%d pos=%d", userID, positionID)
-		if err := s.ledger.Transfer(ledger.SysOptions, userID, c.QuoteAsset, payoff, "option_payoff", ref); err != nil {
+		if err := s.payoffFromCCP(userID, c.QuoteAsset, payoff, ref); err != nil {
 			// 回滚：恢复 open 状态，等待重试/对账。
 			p.Status = StatusOpen
 			p.UpdatedAt = time.Now()
@@ -338,7 +390,7 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 		payoff := itvAmt
 		if payoff.Sign() > 0 {
 			ref := fmt.Sprintf("option_settle_long pos=%d", positionID)
-			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, quote, payoff, "option_payoff", ref); err != nil {
+			if err := s.payoffFromCCP(p.UserID, quote, payoff, ref); err != nil {
 				// 回滚：恢复 open 状态，等待重试/对账。
 				p.Status = StatusOpen
 				p.UpdatedAt = time.Now()
