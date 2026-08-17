@@ -8,3 +8,20 @@ vendor/
 
 # 运行时上传产物目录（otc 付款凭证等）
 internal/otc/uploads/
+
+# 编译产物（各 cmd 构建出的可执行文件，勿提交）
+/futures
+/spot
+/options
+/margin
+/wealth
+/otc
+/admin
+/gateway
+/market
+/matching
+/notification
+/risk
+/settlement
+/user
+/hsm-signing-service

@@ -295,6 +295,32 @@ func (s *mysqlAdminStore) DeleteRole(id int64) error {
 	return tx.Commit()
 }
 
+// UpdateRole 按 ID 更新角色名与描述；改名时若与其它角色重名返回 ErrRoleExists。
+func (s *mysqlAdminStore) UpdateRole(r *Role) error {
+	if _, err := s.GetRoleByID(r.ID); err != nil {
+		return err
+	}
+	if r.Name != "" {
+		if other, err := s.GetRoleByName(r.Name); err == nil && other.ID != r.ID {
+			return ErrRoleExists
+		}
+	}
+	now := time.Now()
+	res, err := s.db.Exec(
+		`UPDATE ce_admin_roles SET name = ?, description = ?, updated_at = ? WHERE id = ?`,
+		r.Name, r.Description, now, r.ID)
+	if err != nil {
+		if isDuplicate(err) {
+			return ErrRoleExists
+		}
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrAdminNotFound
+	}
+	return nil
+}
+
 func (s *mysqlAdminStore) SetRolePermissions(roleID int64, perms []string) error {
 	tx, err := s.db.Begin()
 	if err != nil {

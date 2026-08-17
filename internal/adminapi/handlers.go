@@ -184,6 +184,7 @@ type userListResp struct {
 // 不返回伪造示例用户，发现 4 对称项），并经 X-Degraded 响应头告知前端上游不可用。
 func (s *Server) listUsers(c *gin.Context) {
 	ctx := c.Request.Context()
+	limit, offset := parsePage(c)
 	if base := s.serviceURL("user"); base != "" {
 		var resp userListResp
 		if err := s.up.Get(ctx, base, "/api/v1/user/admin/list", &resp); err == nil {
@@ -200,14 +201,14 @@ func (s *Server) listUsers(c *gin.Context) {
 				s.enrichBalance(ctx, &au) // 接 futures 钱包余额（§25 后续：消除恒为 0）
 				out = append(out, au)
 			}
-			s.ok(c, out)
+			s.ok(c, pageEnvelope(out, limit, offset))
 			return
 		}
 	}
 	// 上游不可达：返回空列表（与正常路径同构，data 始终为数组），不返回伪造的示例用户
 	// （发现 4 对称项）；经 X-Degraded 响应头告知前端上游不可用，便于展示「数据暂不可用」横幅。
 	c.Header("X-Degraded", "user-unavailable")
-	s.ok(c, []AdminUser{})
+	s.ok(c, pageEnvelope([]AdminUser{}, limit, offset))
 }
 
 // enrichBalance 从 futures 钱包服务拉取该用户的 USDT 可用余额填入 AdminUser.Balance 展示字段
@@ -373,7 +374,8 @@ func (s *Server) listSymbols(c *gin.Context) {
 		s.fail(c, http.StatusInternalServerError, "list symbols failed: "+err.Error())
 		return
 	}
-	s.ok(c, syms)
+	limit, offset := parsePage(c)
+	s.ok(c, pageEnvelope(syms, limit, offset))
 }
 
 func (s *Server) upsertSymbol(c *gin.Context) {
@@ -397,7 +399,8 @@ func (s *Server) listChains(c *gin.Context) {
 		s.fail(c, http.StatusInternalServerError, "list chains failed: "+err.Error())
 		return
 	}
-	s.ok(c, chs)
+	limit, offset := parsePage(c)
+	s.ok(c, pageEnvelope(chs, limit, offset))
 }
 
 func (s *Server) createChain(c *gin.Context) {
@@ -444,7 +447,8 @@ func (s *Server) listCoins(c *gin.Context) {
 		s.fail(c, http.StatusInternalServerError, "list coins failed: "+err.Error())
 		return
 	}
-	s.ok(c, coins)
+	limit, offset := parsePage(c)
+	s.ok(c, pageEnvelope(coins, limit, offset))
 }
 
 func (s *Server) createCoin(c *gin.Context) {
@@ -503,30 +507,41 @@ type futuresDeposits struct {
 
 func (s *Server) listDeposits(c *gin.Context) {
 	ctx := c.Request.Context()
+	limit, offset := parsePage(c)
+	userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
+	coin := c.Query("coin")
+	status := c.Query("status")
+
 	if base := s.serviceURL("futures"); base != "" {
 		var resp futuresDeposits
 		if err := s.up.Get(ctx, base, "/api/v1/futures/wallet/deposits", &resp); err == nil {
 			out := make([]Deposit, 0, len(resp.Deposits))
 			for _, d := range resp.Deposits {
-				out = append(out, Deposit{
-				ID:     d.TxHash, // 真实链上标识直接作锚点，不再经 stableID 哈希
-				UserID: d.UserID,
+				dep := Deposit{
+					ID:     d.TxHash, // 真实链上标识直接作锚点，不再经 stableID 哈希
+					UserID: d.UserID,
 					Coin:   d.Asset,
 					Chain:  d.Chain,
 					Amount: d.Amount,
 					TxHash: d.TxHash,
 					Status: d.Status,
 					Time:   time.Unix(d.CreatedAt, 0),
-				})
+				}
+				if (userID == 0 || dep.UserID == userID) &&
+					(coin == "" || dep.Coin == coin) &&
+					(status == "" || dep.Status == status) {
+					out = append(out, dep)
+				}
 			}
-			s.ok(c, out)
+			page, total := paginate(out, limit, offset)
+			s.ok(c, gin.H{"deposits": page, "total": total})
 			return
 		}
 	}
 	// 上游不可达：返回空列表（与正常路径同构，data 始终为数组），不返回伪造记录（发现 4），
 	// 避免误导运营资金决策；经 X-Degraded 响应头告知前端上游不可用。
 	c.Header("X-Degraded", "futures-unavailable")
-	s.ok(c, []Deposit{})
+	s.ok(c, gin.H{"deposits": []Deposit{}, "total": 0})
 }
 
 // futuresHolds 是 futures 提现冷静期 hold 队列的返回结构（含真实 hold_id，审核的真正锚点）。
@@ -548,6 +563,11 @@ type futuresHolds struct {
 
 func (s *Server) listWithdrawals(c *gin.Context) {
 	ctx := c.Request.Context()
+	limit, offset := parsePage(c)
+	userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
+	coin := c.Query("coin")
+	status := c.Query("status")
+
 	if base := s.serviceURL("futures"); base != "" {
 		var resp futuresHolds
 		if err := s.up.Get(ctx, base, "/api/v1/futures/wallet/withdraw/holds", &resp); err == nil {
@@ -555,14 +575,14 @@ func (s *Server) listWithdrawals(c *gin.Context) {
 			out := make([]Withdrawal, 0, len(resp.Holds))
 			for _, h := range resp.Holds {
 				id := h.ID // 真实 hold_id（字符串），直接作审批锚点，不再经 stableID 哈希/服务端 map 反查
-				status := "pending"
+				st := "pending"
 				if h.Finalized {
-					status = "approved"
+					st = "approved"
 				} else if h.Cancelled {
-					status = "rejected"
+					st = "rejected"
 				}
 				if ov, ok := s.store.wdApprovals[id]; ok {
-					status = ov // 叠加本会话内的审批结果回显
+					st = ov // 叠加本会话内的审批结果回显
 				}
 				rec := Withdrawal{
 					ID:      id,
@@ -572,21 +592,26 @@ func (s *Server) listWithdrawals(c *gin.Context) {
 					Amount:  h.Amount,
 					Address: h.Address,
 					TxHash:  h.ID,
-					Status:  status,
+					Status:  st,
 					Time:    h.CreatedAt,
 				}
 				s.store.wdByID[id] = rec
-				out = append(out, rec)
+				if (userID == 0 || rec.UserID == userID) &&
+					(coin == "" || rec.Coin == coin) &&
+					(status == "" || rec.Status == status) {
+					out = append(out, rec)
+				}
 			}
 			s.store.mu.Unlock()
-			s.ok(c, out)
+			page, total := paginate(out, limit, offset)
+			s.ok(c, gin.H{"withdrawals": page, "total": total})
 			return
 		}
 	}
 	// 上游不可达：返回空列表（与正常路径同构，data 始终为数组），不返回伪造记录（发现 4），
 	// 避免误导运营资金决策；经 X-Degraded 响应头告知前端上游不可用。
 	c.Header("X-Degraded", "futures-unavailable")
-	s.ok(c, []Withdrawal{})
+	s.ok(c, gin.H{"withdrawals": []Withdrawal{}, "total": 0})
 }
 
 // approveWithdrawal 管理员审批通过一笔提现：反查 futures hold_id 后真正调用 futures 审批
@@ -668,7 +693,8 @@ func (s *Server) listNotifications(c *gin.Context) {
 		return
 	}
 	out = append(out, local...)
-	s.ok(c, out)
+	limit, offset := parsePage(c)
+	s.ok(c, pageEnvelope(out, limit, offset))
 }
 
 func (s *Server) createNotification(c *gin.Context) {
@@ -835,8 +861,44 @@ func (s *Server) handleLedger(c *gin.Context) {
 		Reconciled:    rec.Balanced,
 		Discrepancy:   disc,
 	}
+
+	// 接入结算服务实时清算聚合：/stats 与 /cleared（若已配置 settlement 上游）。
+	if base := s.serviceURL("settlement"); base != "" {
+		var st struct {
+			TotalTrades     int64              `json:"total_trades"`
+			TotalVolume     float64            `json:"total_volume"`
+			TotalCommission float64            `json:"total_commission"`
+			BySymbol        map[string]float64 `json:"by_symbol"`
+		}
+		if err := s.up.Get(ctx, base, "/api/v1/settlement/stats", &st); err != nil {
+			sum.Settlement.Notes = "settlement stats: " + err.Error()
+		} else {
+			sum.Settlement.Enabled = true
+			sum.Settlement.TotalTrades = st.TotalTrades
+			sum.Settlement.TotalVolume = st.TotalVolume
+			sum.Settlement.TotalCommission = st.TotalCommission
+			sum.Settlement.BySymbol = st.BySymbol
+		}
+		var cl struct {
+			Trades []ClearedTradeView `json:"trades"`
+		}
+		if err := s.up.Get(ctx, base, "/api/v1/settlement/cleared?limit=10", &cl); err != nil {
+			if sum.Settlement.Notes == "" {
+				sum.Settlement.Notes = "settlement cleared: " + err.Error()
+			}
+		} else {
+			sum.Settlement.Recent = cl.Trades
+		}
+	} else {
+		sum.Settlement.Notes = "settlement service url not configured"
+	}
+
 	if len(errs) > 0 {
-		sum.Notes = strings.Join(errs, "; ")
+		if sum.Settlement.Notes != "" {
+			sum.Notes = strings.Join(errs, "; ") + "; " + sum.Settlement.Notes
+		} else {
+			sum.Notes = strings.Join(errs, "; ")
+		}
 	}
 	s.ok(c, sum)
 }

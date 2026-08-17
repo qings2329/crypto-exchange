@@ -44,13 +44,48 @@ func (h *Handler) listActive(c *gin.Context) {
 	response.JSON(c, gin.H{"announcements": list})
 }
 
+// RegisterAdminRoutes 在已鉴权分组（Auth+AdminGuard 由调用方套好）下注册公告管理接口，
+// 复用同一套 handler 与错误映射。用于独立管理后端（cmd/admin）接入公告管理：
+// 当 g 为 /api/admin 分组时，路径为 /api/admin/announcements
+// （GET 列表 / POST 新建 / PUT :id 更新 / DELETE :id 删除）。
+func (h *Handler) RegisterAdminRoutes(g *gin.RouterGroup) {
+	g.GET("/announcements", h.adminList)
+	g.POST("/announcements", h.adminCreate)
+	g.PUT("/announcements/:id", h.adminUpdate)
+	g.DELETE("/announcements/:id", h.adminDelete)
+}
+
 func (h *Handler) adminList(c *gin.Context) {
 	list, err := h.svc.ListAll()
 	if err != nil {
 		fail(c, err)
 		return
 	}
-	response.JSON(c, gin.H{"announcements": list})
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	total := len(list)
+	page := list
+	if total > 0 {
+		if offset >= total {
+			page = list[:0]
+		} else {
+			end := offset + limit
+			if end > total {
+				end = total
+			}
+			page = list[offset:end]
+		}
+	}
+	response.JSON(c, gin.H{"announcements": page, "total": total})
 }
 
 func (h *Handler) adminCreate(c *gin.Context) {

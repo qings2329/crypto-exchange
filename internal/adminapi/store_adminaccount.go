@@ -65,6 +65,7 @@ type AdminStore interface {
 	GetRoleByName(name string) (*Role, error)
 	GetRoleByID(id int64) (*Role, error)
 	ListRoles() ([]*Role, error)
+	UpdateRole(r *Role) error // 按 ID 更新 name/description
 	DeleteRole(id int64) error
 
 	// 角色权限
@@ -221,6 +222,27 @@ func (s *memAdminStore) ListRoles() ([]*Role, error) {
 		out = append(out, &cp)
 	}
 	return out, nil
+}
+
+// UpdateRole 按 ID 更新角色名与描述；改名时需保证不与其它角色重名。
+func (s *memAdminStore) UpdateRole(r *Role) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.roles[r.ID]
+	if !ok {
+		return ErrAdminNotFound
+	}
+	if r.Name != cur.Name {
+		if _, dup := s.roleByName[r.Name]; dup {
+			return ErrRoleExists
+		}
+		delete(s.roleByName, cur.Name)
+		s.roleByName[r.Name] = cur.ID
+		cur.Name = r.Name
+	}
+	cur.Description = r.Description
+	cur.UpdatedAt = time.Now()
+	return nil
 }
 
 func (s *memAdminStore) DeleteRole(id int64) error {

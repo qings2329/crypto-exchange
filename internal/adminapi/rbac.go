@@ -51,6 +51,9 @@ const (
 	// 管理员与权限管理（高危）
 	PermAdminManage = "admin:manage" // 新增/激活/禁用/重置管理员
 	PermRoleManage  = "role:manage"  // 角色与权限分配
+
+	// 审计日志
+	PermAuditRead = "audit:read" // 查看管理员操作审计日志
 )
 
 // PermissionDef 是权限字典中的一条展示元数据。
@@ -89,6 +92,8 @@ var allPermissionDefs = []PermissionDef{
 
 	{Key: PermAdminManage, Name: "管理员管理", Group: "系统"},
 	{Key: PermRoleManage, Name: "角色与权限管理", Group: "系统"},
+
+	{Key: PermAuditRead, Name: "查看审计日志", Group: "审计"},
 }
 
 // AllPermissions 返回全部权限字典（按 key 排序，便于前端稳定展示）。

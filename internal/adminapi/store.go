@@ -112,15 +112,40 @@ type RiskSnapshot struct {
 	Notes string `json:"notes,omitempty"`
 }
 
-// LedgerSummary 是账本对账快照（实时取自 futures 服务的复式记账对账探针）。
+// LedgerSummary 是账本对账快照（实时取自 futures 服务的复式记账对账探针 + settlement 清算聚合）。
 type LedgerSummary struct {
-	UpdatedAt     time.Time `json:"updated_at"`
-	TotalAssets   float64   `json:"total_assets"`
-	SettlementBal float64   `json:"settlement_balance"`
-	Reconciled    bool      `json:"reconciled"`
-	Discrepancy   float64   `json:"discrepancy"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	TotalAssets   float64           `json:"total_assets"`
+	SettlementBal float64           `json:"settlement_balance"`
+	Reconciled    bool              `json:"reconciled"`
+	Discrepancy   float64           `json:"discrepancy"`
+	Settlement    SettlementSummary `json:"settlement"`
 	// Notes 记录部分上游拉取失败的信息（降级时填充）。
 	Notes string `json:"notes,omitempty"`
+}
+
+// SettlementSummary 是结算服务的清算聚合快照（实时取自 settlement 服务的 /stats 与 /cleared）。
+type SettlementSummary struct {
+	Enabled        bool               `json:"enabled"`
+	TotalTrades    int64              `json:"total_trades"`
+	TotalVolume    float64            `json:"total_volume"`
+	TotalCommission float64           `json:"total_commission"`
+	BySymbol       map[string]float64 `json:"by_symbol"`
+	Recent         []ClearedTradeView `json:"recent"`
+	Notes          string             `json:"notes,omitempty"`
+}
+
+// ClearedTradeView 是最近清算成交的精简视图（供运营看板展示）。
+type ClearedTradeView struct {
+	ID        int64   `json:"id"` // 与 settlement 服务一致，为 FNV64 整型幂等键。
+	Symbol    string  `json:"symbol"`
+	Price     float64 `json:"price"`
+	Qty       float64 `json:"qty"`
+	TakerID   int64   `json:"taker_id"`
+	MakerID   int64   `json:"maker_id"`
+	TakerSide string  `json:"taker_side"`
+	Fee       float64 `json:"fee"`
+	Ts        int64   `json:"ts"`
 }
 
 // ServiceHealth 是单个微服务的健康状态（运营看板用）。
