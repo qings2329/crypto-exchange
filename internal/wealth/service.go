@@ -248,25 +248,22 @@ func (s *Service) Redeem(userID, holdingID int64) (*WealthHolding, error) {
 	}
 	// F3-1 拆分记账：本金经 SysWealth 支出，应计收益经 SysWealthYieldPayable 支出，
 	// 不再由 SysWealth 静默透支偿付收益（原实现本金收益混为一笔，赎回会凭空兑付收益、虚高 SysWealth）。
+	// F3 原子：两笔转账整体经 ledger.Batch 执行，任一失败整组回滚，避免"本金已付、收益未付"的半成品
+	// （原实现靠回退转账，非原子且回退本身可能失败）。
+	var ops []ledger.Op
 	if principal.Sign() > 0 {
-		if err := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, principal, "wealth_redeem_principal", ref); err != nil {
-			// 回滚：恢复持有中状态（避免双付）。
-			h.Status = HoldingActive
-			h.RedeemedAt = time.Time{}
-			_ = s.store.UpdateHolding(h)
-			return nil, fmt.Errorf("redeem principal: %w", err)
-		}
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: ledger.SysWealth, To: userID, Asset: p.Asset, Amount: principal, Biz: "wealth_redeem_principal", Ref: ref})
 	}
 	if yield.Sign() > 0 {
-		if err := s.ledger.Transfer(ledger.SysWealthYieldPayable, userID, p.Asset, yield, "wealth_redeem_yield", ref); err != nil {
-			// 收益划转失败：回退本金与终态，保证不重复/不漏付。
-			if principal.Sign() > 0 {
-				_ = s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, principal, "wealth_redeem_principal_rollback", ref)
-			}
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: ledger.SysWealthYieldPayable, To: userID, Asset: p.Asset, Amount: yield, Biz: "wealth_redeem_yield", Ref: ref})
+	}
+	if len(ops) > 0 {
+		if err := s.ledger.Batch(ops); err != nil {
+			// 账本已由 Batch 整组回滚（无需再转账回退）；恢复持有中状态，避免双付。
 			h.Status = HoldingActive
 			h.RedeemedAt = time.Time{}
 			_ = s.store.UpdateHolding(h)
-			return nil, fmt.Errorf("redeem yield: %w", err)
+			return nil, fmt.Errorf("redeem: %w", err)
 		}
 	}
 	return h, nil
