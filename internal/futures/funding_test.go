@@ -1,9 +1,53 @@
 package futures
 
 import (
+	"math"
 	"testing"
 	"time"
 )
+
+// 演示：同一结算周期内重复调用 Settle 必须幂等，不得二次扣收资金费（F1）。
+func TestFundingIdempotent(t *testing.T) {
+	sym := "BTC_USDT_PERP"
+	fm := NewFundingManager(time.Hour) // 大周期，两次调用落在同一周期
+	fm.Register(sym)
+	fm.UpdateIndexPrice(sym, 50000)
+
+	long := Position{UserID: 1, Symbol: sym, Side: Long, Size: 1, EntryPrice: 50000, Margin: 5000, Leverage: 10}
+	short := Position{UserID: 2, Symbol: sym, Side: Short, Size: 1, EntryPrice: 50000, Margin: 5000, Leverage: 10}
+	positions := []Position{long, short}
+
+	ev1 := fm.Settle(sym, 50000, 0.001, positions)
+	if len(ev1.Payments) == 0 {
+		t.Fatal("首次结算应产生资金费支付")
+	}
+	ev2 := fm.Settle(sym, 50000, 0.001, positions)
+	if len(ev2.Payments) != 0 {
+		t.Fatalf("同周期二次结算必须幂等（不重复扣费），实际产生 %d 笔", len(ev2.Payments))
+	}
+}
+
+// 演示：异常行情（NaN/Inf）不得产生资金费支付，避免费率污染（F5）。
+func TestFundingRejectsInvalidMark(t *testing.T) {
+	sym := "BTC_USDT_PERP"
+	fm := NewFundingManager(time.Hour)
+	fm.Register(sym)
+	fm.UpdateIndexPrice(sym, 50000)
+
+	long := Position{UserID: 1, Symbol: sym, Side: Long, Size: 1, EntryPrice: 50000, Margin: 5000, Leverage: 10}
+	positions := []Position{long}
+
+	if ev := fm.Settle(sym, math.NaN(), 0.001, positions); len(ev.Payments) != 0 {
+		t.Fatalf("NaN 标记价不应产生支付，实际 %d 笔", len(ev.Payments))
+	}
+	if ev := fm.Settle(sym, math.Inf(1), 0.001, positions); len(ev.Payments) != 0 {
+		t.Fatalf("Inf 标记价不应产生支付，实际 %d 笔", len(ev.Payments))
+	}
+	// 正常价仍应结算
+	if ev := fm.Settle(sym, 50000, 0.001, positions); len(ev.Payments) == 0 {
+		t.Fatal("正常标记价应产生支付")
+	}
+}
 
 func TestPremiumIndex(t *testing.T) {
 	// 标记价高于指数价 -> 正溢价

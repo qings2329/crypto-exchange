@@ -1,6 +1,7 @@
 package futures
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -276,6 +277,10 @@ func (l *Liquidator) AllPositions(symbol string) []Position {
 // UpdateMarkPrice 更新标记价格并对该交易对所有持仓做强平扫描。
 // 返回本次触发的强平事件。
 func (l *Liquidator) UpdateMarkPrice(symbol string, mark float64) []LiquidationEvent {
+	// F5：异常标记价（NaN/Inf/≤0）直接拒绝，避免据其算出 NaN 盈亏/穿仓并静默落账为 0。
+	if !validMark(mark) {
+		return nil
+	}
 	l.mu.RLock()
 	book, ok := l.books[symbol]
 	l.mu.RUnlock()
@@ -352,8 +357,9 @@ func (l *Liquidator) liquidate(book *PositionBook, p *Position, mark float64) *L
 		// 把强平单送入撮合引擎成交（closer 注入后走真实撮合），据真实成交均价回填持仓。
 		target := cur.Size * l.partialRatio
 		fill := l.closer(p.Symbol, p.UserID, p.Side, target, mark)
-		if fill.Filled <= 1e-9 {
-			// 撮合引擎无法成交（兜底异常）：保守视为已清仓，避免死循环。
+		// F5：无成交或成交均价异常（NaN/Inf/≤0）视为兜底异常，保守清仓退出，
+		// 既避免据 NaN 均价算出静默归零的盈亏，也防止 size 不降导致死循环。
+		if fill.Filled <= 1e-9 || !validMark(fill.AvgPrice) {
 			fullyClosed = true
 			break
 		}
@@ -450,7 +456,8 @@ func (l *Liquidator) liquidateCross(cb *crossBook, a *CrossAccount, mark float64
 		if cur.Long != nil && cur.Long.Size > 1e-9 {
 			target := cur.Long.Size * l.partialRatio
 			fill := l.closer(a.Symbol, a.UserID, Long, target, mark)
-			if fill.Filled > 1e-9 {
+			// F5：成交均价异常则跳过该腿本次平仓（size 不变，下次扫描重试），避免 NaN 落账。
+			if fill.Filled > 1e-9 && validMark(fill.AvgPrice) {
 				r, d, fc := cur.Long.closeBy(fill.AvgPrice, fill.Filled)
 				totalRealized += r
 				totalClosed += fill.Filled
@@ -464,7 +471,8 @@ func (l *Liquidator) liquidateCross(cb *crossBook, a *CrossAccount, mark float64
 		if cur.Short != nil && cur.Short.Size > 1e-9 {
 			target := cur.Short.Size * l.partialRatio
 			fill := l.closer(a.Symbol, a.UserID, Short, target, mark)
-			if fill.Filled > 1e-9 {
+			// F5：成交均价异常则跳过该腿本次平仓，避免 NaN 落账。
+			if fill.Filled > 1e-9 && validMark(fill.AvgPrice) {
 				r, d, fc := cur.Short.closeBy(fill.AvgPrice, fill.Filled)
 				totalRealized += r
 				totalClosed += fill.Filled
@@ -540,6 +548,34 @@ func opposite(s PosSide) PosSide {
 	return Long
 }
 
+// usdtSatoshi 是 USDT 最小精度单位（8 位小数）。futures 引擎内部以 float64 做金额计算，
+// 但最终经 futuresapi 边界以 AssetAmountFromFloat（向零截断）落账。为避免穿仓瀑布各分层
+// （保险/ADL/社会化/残差）在边界各自截断产生亚聪偏差，引擎在金额落账前先按本精度四舍五入，
+// 保证「保险 + ADL + 社会化 + 残差 == 穿仓」在账本上精确成立（F2）。
+const usdtSatoshi = 1e-8
+
+// roundSatoshi 将金额四舍五入到 USDT 最小精度（8 位小数），返回仍是 float64 但为 1e-8 的整数倍，
+// 使边界 AssetAmountFromFloat 能精确还原、不再引入截断残差。
+func roundSatoshi(x float64) float64 {
+	return math.Round(x/usdtSatoshi) * usdtSatoshi
+}
+
+// validFinite 判断金额/价格是否为有限实数（非 NaN/Inf）。行情或预言机若喂入异常值，
+// 经引擎计算后落账会变成 NaN→AssetAmountFromFloat 静默截断为 0，造成资金丢失（F5）。
+func validFinite(x float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0)
+}
+
+// validMark 判断标记价是否可用于强平扫描：必须为正有限实数。
+func validMark(mark float64) bool {
+	return validFinite(mark) && mark > 0
+}
+
+// validMoney 判断金额是否合法：有限且非负。用于穿仓亏损、资金费支付等落账前校验（F5）。
+func validMoney(x float64) bool {
+	return validFinite(x) && x >= 0
+}
+
 // adlTarget ADL 候选减仓目标（对手方向盈利仓位）。
 type adlTarget struct {
 	userID int64
@@ -587,20 +623,28 @@ func (l *Liquidator) adlCandidates(symbol string, against PosSide, mark float64)
 // 把减仓实现的盈利转入保险基金以吸收穿仓亏损，直到覆盖 deficit 或候选盈利耗尽。
 // 返回实际吸收的亏损额（<= deficit）。被减仓者按缺口需要部分减仓，而非整腿。
 func (l *Liquidator) runADL(symbol string, against PosSide, deficit float64) (covered float64) {
-	cands := l.adlCandidates(symbol, against, getLastMark(symbol))
-	remaining := deficit
 	mark := getLastMark(symbol)
+	if !validMark(mark) {
+		return 0 // F5：无有效标记价时不做 ADL 减仓，避免以 0/异常价静默实现盈亏
+	}
+	cands := l.adlCandidates(symbol, against, mark)
+	remaining := deficit
 	for _, c := range cands {
 		if remaining <= 1e-9 {
 			break
 		}
-		if c.upnl <= 0 {
-			continue // 仅盈利仓位可吸收穿仓
+		if c.upnl <= 0 || !validFinite(c.upnl) {
+			continue // 仅盈利仓位可吸收穿仓；跳过异常值（F5）
 		}
 		// 仅减仓到刚好覆盖剩余缺口所需的盈利比例（不超过整腿）。
 		take := remaining
 		if c.upnl < take {
 			take = c.upnl
+		}
+		// F2：吸附到穿仓金额的精度，保证落账精确、与剩余缺口对账一致。
+		take = roundSatoshi(take)
+		if take > remaining {
+			take = remaining
 		}
 		ratio := take / c.upnl
 		reduceSize := c.pos.Size * ratio
@@ -670,15 +714,24 @@ func (l *Liquidator) runADL(symbol string, against PosSide, deficit float64) (co
 // 保险基金净变化 = -deficit + adlCovered + socialized；残差 = deficit - 保险可付 - 已回填，
 // 即保险基金最终承载的未覆盖系统损失（可为负）。
 func (l *Liquidator) absorbDeficit(symbol string, against PosSide, deficit float64, ev *LiquidationEvent) {
+	// F5：穿仓亏损非法（NaN/Inf/负数）直接不处理，避免向账本回调传入异常值。
+	if !validMoney(deficit) {
+		return
+	}
+	// F2：落账前将穿仓金额四舍五入到 USDT 最小精度，保证后续分层之和精确等于本值。
+	deficitR := roundSatoshi(deficit)
+	if deficitR <= 0 {
+		return
+	}
 	insAvail := l.insurance()
-	insCovered := deficit
-	if insAvail < insCovered {
-		insCovered = insAvail
+	insCovered := deficitR
+	if insAvailR := roundSatoshi(insAvail); insAvailR < insCovered {
+		insCovered = insAvailR
 	}
 	if insCovered < 0 {
 		insCovered = 0
 	}
-	remaining := deficit - insCovered
+	remaining := deficitR - insCovered
 
 	adlCovered := 0.0
 	if remaining > 1e-9 {
@@ -699,11 +752,13 @@ func (l *Liquidator) absorbDeficit(symbol string, against PosSide, deficit float
 	}
 
 	// 保险基金支付全部穿仓亏损（不足部分由 ADL/社会化回填，净残差即系统损失）。
-	l.onDeficitPay(deficit)
+	// 传入四舍五入后的 deficitR，使账本 SysInsurance 净变动精确等于 -residual。
+	l.onDeficitPay(deficitR)
 	if len(shares) > 0 {
 		l.onSocialize(shares)
 	}
 
+	ev.Deficit = deficitR
 	ev.InsuranceCovered = insCovered
 	ev.ADLCovered = adlCovered
 	ev.Socialized = socialized
@@ -747,12 +802,15 @@ func (l *Liquidator) socializeCandidates(symbol string, mark float64) []adlTarge
 // 返回实际吸收额与分摊事件列表。
 func (l *Liquidator) runSocializedLoss(symbol string, deficit float64) (float64, []SocializedLossEvent) {
 	mark := getLastMark(symbol)
+	if !validMark(mark) {
+		return 0, nil // F5：无有效标记价时不分摊，避免以 0/异常价静默实现盈亏
+	}
 	cands := l.socializeCandidates(symbol, mark)
 	var totalProfit float64
 	for _, c := range cands {
 		totalProfit += c.upnl
 	}
-	if totalProfit <= 1e-9 {
+	if totalProfit <= 1e-9 || !validFinite(totalProfit) {
 		return 0, nil
 	}
 	remaining := deficit
@@ -761,11 +819,19 @@ func (l *Liquidator) runSocializedLoss(symbol string, deficit float64) (float64,
 		if remaining <= 1e-9 {
 			break
 		}
+		if !validFinite(c.upnl) || c.upnl <= 0 {
+			continue // F5：跳过异常盈利值
+		}
 		// 该户按盈利占比分摊（不超过自身盈利、不超过剩余缺口）
 		share := deficit * (c.upnl / totalProfit)
 		if share > c.upnl {
 			share = c.upnl
 		}
+		if share > remaining {
+			share = remaining
+		}
+		// F2：吸附到穿仓金额精度，保证各户 Share 之和精确等于被吸收额。
+		share = roundSatoshi(share)
 		if share > remaining {
 			share = remaining
 		}
