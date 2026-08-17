@@ -32,7 +32,12 @@ var (
 	ErrNotOwner         = errors.New("not the holding owner")
 	ErrAlreadyRedeemed  = errors.New("holding already redeemed")
 	ErrLocked           = errors.New("fixed product is still locked before maturity")
+	ErrUnsupportedAsset = errors.New("unsupported asset")
 )
+
+// MaxAnnualRate 年化收益率的安全上限（人类单位，如 1000 = 100000%）。
+// 仅作边界护栏：防止管理员误设或被攻陷的管理密钥设天文数字费率，拖垮 SysWealth 透支（F5-3）。
+const MaxAnnualRate = 1000.0
 
 // ProductType 是理财产品类型。
 type ProductType string

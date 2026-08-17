@@ -3,6 +3,7 @@ package wealth
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -11,6 +12,14 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
+
+// maxWealthAmount 单笔申购金额的人类单位上限，防 float 溢出被 AssetAmountFromFloat 静默归零（F5）。
+const maxWealthAmount = 1e15
+
+// finitePositive 校验浮点值为有限正数且不超过上限（F5 边界校验，同 margin/options）。
+func finitePositive(x, max float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0) && x > 0 && x <= max
+}
 
 // Config 是理财资管业务参数。
 type Config struct {
@@ -50,11 +59,17 @@ func (s *Service) CreateProduct(p *WealthProduct) error {
 	if p.AnnualRate < 0 {
 		return ErrInvalidRate
 	}
+	if p.AnnualRate > MaxAnnualRate {
+		return ErrInvalidRate
+	}
 	if p.DurationDays < 0 {
 		return ErrInvalidDuration
 	}
 	if p.Asset == "" {
 		p.Asset = "USDT"
+	}
+	if !settlement.KnownAsset(p.Asset) {
+		return ErrUnsupportedAsset
 	}
 	if p.Status == "" {
 		p.Status = ProductOpen
@@ -87,7 +102,7 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 	if userID <= 0 {
 		return nil, fmt.Errorf("user required")
 	}
-	if amount <= 0 {
+	if !finitePositive(amount, maxWealthAmount) {
 		return nil, ErrInvalidAmount
 	}
 	s.mu.Lock()
@@ -199,13 +214,13 @@ func (s *Service) Redeem(userID, holdingID int64) (*WealthHolding, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 定期产品到期前锁定（须在动钱前校验）。
+	// 定期产品到期前锁定（须在动钱前校验）。统一时钟：到期闸口与计息用同一 now（F5-4）。
+	now := time.Now()
 	if p.Type == TypeFixed && p.DurationDays > 0 {
-		if time.Now().Before(h.CreatedAt.AddDate(0, 0, p.DurationDays)) {
+		if now.Before(h.CreatedAt.AddDate(0, 0, p.DurationDays)) {
 			return nil, ErrLocked
 		}
 	}
-	now := time.Now()
 	_ = s.accrueHolding(h, p, now) // 赎回前补齐到当前的收益
 	total := h.TotalValue()
 	ref := fmt.Sprintf("wealth_redeem product=%d holding=%d user=%d", h.ProductID, holdingID, userID)

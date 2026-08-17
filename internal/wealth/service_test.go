@@ -1,6 +1,7 @@
 package wealth
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -190,5 +191,34 @@ func TestSubscribeInsufficientNoHolding(t *testing.T) {
 	list, _ := svc.MyHoldings(1)
 	if len(list) != 0 {
 		t.Fatalf("insufficient subscribe must not leave holding: %d", len(list))
+	}
+}
+
+// TestCreateProductRejectsUnsupportedAsset F5-1：未知资产不再静默兜底为 USDT，必须显式拒绝。
+func TestCreateProductRejectsUnsupportedAsset(t *testing.T) {
+	svc, _ := newTestService()
+	p := &WealthProduct{Name: "x", Asset: "FOOCOIN", Type: TypeCurrent, AnnualRate: 0.03, MinAmount: 100}
+	if err := svc.CreateProduct(p); err != ErrUnsupportedAsset {
+		t.Fatalf("expected ErrUnsupportedAsset, got %v", err)
+	}
+}
+
+// TestCreateProductRejectsRateOverMax F5-3：年化费率超过安全上界必须拒绝，避免 SysWealth 透支。
+func TestCreateProductRejectsRateOverMax(t *testing.T) {
+	svc, _ := newTestService()
+	p := &WealthProduct{Name: "x", Asset: "USDT", Type: TypeCurrent, AnnualRate: MaxAnnualRate + 1, MinAmount: 100}
+	if err := svc.CreateProduct(p); err != ErrInvalidRate {
+		t.Fatalf("expected ErrInvalidRate, got %v", err)
+	}
+}
+
+// TestSubscribeRejectsNaN F5-2：NaN/Inf/<=0 申购额必须被 finitePositive 拒绝（原 <=0 守卫对 NaN/Inf 失效）。
+func TestSubscribeRejectsNaN(t *testing.T) {
+	svc, _ := newTestService()
+	p := mustProduct(svc, TypeCurrent, 0.03, 0, 100)
+	for _, amt := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 0, -100} {
+		if _, err := svc.Subscribe(1, p.ID, amt); err != ErrInvalidAmount {
+			t.Fatalf("amount=%v: expected ErrInvalidAmount, got %v", amt, err)
+		}
 	}
 }

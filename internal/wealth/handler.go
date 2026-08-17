@@ -7,6 +7,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // RegisterRoutes 在 gin 引擎上注册理财资管路由。
@@ -50,6 +51,14 @@ func (s *Service) handleCreateProduct(c *gin.Context) {
 	}
 	if req.DurationDays < 0 {
 		response.Error(c, 400, 4001, "duration_days must be >= 0")
+		return
+	}
+	if req.Asset != "" && !settlement.KnownAsset(req.Asset) {
+		response.Error(c, 400, 4001, "unsupported asset")
+		return
+	}
+	if req.AnnualRate > MaxAnnualRate {
+		response.Error(c, 400, 4001, "annual_rate exceeds maximum")
 		return
 	}
 	p := &WealthProduct{
