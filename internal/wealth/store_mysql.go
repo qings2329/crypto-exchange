@@ -3,6 +3,8 @@ package wealth
 import (
 	"database/sql"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // mysqlStore 是 MySQL 版 Store。表名 ce_wealth_products / ce_wealth_holdings 已遵守 ce_ 前缀约定。
@@ -86,10 +88,10 @@ func (s *mysqlStore) CreateHolding(h *WealthHolding) error {
 	h.UpdatedAt = now
 	res, err := s.db.Exec(`
 		INSERT INTO ce_wealth_holdings
-			(user_id, product_id, principal, accrued_yield, status, created_at, last_accrual_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		h.UserID, h.ProductID, h.Principal, h.AccruedYield, string(h.Status),
-		h.CreatedAt, h.LastAccrualAt, h.UpdatedAt)
+			(user_id, product_id, asset, principal, accrued_yield, status, created_at, last_accrual_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		h.UserID, h.ProductID, h.Asset, h.Principal.HumanString(), h.AccruedYield.HumanString(),
+		string(h.Status), h.CreatedAt, h.LastAccrualAt, h.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -101,7 +103,7 @@ func (s *mysqlStore) CreateHolding(h *WealthHolding) error {
 
 func (s *mysqlStore) GetHolding(id int64) (*WealthHolding, error) {
 	row := s.db.QueryRow(`
-		SELECT id, user_id, product_id, principal, accrued_yield, status, created_at, last_accrual_at, redeemed_at, updated_at
+		SELECT id, user_id, product_id, asset, principal, accrued_yield, status, created_at, last_accrual_at, redeemed_at, updated_at
 		FROM ce_wealth_holdings WHERE id = ?`, id)
 	return scanHolding(row)
 }
@@ -110,9 +112,9 @@ func (s *mysqlStore) UpdateHolding(h *WealthHolding) error {
 	h.UpdatedAt = time.Now()
 	_, err := s.db.Exec(`
 		UPDATE ce_wealth_holdings SET
-			user_id=?, product_id=?, principal=?, accrued_yield=?, status=?, created_at=?, last_accrual_at=?, redeemed_at=?, updated_at=?
+			user_id=?, product_id=?, asset=?, principal=?, accrued_yield=?, status=?, created_at=?, last_accrual_at=?, redeemed_at=?, updated_at=?
 		WHERE id = ?`,
-		h.UserID, h.ProductID, h.Principal, h.AccruedYield, string(h.Status),
+		h.UserID, h.ProductID, h.Asset, h.Principal.HumanString(), h.AccruedYield.HumanString(), string(h.Status),
 		h.CreatedAt, h.LastAccrualAt, toNullTime(h.RedeemedAt), h.UpdatedAt, h.ID)
 	return err
 }
@@ -124,7 +126,7 @@ func (s *mysqlStore) DeleteHolding(id int64) error {
 
 func (s *mysqlStore) ListHoldings(userID int64) ([]*WealthHolding, error) {
 	rows, err := s.db.Query(`
-		SELECT id, user_id, product_id, principal, accrued_yield, status, created_at, last_accrual_at, redeemed_at, updated_at
+		SELECT id, user_id, product_id, asset, principal, accrued_yield, status, created_at, last_accrual_at, redeemed_at, updated_at
 		FROM ce_wealth_holdings WHERE user_id = ? ORDER BY id`, userID)
 	if err != nil {
 		return nil, err
@@ -135,7 +137,7 @@ func (s *mysqlStore) ListHoldings(userID int64) ([]*WealthHolding, error) {
 
 func (s *mysqlStore) ListAllHoldings() ([]*WealthHolding, error) {
 	rows, err := s.db.Query(`
-		SELECT id, user_id, product_id, principal, accrued_yield, status, created_at, last_accrual_at, redeemed_at, updated_at
+		SELECT id, user_id, product_id, asset, principal, accrued_yield, status, created_at, last_accrual_at, redeemed_at, updated_at
 		FROM ce_wealth_holdings ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -186,11 +188,22 @@ func scanProducts(rows *sql.Rows) ([]*WealthProduct, error) {
 	return out, rows.Err()
 }
 
+// parseWealthAmount 把存储的 principal/accrued_yield 字符串（AssetAmount.HumanString）按持仓资产
+// 的小数位解析为 AssetAmount。
+func parseWealthAmount(s, asset string) settlement.AssetAmount {
+	dec := settlement.AssetDecimalsByName(asset)
+	aa, err := settlement.AssetAmountFromString(s, dec)
+	if err != nil {
+		return settlement.AssetAmount{Decimals: dec}
+	}
+	return aa.ToDecimals(dec)
+}
+
 func scanHolding(row *sql.Row) (*WealthHolding, error) {
 	var h WealthHolding
-	var status string
+	var status, asset, principalStr, accruedStr string
 	var redeemedAt sql.NullTime
-	err := row.Scan(&h.ID, &h.UserID, &h.ProductID, &h.Principal, &h.AccruedYield,
+	err := row.Scan(&h.ID, &h.UserID, &h.ProductID, &asset, &principalStr, &accruedStr,
 		&status, &h.CreatedAt, &h.LastAccrualAt, &redeemedAt, &h.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrHoldingNotFound
@@ -198,6 +211,9 @@ func scanHolding(row *sql.Row) (*WealthHolding, error) {
 	if err != nil {
 		return nil, err
 	}
+	h.Asset = asset
+	h.Principal = parseWealthAmount(principalStr, asset)
+	h.AccruedYield = parseWealthAmount(accruedStr, asset)
 	h.Status = HoldingStatus(status)
 	if redeemedAt.Valid {
 		h.RedeemedAt = redeemedAt.Time
@@ -209,12 +225,15 @@ func scanHoldings(rows *sql.Rows) ([]*WealthHolding, error) {
 	out := make([]*WealthHolding, 0)
 	for rows.Next() {
 		var h WealthHolding
-		var status string
+		var status, asset, principalStr, accruedStr string
 		var redeemedAt sql.NullTime
-		if err := rows.Scan(&h.ID, &h.UserID, &h.ProductID, &h.Principal, &h.AccruedYield,
+		if err := rows.Scan(&h.ID, &h.UserID, &h.ProductID, &asset, &principalStr, &accruedStr,
 			&status, &h.CreatedAt, &h.LastAccrualAt, &redeemedAt, &h.UpdatedAt); err != nil {
 			return nil, err
 		}
+		h.Asset = asset
+		h.Principal = parseWealthAmount(principalStr, asset)
+		h.AccruedYield = parseWealthAmount(accruedStr, asset)
 		h.Status = HoldingStatus(status)
 		if redeemedAt.Valid {
 			h.RedeemedAt = redeemedAt.Time

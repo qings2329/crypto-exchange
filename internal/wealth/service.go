@@ -100,26 +100,30 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 	if p.Status != ProductOpen {
 		return nil, ErrProductNotOpen
 	}
-	if amount < p.MinAmount-1e-9 {
+	dec := settlement.AssetDecimalsByName(p.Asset)
+	amt := settlement.AssetAmountFromFloat(amount, dec)
+	// 起购额判断在定点空间做，去掉 float 的 1e-9 容差。
+	if amt.Cmp(settlement.AssetAmountFromFloat(p.MinAmount, dec)) < 0 {
 		return nil, ErrBelowMinAmount
 	}
 	// 校验用户可用余额。
 	avail, _, _ := s.ledger.Balance(userID, p.Asset)
-	if avail.Cmp(settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(p.Asset))) < 0 {
+	if avail.Cmp(amt) < 0 {
 		return nil, ErrInsufficientBal
 	}
 	// 先落瞬态持仓，再转入本金。
 	h := &WealthHolding{
 		UserID:    userID,
 		ProductID: productID,
-		Principal: amount,
+		Asset:     p.Asset,
+		Principal: amt,
 		Status:    HoldingFunding,
 	}
 	if err := s.store.CreateHolding(h); err != nil {
 		return nil, err
 	}
 	ref := fmt.Sprintf("wealth_subscribe product=%d user=%d", productID, userID)
-	if err := s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(p.Asset)), "wealth_subscribe", ref); err != nil {
+	if err := s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, amt, "wealth_subscribe", ref); err != nil {
 		_ = s.store.DeleteHolding(h.ID) // 回滚：删掉未出资持仓
 		return nil, fmt.Errorf("lock principal: %w", err)
 	}
@@ -131,18 +135,18 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 	return h, nil
 }
 
-// accrueHolding 对单笔持仓按当前时间应计收益（把本金 × 年化 × 小时 计入 AccruedYield）。
-// 返回本轮回填的收益额。
-func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Time) float64 {
-	delta := h.YieldTo(now, p.AnnualRate)
-	if delta > 0 {
-		h.AccruedYield += delta
+// accrueHolding 对单笔持仓按当前时间应计收益（定点累加，避免 float 复利漂移）。返回本轮回填的收益额。
+func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Time) settlement.AssetAmount {
+	dec := settlement.AssetDecimalsByName(p.Asset)
+	delta := settlement.AssetAmountFromFloat(h.YieldTo(now, p.AnnualRate), dec)
+	if delta.Sign() > 0 {
+		h.AccruedYield = h.AccruedYield.Add(delta)
 		h.LastAccrualAt = now
 	}
 	return delta
 }
 
-// Accrue 对全部持有中持仓执行一次应计收益（通常在后台循环调用）。返回本轮回填的总收益。
+// Accrue 对全部持有中持仓执行一次应计收益（通常在后台循环调用）。返回本轮回填的总收益（人类单位）。
 //
 // s.mu 串行化：与 Redeem 互斥，避免后台计息与赎回并发导致 AccruedYield 重复累加、赎回时超额兑付。
 func (s *Service) Accrue(now time.Time) (float64, error) {
@@ -162,8 +166,8 @@ func (s *Service) Accrue(now time.Time) (float64, error) {
 		if err != nil {
 			continue
 		}
-		if d := s.accrueHolding(h, p, now); d > 0 {
-			total += d
+		if d := s.accrueHolding(h, p, now); d.Sign() > 0 {
+			total += d.HumanFloat()
 			_ = s.store.UpdateHolding(h)
 		}
 	}
@@ -203,7 +207,7 @@ func (s *Service) Redeem(userID, holdingID int64) (*WealthHolding, error) {
 	}
 	now := time.Now()
 	_ = s.accrueHolding(h, p, now) // 赎回前补齐到当前的收益
-	total := h.Principal + h.AccruedYield
+	total := h.TotalValue()
 	ref := fmt.Sprintf("wealth_redeem product=%d holding=%d user=%d", h.ProductID, holdingID, userID)
 
 	// 先落终态，再出金。
@@ -212,7 +216,7 @@ func (s *Service) Redeem(userID, holdingID int64) (*WealthHolding, error) {
 	if err := s.store.UpdateHolding(h); err != nil {
 		return nil, err
 	}
-	if err := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, settlement.AssetAmountFromFloat(total, settlement.AssetDecimalsByName(p.Asset)), "wealth_redeem", ref); err != nil {
+	if err := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, total, "wealth_redeem", ref); err != nil {
 		// 回滚：恢复持有中状态（避免双付）。
 		h.Status = HoldingActive
 		h.RedeemedAt = time.Time{}

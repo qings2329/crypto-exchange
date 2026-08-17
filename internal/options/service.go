@@ -165,7 +165,10 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 		// 先落持仓，再扣权利金；扣费失败回滚删除持仓。
 		p := &OptionPosition{
 			UserID: userID, ContractID: contractID, Side: SideLong, Quantity: quantity,
-			Premium: c.Premium, Margin: 0, Status: StatusOpen,
+			QuoteAsset: quote,
+			Premium:    settlement.AssetAmountFromFloat(c.Premium, dec),
+			Margin:     settlement.AssetAmount{Decimals: dec},
+			Status:     StatusOpen,
 		}
 		if err := s.store.UpsertPosition(p); err != nil {
 			return nil, err
@@ -187,7 +190,10 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	}
 	p := &OptionPosition{
 		UserID: userID, ContractID: contractID, Side: SideShort, Quantity: quantity,
-		Premium: c.Premium, Margin: margin, Status: StatusOpen,
+		QuoteAsset: quote,
+		Premium:    settlement.AssetAmountFromFloat(c.Premium, dec),
+		Margin:     marginAmt,
+		Status:     StatusOpen,
 	}
 	if err := s.store.UpsertPosition(p); err != nil {
 		return nil, err
@@ -238,10 +244,11 @@ func (s *Service) Exercise(userID, positionID int64) error {
 	if !ok {
 		return ErrNoPriceFeed
 	}
-	itvTotal := c.IntrinsicValue(spot) * p.Quantity
-	payoff := itvTotal - p.PremiumTotal()
-	if payoff < 0 {
-		payoff = 0
+	dec := settlement.AssetDecimalsByName(c.QuoteAsset)
+	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot)*p.Quantity, dec)
+	payoff := itvAmt.Sub(p.PremiumTotal())
+	if payoff.Sign() < 0 {
+		payoff = settlement.AssetAmount{Decimals: dec}
 	}
 	// 先落终态，再动钱。
 	p.Status = StatusExercised
@@ -249,9 +256,9 @@ func (s *Service) Exercise(userID, positionID int64) error {
 	if err := s.store.UpsertPosition(p); err != nil {
 		return err
 	}
-	if payoff > 0 {
+	if payoff.Sign() > 0 {
 		ref := fmt.Sprintf("option_exercise uid=%d pos=%d", userID, positionID)
-		if err := s.ledger.Transfer(ledger.SysOptions, userID, c.QuoteAsset, settlement.AssetAmountFromFloat(payoff, settlement.AssetDecimalsByName(c.QuoteAsset)), "option_payoff", ref); err != nil {
+		if err := s.ledger.Transfer(ledger.SysOptions, userID, c.QuoteAsset, payoff, "option_payoff", ref); err != nil {
 			// 回滚：恢复 open 状态，等待重试/对账。
 			p.Status = StatusOpen
 			p.UpdatedAt = time.Now()
@@ -289,9 +296,9 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 	if !ok {
 		return false, nil // 无价格不结算，等下次循环
 	}
-	itvTotal := c.IntrinsicValue(spot) * p.Quantity
 	quote := c.QuoteAsset
 	dec := settlement.AssetDecimalsByName(quote)
+	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot)*p.Quantity, dec)
 
 	// 先落终态。
 	p.Status = StatusExpired
@@ -301,13 +308,13 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 	}
 
 	if p.Side == SideLong {
-		payoff := itvTotal - p.PremiumTotal()
-		if payoff < 0 {
-			payoff = 0
+		payoff := itvAmt.Sub(p.PremiumTotal())
+		if payoff.Sign() < 0 {
+			payoff = settlement.AssetAmount{Decimals: dec}
 		}
-		if payoff > 0 {
+		if payoff.Sign() > 0 {
 			ref := fmt.Sprintf("option_settle_long pos=%d", positionID)
-			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, quote, settlement.AssetAmountFromFloat(payoff, dec), "option_payoff", ref); err != nil {
+			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, quote, payoff, "option_payoff", ref); err != nil {
 				// 回滚：恢复 open 状态，等待重试/对账。
 				p.Status = StatusOpen
 				p.UpdatedAt = time.Now()
@@ -319,20 +326,16 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 	}
 
 	// 卖方：解冻保证金，并在保证金范围内承担内在价值义务（超出由系统已收权利金吸收）。
-	margin := p.Margin
-	if margin > 0 {
-		_ = s.ledger.Unfreeze(p.UserID, quote, settlement.AssetAmountFromFloat(margin, dec))
+	if p.Margin.Sign() > 0 {
+		_ = s.ledger.Unfreeze(p.UserID, quote, p.Margin)
 	}
-	pay := itvTotal
-	if pay > margin {
-		pay = margin
-	}
-	if pay > 0 {
+	payAmt := itvAmt.Min(p.Margin)
+	if payAmt.Sign() > 0 {
 		ref := fmt.Sprintf("option_settle_short pos=%d", positionID)
-		if err := s.ledger.Transfer(p.UserID, ledger.SysOptions, quote, settlement.AssetAmountFromFloat(pay, dec), "option_loss", ref); err != nil {
+		if err := s.ledger.Transfer(p.UserID, ledger.SysOptions, quote, payAmt, "option_loss", ref); err != nil {
 			// 回滚：重新冻结保证金并恢复 open 状态。
-			if margin > 0 {
-				_ = s.ledger.Freeze(p.UserID, quote, settlement.AssetAmountFromFloat(margin, dec))
+			if p.Margin.Sign() > 0 {
+				_ = s.ledger.Freeze(p.UserID, quote, p.Margin)
 			}
 			p.Status = StatusOpen
 			p.UpdatedAt = time.Now()

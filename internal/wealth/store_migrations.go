@@ -48,6 +48,20 @@ var WealthMigrations = []migrate.Migration{
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		Down: `DROP TABLE IF EXISTS ce_wealth_holdings`,
 	},
+	{
+		// F2：principal/accrued_yield 由 DOUBLE 改为 VARCHAR(64)，以字符串精确存储 AssetAmount.HumanString
+		// （最小单位十进制），避免 float64 列精度丢失与收益定点累加漂移；新增 asset 列用于扫描时推导小数位。
+		Version: 9703,
+		Name:    "alter_ce_wealth_holdings_fixedpoint",
+		Up: `ALTER TABLE ce_wealth_holdings
+				ADD COLUMN asset VARCHAR(32) NOT NULL DEFAULT '' AFTER product_id,
+				MODIFY principal      VARCHAR(64) NOT NULL DEFAULT '0',
+				MODIFY accrued_yield  VARCHAR(64) NOT NULL DEFAULT '0'`,
+		Down: `ALTER TABLE ce_wealth_holdings
+				MODIFY principal      DOUBLE NOT NULL DEFAULT 0,
+				MODIFY accrued_yield  DOUBLE NOT NULL DEFAULT 0,
+				DROP COLUMN asset`,
+	},
 }
 
 // NewMySQLStore 打开 MySQL 并跑迁移，返回 MySQL 版 Store。

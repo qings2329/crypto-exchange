@@ -14,6 +14,8 @@ package wealth
 import (
 	"errors"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // 领域错误。
@@ -84,8 +86,9 @@ type WealthHolding struct {
 	ID            int64         `json:"id"`
 	UserID        int64         `json:"user_id"`
 	ProductID     int64         `json:"product_id"`
-	Principal     float64       `json:"principal"`      // 本金（申购金额）
-	AccruedYield  float64       `json:"accrued_yield"`  // 已计收益（累计）
+	Asset         string       `json:"asset"`          // 底层资产（principal/accrued_yield 的计价单位，扫描时推导小数位）
+	Principal     settlement.AssetAmount `json:"principal"`      // 本金（申购金额，定点）
+	AccruedYield  settlement.AssetAmount `json:"accrued_yield"`  // 已计收益（累计，定点）
 	Status        HoldingStatus `json:"status"`
 	CreatedAt     time.Time     `json:"created_at"`
 	LastAccrualAt time.Time     `json:"last_accrual_at"` // 上次计息基准时间
@@ -107,10 +110,10 @@ func (h *WealthHolding) YieldTo(t time.Time, annualRate float64) float64 {
 	if hours <= 0 {
 		return 0
 	}
-	return h.Principal * annualRate * hours / 8760.0
+	return h.Principal.HumanFloat() * annualRate * hours / 8760.0
 }
 
-// TotalValue 返回本金 + 已计收益。
-func (h *WealthHolding) TotalValue() float64 {
-	return h.Principal + h.AccruedYield
+// TotalValue 返回本金 + 已计收益（定点）。
+func (h *WealthHolding) TotalValue() settlement.AssetAmount {
+	return h.Principal.Add(h.AccruedYield)
 }

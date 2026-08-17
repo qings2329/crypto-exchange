@@ -201,3 +201,33 @@
 
 ### 注意
 - `migrateV1ToV2` 对未知资产**静默**采用默认 8 位——这是唯一可能错配精度的路径，故步骤 2 的预检是上线硬性前置。
+
+---
+
+## 2026-08-17 — options/margin/wealth 资金字段定点化（F2）
+
+- **状态**：`internal/options`、`internal/margin`、`internal/wealth` 的"代表实际账本资金、会被持久化与累加"的字段已由 `float64` 改为 `settlement.AssetAmount`，沿用 otc F2（`1cc89f1`）的 `DOUBLE→VARCHAR(64)` + `HumanString`/`AssetAmountFromString` 范式。commit 待提交。
+- **背景**：上述三模块的 F2 建议项——资金字段以 `float64` 存储（DB `DOUBLE`）存在精度漂移；`margin.Repay` / `wealth.Subscribe` 用 `1e-9` 浮点容差判断"还清 / 起购额"（与 otc F5b 同款风险）。
+
+### options（OPTIONS-F2）
+- `OptionPosition.Premium`（每张权利金）、`OptionPosition.Margin`（冻结保证金）改 `AssetAmount`；新增 `OptionPosition.QuoteAsset`（解决扫描时小数位推导）。
+- 行权/结算的 payoff 改用 `AssetAmount.Sub` 定点相减，卖方义务用 `AssetAmount.Min` 取保证金上限。
+- 迁移 `9503`：`ce_option_positions` 新增 `quote_asset` 列，`premium`/`margin` 改 `VARCHAR(64)`。
+
+### margin（MARGIN-F2）
+- `MarginAccount.CollateralAmount`/`Debt`/`InterestAccrued` 改 `AssetAmount`；`TotalOwed()` 返回 `AssetAmount`。
+- `Repay` 去除 `1e-9` 容差，改用 `AssetAmount.IsZero()` 判断还清；`accrue` 利息定点累加（`Debt.HumanFloat()*rate*hours` → `AssetAmount` 后 `Add`），消除 float 复利漂移。
+- 迁移 `9202`：`ce_margin_accounts` 三列改 `VARCHAR(64)`（debt/interest 按 `asset`、collateral 按 `collateral_asset` 推导小数位，两列资产均已在表中）。
+
+### wealth（WEALTH-F2）
+- `WealthHolding.Principal`/`AccruedYield` 改 `AssetAmount`；新增 `WealthHolding.Asset`；`TotalValue()` 返回 `AssetAmount`；`YieldTo()` 仍返回 float（边界转 `AssetAmount` 累加）。
+- `Subscribe` 去除 `1e-9` 容差，`amount < MinAmount` 改为 `AssetAmount` 定点比较；`accrueHolding` 收益定点累加。
+- 迁移 `9703`：`ce_wealth_holdings` 新增 `asset` 列，`principal`/`accrued_yield` 改 `VARCHAR(64)`。
+
+### 契约/行为影响
+- 这些金额字段经 `AssetAmount.MarshalJSON` 仍输出为 JSON 数字（如 `1.5`），对外数字契约不变；新增 `quote_asset`（持仓）、`asset`（持仓）两个只读 JSON 字段（加法，向后兼容）。
+- 行为收紧：`margin` 还清判定、`wealth` 起购额判定不再有 `1e-9` 容差，仅影响"恰在边界且因 float 误差落在容差内"的极端输入，属正确化。
+- `OptionContract.Premium`、`WealthProduct.AnnualRate`/`MinAmount`、各 Config 比率等报价/配置类 float **保持不变**（边界转换可接受，符合各模块审查记忆）。
+
+### 升级注意（同 otc F2）
+- 迁移把原 `DOUBLE` 列直接 `MODIFY` 为 `VARCHAR(64)`，MySQL 会把数值写成其字符串形式；扫描时按 `quote_asset`/`asset` 推导小数位。**若库中存在 F2 之前的旧持仓/账户数据，需先回填 `quote_asset`/`asset` 列**（或从空库/预发重新初始化）再上线，否则旧行会按默认 8 位小数解析产生偏差。全新部署无此问题。
