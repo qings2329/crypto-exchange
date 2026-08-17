@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"sort"
@@ -218,15 +219,35 @@ func (o *Oracle) pollAll() {
 }
 
 func (o *Oracle) pollSymbol(symbol string, feeds []PriceFeed) {
+	// F5：单个喂价源解析/网络异常（含恶意响应触发 ParseFunc panic）不得拖垮整个轮询
+	// goroutine，否则预言机停止更新、行情永久冻结（DoS）。单源失败仅记为样本失败。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[oracle] panic polling %s: %v", symbol, r)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), o.cfg.PollInterval)
 	defer cancel()
 
 	samples := make([]feedSample, 0, len(feeds))
 	prices := make([]float64, 0, len(feeds))
 	for _, f := range feeds {
-		p, err := f.Fetch(ctx, symbol)
-		if err != nil || p <= 0 {
-			samples = append(samples, feedSample{Name: f.Name(), OK: false, Err: errMsg(err)})
+		// F5：单个喂价源解析异常（含恶意响应触发 ParseFunc panic）就地拦截，
+		// 记为样本失败并继续处理其余源，避免一次异常拖垮整笔聚合。
+		var p float64
+		var ferr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					ferr = fmt.Errorf("feed %s panic: %v", f.Name(), r)
+				}
+			}()
+			p, ferr = f.Fetch(ctx, symbol)
+		}()
+		// F5：拒绝非有限（NaN/Inf）或非正报价。NaN<=0 恒为 false，原 `p<=0` 无法拦截
+		// NaN/Inf，会被中位聚合污染指数价，进而经引擎 validMark 前的中间链路影响强平/结算。
+		if ferr != nil || !validFeedPrice(p) {
+			samples = append(samples, feedSample{Name: f.Name(), OK: false, Err: errMsg(ferr)})
 			continue
 		}
 		samples = append(samples, feedSample{Name: f.Name(), Price: p, OK: true})
@@ -332,6 +353,12 @@ func errMsg(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// validFeedPrice 校验喂价源报价是否可作为有效指数价：必须为正且有限。
+// 注意 NaN/Inf：NaN>0 恒为 false，故须显式排除 Inf；否则 `p>0` 会放过 +Inf。
+func validFeedPrice(p float64) bool {
+	return p > 0 && !math.IsInf(p, 0)
 }
 
 // BinanceParse Binance ticker/price 响应解析：{"symbol":"BTCUSDT","price":"50000.00"}
