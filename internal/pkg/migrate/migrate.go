@@ -10,6 +10,7 @@
 package migrate
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -35,9 +36,16 @@ func New(db *sql.DB, migrations []Migration) *Runner {
 	return &Runner{db: db, table: "ce_schema_migrations", migrations: migrations}
 }
 
+// queryExecutor 是 *sql.DB 与 *sql.Conn 共同满足的查询接口。迁移在专用连接上执行
+// （配合 GET_LOCK 串行化，避免并发/共享库下的重复迁移/重复建表，见 Up/Down）。
+type queryExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
 // ensureVersionTable 建版本记录表（ce_ 前缀）。
-func (r *Runner) ensureVersionTable() error {
-	_, err := r.db.Exec(fmt.Sprintf(`
+func (r *Runner) ensureVersionTable(ctx context.Context, q queryExecutor) error {
+	_, err := q.ExecContext(ctx, fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
     version   INT         NOT NULL,
     name      VARCHAR(128) NOT NULL,
@@ -48,8 +56,8 @@ CREATE TABLE IF NOT EXISTS %s (
 }
 
 // appliedVersions 返回已应用的版本集合。
-func (r *Runner) appliedVersions() (map[int]bool, error) {
-	rows, err := r.db.Query(fmt.Sprintf("SELECT version FROM %s", r.table))
+func (r *Runner) appliedVersions(ctx context.Context, q queryExecutor) (map[int]bool, error) {
+	rows, err := q.QueryContext(ctx, fmt.Sprintf("SELECT version FROM %s", r.table))
 	if err != nil {
 		return nil, err
 	}
@@ -65,70 +73,95 @@ func (r *Runner) appliedVersions() (map[int]bool, error) {
 	return m, rows.Err()
 }
 
-// Up 应用所有未执行的迁移（按版本升序）。
-func (r *Runner) Up() error {
-	if err := r.ensureVersionTable(); err != nil {
-		return fmt.Errorf("ensure version table: %w", err)
-	}
-	applied, err := r.appliedVersions()
+// withLock 获取专用连接并在其上持有一条 MySQL 命名锁（GET_LOCK），串行化迁移，
+// 避免同一远程库被多个集成测试/进程并发访问时的重复建表或版本记录竞争。连接归还连接池时
+// 锁自动失效，调用方需在 defer 中关闭 conn。
+func (r *Runner) withLock(ctx context.Context, fn func(ctx context.Context, conn *sql.Conn) error) error {
+	conn, err := r.db.Conn(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("migrate: get conn: %w", err)
 	}
-	for _, m := range r.migrations {
-		if applied[m.Version] {
-			continue
-		}
-		if strings.TrimSpace(m.Up) == "" {
-			return fmt.Errorf("migration %d (%s) has empty Up", m.Version, m.Name)
-		}
-		// 逐条语句执行（简单按 ';' 切分，足以覆盖 DDL）。
-		for _, stmt := range splitSQL(m.Up) {
-			if _, err := r.db.Exec(stmt); err != nil {
-				return fmt.Errorf("apply migration %d (%s): %w", m.Version, m.Name, err)
-			}
-		}
-		// INSERT IGNORE：版本记录幂等，避免并发/重跑时唯一键冲突（同一远程库被多个集成测试共享）。
-		if _, err := r.db.Exec(
-			fmt.Sprintf("INSERT IGNORE INTO %s (version, name, applied_at) VALUES (?, ?, NOW(3))", r.table),
-			m.Version, m.Name); err != nil {
-			return fmt.Errorf("record migration %d: %w", m.Version, err)
-		}
+	defer conn.Close()
+	var got int
+	// GET_LOCK 返回 1=成功获取，0=超时，NULL=错误。超时/失败必须显式报错，
+	// 否则会静默地在无锁状态下执行迁移，失去串行化保护作用。
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK('ce_migrate', 10)").Scan(&got); err != nil {
+		return fmt.Errorf("migrate: acquire lock: %w", err)
 	}
-	return nil
+	if got != 1 {
+		return fmt.Errorf("migrate: failed to acquire lock (got %d)", got)
+	}
+	return fn(ctx, conn)
 }
 
-// Down 回滚最近一次未指定数量的迁移（toVersion<0 表示回滚全部）。
-func (r *Runner) Down(toVersion int) error {
-	if err := r.ensureVersionTable(); err != nil {
-		return fmt.Errorf("ensure version table: %w", err)
-	}
-	applied, err := r.appliedVersions()
-	if err != nil {
-		return err
-	}
-	// 从高版本向低版本回滚。
-	for i := len(r.migrations) - 1; i >= 0; i-- {
-		m := r.migrations[i]
-		if !applied[m.Version] {
-			continue
+// Up 应用所有未执行的迁移（按版本升序）。在专用连接上持锁执行，保证串行化与幂等。
+func (r *Runner) Up() error {
+	return r.withLock(context.Background(), func(ctx context.Context, conn *sql.Conn) error {
+		if err := r.ensureVersionTable(ctx, conn); err != nil {
+			return fmt.Errorf("ensure version table: %w", err)
 		}
-		if toVersion >= 0 && m.Version <= toVersion {
-			continue
+		applied, err := r.appliedVersions(ctx, conn)
+		if err != nil {
+			return err
 		}
-		for _, stmt := range splitSQL(m.Down) {
-			if _, err := r.db.Exec(stmt); err != nil {
-				return fmt.Errorf("rollback migration %d (%s): %w", m.Version, m.Name, err)
+		for _, m := range r.migrations {
+			if applied[m.Version] {
+				continue
+			}
+			if strings.TrimSpace(m.Up) == "" {
+				return fmt.Errorf("migration %d (%s) has empty Up", m.Version, m.Name)
+			}
+			// 逐条语句执行（简单按 ';' 切分，足以覆盖 DDL）。
+			for _, stmt := range splitSQL(m.Up) {
+				if _, err := conn.ExecContext(ctx, stmt); err != nil {
+					return fmt.Errorf("apply migration %d (%s): %w", m.Version, m.Name, err)
+				}
+			}
+			// INSERT IGNORE：版本记录幂等，避免并发/重跑时唯一键冲突（同一远程库被多个集成测试共享）。
+			if _, err := conn.ExecContext(ctx,
+				fmt.Sprintf("INSERT IGNORE INTO %s (version, name, applied_at) VALUES (?, ?, NOW(3))", r.table),
+				m.Version, m.Name); err != nil {
+				return fmt.Errorf("record migration %d: %w", m.Version, err)
 			}
 		}
-		if _, err := r.db.Exec(
-			fmt.Sprintf("DELETE FROM %s WHERE version = ?", r.table), m.Version); err != nil {
-			return fmt.Errorf("unrecord migration %d: %w", m.Version, err)
+		return nil
+	})
+}
+
+// Down 回滚最近一次未指定数量的迁移（toVersion<0 表示回滚全部）。在专用连接上持锁执行。
+func (r *Runner) Down(toVersion int) error {
+	return r.withLock(context.Background(), func(ctx context.Context, conn *sql.Conn) error {
+		if err := r.ensureVersionTable(ctx, conn); err != nil {
+			return fmt.Errorf("ensure version table: %w", err)
 		}
-		if toVersion >= 0 {
-			return nil
+		applied, err := r.appliedVersions(ctx, conn)
+		if err != nil {
+			return err
 		}
-	}
-	return nil
+		// 从高版本向低版本回滚。
+		for i := len(r.migrations) - 1; i >= 0; i-- {
+			m := r.migrations[i]
+			if !applied[m.Version] {
+				continue
+			}
+			if toVersion >= 0 && m.Version <= toVersion {
+				continue
+			}
+			for _, stmt := range splitSQL(m.Down) {
+				if _, err := conn.ExecContext(ctx, stmt); err != nil {
+					return fmt.Errorf("rollback migration %d (%s): %w", m.Version, m.Name, err)
+				}
+			}
+			if _, err := conn.ExecContext(ctx,
+				fmt.Sprintf("DELETE FROM %s WHERE version = ?", r.table), m.Version); err != nil {
+				return fmt.Errorf("unrecord migration %d: %w", m.Version, err)
+			}
+			if toVersion >= 0 {
+				return nil
+			}
+		}
+		return nil
+	})
 }
 
 // splitSQL 按分号切分 SQL（忽略空语句）。不处理存储过程等高级语法。
