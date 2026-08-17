@@ -3,6 +3,7 @@ package options
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -11,6 +12,15 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
+
+// maxOptionAmount 期权金额（权利金/保证金/行权价/张数/数量）的人类单位上限，
+// 用于防止 float 溢出被 AssetAmountFromFloat 静默归零（F5：Inf → 0 导致免费开仓/无抵押空头）。
+const maxOptionAmount = 1e15
+
+// finitePositive 校验浮点值为有限正数且不超过上限（F5 边界校验，同 margin.finitePositive）。
+func finitePositive(x, max float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0) && x > 0 && x <= max
+}
 
 // Config 是期权业务参数。
 type Config struct {
@@ -83,8 +93,12 @@ func (s *Service) CreateContract(c *OptionContract) error {
 	if c.QuoteAsset == "" {
 		c.QuoteAsset = s.cfg.QuoteAsset
 	}
-	if c.ContractSize <= 0 {
-		c.ContractSize = 1
+	if !settlement.KnownAsset(c.QuoteAsset) {
+		return ErrUnsupportedAsset
+	}
+	// 合约乘数必须为正：负数/零直接拒绝（不再静默置 1，F5-5）。
+	if c.ContractSize <= 0 || !finitePositive(c.ContractSize, maxOptionAmount) {
+		return fmt.Errorf("contract_size must be positive")
 	}
 	// 权利金：显式给定优先；否则用 BS 实时定价（需行情）。
 	if c.Premium <= 0 {
@@ -95,6 +109,9 @@ func (s *Service) CreateContract(c *OptionContract) error {
 		t := s.yearsToExpiry(c.Expiry)
 		price, _ := BlackScholes(c.Type, spot, c.Strike, t, s.cfg.RiskFreeRate, s.cfg.Volatility)
 		c.Premium = price * c.size()
+	}
+	if math.IsNaN(c.Premium) || math.IsInf(c.Premium, 0) {
+		return fmt.Errorf("invalid premium")
 	}
 	return s.store.CreateContract(c)
 }
@@ -142,7 +159,7 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	if side != SideLong && side != SideShort {
 		return nil, ErrInvalidSide
 	}
-	if quantity <= 0 {
+	if !finitePositive(quantity, maxOptionAmount) {
 		return nil, ErrInvalidQuantity
 	}
 	s.mu.Lock()
@@ -152,9 +169,15 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	if err != nil {
 		return nil, err
 	}
+	if !settlement.KnownAsset(c.QuoteAsset) {
+		return nil, ErrUnsupportedAsset
+	}
 	quote := c.QuoteAsset
 	dec := settlement.AssetDecimalsByName(quote)
 	premiumTotal := c.Premium * quantity
+	if math.IsNaN(premiumTotal) || math.IsInf(premiumTotal, 0) {
+		return nil, ErrInvalidQuantity
+	}
 	premiumAmt := settlement.AssetAmountFromFloat(premiumTotal, dec)
 
 	if side == SideLong {
@@ -183,6 +206,9 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 
 	// short：冻结保证金并收取权利金（来自系统对手方）。
 	margin := c.Strike * c.size() * quantity * s.cfg.MarginRatio
+	if math.IsNaN(margin) || math.IsInf(margin, 0) {
+		return nil, ErrInvalidQuantity
+	}
 	marginAmt := settlement.AssetAmountFromFloat(margin, dec)
 	avail, _, _ := s.ledger.Balance(userID, quote)
 	if avail.Cmp(marginAmt) < 0 {
@@ -241,7 +267,7 @@ func (s *Service) Exercise(userID, positionID int64) error {
 		return ErrNotExercisable
 	}
 	spot, ok := s.priceFn(c.Underlying)
-	if !ok {
+	if !ok || spot <= 0 || math.IsNaN(spot) || math.IsInf(spot, 0) {
 		return ErrNoPriceFeed
 	}
 	dec := settlement.AssetDecimalsByName(c.QuoteAsset)
@@ -293,8 +319,8 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 		return false, nil
 	}
 	spot, ok := s.priceFn(c.Underlying)
-	if !ok {
-		return false, nil // 无价格不结算，等下次循环
+	if !ok || spot <= 0 || math.IsNaN(spot) || math.IsInf(spot, 0) {
+		return false, nil // 无价格/负价不结算，等下次循环
 	}
 	quote := c.QuoteAsset
 	dec := settlement.AssetDecimalsByName(quote)
