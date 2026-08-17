@@ -200,16 +200,34 @@ func (s *Service) Repay(userID int64, asset string, amount float64) error {
 		return err
 	}
 
-	// 动钱：扣还款。
+	// 动钱：拆分本金与利息，保持复式记账借贷恒等（F3-1）。
+	// 本金：burn 用户可用（回补借入时 CreditAvailable 铸造的负债），无对应贷方。
+	// 利息：从用户可用划转到平台利息账户 SysMarginInterest，而非 burn——
+	//       利息并非凭空铸造，burn 会压低货币供应且平台收入未入账。
 	ref := fmt.Sprintf("margin_repay uid=%d asset=%s", userID, asset)
-	if err := s.ledger.DebitAvailable(userID, asset, repayAmt, "margin_repay", ref); err != nil {
-		*a = prev
-		_ = s.store.UpsertAccount(a)
-		return err
+	if principalAmt.Sign() > 0 {
+		if err := s.ledger.DebitAvailable(userID, asset, principalAmt, "margin_repay_principal", ref); err != nil {
+			*a = prev
+			_ = s.store.UpsertAccount(a)
+			return err
+		}
 	}
-	// 还清则解冻抵押（best-effort，与原实现一致）。
+	if interestPortion.Sign() > 0 {
+		if err := s.ledger.Transfer(userID, ledger.SysMarginInterest, asset, interestPortion, "margin_repay_interest", ref); err != nil {
+			*a = prev
+			_ = s.store.UpsertAccount(a)
+			return err
+		}
+	}
+	// 还清则解冻抵押。原实现 "_ = Unfreeze" 静默吞错，可能导致抵押永久冻结（F3-1）。
+	// 改为显式校验：解冻失败直接返回错误（账户已置终态、债务已清，重试会命中终态短路不会双还）。
 	if closing && prev.CollateralAmount.Sign() > 0 {
-		_ = s.ledger.Unfreeze(userID, a.CollateralAsset, prev.CollateralAmount)
+		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, prev.CollateralAmount); err != nil {
+			if s.log != nil {
+				s.log.Error("margin repay: unlock collateral failed", zap.Int64("user_id", userID), zap.String("asset", asset), zap.Error(err))
+			}
+			return err
+		}
 	}
 	return nil
 }

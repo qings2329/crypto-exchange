@@ -96,6 +96,35 @@ func TestAccrueInterest(t *testing.T) {
 	}
 }
 
+// TestRepayRoutesInterestToPlatform F3-1：还款的利息部分须划入 SysMarginInterest，
+// 而非被 burn（否则货币供应被压低且平台收入未入账）。
+func TestRepayRoutesInterestToPlatform(t *testing.T) {
+	svc, l := newTestService()
+	const uid = int64(2)
+	// 借 10 ETH，杠杆 2 -> 抵押 5 USDT；用户可用获铸造的 10 ETH。
+	if _, err := svc.Borrow(uid, "ETH", 10.0, 2); err != nil {
+		t.Fatalf("borrow: %v", err)
+	}
+	// 额外注入 1 ETH，使账户可用足以覆盖本金+利息（10.01）。
+	_ = l.Deposit(uid, "ETH", settlement.AssetAmountFromFloat(1, settlement.AssetDecimalsByName("ETH")), "seed-extra")
+	// 累计 10 小时利息：10 * 0.0001 * 10 = 0.01 ETH（定点后略有浮点尾差）。
+	a, _ := svc.Account(uid, "ETH")
+	a.LastAccrual = time.Now().Add(-10 * time.Hour)
+	svc.accrue(a)
+	_ = svc.store.UpsertAccount(a)
+	wantInterest := a.InterestAccrued.HumanFloat()
+	// 还款 10.01（本金 10 + 利息 ~0.01）。
+	if err := svc.Repay(uid, "ETH", 10.01); err != nil {
+		t.Fatalf("repay: %v", err)
+	}
+	// 利息部分应划转到 SysMarginInterest，而非被 burn（余额约等于应计利息）。
+	ins, _, _ := l.Balance(ledger.SysMarginInterest, "ETH")
+	got := ins.HumanFloat()
+	if got < wantInterest-1e-9 || got > wantInterest+1e-9 {
+		t.Fatalf("interest not routed to SysMarginInterest: got %v want ~%v", got, wantInterest)
+	}
+}
+
 func TestLiquidationPriceAndLiquidate(t *testing.T) {
 	svc, l := newTestService()
 	const uid = int64(3)
