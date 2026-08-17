@@ -54,4 +54,10 @@ var RiskMigrations = []migrate.Migration{
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		Down: `DROP TABLE IF EXISTS ce_risk_events`,
 	},
+	{
+		Version: 9404,
+		Name:    "risk_rules_max_amount_fixedpoint",
+		Up: `ALTER TABLE ce_risk_rules MODIFY max_amount_per_day VARCHAR(64) NOT NULL DEFAULT '0'`,
+		Down: `ALTER TABLE ce_risk_rules MODIFY max_amount_per_day DOUBLE NOT NULL DEFAULT 0`,
+	},
 }

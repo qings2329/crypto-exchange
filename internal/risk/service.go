@@ -3,6 +3,8 @@ package risk
 import (
 	"fmt"
 	"strconv"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // Service 是风控业务逻辑层，仅依赖 Store 接口。
@@ -87,8 +89,15 @@ func (s *Service) CheckWithdraw(userID int64, asset string, amount float64, kycL
 		s.record(userID, KindWithdrawLimit, fmt.Sprintf("kyc level %d < required %d", kycLevel, rule.MinKYCLevel))
 		return CheckResult{Allowed: false, Reason: "kyc level too low"}, nil
 	}
-	if amount > rule.MaxAmountPerDay {
-		s.record(userID, KindWithdrawLimit, fmt.Sprintf("amount %.8f exceeds limit %.8f", amount, rule.MaxAmountPerDay))
+	if amount <= 0 {
+		s.record(userID, KindWithdrawLimit, fmt.Sprintf("amount %.8f invalid (must be positive)", amount))
+		return CheckResult{Allowed: false, Reason: "amount must be positive"}, nil
+	}
+	dec := settlement.AssetDecimalsByName(asset)
+	amt := settlement.AssetAmountFromFloat(amount, dec)
+	limit := rule.MaxAmountPerDay.ToDecimals(dec)
+	if amt.Cmp(limit) > 0 {
+		s.record(userID, KindWithdrawLimit, fmt.Sprintf("amount %s exceeds limit %s", amt.HumanString(), limit.HumanString()))
 		return CheckResult{Allowed: false, Reason: "exceeds withdraw limit"}, nil
 	}
 	return CheckResult{Allowed: true}, nil
@@ -109,8 +118,15 @@ func (s *Service) CheckOrder(userID int64, asset string, qty float64, kycLevel i
 		s.record(userID, KindOrderLimit, fmt.Sprintf("kyc level %d < required %d", kycLevel, rule.MinKYCLevel))
 		return CheckResult{Allowed: false, Reason: "kyc level too low"}, nil
 	}
-	if qty > rule.MaxAmountPerDay {
-		s.record(userID, KindOrderLimit, fmt.Sprintf("qty %.8f exceeds limit %.8f", qty, rule.MaxAmountPerDay))
+	if qty <= 0 {
+		s.record(userID, KindOrderLimit, fmt.Sprintf("qty %.8f invalid (must be positive)", qty))
+		return CheckResult{Allowed: false, Reason: "qty must be positive"}, nil
+	}
+	dec := settlement.AssetDecimalsByName(asset)
+	amt := settlement.AssetAmountFromFloat(qty, dec)
+	limit := rule.MaxAmountPerDay.ToDecimals(dec)
+	if amt.Cmp(limit) > 0 {
+		s.record(userID, KindOrderLimit, fmt.Sprintf("qty %s exceeds limit %s", amt.HumanString(), limit.HumanString()))
 		return CheckResult{Allowed: false, Reason: "exceeds order limit"}, nil
 	}
 	return CheckResult{Allowed: true}, nil

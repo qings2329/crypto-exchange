@@ -3,6 +3,8 @@ package risk
 import (
 	"errors"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // 风控规则类型。
@@ -38,8 +40,8 @@ type RiskRule struct {
 	Kind           string    `json:"kind"`
 	Scope          string    `json:"scope"`
 	UserID         int64     `json:"user_id"`       // Scope=user 时有效
-	Asset          string    `json:"asset"`         // 空表示任意资产
-	MaxAmountPerDay float64  `json:"max_amount_per_day"`
+	Asset          string                   `json:"asset"`         // 空表示任意资产
+	MaxAmountPerDay settlement.AssetAmount  `json:"max_amount_per_day"`
 	MaxCountPerDay  int      `json:"max_count_per_day"`
 	MinKYCLevel    int       `json:"min_kyc_level"`
 	Enabled        bool      `json:"enabled"`

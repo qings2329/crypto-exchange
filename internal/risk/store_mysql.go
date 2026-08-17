@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // mysqlStore 是风控的 MySQL 实现，表名遵守 ce_ 约定。
@@ -28,7 +29,7 @@ func (s *mysqlStore) UpsertRule(r *RiskRule) (*RiskRule, error) {
 			`UPDATE ce_risk_rules SET name=?, kind=?, scope=?, user_id=?, asset=?,
 				max_amount_per_day=?, max_count_per_day=?, min_kyc_level=?, enabled=?
 			 WHERE id=?`,
-			r.Name, r.Kind, r.Scope, r.UserID, r.Asset, r.MaxAmountPerDay, r.MaxCountPerDay,
+			r.Name, r.Kind, r.Scope, r.UserID, r.Asset, r.MaxAmountPerDay.HumanString(), r.MaxCountPerDay,
 			r.MinKYCLevel, boolToInt(r.Enabled), r.ID)
 		if err != nil {
 			return nil, err
@@ -43,7 +44,7 @@ func (s *mysqlStore) UpsertRule(r *RiskRule) (*RiskRule, error) {
 		`INSERT INTO ce_risk_rules
 		 (name, kind, scope, user_id, asset, max_amount_per_day, max_count_per_day, min_kyc_level, enabled, created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		r.Name, r.Kind, r.Scope, r.UserID, r.Asset, r.MaxAmountPerDay, r.MaxCountPerDay,
+		r.Name, r.Kind, r.Scope, r.UserID, r.Asset, r.MaxAmountPerDay.HumanString(), r.MaxCountPerDay,
 		r.MinKYCLevel, boolToInt(r.Enabled), now)
 	if err != nil {
 		return nil, err
@@ -174,14 +175,19 @@ func (s *mysqlStore) ListEvents(userID int64, limit int) ([]*RiskEvent, error) {
 func (s *mysqlStore) scanRule(q string, args ...interface{}) (*RiskRule, error) {
 	var r RiskRule
 	var enabled int
+	var maxAmt string
 	if err := s.db.QueryRow(q, args...).Scan(
 		&r.ID, &r.Name, &r.Kind, &r.Scope, &r.UserID, &r.Asset,
-		&r.MaxAmountPerDay, &r.MaxCountPerDay, &r.MinKYCLevel, &enabled, &r.CreatedAt); err == sql.ErrNoRows {
+		&maxAmt, &r.MaxCountPerDay, &r.MinKYCLevel, &enabled, &r.CreatedAt); err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	} else if err != nil {
 		return nil, err
 	}
 	r.Enabled = enabled == 1
+	var err error
+	if r.MaxAmountPerDay, err = settlement.AssetAmountFromString(maxAmt, settlement.AssetDecimalsByName(r.Asset)); err != nil {
+		return nil, err
+	}
 	return &r, nil
 }
 
@@ -195,12 +201,17 @@ func (s *mysqlStore) queryRules(q string, args ...interface{}) ([]*RiskRule, err
 	for rows.Next() {
 		var r RiskRule
 		var enabled int
+		var maxAmt string
 		if err := rows.Scan(
 			&r.ID, &r.Name, &r.Kind, &r.Scope, &r.UserID, &r.Asset,
-			&r.MaxAmountPerDay, &r.MaxCountPerDay, &r.MinKYCLevel, &enabled, &r.CreatedAt); err != nil {
+			&maxAmt, &r.MaxCountPerDay, &r.MinKYCLevel, &enabled, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		r.Enabled = enabled == 1
+		var err error
+		if r.MaxAmountPerDay, err = settlement.AssetAmountFromString(maxAmt, settlement.AssetDecimalsByName(r.Asset)); err != nil {
+			return nil, err
+		}
 		out = append(out, &r)
 	}
 	return out, rows.Err()

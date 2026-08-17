@@ -1,12 +1,16 @@
 package risk
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
+)
 
 func newTestSvc() *Service { return New(NewMemStore()) }
 
 func TestWithdrawLimitPass(t *testing.T) {
 	svc := newTestSvc()
-	if _, err := svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: 1000, MinKYCLevel: 1}); err != nil {
+	if _, err := svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 1}); err != nil {
 		t.Fatalf("add rule: %v", err)
 	}
 	res, err := svc.CheckWithdraw(1, "BTC", 500, 1, "")
@@ -17,7 +21,7 @@ func TestWithdrawLimitPass(t *testing.T) {
 
 func TestWithdrawLimitExceeded(t *testing.T) {
 	svc := newTestSvc()
-	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: 1000, MinKYCLevel: 1})
+	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 1})
 	res, _ := svc.CheckWithdraw(1, "BTC", 2000, 1, "")
 	if res.Allowed || res.Reason != "exceeds withdraw limit" {
 		t.Fatalf("want rejected(exceeds), got %+v", res)
@@ -26,7 +30,7 @@ func TestWithdrawLimitExceeded(t *testing.T) {
 
 func TestWithdrawLowKYC(t *testing.T) {
 	svc := newTestSvc()
-	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: 1000, MinKYCLevel: 2})
+	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 2})
 	res, _ := svc.CheckWithdraw(1, "BTC", 500, 1, "")
 	if res.Allowed || res.Reason != "kyc level too low" {
 		t.Fatalf("want rejected(kyc), got %+v", res)
@@ -69,7 +73,7 @@ func TestNoRuleDefaultsAllow(t *testing.T) {
 
 func TestOrderLimit(t *testing.T) {
 	svc := newTestSvc()
-	svc.AddRule(&RiskRule{Kind: KindOrderLimit, Asset: "ETH", MaxAmountPerDay: 10, MinKYCLevel: 1})
+	svc.AddRule(&RiskRule{Kind: KindOrderLimit, Asset: "ETH", MaxAmountPerDay: settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("ETH")), MinKYCLevel: 1})
 	if res, _ := svc.CheckOrder(1, "ETH", 5, 1); !res.Allowed {
 		t.Fatalf("want allowed, got %+v", res)
 	}
@@ -78,10 +82,52 @@ func TestOrderLimit(t *testing.T) {
 	}
 }
 
+func TestWithdrawNegativeAmountRejected(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 1})
+	res, _ := svc.CheckWithdraw(1, "BTC", -100, 1, "")
+	if res.Allowed || res.Reason != "amount must be positive" {
+		t.Fatalf("want rejected(negative amount), got %+v", res)
+	}
+}
+
+func TestWithdrawZeroAmountRejected(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 1})
+	res, _ := svc.CheckWithdraw(1, "BTC", 0, 1, "")
+	if res.Allowed || res.Reason != "amount must be positive" {
+		t.Fatalf("want rejected(zero amount), got %+v", res)
+	}
+}
+
+func TestOrderNegativeQtyRejected(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindOrderLimit, Asset: "ETH", MaxAmountPerDay: settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("ETH")), MinKYCLevel: 1})
+	res, _ := svc.CheckOrder(1, "ETH", -5, 1)
+	if res.Allowed || res.Reason != "qty must be positive" {
+		t.Fatalf("want rejected(negative qty), got %+v", res)
+	}
+}
+
+func TestWithdrawLimitBoundaryExact(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 1})
+	// 边界相等：定点化后 Cmp 为 0，应放行（不再因浮点漂移误杀）。
+	res, _ := svc.CheckWithdraw(1, "BTC", 1000, 1, "")
+	if !res.Allowed {
+		t.Fatalf("want allowed at exact limit, got %+v", res)
+	}
+	// 恰超 1 satoshi 应拒绝。
+	res, _ = svc.CheckWithdraw(1, "BTC", 1000.00000001, 1, "")
+	if res.Allowed || res.Reason != "exceeds withdraw limit" {
+		t.Fatalf("want rejected(just over), got %+v", res)
+	}
+}
+
 func TestRuleListAndRemove(t *testing.T) {
 	svc := newTestSvc()
-	r1, _ := svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: 100})
-	r2, _ := svc.AddRule(&RiskRule{Kind: KindOrderLimit, Asset: "ETH", MaxAmountPerDay: 10})
+	r1, _ := svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(100, settlement.AssetDecimalsByName("BTC"))})
+	r2, _ := svc.AddRule(&RiskRule{Kind: KindOrderLimit, Asset: "ETH", MaxAmountPerDay: settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("ETH"))})
 	all, _ := svc.ListRules("")
 	if len(all) != 2 {
 		t.Fatalf("want 2 rules got %d", len(all))
@@ -103,7 +149,7 @@ func TestRuleListAndRemove(t *testing.T) {
 
 func TestEventsRecordedOnReject(t *testing.T) {
 	svc := newTestSvc()
-	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: 100, MinKYCLevel: 1})
+	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(100, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 1})
 	svc.CheckWithdraw(1, "BTC", 5000, 1, "")
 	evs, _ := svc.ListEvents(1, 0)
 	if len(evs) != 1 {
