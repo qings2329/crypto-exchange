@@ -1,0 +1,444 @@
+package spot
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/coldlar/crypto-exchange/internal/matching"
+	"github.com/coldlar/crypto-exchange/internal/matching/client"
+	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+)
+
+var testVerifier = middleware.NewTokenVerifier("test-secret")
+
+// fakeMatcher 是 matcherClient 的测试假实现，记录 Submit/Cancel 调用次数，
+// 并在 Submit 时回写 o.ID（与 client.Client 行为一致），供断言幂等/冒充。
+type fakeMatcher struct {
+	submitCalls int
+	cancelCalls int
+	orders      map[int64]matching.OrderView
+	mu          sync.Mutex
+}
+
+var fakeOID int64
+
+func (f *fakeMatcher) Submit(symbol string, o *matching.Order) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.submitCalls++
+	if o.ID == 0 {
+		o.ID = atomic.AddInt64(&fakeOID, 1)
+	}
+	if f.orders == nil {
+		f.orders = make(map[int64]matching.OrderView)
+	}
+	f.orders[o.ID] = matching.OrderView{ID: o.ID, UserID: o.UserID, Symbol: symbol, Market: "spot", Side: sideStr(o.Side), Price: o.Price, Qty: o.Qty}
+	return true
+}
+
+func (f *fakeMatcher) CancelOrder(symbol string, orderID int64) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelCalls++
+	_, ok := f.orders[orderID]
+	delete(f.orders, orderID)
+	return ok, nil
+}
+
+func (f *fakeMatcher) GetOrder(orderID int64) (matching.OrderView, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.orders[orderID]
+	return v, ok
+}
+
+func (f *fakeMatcher) ListOrders(userID int64, symbol, status string, limit int) []matching.OrderView {
+	return nil
+}
+
+func (f *fakeMatcher) ListTrades(userID int64, symbol string, limit int) []matching.TradeView {
+	return nil
+}
+
+func (f *fakeMatcher) Depth(symbol string) (bids, asks []matching.Level, ok bool) {
+	return nil, nil, true
+}
+
+func (f *fakeMatcher) Watch(ctx context.Context, symbols []string, onTrade func(client.TradeEvent), onDepth func(client.DepthEvent)) error {
+	return nil
+}
+
+func sideStr(s matching.Side) string {
+	if s == matching.Sell {
+		return "sell"
+	}
+	return "buy"
+}
+
+func setupRouter(s *Server) *gin.Engine {
+	r := gin.New()
+	s.RegisterRoutes(r, testVerifier)
+	return r
+}
+
+func authHeader(uid int64) string {
+	return "Bearer " + testVerifier.Issue(uid, time.Hour)
+}
+
+func adminHeader() string {
+	return "Bearer " + testVerifier.IssueAdmin(99, "admin", nil, time.Hour)
+}
+
+// countSpotTrade 统计某 ref 下「成交转账」的笔数（而非流水条数）。
+// 每笔 ledger.Transfer 写入 2 条单边流水（借/贷），故一次完整结算（计价腿+基础腿）
+// 计为 2 笔转账；发生双付时该值会翻倍（4、6…），据此检测重放/并发双付。
+func countSpotTrade(s *Server, ref string) int {
+	n := 0
+	for _, e := range s.ledgerSvc.Log() {
+		if e.BizType == "spot_trade" && e.Ref == ref && e.Delta.Sign() < 0 {
+			n++ // 仅计借方单边，一笔记账=一笔转账
+		}
+	}
+	return n
+}
+
+// respData 解包统一响应信封 {"code":0,"message":"ok","data":{...}}，返回 data 层。
+func respData(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{} {
+	t.Helper()
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode resp: %v", err)
+	}
+	data, ok := resp["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("no data envelope in resp %s", w.Body.String())
+	}
+	return data
+}
+
+func extractOrderID(t *testing.T, w *httptest.ResponseRecorder) int64 {
+	t.Helper()
+	data := respData(t, w)
+	v, ok := data["order_id"]
+	if !ok {
+		t.Fatalf("no order_id in resp %s", w.Body.String())
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	}
+	t.Fatalf("bad order_id type %T", v)
+	return 0
+}
+
+// 用例1（F1 重放双付）：同 Trade 连调 settleFill 两次，spot_trade 流水数恒为 2。
+func TestSettleFillNoDoublePay_Replay(t *testing.T) {
+	s := newTestServer()
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	s.openOrders[101] = buyRec
+	s.openOrders[202] = sellRec
+
+	trade := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
+	ref := tradeRef("BTC_USDT", trade)
+
+	if err := s.settleFill("BTC_USDT", trade); err != nil {
+		t.Fatalf("first settle failed: %v", err)
+	}
+	if got := countSpotTrade(s, ref); got != 2 {
+		t.Fatalf("after first settle expect 2 entries, got %d", got)
+	}
+	if err := s.settleFill("BTC_USDT", trade); err != nil {
+		t.Fatalf("replay settle failed: %v", err)
+	}
+	if got := countSpotTrade(s, ref); got != 2 {
+		t.Fatalf("after replay expect still 2 entries, got %d", got)
+	}
+	// 余额与单次结算一致（无双付）。
+	if b, _, _ := s.ledgerSvc.Balance(1, "BTC"); !eqAmt(b, 1, "BTC") {
+		t.Fatalf("buyer BTC=%v want 1", b)
+	}
+	if u, _, _ := s.ledgerSvc.Balance(2, "USDT"); !eqAmt(u, 100, "USDT") {
+		t.Fatalf("seller USDT=%v want 100", u)
+	}
+}
+
+// 用例2（F1 竞态 + 重放）：并发同 Trade 调用 settleFill，仍仅 2 条流水、无 data race。
+func TestSettleFillConcurrentReplay(t *testing.T) {
+	s := newTestServer()
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	s.openOrders[101] = buyRec
+	s.openOrders[202] = sellRec
+
+	trade := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
+	ref := tradeRef("BTC_USDT", trade)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = s.settleFill("BTC_USDT", trade)
+		}()
+	}
+	wg.Wait()
+	if got := countSpotTrade(s, ref); got != 2 {
+		t.Fatalf("expect 2 entries after concurrent replay, got %d", got)
+	}
+	if !s.ledgerSvc.IsBalanced() {
+		t.Fatal("ledger unbalanced after concurrent settle")
+	}
+}
+
+// 用例3（F1 下单幂等）：同 client_oid 两次下单，假 matcher 的 Submit 仅 1 次、冻结不翻倍。
+func TestReserveIdempotentByClientOID(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 100000, 0)
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","side":"buy","price":100,"qty":1,"client_oid":"abc"}`
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/api/v1/spot/order", strings.NewReader(body))
+		req.Header.Set("Authorization", authHeader(1))
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("order %d status=%d body=%s", i, w.Code, w.Body.String())
+		}
+	}
+	if fm.submitCalls != 1 {
+		t.Fatalf("expect Submit called once, got %d", fm.submitCalls)
+	}
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 100, "USDT") {
+		t.Fatalf("frozen should be 100 (not doubled), got %v", f)
+	}
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST", "/api/v1/spot/order", strings.NewReader(body))
+	req2.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w2, req2)
+	data := respData(t, w2)
+	if data["idempotent"] != true {
+		t.Fatalf("second order should be idempotent, body=%s", w2.Body.String())
+	}
+}
+
+// 用例4（F4 身份伪造）：token uid=1 但 body 带 user_id=2，订单须以 uid=1 下单。
+func TestHandleOrderRejectsImpersonation(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","side":"buy","price":100,"qty":1,"user_id":2}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/order", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	oid := extractOrderID(t, w)
+	s.freezeMu.Lock()
+	rec := s.openOrders[oid]
+	s.freezeMu.Unlock()
+	if rec == nil {
+		t.Fatal("no open order recorded")
+	}
+	if rec.user != 1 {
+		t.Fatalf("impersonation succeeded: order booked under uid=%d, want 1", rec.user)
+	}
+}
+
+// 用例5（F4 越权撤单）：uid=1 撤 uid=2 的订单 → 403，且不释放冻结、不转发撤单。
+func TestHandleCancelForbiddenForOtherUser(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 100000, 0)
+	// 预冻结属于 uid=2 的订单 555。
+	rec, _ := s.reserveOnOpen(2, matching.Buy, 100, 1, "BTC_USDT")
+	s.openOrders[555] = rec
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","order_id":555}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/cancel", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1)) // 攻击者 uid=1
+	r.ServeHTTP(w, req)
+	if w.Code != 403 {
+		t.Fatalf("expect 403, got %d body=%s", w.Code, w.Body.String())
+	}
+	if fm.cancelCalls != 0 {
+		t.Fatalf("must not forward cancel to matching, got %d", fm.cancelCalls)
+	}
+	s.freezeMu.Lock()
+	still := s.openOrders[555]
+	s.freezeMu.Unlock()
+	if still == nil {
+		t.Fatal("victim's order rec must remain")
+	}
+	if _, f, _ := s.ledgerSvc.Balance(2, "USDT"); !eqAmt(f, 100, "USDT") {
+		t.Fatalf("victim's frozen changed=%v, want 100", f)
+	}
+}
+
+// 用例6（F5 零价）：price<=0 下单 → 400，不冻结、不提交。
+func TestHandleOrderRejectsZeroPrice(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 100000, 0)
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","side":"buy","price":0,"qty":1}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/order", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expect 400, got %d body=%s", w.Code, w.Body.String())
+	}
+	if fm.submitCalls != 0 {
+		t.Fatalf("must not submit, got %d", fm.submitCalls)
+	}
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 0, "USDT") {
+		t.Fatalf("must not freeze, got %v", f)
+	}
+}
+
+// 用例7（F5 纵深：零价白嫖）：cost==0 的 Trade 须被 settleFill 拒绝，卖方 base 不被无偿划转。
+func TestSettleFillZeroPriceNoFreeLunch(t *testing.T) {
+	s := newTestServer()
+	seed(s, 2, 0, 10) // 卖方有 BTC
+	trade := matching.Trade{Price: 0, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
+	if err := s.settleFill("BTC_USDT", trade); err == nil {
+		t.Fatal("expect error for zero-price trade")
+	}
+	if b, _, _ := s.ledgerSvc.Balance(2, "BTC"); !eqAmt(b, 10, "BTC") {
+		t.Fatalf("seller BTC must be unchanged (no free lunch), got %v", b)
+	}
+	if got := countSpotTrade(s, tradeRef("BTC_USDT", trade)); got != 0 {
+		t.Fatalf("expect 0 spot_trade entries, got %d", got)
+	}
+}
+
+// 用例8（F2 部分成交钳位）：2 BTC 单分两次 1 BTC 成交，末笔精确结算，撤单后无残留冻结。
+func TestPartialFillClampNoResidual(t *testing.T) {
+	s := newTestServer()
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 2, "BTC_USDT") // 冻结 200 USDT
+	s.openOrders[888] = rec
+
+	t1 := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 999}
+	t2 := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 998}
+	if err := s.settleFill("BTC_USDT", t1); err != nil {
+		t.Fatalf("t1 settle: %v", err)
+	}
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 100, "USDT") {
+		t.Fatalf("after 1st fill frozen=%v want 100", f)
+	}
+	if err := s.settleFill("BTC_USDT", t2); err != nil {
+		t.Fatalf("t2 settle: %v", err)
+	}
+	s.freezeMu.Lock()
+	n := len(s.openOrders)
+	s.freezeMu.Unlock()
+	if n != 0 {
+		t.Fatalf("expect openOrders empty after full fill, got %d", n)
+	}
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 0, "USDT") {
+		t.Fatalf("residual frozen=%v want 0", f)
+	}
+}
+
+// 用例9（F3 对账端点）：非 admin → 403；admin → 200 且 balanced 与账本一致。
+func TestReconcileAdminEndpoint(t *testing.T) {
+	s := newTestServer()
+	seed(s, 1, 100000, 0)
+	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	s.openOrders[777] = rec
+	r := setupRouter(s)
+
+	// 非 admin
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/spot/admin/reconcile", nil)
+	req.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w, req)
+	if w.Code != 403 {
+		t.Fatalf("expect 403 for non-admin, got %d", w.Code)
+	}
+
+	// admin
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("GET", "/api/v1/spot/admin/reconcile", nil)
+	req2.Header.Set("Authorization", adminHeader())
+	r.ServeHTTP(w2, req2)
+	if w2.Code != 200 {
+		t.Fatalf("expect 200 for admin, got %d body=%s", w2.Code, w2.Body.String())
+	}
+	data := respData(t, w2)
+	if data["balanced"] != true {
+		t.Fatalf("expect balanced=true, got %v", data["balanced"])
+	}
+}
+
+// 用例10（F1 撤单 vs 在途成交）：并发撤单与结算同订单，不双付、账本平衡。
+func TestCancelVsInFlightFill(t *testing.T) {
+	s := newTestServer()
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	s.openOrders[888] = rec
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	s.openOrders[202] = sellRec
+
+	trade := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 202}
+	ref := tradeRef("BTC_USDT", trade)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = s.settleFill("BTC_USDT", trade)
+		}()
+		go func() {
+			defer wg.Done()
+			s.freezeMu.Lock()
+			if r, ok := s.openOrders[888]; ok {
+				s.releaseRemaining(r)
+				delete(s.openOrders, 888)
+			}
+			s.freezeMu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if got := countSpotTrade(s, ref); got != 2 {
+		t.Fatalf("expect exactly 2 spot_trade entries (no double pay), got %d", got)
+	}
+	if !s.ledgerSvc.IsBalanced() {
+		t.Fatal("ledger unbalanced")
+	}
+}

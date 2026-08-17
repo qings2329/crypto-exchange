@@ -20,6 +20,18 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/ws"
 )
 
+// matcherClient 是 spot 对撮合能力的依赖抽象（接口），便于单测注入假实现。
+// client.Client 自然满足该接口；生产由 cmd/spot 传入具体 *client.Client。
+type matcherClient interface {
+	Submit(symbol string, o *matching.Order) bool
+	CancelOrder(symbol string, orderID int64) (bool, error)
+	GetOrder(orderID int64) (matching.OrderView, bool)
+	ListOrders(userID int64, symbol, status string, limit int) []matching.OrderView
+	ListTrades(userID int64, symbol string, limit int) []matching.TradeView
+	Depth(symbol string) (bids, asks []matching.Level, ok bool)
+	Watch(ctx context.Context, symbols []string, onTrade func(client.TradeEvent), onDepth func(client.DepthEvent)) error
+}
+
 // Server 聚合现货交易服务运行所需的依赖与生命周期。
 //
 // 多实例收敛（见 DEVELOPMENT_TASKS §18）：现货不再持有进程内撮合引擎，而是改为调用
@@ -29,14 +41,25 @@ import (
 //
 // 资金闭环（本里程碑新增）：下单前在 ledger 预冻结买方计价资产 / 卖方基础资产；每笔成交
 // 经 settleFill 解冻已成交部分并转账（买方付计价、卖方付基础）；撤单释放剩余冻结。
+//
+// 资金安全（F1–F5 边界审查整改）：
+//   - F4 身份必须来自鉴权 token，拒绝请求体 user_id 冒充。
+//   - F1 下单幂等（client_oid 去重，避免重试双冻）+ 成交重放去重（settledRefs，避免双付）。
+//   - F1 并发成交串行化（settleFill 全程持 freezeMu），消除 freezeRec 竞态。
+//   - F5 拒绝 price<=0 订单；结算纵深拦截零/负额转账。
+//   - F2 预冻结额以 settlement.AssetAmount 跟踪，结算钳位到真实剩余，消除浮点漂移/残留。
+//   - F3 结算顺序固定 Unfreeze→Transfer，失败补偿回滚；提供 admin/reconcile 对账。
 type Server struct {
 	log    *zap.Logger
-	client *client.Client
+	client matcherClient
 	hub    *ws.Hub
 
-	ledgerSvc  *ledger.Ledger // 现货自有复式记账账本（与合约服务各自独立实例，见计划说明）
-	freezeMu   sync.Mutex
-	openOrders map[int64]*freezeRec // orderID -> 预冻结记录，供成交递减与撤单释放
+	ledgerSvc *ledger.Ledger // 现货自有复式记账账本（与合约服务各自独立实例，见计划说明）
+
+	freezeMu    sync.Mutex
+	openOrders  map[int64]*freezeRec // orderID -> 预冻结记录，供成交递减与撤单释放
+	clientOIDMap map[string]int64    // "uid:client_oid" -> orderID（下单幂等，避免重试双冻）
+	settledRefs map[string]bool      // 成交去重键 -> 已结算（避免重放双付）
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -46,13 +69,15 @@ type Server struct {
 func NewServer(ledgerSvc *ledger.Ledger, cfg *config.Config, log *zap.Logger) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		log:        log,
-		client:     client.New(cfg.Matching.URL),
-		hub:        ws.NewHub(),
-		ledgerSvc:  ledgerSvc,
-		openOrders: make(map[int64]*freezeRec),
-		ctx:        ctx,
-		cancel:     cancel,
+		log:          log,
+		client:       client.New(cfg.Matching.URL),
+		hub:          ws.NewHub(),
+		ledgerSvc:    ledgerSvc,
+		openOrders:   make(map[int64]*freezeRec),
+		clientOIDMap: make(map[string]int64),
+		settledRefs:  make(map[string]bool),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	// 订阅 cmd/matching 的行情流（成交 + 深度），转发到本地前端 hub；成交同时驱动记账。
@@ -97,29 +122,38 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 	r.GET("/api/v1/spot/orders", s.handleOrders)
 	r.GET("/api/v1/spot/orders/:id", s.handleOrderDetail)
 	r.GET("/api/v1/spot/trades", s.handleTrades)
+	// 资金对账：仅管理员。
+	r.GET("/api/v1/spot/admin/reconcile", middleware.AdminGuard(), s.handleReconcile)
 }
 
 // handleOrder 提交一笔现货订单（买/卖），经 cmd/matching 撮合，并在撮合前预冻结资金。
+// F4：身份来自鉴权 token（忽略请求体 user_id）。F5：拒绝 price<=0。F1：client_oid 幂等。
 func (s *Server) handleOrder(c *gin.Context) {
 	var req struct {
-		Symbol   string  `json:"symbol"`
-		UserID   int64   `json:"user_id"`
-		Side     string  `json:"side"`
-		Price    float64 `json:"price"`
-		Qty      float64 `json:"qty"`
-		IsMargin bool    `json:"is_margin"`          // 杠杆现货单（借币后下单）
-		Leverage float64 `json:"leverage,omitempty"` // 杠杆倍数（is_margin 时有效）
+		Symbol    string  `json:"symbol"`
+		UserID    int64   `json:"user_id"` // 已废弃：身份必须来自 token（F4）
+		Side      string  `json:"side"`
+		Price     float64 `json:"price"`
+		Qty       float64 `json:"qty"`
+		IsMargin  bool    `json:"is_margin"`          // 杠杆现货单（借币后下单）
+		Leverage  float64 `json:"leverage,omitempty"` // 杠杆倍数（is_margin 时有效）
+		ClientOID string  `json:"client_oid"`          // 下单幂等键（F1）
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
-	if req.UserID == 0 {
-		response.Error(c, 400, 400, "user_id required")
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
 		return
 	}
 	if req.Qty <= 0 {
 		response.Error(c, 400, 400, "qty must be positive")
+		return
+	}
+	if req.Price <= 0 { // F5：零/负价会被结算视为白嫖（付 0 计价收基础资产），必须拦截。
+		response.Error(c, 400, 400, "price must be positive")
 		return
 	}
 	side := matching.Buy
@@ -131,8 +165,19 @@ func (s *Server) handleOrder(c *gin.Context) {
 		return
 	}
 
+	// F1 下单幂等：同 uid+client_oid 已存在则返回已有 order_id，不重复冻结/提交。
+	if req.ClientOID != "" {
+		s.freezeMu.Lock()
+		if oid, exists := s.clientOIDMap[fmt.Sprintf("%d:%s", uid, req.ClientOID)]; exists {
+			s.freezeMu.Unlock()
+			response.JSON(c, gin.H{"order_id": oid, "status": "accepted", "idempotent": true})
+			return
+		}
+		s.freezeMu.Unlock()
+	}
+
 	o := &matching.Order{
-		UserID: req.UserID,
+		UserID: uid, // F4：身份来自 token。
 		Side:   side,
 		Price:  req.Price,
 		Qty:    req.Qty,
@@ -143,30 +188,32 @@ func (s *Server) handleOrder(c *gin.Context) {
 		Leverage: req.Leverage,
 	}
 
-	// 预冻结：撮合前锁定买方计价资产 / 卖方基础资产，杜绝「超卖/超买」。
-	rec, err := s.reserveOnOpen(req.UserID, side, req.Price, req.Qty, req.Symbol)
+	// 预冻结（先写 openOrders 再 Submit，避免成交事件早到漏结算）。
+	rec, err := s.reserveOnOpen(uid, side, req.Price, req.Qty, req.Symbol)
 	if err != nil {
 		response.Error(c, 400, 400, "insufficient balance: "+err.Error())
 		return
 	}
 
+	s.freezeMu.Lock()
 	if !s.client.Submit(req.Symbol, o) {
 		// 撮合不可用，回滚预冻结，避免资金被错误锁定。
 		s.releaseRemaining(rec)
+		s.freezeMu.Unlock()
 		response.Error(c, 400, 400, "unknown symbol or matching unavailable")
 		return
 	}
-
-	// 记录预冻结（绑定 orderID），供成交递减与撤单释放。
-	s.freezeMu.Lock()
 	s.openOrders[o.ID] = rec
+	if req.ClientOID != "" {
+		s.clientOIDMap[fmt.Sprintf("%d:%s", uid, req.ClientOID)] = o.ID
+	}
 	s.freezeMu.Unlock()
 
 	response.JSON(c, gin.H{"order_id": o.ID, "status": "accepted"})
 }
 
 // reserveOnOpen 下单前预冻结资金，返回（尚未绑定 orderID 的）预冻结记录。
-// 市价买单（price=0）无法预估花费，不下预冻结，仅做可用余额内的尽力结算。
+// 冻结额以 settlement.AssetAmount 计算并跟踪（F2）。price>0 已由调用方校验。
 func (s *Server) reserveOnOpen(userID int64, side matching.Side, price, qty float64, symbol string) (*freezeRec, error) {
 	base, quote, ok := splitSymbol(symbol)
 	if !ok {
@@ -174,21 +221,23 @@ func (s *Server) reserveOnOpen(userID int64, side matching.Side, price, qty floa
 	}
 	rec := &freezeRec{user: userID, side: side, symbol: symbol, base: base, quote: quote}
 	var asset string
-	var amt float64
+	var amt settlement.AssetAmount
 	switch {
-	case side == matching.Buy && price > 0:
-		asset, amt = quote, price*qty
+	case side == matching.Buy:
+		asset = quote
+		amt = settlement.AssetAmountFromFloat(price*qty, settlement.AssetDecimalsByName(asset))
 	case side == matching.Sell:
-		asset, amt = base, qty
+		asset = base
+		amt = settlement.AssetAmountFromFloat(qty, settlement.AssetDecimalsByName(asset))
 	}
-	if amt > 0 {
-		if err := s.ledgerSvc.Freeze(userID, asset, settlement.AssetAmountFromFloat(amt, settlement.AssetDecimalsByName(asset))); err != nil {
+	if !amt.IsZero() {
+		if err := s.ledgerSvc.Freeze(userID, asset, amt); err != nil {
 			return nil, err
 		}
 	}
-	if side == matching.Buy && price > 0 {
+	if side == matching.Buy {
 		rec.frozenQuote = amt
-	} else if side == matching.Sell {
+	} else {
 		rec.frozenBase = amt
 	}
 	return rec, nil
@@ -199,34 +248,55 @@ func (s *Server) releaseRemaining(rec *freezeRec) {
 	if rec == nil {
 		return
 	}
-	if rec.frozenQuote > 0 {
-		_ = s.ledgerSvc.Unfreeze(rec.user, rec.quote, settlement.AssetAmountFromFloat(rec.frozenQuote, settlement.AssetDecimalsByName(rec.quote)))
+	if !rec.frozenQuote.IsZero() {
+		_ = s.ledgerSvc.Unfreeze(rec.user, rec.quote, rec.frozenQuote)
 	}
-	if rec.frozenBase > 0 {
-		_ = s.ledgerSvc.Unfreeze(rec.user, rec.base, settlement.AssetAmountFromFloat(rec.frozenBase, settlement.AssetDecimalsByName(rec.base)))
+	if !rec.frozenBase.IsZero() {
+		_ = s.ledgerSvc.Unfreeze(rec.user, rec.base, rec.frozenBase)
 	}
 }
 
 // handleCancel 撤销一笔现货订单，并释放其尚未成交的预冻结资金。
+// F4：释放/转发前校验订单归属本人（否则 403，不释放、不转发）；rec 缺失时向撮合引擎核验归属。
 func (s *Server) handleCancel(c *gin.Context) {
 	var req struct {
 		Symbol  string `json:"symbol"`
 		OrderID int64  `json:"order_id"`
-		UserID  int64  `json:"user_id"`
+		UserID  int64  `json:"user_id"` // 已废弃：身份来自 token（F4）
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
 
-	// 释放剩余预冻结（幂等：记录不存在则跳过，仅转发撤单到撮合引擎）。
+	// F4 归属校验：本地记录存在时确认归属本人。
 	s.freezeMu.Lock()
-	rec, ok := s.openOrders[req.OrderID]
-	if ok {
+	rec, exists := s.openOrders[req.OrderID]
+	if exists {
+		if rec.user != uid { // 非本人：拒绝，不释放、不转发撤单。
+			s.freezeMu.Unlock()
+			response.Error(c, 403, 403, "forbidden")
+			return
+		}
 		s.releaseRemaining(rec)
 		delete(s.openOrders, req.OrderID)
+		s.cleanupClientOIDLocked(req.OrderID)
+		s.freezeMu.Unlock()
+	} else {
+		s.freezeMu.Unlock()
+		// 本地记录缺失（已成交清理/从未见）：向撮合引擎核验归属，避免越权撤他人订单。
+		if v, ok2 := s.client.GetOrder(req.OrderID); ok2 {
+			if v.UserID != uid {
+				response.Error(c, 403, 403, "forbidden")
+				return
+			}
+		}
 	}
-	s.freezeMu.Unlock()
 
 	canceled, _ := s.client.CancelOrder(req.Symbol, req.OrderID)
 	response.JSON(c, gin.H{"symbol": req.Symbol, "order_id": req.OrderID, "canceled": canceled})
@@ -234,10 +304,18 @@ func (s *Server) handleCancel(c *gin.Context) {
 
 // settleFill 结算一笔现货成交：买方支付计价资产、卖方支付基础资产，均经账本转账。
 // 若对应订单有预冻结，则先释放已成交部分再转账，保证「冻结→解冻→划转」资金闭环。
+//
+// 资金安全整改：全程持 freezeMu 串行（F1 竞态）；成交去重（F1 重放双付）；
+// 顺序固定 Unfreeze→Transfer、失败补偿回滚（F3 原子性）；结算额钳位到真实剩余（F2）；
+// 零/负额拦截（F5 纵深）。
 func (s *Server) settleFill(symbol string, t matching.Trade) error {
 	base, quote, ok := splitSymbol(symbol)
 	if !ok {
 		return fmt.Errorf("unsupported symbol %s", symbol)
+	}
+	// F5 纵深：ledger.Transfer 允许 0 转账，必须拦截零/负额，避免"付 0 计价收基础资产"白嫖。
+	if t.Price <= 0 || t.Qty <= 0 {
+		return fmt.Errorf("invalid trade: price/qty must be positive")
 	}
 	cost := t.Price * t.Qty
 
@@ -248,51 +326,81 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 	} else {
 		buyer, seller = t.MakerID, t.TakerID
 	}
-	ref := fmt.Sprintf("spot:%s:%d", symbol, t.TakerOID)
-	if t.TakerOID == 0 {
-		ref = fmt.Sprintf("spot:%s:%d", symbol, t.MakerOID)
+	ref := tradeRef(symbol, t)
+
+	s.freezeMu.Lock()
+	defer s.freezeMu.Unlock()
+
+	// F1 重放去重：已结算则跳过（临界区内检查+置位，保证仅结算一次）。
+	if s.settledRefs[ref] {
+		return nil
 	}
 
 	// 按订单维度查找本方预冻结记录，成交时递减。
-	buyRec := s.lookupFreeze(t.TakerOID, t.MakerOID, matching.Buy)
-	sellRec := s.lookupFreeze(t.TakerOID, t.MakerOID, matching.Sell)
+	buyRec := s.lookupFreezeLocked(t.TakerOID, t.MakerOID, matching.Buy)
+	sellRec := s.lookupFreezeLocked(t.TakerOID, t.MakerOID, matching.Sell)
 
-	// 买方支付计价资产。
-	if buyRec != nil {
-		_ = s.ledgerSvc.Unfreeze(buyer, quote, settlement.AssetAmountFromFloat(cost, settlement.AssetDecimalsByName(quote)))
-		buyRec.frozenQuote -= cost
-		if buyRec.frozenQuote < 0 {
-			buyRec.frozenQuote = 0
+	// 计价腿：买方支付 quote（先解冻后转账）。
+	quoteAmt := settlement.AssetAmountFromFloat(cost, settlement.AssetDecimalsByName(quote))
+	if buyRec != nil && quoteAmt.Cmp(buyRec.frozenQuote) > 0 {
+		quoteAmt = buyRec.frozenQuote // F2 钳位到真实剩余，消除累计漂移/残留。
+	}
+	if !quoteAmt.IsZero() {
+		if buyRec != nil {
+			if err := s.ledgerSvc.Unfreeze(buyer, quote, quoteAmt); err != nil {
+				return fmt.Errorf("unfreeze buyer quote: %w", err)
+			}
+		}
+		if err := s.ledgerSvc.Transfer(buyer, seller, quote, quoteAmt, "spot_trade", ref); err != nil {
+			if buyRec != nil { // 补偿回滚：重新冻结，使可安全重试。
+				_ = s.ledgerSvc.Freeze(buyer, quote, quoteAmt)
+			}
+			return fmt.Errorf("settle buyer leg: %w", err)
+		}
+		if buyRec != nil {
+			buyRec.frozenQuote = buyRec.frozenQuote.Sub(quoteAmt)
 		}
 	}
-	if err := s.ledgerSvc.Transfer(buyer, seller, quote, settlement.AssetAmountFromFloat(cost, settlement.AssetDecimalsByName(quote)), "spot_trade", ref); err != nil {
-		s.log.Error("spot settle buyer leg failed", zap.Int64("buyer", buyer), zap.Error(err))
-		return err
-	}
 
-	// 卖方支付基础资产。
-	if sellRec != nil {
-		_ = s.ledgerSvc.Unfreeze(seller, base, settlement.AssetAmountFromFloat(t.Qty, settlement.AssetDecimalsByName(base)))
-		sellRec.frozenBase -= t.Qty
-		if sellRec.frozenBase < 0 {
-			sellRec.frozenBase = 0
+	// 基础腿：卖方支付 base（先解冻后转账）。
+	baseAmt := settlement.AssetAmountFromFloat(t.Qty, settlement.AssetDecimalsByName(base))
+	if sellRec != nil && baseAmt.Cmp(sellRec.frozenBase) > 0 {
+		baseAmt = sellRec.frozenBase
+	}
+	if !baseAmt.IsZero() {
+		if sellRec != nil {
+			if err := s.ledgerSvc.Unfreeze(seller, base, baseAmt); err != nil {
+				return fmt.Errorf("unfreeze seller base: %w", err)
+			}
+		}
+		if err := s.ledgerSvc.Transfer(seller, buyer, base, baseAmt, "spot_trade", ref); err != nil {
+			if sellRec != nil {
+				_ = s.ledgerSvc.Freeze(seller, base, baseAmt)
+			}
+			return fmt.Errorf("settle seller leg: %w", err)
+		}
+		if sellRec != nil {
+			sellRec.frozenBase = sellRec.frozenBase.Sub(baseAmt)
 		}
 	}
-	if err := s.ledgerSvc.Transfer(seller, buyer, base, settlement.AssetAmountFromFloat(t.Qty, settlement.AssetDecimalsByName(base)), "spot_trade", ref); err != nil {
-		s.log.Error("spot settle seller leg failed", zap.Int64("seller", seller), zap.Error(err))
-		return err
-	}
 
-	// 完全成交的订单清理记录。
-	s.maybeCleanup(t.TakerOID)
-	s.maybeCleanup(t.MakerOID)
+	// 全部成功：置去重标记，清理终态记录（释放 client_oid 映射，避免无界增长）。
+	s.settledRefs[ref] = true
+	s.maybeCleanupLocked(t.TakerOID)
+	s.maybeCleanupLocked(t.MakerOID)
 	return nil
 }
 
-// lookupFreeze 在预冻结记录中按订单 ID 与方向查找（taker/maker 任一命中即可）。
-func (s *Server) lookupFreeze(takerOID, makerOID int64, side matching.Side) *freezeRec {
-	s.freezeMu.Lock()
-	defer s.freezeMu.Unlock()
+// tradeRef 生成成交去重键。注：同对同价同量两笔独立成交理论上同键（极罕见，实践中几乎不可能），
+// 此处沿用现有 Trade 字段组合，必要时可改为在 matching.Trade 增加全局唯一 Seq。
+func tradeRef(symbol string, t matching.Trade) string {
+	return fmt.Sprintf("spot:%s:t%d:m%d:p%v:q%v:b%d:s%d:%v",
+		symbol, t.TakerOID, t.MakerOID, t.Price, t.Qty, t.TakerID, t.MakerID, t.TakerSide)
+}
+
+// lookupFreezeLocked 在预冻结记录中按订单 ID 与方向查找（taker/maker 任一命中即可）。
+// 调用方须已持 freezeMu。
+func (s *Server) lookupFreezeLocked(takerOID, makerOID int64, side matching.Side) *freezeRec {
 	for _, oid := range []int64{takerOID, makerOID} {
 		if rec, ok := s.openOrders[oid]; ok && rec.side == side {
 			return rec
@@ -301,19 +409,29 @@ func (s *Server) lookupFreeze(takerOID, makerOID int64, side matching.Side) *fre
 	return nil
 }
 
-// maybeCleanup 当一笔订单的预冻结已完全释放时，移除其记录。
-func (s *Server) maybeCleanup(orderID int64) {
+// maybeCleanupLocked 当一笔订单的预冻结已完全释放时，移除其记录并清理 client_oid 映射。
+// 调用方须已持 freezeMu。
+func (s *Server) maybeCleanupLocked(orderID int64) {
 	if orderID == 0 {
 		return
 	}
-	s.freezeMu.Lock()
-	defer s.freezeMu.Unlock()
 	rec, ok := s.openOrders[orderID]
 	if !ok {
 		return
 	}
-	if rec.frozenQuote <= 1e-9 && rec.frozenBase <= 1e-9 {
+	if rec.frozenQuote.IsZero() && rec.frozenBase.IsZero() {
 		delete(s.openOrders, orderID)
+		s.cleanupClientOIDLocked(orderID)
+	}
+}
+
+// cleanupClientOIDLocked 删除指向指定 orderID 的 client_oid 映射条目。调用方须已持 freezeMu。
+func (s *Server) cleanupClientOIDLocked(orderID int64) {
+	for k, oid := range s.clientOIDMap {
+		if oid == orderID {
+			delete(s.clientOIDMap, k)
+			return
+		}
 	}
 }
 
@@ -411,6 +529,48 @@ func (s *Server) handleDepth(c *gin.Context) {
 // handleWS 升级为现货行情 WebSocket，推送成交与深度。
 func (s *Server) handleWS(c *gin.Context) {
 	s.hub.Handle(c.Writer, c.Request)
+}
+
+// reconcile 比对 spot 预冻结记录与账本冻结余额，返回每「用户:资产」的偏差。
+func (s *Server) reconcile() map[string]settlement.AssetAmount {
+	s.freezeMu.Lock()
+	expected := make(map[int64]map[string]settlement.AssetAmount) // uid -> asset -> 预期冻结额
+	for _, rec := range s.openOrders {
+		if !rec.frozenQuote.IsZero() {
+			if expected[rec.user] == nil {
+				expected[rec.user] = make(map[string]settlement.AssetAmount)
+			}
+			expected[rec.user][rec.quote] = expected[rec.user][rec.quote].Add(rec.frozenQuote)
+		}
+		if !rec.frozenBase.IsZero() {
+			if expected[rec.user] == nil {
+				expected[rec.user] = make(map[string]settlement.AssetAmount)
+			}
+			expected[rec.user][rec.base] = expected[rec.user][rec.base].Add(rec.frozenBase)
+		}
+	}
+	s.freezeMu.Unlock()
+
+	dev := make(map[string]settlement.AssetAmount)
+	for uid, assets := range expected {
+		for asset, exp := range assets {
+			_, frozen, ok := s.ledgerSvc.Balance(uid, asset)
+			if !ok {
+				dev[fmt.Sprintf("%d:%s", uid, asset)] = exp
+				continue
+			}
+			if diff := frozen.Sub(exp); !diff.IsZero() {
+				dev[fmt.Sprintf("%d:%s", uid, asset)] = diff
+			}
+		}
+	}
+	return dev
+}
+
+// handleReconcile 暴露资金对账结果（仅管理员，见 RegisterRoutes 的 AdminGuard）。
+func (s *Server) handleReconcile(c *gin.Context) {
+	dev := s.reconcile()
+	response.JSON(c, gin.H{"balanced": len(dev) == 0, "deviation": dev})
 }
 
 // Close 停止行情订阅。
