@@ -117,6 +117,11 @@ func (s *mysqlStore) UpdateHolding(h *WealthHolding) error {
 	return err
 }
 
+func (s *mysqlStore) DeleteHolding(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM ce_wealth_holdings WHERE id = ?`, id)
+	return err
+}
+
 func (s *mysqlStore) ListHoldings(userID int64) ([]*WealthHolding, error) {
 	rows, err := s.db.Query(`
 		SELECT id, user_id, product_id, principal, accrued_yield, status, created_at, last_accrual_at, redeemed_at, updated_at

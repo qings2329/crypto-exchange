@@ -16,12 +16,12 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 	api.Use(middleware.Auth(verifier))
 	{
 		api.GET("/products", s.handleListProducts)
-		api.POST("/products", s.handleCreateProduct)
+		api.POST("/products", middleware.AdminGuard(), s.handleCreateProduct)
 		api.POST("/subscribe", s.handleSubscribe)
 		api.POST("/redeem", s.handleRedeem)
 		api.GET("/holdings", s.handleMyHoldings)
-		api.GET("/admin/holdings", s.handleAdminHoldings)
-		api.POST("/admin/accrue", s.handleAccrue)
+		api.GET("/admin/holdings", middleware.AdminGuard(), s.handleAdminHoldings)
+		api.POST("/admin/accrue", middleware.AdminGuard(), s.handleAccrue)
 	}
 }
 

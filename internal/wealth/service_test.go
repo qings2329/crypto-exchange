@@ -146,3 +146,41 @@ func TestYieldToPure(t *testing.T) {
 		t.Fatalf("YieldTo wrong: %.4f want ~10", got)
 	}
 }
+
+// TestRedeemIdempotent F1：已赎回的持仓再次赎回应被终态短路，本金+收益只兑付一次。
+func TestRedeemIdempotent(t *testing.T) {
+	svc, l := newTestService()
+	p := mustProduct(svc, TypeCurrent, 0.365, 0, 100) // 365% 年化
+	store := svc.store
+	h := &WealthHolding{UserID: 1, ProductID: p.ID, Principal: 1000, Status: HoldingActive,
+		CreatedAt: time.Now().Add(-365 * 24 * time.Hour), LastAccrualAt: time.Now().Add(-365 * 24 * time.Hour)}
+	if err := store.CreateHolding(h); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before, _, _ := l.Balance(1, "USDT")
+	if _, err := svc.Redeem(1, h.ID); err != nil {
+		t.Fatalf("redeem#1: %v", err)
+	}
+	if _, err := svc.Redeem(1, h.ID); err != ErrAlreadyRedeemed {
+		t.Fatalf("redeem#2: expected ErrAlreadyRedeemed, got %v", err)
+	}
+	after, _, _ := l.Balance(1, "USDT")
+	diff := after.HumanFloat() - before.HumanFloat()
+	// 仅兑付一次：本金 1000 + 收益≈365 ≈ 1365，不得翻倍。
+	if diff < 1364 || diff > 1366 {
+		t.Fatalf("idempotent redeem paid wrong amount: diff=%.4f want ~1365", diff)
+	}
+}
+
+// TestSubscribeInsufficientNoHolding F1：余额不足时不得残留（Funding）持仓。
+func TestSubscribeInsufficientNoHolding(t *testing.T) {
+	svc, _ := newTestService()
+	p := mustProduct(svc, TypeCurrent, 0.03, 0, 1000)
+	if _, err := svc.Subscribe(1, p.ID, 1e9); err != ErrInsufficientBal {
+		t.Fatalf("expected ErrInsufficientBal, got %v", err)
+	}
+	list, _ := svc.MyHoldings(1)
+	if len(list) != 0 {
+		t.Fatalf("insufficient subscribe must not leave holding: %d", len(list))
+	}
+}
