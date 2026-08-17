@@ -28,6 +28,7 @@ type Server struct {
 	catalog     CatalogStore   // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
 	annH       *announcement.Handler // 公告管理（与用户服务共用同一份 ce_announcements 表与迁移版本 9401）
 	auditStore AuditStore    // 管理员操作审计日志（MySQL 优先，失败回退内存）
+	loginLimiter *loginIPLimiter // 基于 IP 的登录限流（防单 IP 爆破 + 缓解账户锁定 DoS）
 }
 
 // NewServer 装配管理后台服务。verifier 使用全局 auth 共享密钥（与用户 token 同一密钥，
@@ -105,6 +106,10 @@ func NewServer(cfg *config.Config) *Server {
 		catalog:     catalog,
 		annH:        annH,
 		auditStore:  auditStore,
+		loginLimiter: newLoginIPLimiter(
+			cfg.Admin.LoginRateLimitPerIP,
+			time.Duration(cfg.Admin.LoginRateWindowSec)*time.Second,
+		),
 	}
 }
 

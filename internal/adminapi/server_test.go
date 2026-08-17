@@ -166,3 +166,45 @@ func TestAdminLoginLockout(t *testing.T) {
 		t.Fatalf("locked wrong login: expected 401, got %d", code)
 	}
 }
+
+// TestAdminLoginIPRateLimit 验证基于 IP 的登录限流：单 IP 达阈值后返回 429，
+// 且不同 IP 独立计数（证明按来源 IP 限流，不波及他人）。
+func TestAdminLoginIPRateLimit(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Auth.Secret = "test-secret"
+	cfg.Admin.Username = "admin"
+	cfg.Admin.Password = "admin123"
+	cfg.Admin.TokenTTLSec = 3600
+	cfg.Admin.LoginRateLimitPerIP = 2 // 单 IP 2 次/窗口
+	cfg.Admin.LoginRateWindowSec = 60
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	adminapi.NewServer(cfg).RegisterRoutes(r)
+
+	// loginAs 以指定来源 IP 发起一次登录尝试。
+	loginAs := func(ip string) int {
+		b, _ := json.Marshal(map[string]string{"username": "admin", "password": "wrong"})
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/login", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = ip + ":1234"
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	// 1) IP-A 前 2 次尝试 → 401（在阈值内，放行）
+	if code := loginAs("10.0.0.1"); code != http.StatusUnauthorized {
+		t.Fatalf("ipA attempt1: expected 401, got %d", code)
+	}
+	if code := loginAs("10.0.0.1"); code != http.StatusUnauthorized {
+		t.Fatalf("ipA attempt2: expected 401, got %d", code)
+	}
+	// 2) IP-A 第 3 次 → 429（达阈值被限流）
+	if code := loginAs("10.0.0.1"); code != http.StatusTooManyRequests {
+		t.Fatalf("ipA attempt3: expected 429, got %d", code)
+	}
+	// 3) 不同 IP-B 仍被放行（独立计数，证明按 IP 限流）
+	if code := loginAs("10.0.0.2"); code != http.StatusUnauthorized {
+		t.Fatalf("ipB attempt: expected 401 (independent bucket), got %d", code)
+	}
+}

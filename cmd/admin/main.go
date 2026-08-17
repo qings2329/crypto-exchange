@@ -42,6 +42,12 @@ func main() {
 	}
 
 	r := gin.New()
+	// 配置受信任代理后，c.ClientIP() 从 X-Forwarded-For 取真实客户端 IP；
+	// 留空则不信任任何代理，使用直连对端 IP（RemoteAddr）。这让登录 IP 限流、审计 IP、
+	// 全局限流都能正确归因到真实来源（避免经网关转发时全体管理员被误判为同一 IP）。
+	if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+		log.Fatalf("set trusted proxies: %v", err)
+	}
 	r.Use(middleware.Common(logger, cfg)...)
 
 	srv := adminapi.NewServer(cfg)
