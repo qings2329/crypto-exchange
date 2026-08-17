@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"database/sql"
 	"os"
 	"testing"
 	"time"
@@ -73,5 +74,72 @@ func TestSaveLoadMySQL(t *testing.T) {
 	}
 	if avail, _, ok := l2.Balance(70001, "USDT"); !ok || !eqAmt(avail, 99900) {
 		t.Fatalf("available balance should reflect 1 frozen hold (~99900), got %v ok=%v", avail, ok)
+	}
+}
+
+// TestIdempotencyPersistedToMySQL 验证 #26 的幂等指纹持久化：进程重启（全新 Ledger 实例、
+// 内存去重 map 为空）后，同 ref 的重复提交会被 DB 唯一约束拦截，从而杜绝"重启后同 ref 双付"。
+// 仅在设置 MYSQL_TEST_DSN 时运行；无 MySQL 时跳过。
+func TestIdempotencyPersistedToMySQL(t *testing.T) {
+	dsn := os.Getenv("MYSQL_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MYSQL_TEST_DSN not set; skipping MySQL integration test")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		t.Fatalf("db.Ping: %v", err)
+	}
+
+	const ledgerID = "idem_test"
+	// 清理可能残留的同一 ledger_id 指纹，保证测试可重复（SETUP）。
+	if _, err := db.Exec("DELETE FROM ce_ledger_idempotency WHERE ledger_id=?", ledgerID); err != nil {
+		t.Fatalf("cleanup idempotency rows: %v", err)
+	}
+
+	// 第一次运行（模拟进程生命周期 1）：存款并发起带 ref 的转账，指纹落库。
+	l1 := New()
+	if err := l1.SetIdempotencyDB(db, ledgerID); err != nil {
+		t.Fatalf("SetIdempotencyDB l1: %v", err)
+	}
+	_ = l1.Deposit(1, "USDT", amt("USDT", 100000), "seed")
+	if err := l1.Transfer(1, 2, "USDT", amt("USDT", 5000), "transfer", "R1"); err != nil {
+		t.Fatalf("l1 transfer R1: %v", err)
+	}
+	if avail, _, ok := l1.Balance(1, "USDT"); !ok || !eqAmt(avail, 95000) {
+		t.Fatalf("l1 sender after R1: %v want 95000", avail)
+	}
+
+	// 模拟重启：全新 Ledger 实例（内存幂等 map 为空），但共享同一 DB 后端。
+	l2 := New()
+	if err := l2.SetIdempotencyDB(db, ledgerID); err != nil {
+		t.Fatalf("SetIdempotencyDB l2: %v", err)
+	}
+	// 关键前提：重启后 l2 尚未感知过 R1（内存 map 空），若 DB 不拦截就会双付。
+	if err := l2.Transfer(1, 2, "USDT", amt("USDT", 5000), "transfer", "R1"); err != nil {
+		t.Fatalf("l2 transfer R1 (dup): %v", err)
+	}
+	// DB 命中唯一约束 → 跳过 → l2 余额未变化（发送方仍是满额，接收方仍是 0）。
+	if avail, _, ok := l2.Balance(1, "USDT"); !ok || !eqAmt(avail, 100000) {
+		t.Fatalf("l2 sender after dup R1: %v want 100000 (no double pay across restart)", avail)
+	}
+	if recv, _, ok := l2.Balance(2, "USDT"); !ok || !eqAmt(recv, 0) {
+		t.Fatalf("l2 receiver after dup R1: %v want 0 (no double pay across restart)", recv)
+	}
+
+	// 指纹仅写入一次（INSERT IGNORE 收敛并发/重启重复写入）。
+	fp := transferFingerprint(1, 2, "USDT", amt("USDT", 5000), "transfer", "R1")
+	var cnt int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM ce_ledger_idempotency WHERE ledger_id=? AND kind='transfer' AND fp=?",
+		ledgerID, fp,
+	).Scan(&cnt); err != nil {
+		t.Fatalf("count idempotency rows: %v", err)
+	}
+	if cnt != 1 {
+		t.Fatalf("expected exactly 1 idempotency row for R1, got %d", cnt)
 	}
 }
