@@ -114,6 +114,13 @@ type Ledger struct {
 	// 故按"完整元组"去重而非按 (biz,ref) 去重——后者会误杀多腿交易（见 #20）。
 	transferSeen map[string]bool
 
+	// freezeSeen 是冻结类操作指纹 -> 已结算 的幂等集合（纵深防双付，F1）。
+	// 指纹 = op|user|asset|amount|ref（op ∈ {freeze,unfreeze,freezewithdraw,unfreezewithdraw}），
+	// 含 amount 以与 #20 Transfer 去重一致——即便调用方对同一 ref 传入不同金额，也不会被误去重，
+	// 账本基建对调用方误用更健壮。仅当调用方显式传入非空 ref 时启用去重；ref 为空则保持
+	// 原"每次调用均生效"的语义（增量冻结 Unfreeze(prev)+Freeze(new) 因此完全不受影响）。
+	freezeSeen map[string]bool
+
 	// 对账巡检（定时对账探针）：reconMu 独立保护巡检状态，避免长持有 l.mu。
 	reconMu      sync.RWMutex
 	reconStats   ReconStats
@@ -239,6 +246,7 @@ func New() *Ledger {
 		accounts:             make(map[string]*Account),
 		restricted:           make(map[string]bool),
 		transferSeen:         make(map[string]bool),
+		freezeSeen:           make(map[string]bool),
 		badDebtByUser:        make(map[string]settlement.AssetAmount),
 		socializeProposals:   make(map[string]*SocializeProposal),
 		hotWallet:            make(map[string]settlement.AssetAmount),
@@ -335,67 +343,132 @@ func (l *Ledger) Balance(userID int64, asset string) (available, frozen settleme
 }
 
 // Freeze 将可用余额冻结（开仓锁定保证金）。可用不足返回错误。
-func (l *Ledger) Freeze(userID int64, asset string, amount settlement.AssetAmount) error {
+// refs 为可选幂等引用：传入非空 ref 时，相同指纹（op|user|asset|amount|ref）的重复调用
+// 视为已结算、直接跳过（no-op），作为账本层纵深防双付（F1）；ref 为空则保持原"每次调用均生效"语义。
+func (l *Ledger) Freeze(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
 	if amount.Sign() < 0 {
 		return fmt.Errorf("freeze amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
+	var ref string
+	if len(refs) > 0 {
+		ref = refs[0]
+	}
+	var fp string
+	if ref != "" {
+		fp = freezeFingerprint("freeze", userID, asset, amount, ref)
+		if l.freezeSeen[fp] {
+			return nil
+		}
+	}
 	a := l.getOrCreateLocked(userID, asset)
 	if a.Available.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
 	}
 	a.Available = a.Available.Sub(amount)
 	a.Frozen = a.Frozen.Add(amount)
+	if ref != "" {
+		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+	}
 	return nil
 }
 
 // Unfreeze 解冻到可用余额（平仓释放保证金）。冻结不足返回错误。
-func (l *Ledger) Unfreeze(userID int64, asset string, amount settlement.AssetAmount) error {
+// refs 为可选幂等引用（语义同 Freeze）：非空 ref 时相同指纹的重复调用为 no-op。
+func (l *Ledger) Unfreeze(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
 	if amount.Sign() < 0 {
 		return fmt.Errorf("unfreeze amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
+	var ref string
+	if len(refs) > 0 {
+		ref = refs[0]
+	}
+	var fp string
+	if ref != "" {
+		fp = freezeFingerprint("unfreeze", userID, asset, amount, ref)
+		if l.freezeSeen[fp] {
+			return nil
+		}
+	}
 	a := l.getOrCreateLocked(userID, asset)
 	if a.Frozen.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient frozen balance")
 	}
 	a.Frozen = a.Frozen.Sub(amount)
 	a.Available = a.Available.Add(amount)
+	if ref != "" {
+		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+	}
 	return nil
 }
 
 // FreezeWithdraw 将可用余额冻结为提现冻结（提交提现受理时锁定，与持仓保证金冻结
 // Frozen 互不干扰）。可用不足返回错误。
-func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount) error {
+// refs 为可选幂等引用（语义同 Freeze）：非空 ref 时相同指纹的重复调用为 no-op。
+func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
 	if amount.Sign() < 0 {
 		return fmt.Errorf("freeze withdraw amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
+	var ref string
+	if len(refs) > 0 {
+		ref = refs[0]
+	}
+	var fp string
+	if ref != "" {
+		fp = freezeFingerprint("freezewithdraw", userID, asset, amount, ref)
+		if l.freezeSeen[fp] {
+			return nil
+		}
+	}
 	a := l.getOrCreateLocked(userID, asset)
 	if a.Available.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
 	}
 	a.Available = a.Available.Sub(amount)
 	a.WithdrawFrozen = a.WithdrawFrozen.Add(amount)
+	if ref != "" {
+		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+	}
 	return nil
 }
 
 // UnfreezeWithdraw 解冻提现冻结到可用余额（提现失败回退或回滚后退回可用）。冻结不足返回错误。
-func (l *Ledger) UnfreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount) error {
+// refs 为可选幂等引用（语义同 Freeze）：非空 ref 时相同指纹的重复调用为 no-op。
+func (l *Ledger) UnfreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
 	if amount.Sign() < 0 {
 		return fmt.Errorf("unfreeze withdraw amount must be >= 0")
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
+	var ref string
+	if len(refs) > 0 {
+		ref = refs[0]
+	}
+	var fp string
+	if ref != "" {
+		fp = freezeFingerprint("unfreezewithdraw", userID, asset, amount, ref)
+		if l.freezeSeen[fp] {
+			return nil
+		}
+	}
 	a := l.getOrCreateLocked(userID, asset)
 	if a.WithdrawFrozen.Cmp(amount) < 0 {
 		return fmt.Errorf("insufficient withdraw frozen balance")
 	}
 	a.WithdrawFrozen = a.WithdrawFrozen.Sub(amount)
 	a.Available = a.Available.Add(amount)
+	if ref != "" {
+		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+	}
 	return nil
 }
 
@@ -442,6 +515,13 @@ func (l *Ledger) DebitAvailable(userID int64, asset string, amount settlement.As
 // 得到相同指纹（可去重），而同一交易的两腿（from/to 互换、asset 不同）指纹不同（不被误杀）。
 func transferFingerprint(from, to int64, asset string, amount settlement.AssetAmount, biz, ref string) string {
 	return fmt.Sprintf("%d|%d|%s|%s|%d|%s|%s", from, to, asset, amount.Value.String(), amount.Decimals, biz, ref)
+}
+
+// freezeFingerprint 计算一次"冻结类操作"的幂等指纹。
+// 覆盖 op/user/asset/金额(最小单位+小数)/ref 全部维度，使同一笔冻结的两次提交得到相同指纹
+// （可去重），而同 ref 不同金额、或不同 op（Unfreeze(prev) vs Freeze(new)）指纹不同（不被误杀）。
+func freezeFingerprint(op string, userID int64, asset string, amount settlement.AssetAmount, ref string) string {
+	return fmt.Sprintf("%s|%d|%s|%s|%d|%s", op, userID, asset, amount.Value.String(), amount.Decimals, ref)
 }
 
 // Transfer 从 from 可用余额转到 to 可用余额，两边各记一条相反数流水。

@@ -77,6 +77,123 @@ func TestFreezeUnfreeze(t *testing.T) {
 	assertBalance(t, l, 1, "USDT", 10000, 0)
 }
 
+// TestFreezeIdempotentByRef 验证：传入非空 ref 时，相同指纹的重复 Freeze 为 no-op（不二次扣减可用/不二次增加冻结）。
+func TestFreezeIdempotentByRef(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", amt("USDT", 10000), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	amount := amt("USDT", 5000)
+	// 第一次冻结生效
+	if err := l.Freeze(1, "USDT", amount, "ref-1"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 5000, 5000)
+	// 相同 ref 重复提交：应为 no-op
+	if err := l.Freeze(1, "USDT", amount, "ref-1"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 5000, 5000) // 余额未变
+}
+
+// TestUnfreezeIdempotentByRef 验证：传入非空 ref 时，相同指纹的重复 Unfreeze 为 no-op。
+func TestUnfreezeIdempotentByRef(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", amt("USDT", 10000), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	amount := amt("USDT", 5000)
+	if err := l.Freeze(1, "USDT", amount, "freeze-ref"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 5000, 5000)
+	// 第一次解冻生效
+	if err := l.Unfreeze(1, "USDT", amount, "ref-2"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 10000, 0)
+	// 相同 ref 重复提交：应为 no-op（不会把可用余额再凭空增加）
+	if err := l.Unfreeze(1, "USDT", amount, "ref-2"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 10000, 0) // 余额未变
+}
+
+// TestFreezeWithoutRefNoDedupe 回归保护：不传 ref 时保持原语义，每次调用均生效。
+func TestFreezeWithoutRefNoDedupe(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", amt("USDT", 10000), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	amount := amt("USDT", 5000)
+	if err := l.Freeze(1, "USDT", amount); err != nil {
+		t.Fatal(err)
+	}
+	// 无 ref 重复调用：仍生效（可用再扣 5000、冻结再增 5000）
+	if err := l.Freeze(1, "USDT", amount); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 0, 10000) // 两次都生效
+}
+
+// TestFreezeDistinctRefsApply 验证：含 amount 的指纹确保「同 ref 不同金额」与「同金额不同 ref」均不被误去重。
+func TestFreezeDistinctRefsApply(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", amt("USDT", 100000), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	// 同 ref "x"，不同金额：两笔都应生效（指纹因 amount 不同而不同）
+	if err := l.Freeze(1, "USDT", amt("USDT", 10), "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Freeze(1, "USDT", amt("USDT", 20), "x"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 100000-30, 30)
+	// 同金额，不同 ref "a"/"b"：两笔都应生效（指纹因 ref 不同而不同）
+	if err := l.Freeze(1, "USDT", amt("USDT", 5), "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Freeze(1, "USDT", amt("USDT", 5), "b"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 100000-40, 40)
+}
+
+// TestFreezeWithdrawIdempotentByRef 覆盖 FreezeWithdraw/UnfreezeWithdraw 入口的幂等。
+func TestFreezeWithdrawIdempotentByRef(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", amt("USDT", 10000), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	amount := amt("USDT", 5000)
+	// 提现冻结（带 ref），重复提交应为 no-op
+	if err := l.FreezeWithdraw(1, "USDT", amount, "wd-ref"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.FreezeWithdraw(1, "USDT", amount, "wd-ref"); err != nil {
+		t.Fatal(err)
+	}
+	// 注意：Balance 的第二个返回值是持仓保证金冻结(Frozen)，提现冻结需用 WithdrawFrozenBalance 读取。
+	_, avail, _ := l.Balance(1, "USDT")
+	wf, _ := l.WithdrawFrozenBalance(1, "USDT")
+	if !eqAmt(wf, 5000) {
+		t.Fatalf("withdraw frozen = %s, want 5000 (avail=%s)", wf.HumanString(), avail.HumanString())
+	}
+	// 退回（带不同 ref），重复提交应为 no-op
+	if err := l.UnfreezeWithdraw(1, "USDT", amount, "unwd-ref"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.UnfreezeWithdraw(1, "USDT", amount, "unwd-ref"); err != nil {
+		t.Fatal(err)
+	}
+	avail2, _, _ := l.Balance(1, "USDT")
+	wf2, _ := l.WithdrawFrozenBalance(1, "USDT")
+	if !eqAmt(wf2, 0) || !eqAmt(avail2, 10000) {
+		t.Fatalf("after unwind: avail=%s wf=%s, want avail=10000 wf=0", avail2.HumanString(), wf2.HumanString())
+	}
+}
+
 // TestFundingClosedLoop 资金费多空转账闭环：净额恒为零。
 func TestFundingClosedLoop(t *testing.T) {
 	l := ledger.New()
