@@ -5,6 +5,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // RegisterRoutes 在 gin 引擎上注册杠杆业务路由。
@@ -41,7 +42,7 @@ func (s *Service) handleBorrow(c *gin.Context) {
 		response.Error(c, 400, 4000, "invalid body")
 		return
 	}
-	if req.Asset == "" || req.Amount <= 0 || req.Leverage < 1 {
+	if req.Asset == "" || !settlement.KnownAsset(req.Asset) || req.Amount <= 0 || req.Leverage < 1 {
 		response.Error(c, 400, 4001, "asset/amount/leverage required")
 		return
 	}
@@ -69,7 +70,7 @@ func (s *Service) handleRepay(c *gin.Context) {
 		response.Error(c, 400, 4000, "invalid body")
 		return
 	}
-	if req.Asset == "" || req.Amount <= 0 {
+	if req.Asset == "" || !settlement.KnownAsset(req.Asset) || req.Amount <= 0 {
 		response.Error(c, 400, 4001, "asset/amount required")
 		return
 	}
@@ -92,7 +93,7 @@ func (s *Service) handleLiquidate(c *gin.Context) {
 		response.Error(c, 400, 4000, "invalid body")
 		return
 	}
-	if req.UserID <= 0 || req.Asset == "" {
+	if req.UserID <= 0 || req.Asset == "" || !settlement.KnownAsset(req.Asset) {
 		response.Error(c, 400, 4001, "user_id/asset required")
 		return
 	}

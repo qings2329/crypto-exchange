@@ -3,6 +3,7 @@ package margin
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -11,6 +12,17 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
+
+// maxAssetAmount 单笔借入/还款金额的人类单位上限，用于防止 float 溢出被
+// AssetAmountFromFloat 静默归零（F5：NaN/Inf → 0 会导致免费借入/无抵押空头）。
+const maxAssetAmount = 1e15
+
+// finitePositive 校验浮点值为有限正数且不超过上限。
+// 用于边界校验：settlement.AssetAmountFromFloat 对 NaN/Inf 会静默返回 0，
+// 须在转换前显式拒绝，否则会产生「免费借入」「零抵押开仓」等资金漏洞（F5）。
+func finitePositive(x, max float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0) && x > 0 && x <= max
+}
 
 // Config 是杠杆业务参数。
 type Config struct {
@@ -67,7 +79,13 @@ func NewService(store Store, ledgerSvc *ledger.Ledger, cfg Config, log *zap.Logg
 // 任一步失败回滚（删除账户/解冻）；同一 (user, asset) 已存在活跃账户时拒绝重复开仓，避免覆盖式双借。
 // s.mu 串行化开仓以避免并发重复扣费。
 func (s *Service) Borrow(userID int64, asset string, amount float64, leverage int) (*MarginAccount, error) {
-	if amount <= 0 {
+	if !settlement.KnownAsset(asset) {
+		return nil, ErrUnsupportedAsset
+	}
+	if !settlement.KnownAsset(s.cfg.CollateralAsset) {
+		return nil, ErrUnsupportedAsset
+	}
+	if !finitePositive(amount, maxAssetAmount) {
 		return nil, ErrAmountMustBePositive
 	}
 	if leverage < 1 {
@@ -128,7 +146,10 @@ func (s *Service) Borrow(userID int64, asset string, amount float64, leverage in
 //
 // 幂等设计：先落更新后的账户状态再 Debit，Debit 失败回滚账户；s.mu 串行化避免并发/重试双还。
 func (s *Service) Repay(userID int64, asset string, amount float64) error {
-	if amount <= 0 {
+	if !settlement.KnownAsset(asset) {
+		return ErrUnsupportedAsset
+	}
+	if !finitePositive(amount, maxAssetAmount) {
 		return ErrAmountMustBePositive
 	}
 	s.mu.Lock()
@@ -245,6 +266,9 @@ func (s *Service) LiquidationPrice(userID int64, asset string) (float64, error) 
 // 任一步失败回滚账户与抵押；顶部终态短路实现幂等（重复调用不再双占双罚）。s.mu 串行化
 // 避免与后台 RunLoop 并发强平重复动钱。
 func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
+	if !settlement.KnownAsset(asset) {
+		return false, ErrUnsupportedAsset
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

@@ -1,6 +1,7 @@
 package margin
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -217,5 +218,24 @@ func TestLiquidateIdempotent(t *testing.T) {
 	ins, _, _ := l.Balance(ledger.SysInsurance, "USDT")
 	if !eqAmt(ins, 0.025, "USDT") {
 		t.Fatalf("liquidate not idempotent: insurance=%v want 0.025", ins)
+	}
+}
+
+// TestBorrowRejectsUnsupportedAsset F5-1：未知资产不得借入（防凭空铸造）。
+func TestBorrowRejectsUnsupportedAsset(t *testing.T) {
+	svc, _ := newTestService()
+	if _, err := svc.Borrow(1, "XYZ", 1.0, 2); err != ErrUnsupportedAsset {
+		t.Fatalf("expected ErrUnsupportedAsset, got %v", err)
+	}
+}
+
+// TestRepayRejectsNaN F5-2：NaN/Inf 金额不得作为还款（AssetAmountFromFloat 会静默归零）。
+func TestRepayRejectsNaN(t *testing.T) {
+	svc, _ := newTestService()
+	if err := svc.Repay(1, "BTC", math.NaN()); err != ErrAmountMustBePositive {
+		t.Fatalf("expected ErrAmountMustBePositive for NaN, got %v", err)
+	}
+	if err := svc.Repay(1, "BTC", math.Inf(1)); err != ErrAmountMustBePositive {
+		t.Fatalf("expected ErrAmountMustBePositive for +Inf, got %v", err)
 	}
 }
