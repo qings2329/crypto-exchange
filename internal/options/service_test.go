@@ -102,14 +102,19 @@ func TestExerciseLongPayoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	// spot=50000, ITV=(50000-40000)*1=10000; payoff=10000-1000=9000。
+	// spot=50000, ITV=(50000-40000)*1=10000; 中性 CCP payoff=10000（不再扣权利金）。
 	if err := svc.Exercise(uid, p.ID); err != nil {
 		t.Fatalf("exercise: %v", err)
 	}
 	avail, _, _ := l.Balance(uid, "USDT")
-	if avail.Cmp(settlement.AssetAmountFromFloat(107999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
-		avail.Cmp(settlement.AssetAmountFromFloat(108001, settlement.AssetDecimalsByName("USDT"))) > 0 {
-		t.Fatalf("exercise payoff wrong: avail=%v want ~108000", avail)
+	if avail.Cmp(settlement.AssetAmountFromFloat(108999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
+		avail.Cmp(settlement.AssetAmountFromFloat(109001, settlement.AssetDecimalsByName("USDT"))) > 0 {
+		t.Fatalf("exercise payoff wrong: avail=%v want ~109000", avail)
+	}
+	// 净收益对账（F3-1）：long 净收益 = 内在价值 - 已付权利金 = 10000 - 1000 = 9000；
+	// 仅有多头、无空头对冲时，SysOptions 承担 CCP 损失 -(ITV-premium) = -9000（系统账户允许透支）。
+	if ins, _, _ := l.Balance(ledger.SysOptions, "USDT"); !eqAmt(ins, -9000, "USDT") {
+		t.Fatalf("SysOptions CCP net wrong: %v want -9000", ins)
 	}
 	got, _ := svc.GetPosition(p.ID)
 	if got.Status != StatusExercised {
@@ -131,9 +136,9 @@ func TestSettleExpiryLong(t *testing.T) {
 		t.Fatal("expected settled=true")
 	}
 	avail, _, _ := l.Balance(uid, "USDT")
-	if avail.Cmp(settlement.AssetAmountFromFloat(107999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
-		avail.Cmp(settlement.AssetAmountFromFloat(108001, settlement.AssetDecimalsByName("USDT"))) > 0 {
-		t.Fatalf("long settle payoff wrong: avail=%v want ~108000", avail)
+	if avail.Cmp(settlement.AssetAmountFromFloat(108999, settlement.AssetDecimalsByName("USDT"))) < 0 ||
+		avail.Cmp(settlement.AssetAmountFromFloat(109001, settlement.AssetDecimalsByName("USDT"))) > 0 {
+		t.Fatalf("long settle payoff wrong: avail=%v want ~109000", avail)
 	}
 	got, _ := svc.GetPosition(p.ID)
 	if got.Status != StatusExpired {
@@ -202,10 +207,10 @@ func TestExerciseIdempotent(t *testing.T) {
 	if err := svc.Exercise(uid, p.ID); err != ErrAlreadySettled {
 		t.Fatalf("exercise#2: expected ErrAlreadySettled, got %v", err)
 	}
-	// 收益只结算一次：可用 = 100000 - 1000(权利金) + 9000(payoff) = 108000。
+	// 收益只结算一次：可用 = 100000 - 1000(权利金) + 10000(payoff) = 109000。
 	avail, _, _ := l.Balance(uid, "USDT")
-	if !eqAmt(avail, 108000, "USDT") {
-		t.Fatalf("exercise not idempotent: avail=%v want 108000", avail)
+	if !eqAmt(avail, 109000, "USDT") {
+		t.Fatalf("exercise not idempotent: avail=%v want 109000", avail)
 	}
 	got, _ := svc.GetPosition(p.ID)
 	if got.Status != StatusExercised {
@@ -228,10 +233,10 @@ func TestSettleLongIdempotent(t *testing.T) {
 	if err != nil || settled {
 		t.Fatalf("settle#2: expected (false,nil), got settled=%v err=%v", settled, err)
 	}
-	// 收益只结算一次：可用 = 108000。
+	// 收益只结算一次：可用 = 109000。
 	avail, _, _ := l.Balance(uid, "USDT")
-	if !eqAmt(avail, 108000, "USDT") {
-		t.Fatalf("settle not idempotent: avail=%v want 108000", avail)
+	if !eqAmt(avail, 109000, "USDT") {
+		t.Fatalf("settle not idempotent: avail=%v want 109000", avail)
 	}
 }
 
