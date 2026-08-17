@@ -8,6 +8,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // RegisterRoutes 在 gin 引擎上注册期权业务路由。
@@ -48,6 +49,11 @@ func (s *Service) handleCreateContract(c *gin.Context) {
 		(req.Type != "call" && req.Type != "put") ||
 		(req.Style != "european" && req.Style != "american") {
 		response.Error(c, 400, 4001, "underlying/strike/expiry/type/style required and valid")
+		return
+	}
+	if !settlement.KnownAsset(req.Underlying) ||
+		(req.QuoteAsset != "" && !settlement.KnownAsset(req.QuoteAsset)) {
+		response.Error(c, 400, 4001, "unsupported underlying/quote_asset")
 		return
 	}
 	contract := &OptionContract{

@@ -29,6 +29,7 @@ var (
 	ErrAlreadySettled    = errors.New("position already settled")
 	ErrNoPriceFeed       = errors.New("price feed unavailable for underlying")
 	ErrPremiumRequired   = errors.New("premium required (or provide a live price feed)")
+	ErrUnsupportedAsset  = errors.New("unsupported asset")
 )
 
 // OptionType 是期权类型。

@@ -283,7 +283,7 @@ func TestQuoteRejectsMissingPrice(t *testing.T) {
 	c := &OptionContract{
 		Underlying: "ETH", QuoteAsset: "USDT", Strike: 100,
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall,
-		Style: StyleAmerican, Premium: 100,
+		Style: StyleAmerican, ContractSize: 1, Premium: 100,
 	}
 	if err := svc.CreateContract(c); err != nil {
 		t.Fatalf("create: %v", err)
@@ -319,5 +319,63 @@ func TestBlackScholes(t *testing.T) {
 	price, _ = BlackScholes(TypePut, 150, 100, 0, 0.03, 0.2)
 	if price > 1e-6 {
 		t.Fatalf("expired OTM put price should be 0, got %.4f", price)
+	}
+}
+
+// TestCreateContractRejectsUnsupportedAsset F5-1：未知计价资产不得建约（防按默认 8 位缩放错配/铸造）。
+func TestCreateContractRejectsUnsupportedAsset(t *testing.T) {
+	svc, _ := newTestService()
+	c := &OptionContract{
+		Underlying: "BTC", QuoteAsset: "XYZ", Strike: 40000,
+		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
+		ContractSize: 1, Premium: 100,
+	}
+	if err := svc.CreateContract(c); err != ErrUnsupportedAsset {
+		t.Fatalf("expected ErrUnsupportedAsset, got %v", err)
+	}
+}
+
+// TestCreateContractRejectsBadContractSize F5-5：非正合约乘数直接拒绝（不再静默置 1）。
+func TestCreateContractRejectsBadContractSize(t *testing.T) {
+	svc, _ := newTestService()
+	c := &OptionContract{
+		Underlying: "BTC", QuoteAsset: "USDT", Strike: 40000,
+		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
+		ContractSize: -1, Premium: 100,
+	}
+	if err := svc.CreateContract(c); err == nil {
+		t.Fatal("expected error for negative contract_size")
+	}
+}
+
+// TestExerciseRejectsBadSpot F5-4：负价行情不得行权（防看跌赔付被放大）。
+func TestExerciseRejectsBadSpot(t *testing.T) {
+	svc, _ := newTestService()
+	svc.priceFn = func(asset string) (float64, bool) { return -1, true }
+	c := mustContract(svc, 1000, time.Now().Add(time.Hour))
+	const uid = int64(1)
+	p, err := svc.OpenPosition(uid, c.ID, SideLong, 1)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := svc.Exercise(uid, p.ID); err != ErrNoPriceFeed {
+		t.Fatalf("expected ErrNoPriceFeed for negative spot, got %v", err)
+	}
+}
+
+// TestOpenPositionRejectsUnsupportedAsset F5-2：持仓计价资产未知时不得开仓（防御性校验，
+// 即使合约经 store 直写绕过 CreateContract 白名单也应被拒）。
+func TestOpenPositionRejectsUnsupportedAsset(t *testing.T) {
+	svc, _ := newTestService()
+	c := &OptionContract{
+		Underlying: "BTC", QuoteAsset: "XYZ", Strike: 40000,
+		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
+		ContractSize: 1, Premium: 100,
+	}
+	if err := svc.store.CreateContract(c); err != nil {
+		t.Fatalf("seed contract: %v", err)
+	}
+	if _, err := svc.OpenPosition(1, c.ID, SideLong, 1); err != ErrUnsupportedAsset {
+		t.Fatalf("expected ErrUnsupportedAsset, got %v", err)
 	}
 }
