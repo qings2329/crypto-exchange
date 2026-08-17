@@ -46,6 +46,12 @@ func (s *Server) handleLogin(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid body")
 		return
 	}
+	// 基于 IP 的登录限流（防单 IP 自动化爆破 + 缓解账户级锁定的 DoS 取舍）。
+	if !s.loginLimiter.allow(c.ClientIP()) {
+		log.Printf("[admin] SECURITY: login rate-limited for IP %s", c.ClientIP())
+		s.fail(c, http.StatusTooManyRequests, "too many login attempts from this IP, try again later")
+		return
+	}
 	// 阈值与锁定时长（配置化，缺省 5 次 / 15 分钟）。
 	maxFails := s.cfg.Admin.MaxLoginFailures
 	if maxFails <= 0 {

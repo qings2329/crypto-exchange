@@ -23,6 +23,10 @@ type Config struct {
 		AllowedOrigins []string `yaml:"allowed_origins"`
 		// MaxBodyBytes 请求体大小上限（默认 1 MiB）。
 		MaxBodyBytes int64 `yaml:"max_body_bytes"`
+		// TrustedProxies 受信任的反向代理/负载均衡 IP 或 CIDR；配置后 c.ClientIP()
+		// 从 X-Forwarded-For 取真实客户端 IP（用于登录 IP 限流、审计 IP、全局限流正确归因）。
+		// 留空则不信任任何代理，直接使用直连对端 IP（RemoteAddr）。
+		TrustedProxies []string `yaml:"trusted_proxies"`
 		// TLS 启用 HTTPS 所需的证书与私钥路径；同时配置才启用，否则明文 HTTP。
 		TLS struct {
 			CertFile string `yaml:"cert_file"`
@@ -126,6 +130,11 @@ type AdminConfig struct {
 	MaxLoginFailures int `yaml:"max_login_failures"`
 	// LoginLockoutSec 账户锁定持续时间（秒，自动过期），<=0 时默认 900（15 分钟）。
 	LoginLockoutSec int `yaml:"login_lockout_sec"`
+	// LoginRateLimitPerIP 单 IP 在 LoginRateWindowSec 窗口内的登录尝试上限（基于 IP 的限流，
+	// 防单 IP 自动化爆破，并缓解账户级锁定的 DoS 取舍），<=0 时默认 10。
+	LoginRateLimitPerIP int `yaml:"login_rate_limit_per_ip"`
+	// LoginRateWindowSec 单 IP 登录限流窗口（秒），<=0 时默认 60。
+	LoginRateWindowSec int `yaml:"login_rate_window_sec"`
 }
 
 // Load 从给定路径读取 yaml 配置。
