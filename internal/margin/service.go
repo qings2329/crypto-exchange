@@ -334,28 +334,22 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 		return false, err
 	}
 
+	// 清算资金动作（收回借出资产/解冻抵押/罚没入保险基金）经账本 Batch 原子执行：
+	// 任一步失败整体回滚（账户与抵押/终态恢复），避免部分解冻/部分罚没导致账实不一致。
+	// 此前三步各自调用并手工回滚，存在"第一步成功、第二步失败"留下半成品状态的风险。
+	ops := []ledger.Op{}
 	if seize.Sign() > 0 {
-		if err := s.ledger.DebitAvailable(userID, asset, seize, "margin_liquidation", ref); err != nil {
-			*a = prev
-			_ = s.store.UpsertAccount(a)
-			return false, err
-		}
+		ops = append(ops, ledger.Op{Kind: ledger.OpDebit, User: userID, Asset: asset, Amount: seize, Biz: "margin_liquidation", Ref: ref})
 	}
 	if prev.CollateralAmount.Sign() > 0 {
-		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, collAmt); err != nil {
-			// 解冻失败：恢复抵押与终态。
-			*a = prev
-			_ = s.ledger.Freeze(userID, a.CollateralAsset, collAmt)
-			_ = s.store.UpsertAccount(a)
-			return false, err
-		}
+		ops = append(ops, ledger.Op{Kind: ledger.OpUnfreeze, User: userID, Asset: a.CollateralAsset, Amount: collAmt, Ref: ref})
 	}
 	if penaltyAmt.Sign() > 0 {
-		if err := s.ledger.Transfer(userID, ledger.SysInsurance, a.CollateralAsset, penaltyAmt, "margin_liq_penalty", ref); err != nil {
-			// 罚没失败：重新冻结抵押并恢复终态。
-			if prev.CollateralAmount.Sign() > 0 {
-				_ = s.ledger.Freeze(userID, a.CollateralAsset, collAmt)
-			}
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: userID, To: ledger.SysInsurance, Asset: a.CollateralAsset, Amount: penaltyAmt, Biz: "margin_liq_penalty", Ref: ref})
+	}
+	if len(ops) > 0 {
+		if err := s.ledger.Batch(ops); err != nil {
+			// 整组原子回滚：恢复抵押与终态，等待重试（终态短路保证不双占双罚）。
 			*a = prev
 			_ = s.store.UpsertAccount(a)
 			return false, err
