@@ -12,6 +12,7 @@ type Store interface {
 	CreateHolding(h *WealthHolding) error
 	GetHolding(id int64) (*WealthHolding, error)
 	UpdateHolding(h *WealthHolding) error
+	DeleteHolding(id int64) error
 	ListHoldings(userID int64) ([]*WealthHolding, error)
 	ListAllHoldings() ([]*WealthHolding, error)
 }

@@ -119,6 +119,13 @@ func (s *memStore) UpdateHolding(h *WealthHolding) error {
 	return nil
 }
 
+func (s *memStore) DeleteHolding(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.holdings, id)
+	return nil
+}
+
 func (s *memStore) ListHoldings(userID int64) ([]*WealthHolding, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

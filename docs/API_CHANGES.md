@@ -150,6 +150,38 @@
 
 ---
 
+## 2026-08-16 — wealth 资金流动幂等(F1)与权限护栏(F4)审查修复
+
+- **状态**：`internal/wealth/{service,handler,model,store}.go` 已修复，待提交。
+- **背景**：边界审查发现 wealth 与 otc/options/margin 同根因（ledger 不按 ref 去重、Service.mu 未加锁），
+  且申购/赎回均为「先 Transfer 后持久化」，崩溃/重试/并发会双扣本金、双付本金+收益；管理/运营端点缺 AdminGuard。
+
+### F1 幂等（与 otc/options/margin 一致）
+- `Subscribe`：先落瞬态持仓（`HoldingFunding`）再转入托管本金，出资成功置 `HoldingActive`；转入失败回滚（删持仓）。
+  引入 `HoldingFunding` 瞬态，使「落库未出资」的持仓不可被赎回/计息（关闭未出资持仓白嫖赎回的残余）。
+- `Redeem`：先落终态（`HoldingRedeemed`）再 Transfer，Transfer 失败回滚为持有中；顶部终态短路幂等（重复赎回不再双付）。
+- `Accrue`：加 `s.mu` 与 `Redeem` 互斥，避免后台计息与赎回并发导致 `AccruedYield` 重复累加、赎回时超额兑付。
+- 三条路径统一加 `s.mu` 串行化。
+- `store` 接口新增 `DeleteHolding`（mem/mysql 均实现）。
+
+### F4 权限护栏
+- `POST /api/v1/wealth/products`（发行产品）、`GET /api/v1/wealth/admin/holdings`（全量持仓）、
+  `POST /api/v1/wealth/admin/accrue`（触发计息）均加 `middleware.AdminGuard()`，非管理员返回 403。
+- `subscribe`/`redeem`/`holdings` 用户态端点已正确从 token 取身份（无 IDOR），无需改动。
+
+### 契约/行为影响
+- 新增 403 约束：发行产品、查看全量持仓、手动触发计息现仅管理员可调用；前端普通用户调用将收到 403。
+- **残余边界（与 otc F1 同款）**：若进程在「已落终态/更新、但账本资金未动」之间崩溃，状态已变更、资金未动（不会双付/双扣），
+  但需运营/对账介入重放（如 Redeem 崩溃则持仓已终态、本金未出，需人工补付；Subscribe 崩溃则留一条 `HoldingFunding` 孤儿记录需清理）。
+- F2 定点化（本金/收益 float 派生）+ `1e-9` 容差（起购额判断）为建议项，本轮未改。
+
+### 验证
+- F1：`TestRedeemIdempotent`（重复赎回只兑付一次）、`TestSubscribeInsufficientNoHolding`（余额不足不残留持仓）。
+- F4：`TestAdminEndpointsRequireAdmin`（发行产品/全量持仓/触发计息：非管理员 403、管理员通过护栏）。
+- `go test -race ./internal/wealth/...` 通过。
+
+---
+
 ## 2026-08-16 — 账本 v1→v2 快照迁移真实数据校验（定点化配套）
 
 - **背景**：账本金额已定点化（`settlement.AssetAmount`）。旧快照（无 `schema_version` 的 float 快照）

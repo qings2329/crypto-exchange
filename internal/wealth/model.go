@@ -52,7 +52,8 @@ const (
 type HoldingStatus string
 
 const (
-	HoldingActive   HoldingStatus = "active"   // 持有中
+	HoldingActive   HoldingStatus = "active"   // 持有中（已出资，可赎回/计息）
+	HoldingFunding  HoldingStatus = "funding"  // 瞬态：持仓已落库、本金转入进行中（不可赎回/计息）
 	HoldingRedeemed HoldingStatus = "redeemed" // 已赎回（终态）
 )
 
