@@ -13,7 +13,11 @@ package futuresapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +28,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
+	"github.com/coldlar/crypto-exchange/internal/risk"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/ws"
 )
@@ -50,6 +55,11 @@ type Server struct {
 	chainGateway  settlement.DepositGateway
 	chainWithdraw settlement.WithdrawGateway
 
+	// 风控：提现强制路径在冻结资金前调用 riskSvc.CheckWithdraw 网关。
+	riskSvc    *risk.Service
+	userSvcURL string
+	kycFetcher func(c *gin.Context) (int, error) // 可注入，便于测试；默认从 user 服务取 kyc_level
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -65,7 +75,7 @@ type Server struct {
 //
 // 调用方约定：在调用前必须已经完成账本快照恢复或种子充值（本函数会配置账本风控参数并启动巡检，
 // 但不负责账本初始状态的载入）。onTrade 由 WS 推送在成交后调用，此时 s.liquidator 已赋值。
-func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string, oracleConf oracle.OracleConf, chainRPC settlement.ChainRPCConfig) *Server {
+func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string, oracleConf oracle.OracleConf, chainRPC settlement.ChainRPCConfig, riskSvc *risk.Service, userSvcURL string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		log:       log,
@@ -76,6 +86,10 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 		markCalcs: make(map[string]*futures.MarkPriceCalculator),
 		ctx:       ctx,
 		cancel:    cancel,
+
+		riskSvc:    riskSvc,
+		userSvcURL: userSvcURL,
+		kycFetcher: newKYCFetcher(userSvcURL),
 	}
 
 	// 账本资金安全防线（演示值，生产按资产风险配置）。
@@ -566,6 +580,42 @@ func (s *Server) fundingLoop() {
 				s.hub.Broadcast(sym, ginH{"type": "funding", "data": ev})
 			}
 		}
+	}
+}
+
+// newKYCFetcher 返回从 user 服务取 kyc_level 的函数（注入到 Server，便于测试替换）。
+//   - userSvcURL 为空：KYC 子项视为最高级、恒过（限额/黑名单仍生效）；生产必须配置 user 服务。
+//   - 否则：转发调用方 Bearer Token，GET {base}/api/v1/user/me，解析 kyc_level；
+//     非 200 / 网络错误 / 解码失败均返回 error，由调用方 fail-closed 拒绝提现（资金安全优先）。
+func newKYCFetcher(userSvcURL string) func(c *gin.Context) (int, error) {
+	if userSvcURL == "" {
+		return func(c *gin.Context) (int, error) { return math.MaxInt, nil }
+	}
+	base := strings.TrimRight(userSvcURL, "/")
+	client := &http.Client{Timeout: 3 * time.Second}
+	return func(c *gin.Context) (int, error) {
+		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, base+"/api/v1/user/me", nil)
+		if err != nil {
+			return 0, err
+		}
+		if auth := c.GetHeader("Authorization"); auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return 0, fmt.Errorf("user service returned status %d", resp.StatusCode)
+		}
+		var body struct {
+			KYCLevel int `json:"kyc_level"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return 0, err
+		}
+		return body.KYCLevel, nil
 	}
 }
 

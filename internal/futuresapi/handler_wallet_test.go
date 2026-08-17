@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
+	"github.com/coldlar/crypto-exchange/internal/risk"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
@@ -37,7 +38,16 @@ func newWithdrawServer(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	gw := settlement.NewMockWithdrawGateway(3, time.Second)
-	return &Server{ledgerSvc: l, chainWithdraw: gw}
+	s := &Server{ledgerSvc: l, chainWithdraw: gw, riskSvc: risk.New(risk.NewMemStore())}
+	// 多链/多资产手续费模型（与 NewServer 一致），否则 handleWithdrawRequest 估费时 nil panic。
+	s.feeModel = settlement.NewFeeModel()
+	s.feeModel.Register(settlement.ChainETH, "USDT", 0.1, 0)
+	s.feeModel.Register(settlement.ChainETH, "ETH", 0.001, 0)
+	s.feeModel.Register(settlement.ChainBTC, "BTC", 0.0005, 0)
+	s.feeModel.Register(settlement.ChainTRON, "USDT", 1, 0)
+	// 测试默认桩：kyc_level=2（满足多数规则）；可按用例覆盖 s.kycFetcher。
+	s.kycFetcher = func(c *gin.Context) (int, error) { return 2, nil }
+	return s
 }
 
 // decodeData 解包 {code,data,message} 信封，返回 data 部分（code!=0 时失败）。
@@ -81,6 +91,134 @@ func callReject(s *Server, holdID string) *httptest.ResponseRecorder {
 	c.Request, _ = http.NewRequest(http.MethodPost, "/x/"+holdID, nil)
 	s.handleWithdrawReject(c)
 	return w
+}
+
+// callWithdrawRequest 直接驱动提现受理 handler（含 risk 强制网关）。
+func callWithdrawRequest(s *Server, userID int64, asset, chain string, amount, fee float64, address string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	body, _ := json.Marshal(gin.H{
+		"user_id": userID, "asset": asset, "chain": chain,
+		"amount": amount, "fee": fee, "address": address,
+	})
+	c.Request, _ = http.NewRequest(http.MethodPost, "/x", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	s.handleWithdrawRequest(c)
+	return w
+}
+
+// decodeEnv 解析 {code,message} 信封，返回 (code, message)。
+func decodeEnv(t *testing.T, w *httptest.ResponseRecorder) (int, string) {
+	t.Helper()
+	var env struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode envelope: %v (body=%s)", err, w.Body.String())
+	}
+	return env.Code, env.Message
+}
+
+// TestWithdrawRiskLimitRejected 验证提现超限被 risk 网关拒绝。
+func TestWithdrawRiskLimitRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newWithdrawServer(t)
+	if _, err := s.riskSvc.AddRule(&risk.RiskRule{
+		Kind: risk.KindWithdrawLimit, Asset: "USDT",
+		MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		MinKYCLevel:     1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w := callWithdrawRequest(s, 1, "USDT", "Ethereum", 2000, 0, "0xabc")
+	code, msg := decodeEnv(t, w)
+	if code != 403 || msg != "exceeds withdraw limit" {
+		t.Fatalf("want 403 exceeds withdraw limit, got %d %q", code, msg)
+	}
+}
+
+// TestWithdrawRiskUserBlacklistRejected 验证用户黑名单被 risk 网关拒绝。
+func TestWithdrawRiskUserBlacklistRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newWithdrawServer(t)
+	if _, err := s.riskSvc.AddBlacklist("1", risk.BlacklistUser, "fraud"); err != nil {
+		t.Fatal(err)
+	}
+	w := callWithdrawRequest(s, 1, "USDT", "Ethereum", 100, 0, "0xabc")
+	code, msg := decodeEnv(t, w)
+	if code != 403 || msg != "user blacklisted" {
+		t.Fatalf("want 403 user blacklisted, got %d %q", code, msg)
+	}
+}
+
+// TestWithdrawRiskAddressBlacklistRejected 验证地址黑名单被 risk 网关拒绝。
+func TestWithdrawRiskAddressBlacklistRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newWithdrawServer(t)
+	if _, err := s.riskSvc.AddBlacklist("0xbad", risk.BlacklistAddress, "sanctioned"); err != nil {
+		t.Fatal(err)
+	}
+	w := callWithdrawRequest(s, 1, "USDT", "Ethereum", 100, 0, "0xbad")
+	code, msg := decodeEnv(t, w)
+	if code != 403 || msg != "address blacklisted" {
+		t.Fatalf("want 403 address blacklisted, got %d %q", code, msg)
+	}
+}
+
+// TestWithdrawRiskLowKYCRejected 验证 KYC 等级不足被 risk 网关拒绝。
+func TestWithdrawRiskLowKYCRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newWithdrawServer(t)
+	s.kycFetcher = func(c *gin.Context) (int, error) { return 1, nil } // 覆盖为低 KYC
+	if _, err := s.riskSvc.AddRule(&risk.RiskRule{
+		Kind: risk.KindWithdrawLimit, Asset: "USDT",
+		MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		MinKYCLevel:     2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w := callWithdrawRequest(s, 1, "USDT", "Ethereum", 100, 0, "0xabc")
+	code, msg := decodeEnv(t, w)
+	if code != 403 || msg != "kyc level too low" {
+		t.Fatalf("want 403 kyc level too low, got %d %q", code, msg)
+	}
+}
+
+// TestWithdrawNegativeRejected 验证负金额在提现强制路径被阻断（handler 输入校验 + risk 双重保险）。
+func TestWithdrawNegativeRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newWithdrawServer(t)
+	w := callWithdrawRequest(s, 1, "USDT", "Ethereum", -100, 0, "0xabc")
+	if w.Code != 400 {
+		t.Fatalf("want 400 for negative amount, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// TestWithdrawRiskPass 验证满足规则时正常受理（返回 hold_id）。
+func TestWithdrawRiskPass(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newWithdrawServer(t)
+	if _, err := s.riskSvc.AddRule(&risk.RiskRule{
+		Kind: risk.KindWithdrawLimit, Asset: "USDT",
+		MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		MinKYCLevel:     1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w := callWithdrawRequest(s, 1, "USDT", "Ethereum", 100, 0, "0xabc")
+	if w.Code != 200 {
+		t.Fatalf("want 200, got %d %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		HoldID string `json:"hold_id"`
+	}
+	if err := json.Unmarshal(decodeData(t, w), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.HoldID == "" {
+		t.Fatalf("expected hold_id, got %+v", resp)
+	}
 }
 
 // TestWithdrawApproveSkipsCooling 验证管理员 approve 跳过冷静期直接放行，

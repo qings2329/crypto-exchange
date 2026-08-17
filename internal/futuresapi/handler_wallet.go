@@ -359,6 +359,24 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 		response.Error(c, 400, 400, "insufficient available balance")
 		return
 	}
+	// 风控强制网关：冻结资金前先经 risk.CheckWithdraw。命中黑名单/超限额/低 KYC/负金额
+	// 一律拒绝（403）；user 服务不可达则 fail-closed（503），确保资金安全时阻断。
+	if s.riskSvc != nil {
+		kyc, kerr := s.kycFetcher(c)
+		if kerr != nil {
+			response.Error(c, 503, 503, "risk: cannot verify kyc")
+			return
+		}
+		res, rerr := s.riskSvc.CheckWithdraw(req.UserID, asset, req.Amount, kyc, req.Address)
+		if rerr != nil {
+			response.Error(c, 500, 500, rerr.Error())
+			return
+		}
+		if !res.Allowed {
+			response.Error(c, 403, 403, res.Reason)
+			return
+		}
+	}
 	id, holdUntil, err := s.ledgerSvc.RequestWithdrawHold(req.UserID, asset, amt, feeAmt, req.Chain, req.Address)
 	if err != nil {
 		response.Error(c, 403, 403, err.Error())
