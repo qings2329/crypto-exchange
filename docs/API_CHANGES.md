@@ -231,3 +231,24 @@
 
 ### 升级注意（同 otc F2）
 - 迁移把原 `DOUBLE` 列直接 `MODIFY` 为 `VARCHAR(64)`，MySQL 会把数值写成其字符串形式；扫描时按 `quote_asset`/`asset` 推导小数位。**若库中存在 F2 之前的旧持仓/账户数据，需先回填 `quote_asset`/`asset` 列**（或从空库/预发重新初始化）再上线，否则旧行会按默认 8 位小数解析产生偏差。全新部署无此问题。
+
+---
+
+## 2026-08-17 — risk 限额字段定点化 + 负金额校验（F2）
+
+- **状态**：`internal/risk` 已修复 F2 建议项——`RiskRule.MaxAmountPerDay` 由 `float64` 改为 `settlement.AssetAmount`，并新增提现/下单的负金额（含零）校验。**注意：risk 当前未接入实际提现/下单强制路径（仅 risk 服务自闭环），但接入前必须先消除浮点漂移与负金额绕过。** commit 待提交。
+
+### 字段与存储
+- `RiskRule.MaxAmountPerDay` 改 `settlement.AssetAmount`；经 `AssetAmount.MarshalJSON`/`UnmarshalJSON` 在网络上**仍为 JSON 数字**（如 `1000`），前端无需改动。
+- 迁移 `9404`：`ce_risk_rules.max_amount_per_day` 由 `DOUBLE` 改为 `VARCHAR(64)`（旧 `DOUBLE` 行自动按字符串无损转存，资产小数位由 `asset` 列推导，资产为空时默认 8 位）；`Down` 回退为 `DOUBLE`。
+
+### 校验与比较（service.go）
+- `CheckWithdraw`/`CheckOrder` 新增 `amount/qty <= 0` 直接拒绝（reason `amount must be positive` / `qty must be positive`），修复"负金额因 `< limit` 恒为真而绕过限额"的隐患。
+- 限额比较改为边界定点化：`dec := settlement.AssetDecimalsByName(asset)`，`AssetAmountFromFloat(amount, dec).Cmp(rule.MaxAmountPerDay.ToDecimals(dec)) > 0` 判定超限，消除 `float64` 直接 `>` 的边界精度漂移；边界相等（`amount == limit`）仍放行。
+
+### 契约/行为影响
+- `max_amount_per_day` JSON 形状保持数字，前端无感知。
+- 行为收紧：`amount/qty <= 0` 现在一律拒绝（原会放行负数）。
+
+### 升级注意
+- 上线前须执行迁移 `9404`；旧 `DOUBLE` 行自动转 `VARCHAR(64)`（如 `1000`→`"1000"`），按 `asset` 列小数位解析为定点数，金额语义无损。全新部署无此问题。
