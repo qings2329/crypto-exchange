@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"testing"
@@ -35,7 +36,7 @@ func TestRunMigrations(t *testing.T) {
 	if err := r.Up(); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	applied, err := r.appliedVersions()
+	applied, err := r.appliedVersions(context.Background(), db)
 	if err != nil {
 		t.Fatalf("appliedVersions: %v", err)
 	}
@@ -50,7 +51,7 @@ func TestRunMigrations(t *testing.T) {
 	if err := r.Down(1); err != nil {
 		t.Fatalf("down to 1: %v", err)
 	}
-	applied, _ = r.appliedVersions()
+	applied, _ = r.appliedVersions(context.Background(), db)
 	if applied[2] {
 		t.Fatal("version 2 should be rolled back")
 	}
