@@ -257,3 +257,33 @@ func TestWealthAccrueMovesYieldToPayable(t *testing.T) {
 		t.Fatalf("SysWealth %v != principal-yield %v", sys, wantSys)
 	}
 }
+
+// TestWealthAccrueIntegerExact #47：利息整数化——按定点整数运算，增量计息精确累加、无浮点尾差。
+func TestWealthAccrueIntegerExact(t *testing.T) {
+	svc, _ := newTestService()
+	p := mustProduct(svc, TypeCurrent, 0.876, 0, 100) // 876% 年化 => 1% 每小时
+	store := svc.store
+	base := time.Now()
+	h := &WealthHolding{UserID: 2, ProductID: p.ID, Asset: "USDT",
+		Principal: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		Status:    HoldingActive, CreatedAt: base, LastAccrualAt: base}
+	if err := store.CreateHolding(h); err != nil {
+		t.Fatalf("seed holding: %v", err)
+	}
+	// 第一次计息：100 小时 => 恰好 10.000000 USDT（定点整数，无尾差）。
+	if _, err := svc.Accrue(base.Add(100 * time.Hour)); err != nil {
+		t.Fatalf("accrue#1: %v", err)
+	}
+	got, _ := store.GetHolding(h.ID)
+	if !eqAmt(got.AccruedYield, 10, "USDT") {
+		t.Fatalf("first accrual %v want exactly 10 (integer, no float drift)", got.AccruedYield)
+	}
+	// 第二次计息：再 100 小时 => 再恰好 10，累计 20（增量精确累加）。
+	if _, err := svc.Accrue(base.Add(200 * time.Hour)); err != nil {
+		t.Fatalf("accrue#2: %v", err)
+	}
+	got, _ = store.GetHolding(h.ID)
+	if !eqAmt(got.AccruedYield, 20, "USDT") {
+		t.Fatalf("second accrual total %v want exactly 20", got.AccruedYield)
+	}
+}

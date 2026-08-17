@@ -158,7 +158,8 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 // 划转失败则不计入 AccruedYield（下个计息周期按 LastAccrualAt 重算补齐），避免账实不一致。
 func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Time) settlement.AssetAmount {
 	dec := settlement.AssetDecimalsByName(p.Asset)
-	delta := settlement.AssetAmountFromFloat(h.YieldTo(now, p.AnnualRate), dec)
+	// 利息整数化（#47）：直接按定点整数运算，避免 Principal.HumanFloat() 的 float 精度丢失与每期尾差累积。
+	delta := h.YieldToAmount(now, p.AnnualRate, dec)
 	if delta.Sign() > 0 {
 		ref := fmt.Sprintf("wealth_accrue product=%d holding=%d", p.ID, h.ID)
 		if err := s.ledger.Transfer(ledger.SysWealth, ledger.SysWealthYieldPayable, p.Asset, delta, "wealth_accrue", ref); err != nil {
