@@ -178,11 +178,15 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	})
 	s.liquidator.SetADLCallback(func(ev futures.ADLEvent) {
 		ref := fmt.Sprintf("adl:%d:%s", ev.UserID, ev.Symbol)
-		if err := ledgerSvc.DebitAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.ProfitCovered, settlement.AssetDecimalsByName("USDT")), "adl", ref); err != nil {
-			log.Error("adl debit failed", zap.Int64("user", ev.UserID), zap.Error(err))
+		amt := settlement.AssetAmountFromFloat(ev.ProfitCovered, settlement.AssetDecimalsByName("USDT"))
+		// F3 原子：ADL 扣减用户保证金 + 转入保险基金，整体经 Batch 执行，任一失败整组回滚
+		// （避免"用户已扣、保险未收"的账本失衡）。Debit/Credit 不按 ref 去重，ref 仅作流水标签。
+		ops := []ledger.Op{
+			{Kind: ledger.OpDebit, User: ev.UserID, Asset: "USDT", Amount: amt, Biz: "adl", Ref: ref},
+			{Kind: ledger.OpCredit, User: ledger.SysInsurance, Asset: "USDT", Amount: amt, Biz: "adl", Ref: ref},
 		}
-		if err := ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", settlement.AssetAmountFromFloat(ev.ProfitCovered, settlement.AssetDecimalsByName("USDT")), "adl", ref); err != nil {
-			log.Error("adl insurance credit failed", zap.Error(err))
+		if err := ledgerSvc.Batch(ops); err != nil {
+			log.Error("adl settle failed", zap.Int64("user", ev.UserID), zap.Error(err))
 		}
 		s.hub.Broadcast(ev.Symbol, ginH{"type": "adl", "data": ev})
 		log.Warn("auto-deleveraging",
@@ -192,19 +196,27 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	s.liquidator.SetDeficitPayer(func(deficit float64) {
 		ref := fmt.Sprintf("deficit:%d", time.Now().UnixNano())
 		amt := settlement.AssetAmountFromFloat(deficit, settlement.AssetDecimalsByName("USDT"))
-		_ = ledgerSvc.DebitAvailable(ledger.SysInsurance, "USDT", amt, "liquidation_deficit", ref)
-		_ = ledgerSvc.CreditAvailable(ledger.SysLiquidationLoss, "USDT", amt, "liquidation_deficit", ref)
+		// F3 原子：保险基金垫付穿仓亏损 → 记为清算损失，整体 Batch（消除原 _= 吞错导致的失衡）。
+		ops := []ledger.Op{
+			{Kind: ledger.OpDebit, User: ledger.SysInsurance, Asset: "USDT", Amount: amt, Biz: "liquidation_deficit", Ref: ref},
+			{Kind: ledger.OpCredit, User: ledger.SysLiquidationLoss, Asset: "USDT", Amount: amt, Biz: "liquidation_deficit", Ref: ref},
+		}
+		if err := ledgerSvc.Batch(ops); err != nil {
+			log.Error("liquidation deficit settle failed", zap.Error(err))
+		}
 		log.Warn("liquidation deficit paid by insurance", zap.Float64("deficit", deficit))
 	})
 	s.liquidator.SetSocializeCallback(func(shares []futures.SocializedLossEvent) {
 		for _, sh := range shares {
 			ref := fmt.Sprintf("socialize:%d:%s", sh.UserID, sh.Symbol)
 			amt := settlement.AssetAmountFromFloat(sh.Share, settlement.AssetDecimalsByName("USDT"))
-			if err := ledgerSvc.DebitAvailable(sh.UserID, "USDT", amt, "socialized_loss", ref); err != nil {
-				log.Error("socialize debit failed", zap.Int64("user", sh.UserID), zap.Error(err))
+			// F3 原子：社会化分摊从用户扣减 → 转入保险基金，整体 Batch。
+			ops := []ledger.Op{
+				{Kind: ledger.OpDebit, User: sh.UserID, Asset: "USDT", Amount: amt, Biz: "socialized_loss", Ref: ref},
+				{Kind: ledger.OpCredit, User: ledger.SysInsurance, Asset: "USDT", Amount: amt, Biz: "socialized_loss", Ref: ref},
 			}
-			if err := ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", amt, "socialized_loss", ref); err != nil {
-				log.Error("socialize insurance credit failed", zap.Error(err))
+			if err := ledgerSvc.Batch(ops); err != nil {
+				log.Error("socialize settle failed", zap.Int64("user", sh.UserID), zap.Error(err))
 			}
 		}
 		s.hub.Broadcast(shares[0].Symbol, ginH{"type": "socialized", "data": shares})
@@ -400,11 +412,16 @@ func (s *Server) onLiquidation(ev futures.LiquidationEvent) {
 				_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(-ev.Realized, settlement.AssetDecimalsByName("USDT")))
 			}
 		} else {
-			_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")))
+			marginAmt := settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT"))
+			// F3 原子：释放冻结保证金 + 实现盈亏（贷记/借记用户），整体 Batch。
+			ops := []ledger.Op{{Kind: ledger.OpUnfreeze, User: ev.UserID, Asset: "USDT", Amount: marginAmt}}
 			if ev.Realized >= 0 {
-				_ = s.ledgerSvc.CreditAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Realized, settlement.AssetDecimalsByName("USDT")), "partial_liq", ref)
+				ops = append(ops, ledger.Op{Kind: ledger.OpCredit, User: ev.UserID, Asset: "USDT", Amount: settlement.AssetAmountFromFloat(ev.Realized, settlement.AssetDecimalsByName("USDT")), Biz: "partial_liq", Ref: ref})
 			} else {
-				_ = s.ledgerSvc.DebitAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(-ev.Realized, settlement.AssetDecimalsByName("USDT")), "partial_liq", ref)
+				ops = append(ops, ledger.Op{Kind: ledger.OpDebit, User: ev.UserID, Asset: "USDT", Amount: settlement.AssetAmountFromFloat(-ev.Realized, settlement.AssetDecimalsByName("USDT")), Biz: "partial_liq", Ref: ref})
+			}
+			if err := s.ledgerSvc.Batch(ops); err != nil {
+				s.log.Error("partial liquidation settle failed", zap.Int64("user", ev.UserID), zap.Error(err))
 			}
 		}
 		s.log.Info("partial liquidation",
@@ -414,12 +431,15 @@ func (s *Server) onLiquidation(ev futures.LiquidationEvent) {
 		return
 	}
 
-	_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")))
-	if err := s.ledgerSvc.DebitAvailable(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")), "liquidation", ref); err != nil {
-		s.log.Error("liquidation debit failed", zap.Error(err))
+	marginAmt := settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT"))
+	// F3 原子：释放冻结保证金 + 没收入保险基金，整体 Batch（任一失败整组回滚，避免"释放却未没收"的失衡）。
+	ops := []ledger.Op{
+		{Kind: ledger.OpUnfreeze, User: ev.UserID, Asset: "USDT", Amount: marginAmt},
+		{Kind: ledger.OpDebit, User: ev.UserID, Asset: "USDT", Amount: marginAmt, Biz: "liquidation", Ref: ref},
+		{Kind: ledger.OpCredit, User: ledger.SysInsurance, Asset: "USDT", Amount: marginAmt, Biz: "liquidation", Ref: ref},
 	}
-	if err := s.ledgerSvc.CreditAvailable(ledger.SysInsurance, "USDT", settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT")), "liquidation", ref); err != nil {
-		s.log.Error("insurance credit failed", zap.Error(err))
+	if err := s.ledgerSvc.Batch(ops); err != nil {
+		s.log.Error("liquidation settle failed", zap.Int64("user", ev.UserID), zap.Error(err))
 	}
 	s.log.Info("liquidation settled",
 		zap.Int64("user", ev.UserID),
@@ -550,25 +570,40 @@ func (s *Server) fundingLoop() {
 				var totalPaid float64
 				for _, p := range ev.Payments {
 					totalPaid += p.Payment
+					cross := s.liquidator.ModeOf(sym, p.UserID) == futures.Cross
 					switch {
 					case p.Payment < 0:
 						pay := -p.Payment
 						payAmt := settlement.AssetAmountFromFloat(pay, settlement.AssetDecimalsByName("USDT"))
-						if s.liquidator.ModeOf(sym, p.UserID) == futures.Cross {
-							_ = s.ledgerSvc.Unfreeze(p.UserID, "USDT", payAmt)
-							s.liquidator.AdjustCrossBalance(sym, p.UserID, -pay)
+						// F3 原子：跨仓先解冻保证金，再转账给资金费池；整体 Batch，失败整组回滚。
+						ops := []ledger.Op{
+							{Kind: ledger.OpTransfer, From: p.UserID, To: ledger.SysFundingPool, Asset: "USDT", Amount: payAmt, Biz: "funding", Ref: ref},
 						}
-						if err := s.ledgerSvc.Transfer(p.UserID, ledger.SysFundingPool, "USDT", payAmt, "funding", ref); err != nil {
+						if cross {
+							ops = append([]ledger.Op{{Kind: ledger.OpUnfreeze, User: p.UserID, Asset: "USDT", Amount: payAmt}}, ops...)
+						}
+						if err := s.ledgerSvc.Batch(ops); err != nil {
 							s.log.Error("funding debit failed", zap.Int64("user", p.UserID), zap.Error(err))
+							continue
+						}
+						if cross {
+							s.liquidator.AdjustCrossBalance(sym, p.UserID, -pay)
 						}
 					case p.Payment > 0:
 						payAmt := settlement.AssetAmountFromFloat(p.Payment, settlement.AssetDecimalsByName("USDT"))
-						if err := s.ledgerSvc.Transfer(ledger.SysFundingPool, p.UserID, "USDT", payAmt, "funding", ref); err != nil {
-							s.log.Error("funding credit failed", zap.Int64("user", p.UserID), zap.Error(err))
+						// F3 原子：资金费池转账给用户，跨仓再冻结保证金；整体 Batch，失败整组回滚。
+						ops := []ledger.Op{
+							{Kind: ledger.OpTransfer, From: ledger.SysFundingPool, To: p.UserID, Asset: "USDT", Amount: payAmt, Biz: "funding", Ref: ref},
 						}
-						if s.liquidator.ModeOf(sym, p.UserID) == futures.Cross {
+						if cross {
+							ops = append(ops, ledger.Op{Kind: ledger.OpFreeze, User: p.UserID, Asset: "USDT", Amount: payAmt})
+						}
+						if err := s.ledgerSvc.Batch(ops); err != nil {
+							s.log.Error("funding credit failed", zap.Int64("user", p.UserID), zap.Error(err))
+							continue
+						}
+						if cross {
 							s.liquidator.AdjustCrossBalance(sym, p.UserID, p.Payment)
-							_ = s.ledgerSvc.Freeze(p.UserID, "USDT", payAmt)
 						}
 					}
 				}

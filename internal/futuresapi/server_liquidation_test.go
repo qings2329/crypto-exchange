@@ -6,6 +6,8 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/futures"
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/matching"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
+	"go.uber.org/zap"
 )
 
 // 演示：生产路径的 liquidationCloser——强平单作为市价单送入撮合引擎，
@@ -62,4 +64,43 @@ func approx(a, b, eps float64) bool {
 		d = -d
 	}
 	return d <= eps
+}
+
+// eqAmt 将账本 AssetAmount 与人类单位字面量按资产小数位精确比较（无 epsilon）。
+func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
+	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
+}
+
+// TestOnLiquidationFullBatchAtomic 验证整仓强平的资金动作经 ledger.Batch 原子执行：
+// 释放冻结保证金 + 没收入保险基金后，账本保持全局平衡，且保证金完整转入 SysInsurance。
+// 回归：确认 F3 多腿原子化改造未改变净额语义（此前若 Debit 成功、Credit 失败会失衡）。
+func TestOnLiquidationFullBatchAtomic(t *testing.T) {
+	l := ledger.New()
+	// 链上充值保持创世平衡；冻结 1000 USDT 作为被强平用户的保证金。
+	_ = l.ReceiveOnChain(1, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed:1:USDT")
+	if err := l.Freeze(1, "USDT", settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT"))); err != nil {
+		t.Fatalf("freeze failed: %v", err)
+	}
+	s := &Server{ledgerSvc: l, log: zap.NewNop()}
+
+	ev := futures.LiquidationEvent{
+		UserID: 1, Symbol: "BTC_USDT", Mode: futures.Isolated,
+		Margin: 1000, Realized: 0, Partial: false,
+	}
+	s.onLiquidation(ev)
+
+	// 用户：冻结应清零，可用应为 99000（100000 - 1000 没收）。
+	if _, f, _ := l.Balance(1, "USDT"); !eqAmt(f, 0, "USDT") {
+		t.Fatalf("user frozen should be 0, got %v", f)
+	}
+	if a, _, _ := l.Balance(1, "USDT"); !eqAmt(a, 99000, "USDT") {
+		t.Fatalf("user available should be 99000, got %v", a)
+	}
+	// 保险基金应收到 1000 没收保证金。
+	if ins, _, _ := l.Balance(ledger.SysInsurance, "USDT"); !eqAmt(ins, 1000, "USDT") {
+		t.Fatalf("SysInsurance should be 1000, got %v", ins)
+	}
+	if !l.IsBalanced() {
+		t.Fatalf("ledger unbalanced after full liquidation")
+	}
 }
