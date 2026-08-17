@@ -27,6 +27,7 @@ var (
 	ErrAccountLiquidated    = errors.New("account already liquidated/closed")
 	ErrAmountMustBePositive = errors.New("amount must be positive")
 	ErrAlreadyBorrowed      = errors.New("active margin account already exists for this asset")
+	ErrUnsupportedAsset     = errors.New("unsupported asset")
 )
 
 // AccountStatus 是杠杆账户状态。
