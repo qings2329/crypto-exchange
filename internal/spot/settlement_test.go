@@ -18,9 +18,11 @@ func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
 // newTestServer 构造一个不依赖实时撮合服务的现货 Server，仅用于结算单元测试。
 func newTestServer() *Server {
 	return &Server{
-		log:        zap.NewNop(),
-		ledgerSvc:  ledger.New(),
-		openOrders: make(map[int64]*freezeRec),
+		log:          zap.NewNop(),
+		ledgerSvc:    ledger.New(),
+		openOrders:   make(map[int64]*freezeRec),
+		clientOIDMap: make(map[string]int64),
+		settledRefs:  make(map[string]bool),
 	}
 }
 
@@ -40,7 +42,7 @@ func TestReserveOnOpenBuyLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve failed: %v", err)
 	}
-	if rec.frozenQuote != 100 {
+	if rec.frozenQuote.Cmp(settlement.AssetAmountFromFloat(100, settlement.AssetDecimalsByName("USDT"))) != 0 {
 		t.Fatalf("expect frozenQuote=100, got %v", rec.frozenQuote)
 	}
 	avail, frozen, _ := s.ledgerSvc.Balance(1, "USDT")
