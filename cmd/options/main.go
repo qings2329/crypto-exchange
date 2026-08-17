@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -40,9 +41,16 @@ func main() {
 
 	// 钱包总账（复式记账），期权权利金与结算资金流均走它（系统对手方账户 SysOptions）。
 	ledgerSvc := ledger.New()
+	// 演示种子充值：经链上充值（复式记账）预置 USDT，使账本从创世起即全局平衡（对账巡检不误报）。
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = ledgerSvc.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
+		_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
 	}
+	// 对账巡检：探测不平账并告警（演示日志钩子）。
+	ledgerSvc.SetReconcileAlertHook(func(dev map[string]settlement.AssetAmount) {
+		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
+	})
+	ledgerSvc.StartReconciler(15 * time.Second)
+	defer ledgerSvc.StopReconciler()
 
 	// 选择 Store：配置了 DSN 则连 MySQL 并跑迁移，否则内存（演示）。
 	var store options.Store
