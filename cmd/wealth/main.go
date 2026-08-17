@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -39,10 +40,17 @@ func main() {
 
 	// 钱包总账（复式记账），用户申购本金与赎回收益均走它（中央托管账户 SysWealth）。
 	ledgerSvc := ledger.New()
+	// 演示种子充值：经链上充值（复式记账）预置多资产，使账本从创世起即全局平衡（对账巡检不误报）。
 	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = ledgerSvc.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
-		_ = ledgerSvc.Deposit(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), "seed")
+		_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
+		_ = ledgerSvc.ReceiveOnChain(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), fmt.Sprintf("seed:%d:BTC", uid))
 	}
+	// 对账巡检：探测不平账并告警（演示日志钩子）。
+	ledgerSvc.SetReconcileAlertHook(func(dev map[string]settlement.AssetAmount) {
+		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
+	})
+	ledgerSvc.StartReconciler(15 * time.Second)
+	defer ledgerSvc.StopReconciler()
 
 	// 选择 Store：配置了 DSN 则连 MySQL 并跑迁移，否则内存（演示）。
 	var store wealth.Store

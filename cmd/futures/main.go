@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -48,10 +49,10 @@ func main() {
 		dsn = cfg.MySQL.DSN
 	}
 
-	// 演示种子充值：为常用用户预置 USDT 余额（生产来自链上充值/清结算）。
+	// 演示种子充值：经链上充值（复式记账）预置 USDT，使账本从创世起即全局平衡（对账巡检不误报）。
 	seedDemo := func() {
 		for _, uid := range []int64{1, 2, 3, 4} {
-			_ = ledgerSvc.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
+			_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
 		}
 	}
 
