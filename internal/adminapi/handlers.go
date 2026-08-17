@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"sort"
@@ -34,6 +35,7 @@ func parseInt64(c *gin.Context, param string) (int64, bool) {
 }
 
 // --- 登录（无 guard）：校验管理员账户（状态/密码/可选 TOTP）后签发带权限的 token ---
+// 内置暴力破解防护：连续失败达到阈值锁定账户一段时间（自动过期、成功登录清零）。
 func (s *Server) handleLogin(c *gin.Context) {
 	var req struct {
 		Username string `json:"username"`
@@ -44,20 +46,46 @@ func (s *Server) handleLogin(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid body")
 		return
 	}
+	// 阈值与锁定时长（配置化，缺省 5 次 / 15 分钟）。
+	maxFails := s.cfg.Admin.MaxLoginFailures
+	if maxFails <= 0 {
+		maxFails = 5
+	}
+	lockSec := s.cfg.Admin.LoginLockoutSec
+	if lockSec <= 0 {
+		lockSec = 900
+	}
+
 	acc, err := s.adminStore.GetAccountByUsername(req.Username)
 	if err != nil || acc.Status != AdminStatusActive {
+		// 统一错误，避免用户枚举；且不区分"不存在/锁定"，与现有 no-enumeration 策略一致。
+		s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
+		return
+	}
+	// 锁定检查置于 bcrypt 之前以节省算力；返回统一错误避免泄露锁定状态。
+	now := time.Now().Unix()
+	if acc.LockedUntil > now {
 		s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(acc.PasswordHash), []byte(req.Password)) != nil {
+		s.recordLoginFailure(acc, maxFails, lockSec)
 		s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
 		return
 	}
 	if acc.TOTPEnabled {
 		if !VerifyTOTP(acc.TOTPSecret, req.TOTP, time.Now()) {
-			s.fail(c, http.StatusUnauthorized, "invalid totp code")
+			s.recordLoginFailure(acc, maxFails, lockSec)
+			s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
 			return
 		}
+	}
+	// 登录成功：清零失败计数与锁定。
+	acc.FailedAttempts = 0
+	acc.LockedUntil = 0
+	if err := s.adminStore.UpdateAccount(acc); err != nil {
+		s.fail(c, http.StatusInternalServerError, "login state update failed")
+		return
 	}
 	// 聚合该账户角色的权限集合，打包进 token（有效期内的权限快照）。
 	perms := []string{}
@@ -76,6 +104,26 @@ func (s *Server) handleLogin(c *gin.Context) {
 		"expires_in":    s.cfg.Admin.TokenTTLSec,
 		"totp_required": acc.TOTPEnabled,
 	})
+}
+
+// recordLoginFailure 累加失败次数；达到阈值则锁定账户 lockSec 秒（自动过期）。
+// 失败计数与锁定到期持久化到账户，跨重启/副本一致；成功登录由调用方清零。
+// 每次失败/锁定均写入审计日志，便于异常登录行为追溯。
+func (s *Server) recordLoginFailure(acc *AdminAccount, maxFails, lockSec int) {
+	acc.FailedAttempts++
+	if acc.FailedAttempts >= maxFails {
+		acc.LockedUntil = time.Now().Unix() + int64(lockSec)
+		log.Printf("[admin] SECURITY: account %q locked for %d sec after %d failed logins",
+			acc.Username, lockSec, maxFails)
+	} else {
+		log.Printf("[admin] SECURITY: failed login for account %q (attempt %d/%d)",
+			acc.Username, acc.FailedAttempts, maxFails)
+	}
+	// 持久化失败计数/锁定（失败也照常写入，便于跨实例共享限流状态）。
+	if err := s.adminStore.UpdateAccount(acc); err != nil {
+		// 限流状态写入失败不阻断登录失败响应，仅记录（避免泄露内部错误）。
+		log.Printf("[admin] failed to persist login failure state for %q: %v", acc.Username, err)
+	}
 }
 
 func (s *Server) handleHealth(c *gin.Context) {

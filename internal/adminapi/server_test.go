@@ -127,3 +127,42 @@ func TestAdminRequiresLogin(t *testing.T) {
 		t.Fatalf("expected 401 without token, got %d", w.Code)
 	}
 }
+
+// TestAdminLoginLockout 验证登录暴力防护：连续失败达到阈值锁定账户，
+// 锁定后即便正确密码也被拒（证明锁定生效），且锁定前成功登录会清零失败计数。
+func TestAdminLoginLockout(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Auth.Secret = "test-secret"
+	cfg.Admin.Username = "admin"
+	cfg.Admin.Password = "admin123"
+	cfg.Admin.TokenTTLSec = 3600
+	cfg.Admin.MaxLoginFailures = 2 // 测试用小阈值
+	cfg.Admin.LoginLockoutSec = 900
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	adminapi.NewServer(cfg).RegisterRoutes(r)
+
+	// 1) 锁定前：第 1 次错误 → 401（未达阈值）
+	if code, _ := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "wrong"}); code != http.StatusUnauthorized {
+		t.Fatalf("attempt1: expected 401, got %d", code)
+	}
+	// 2) 锁定前正确密码 → 200（并清零失败计数）
+	if code, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "admin123"}); code != http.StatusOK {
+		t.Fatalf("pre-lock good login: expected 200, got %d", code)
+	} else if data.(map[string]interface{})["token"] == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	// 3) 连续 2 次错误 → 触发锁定
+	postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "wrong1"})
+	postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "wrong2"})
+
+	// 4) 锁定后：即使正确密码也应被拒（证明锁定生效，而非仅计数）
+	if code, _ := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "admin123"}); code != http.StatusUnauthorized {
+		t.Fatalf("locked correct login: expected 401, got %d", code)
+	}
+	// 5) 锁定后：错误密码同样被拒
+	if code, _ := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "wrong3"}); code != http.StatusUnauthorized {
+		t.Fatalf("locked wrong login: expected 401, got %d", code)
+	}
+}

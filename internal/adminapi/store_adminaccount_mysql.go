@@ -15,6 +15,7 @@ const (
 	adminMigVerAccounts = 9201
 	adminMigVerRoles    = 9202
 	adminMigVerRolePerms = 9203
+	adminMigVerLoginLock = 9204
 )
 
 // AdminMigrations 是管理员模块的建表迁移，运行时由 NewMySQLAdminStore 应用。
@@ -61,6 +62,17 @@ var AdminMigrations = []migrate.Migration{
     KEY idx_perm_key (perm_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		Down: "DROP TABLE IF EXISTS ce_admin_role_perms;",
+	},
+	{
+		// 登录暴力防护：在已存在的账户表上追加失败计数与锁定到期列（幂等，仅首次应用）。
+		Version: adminMigVerLoginLock,
+		Name:    "alter_ce_admin_accounts_login_lock",
+		Up: `ALTER TABLE ce_admin_accounts
+    ADD COLUMN failed_attempts INT    NOT NULL DEFAULT 0,
+    ADD COLUMN locked_until   BIGINT NOT NULL DEFAULT 0;`,
+		Down: `ALTER TABLE ce_admin_accounts
+    DROP COLUMN failed_attempts,
+    DROP COLUMN locked_until;`,
 	},
 }
 
@@ -132,13 +144,15 @@ func (s *mysqlAdminStore) CreateAccount(a *AdminAccount) error {
 
 func (s *mysqlAdminStore) GetAccountByUsername(username string) (*AdminAccount, error) {
 	return s.scanAccount(
-		`SELECT id, username, pass_hash, status, role_id, COALESCE(totp_secret,''), totp_enabled, created_at, updated_at
+		`SELECT id, username, pass_hash, status, role_id, COALESCE(totp_secret,''), totp_enabled,
+		        failed_attempts, locked_until, created_at, updated_at
 		 FROM ce_admin_accounts WHERE username = ?`, username)
 }
 
 func (s *mysqlAdminStore) GetAccountByID(id int64) (*AdminAccount, error) {
 	return s.scanAccount(
-		`SELECT id, username, pass_hash, status, role_id, COALESCE(totp_secret,''), totp_enabled, created_at, updated_at
+		`SELECT id, username, pass_hash, status, role_id, COALESCE(totp_secret,''), totp_enabled,
+		        failed_attempts, locked_until, created_at, updated_at
 		 FROM ce_admin_accounts WHERE id = ?`, id)
 }
 
@@ -147,7 +161,8 @@ func (s *mysqlAdminStore) scanAccount(query string, args ...interface{}) (*Admin
 	var totpSecret string
 	var totpEnabled int
 	err := s.db.QueryRow(query, args...).Scan(
-		&a.ID, &a.Username, &a.PasswordHash, &a.Status, &a.RoleID, &totpSecret, &totpEnabled, &a.CreatedAt, &a.UpdatedAt)
+		&a.ID, &a.Username, &a.PasswordHash, &a.Status, &a.RoleID, &totpSecret, &totpEnabled,
+		&a.FailedAttempts, &a.LockedUntil, &a.CreatedAt, &a.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrAdminNotFound
 	}
@@ -161,7 +176,8 @@ func (s *mysqlAdminStore) scanAccount(query string, args ...interface{}) (*Admin
 
 func (s *mysqlAdminStore) ListAccounts() ([]*AdminAccount, error) {
 	rows, err := s.db.Query(
-		`SELECT id, username, pass_hash, status, role_id, COALESCE(totp_secret,''), totp_enabled, created_at, updated_at
+		`SELECT id, username, pass_hash, status, role_id, COALESCE(totp_secret,''), totp_enabled,
+		        failed_attempts, locked_until, created_at, updated_at
 		 FROM ce_admin_accounts ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -172,7 +188,7 @@ func (s *mysqlAdminStore) ListAccounts() ([]*AdminAccount, error) {
 		var a AdminAccount
 		var totpSecret string
 		var totpEnabled int
-		if err := rows.Scan(&a.ID, &a.Username, &a.PasswordHash, &a.Status, &a.RoleID, &totpSecret, &totpEnabled, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Username, &a.PasswordHash, &a.Status, &a.RoleID, &totpSecret, &totpEnabled, &a.FailedAttempts, &a.LockedUntil, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, err
 		}
 		a.TOTPSecret = totpSecret
@@ -185,8 +201,9 @@ func (s *mysqlAdminStore) ListAccounts() ([]*AdminAccount, error) {
 func (s *mysqlAdminStore) UpdateAccount(a *AdminAccount) error {
 	a.UpdatedAt = time.Now()
 	res, err := s.db.Exec(
-		`UPDATE ce_admin_accounts SET username=?, pass_hash=?, status=?, role_id=?, totp_secret=NULLIF(?, ''), totp_enabled=?, updated_at=? WHERE id=?`,
-		a.Username, a.PasswordHash, a.Status, a.RoleID, a.TOTPSecret, boolToInt(a.TOTPEnabled), a.UpdatedAt, a.ID)
+		`UPDATE ce_admin_accounts SET username=?, pass_hash=?, status=?, role_id=?, totp_secret=NULLIF(?, ''), totp_enabled=?, failed_attempts=?, locked_until=?, updated_at=? WHERE id=?`,
+		a.Username, a.PasswordHash, a.Status, a.RoleID, a.TOTPSecret, boolToInt(a.TOTPEnabled),
+		a.FailedAttempts, a.LockedUntil, a.UpdatedAt, a.ID)
 	if err != nil {
 		if isDuplicate(err) {
 			return ErrAdminExists

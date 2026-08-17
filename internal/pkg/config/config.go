@@ -122,6 +122,10 @@ type AdminConfig struct {
 	TokenTTLSec int `yaml:"token_ttl_sec"`
 	// AllowedOrigins 管理后台前端来源白名单（如 http://localhost:5174）。
 	AllowedOrigins []string `yaml:"allowed_origins"`
+	// MaxLoginFailures 连续登录失败达到该次数后锁定账户（防暴力破解），<=0 时默认 5。
+	MaxLoginFailures int `yaml:"max_login_failures"`
+	// LoginLockoutSec 账户锁定持续时间（秒，自动过期），<=0 时默认 900（15 分钟）。
+	LoginLockoutSec int `yaml:"login_lockout_sec"`
 }
 
 // Load 从给定路径读取 yaml 配置。
