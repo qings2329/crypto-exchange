@@ -7,6 +7,7 @@
 - **用户个人设置**：服务 `internal/services/user`，前缀 `/api/v1/user`（见 [用户设置模块](#user)）。
 - **公告模块**：服务 `internal/announcement`（挂载于用户服务 `cmd/user`，共用同一数据库），前缀 `/api/v1/announcement`（见 [公告模块](#ann)）。
 - **理财资管**：服务 `internal/wealth`（独立二进制 `cmd/wealth`，监听 `:8092`），前缀 `/api/v1/wealth`（见 [理财模块](#wealth)）。
+- **钱包与资金流水**：服务 `internal/futuresapi`（合约钱包服务），前缀 `/api/v1/futures/wallet`（见 [钱包与资金流水](#wallet)）。
 
 ---
 
@@ -21,6 +22,8 @@
   - [基础约定](#ann-basics) · [数据模型](#ann-models) · [接口列表](#ann-endpoints) · [错误映射](#ann-errors) · [存储与迁移](#ann-store) · [前端对接](#ann-frontend)
 - [理财资管模块](#wealth)
   - [基础约定](#wealth-basics) · [数据模型](#wealth-models) · [接口列表](#wealth-endpoints) · [错误映射](#wealth-errors) · [存储与迁移](#wealth-store) · [前端对接](#wealth-frontend)
+- [钱包与资金流水](#wallet)
+  - [数据模型](#wallet-models) · [接口列表](#wallet-endpoints) · [前端对接](#wallet-frontend)
 - [错误码总览](#errors)
 
 ---
@@ -563,6 +566,49 @@ go build -o bin/otc ./cmd/otc
 
 ---
 
+<a id="wallet"></a>
+## 钱包与资金流水（合约钱包服务）
+
+> 服务：`internal/futuresapi`（合约钱包服务），路由前缀 `/api/v1/futures/wallet`。
+> 该服务持有交易所用户钱包账本（`internal/ledger`），记录充值 / 提现 / 转账 / 资金费 / 强平 / 坏账补缴等资金变动。
+
+<a id="wallet-models"></a>
+### 资金流水数据模型
+
+`LedgerEntry`（用户侧资金流水条目）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | int | 流水序号（自增） |
+| user_id | int | 账户主体（恒为当前登录用户） |
+| asset | string | 资产，如 `USDT` |
+| delta | number | 变动额：`+` 入账 / `-` 出账（JSON 数字） |
+| balance | number | 变动后的可用余额（JSON 数字） |
+| biz_type | string | 业务类型（见下） |
+| ref | string | 关联单号（订单号 / 链上哈希 / 提现 hold_id） |
+| time | int | Unix 纳秒时间戳 |
+
+`biz_type` 取值：`deposit`(充值) / `withdraw`(提现) / `transfer`(转账) / `funding`(资金费) / `liquidation`(强平) / `repay`(坏账补缴) / `open`(开仓) / `close`(平仓) / `fee`(手续费)。
+
+<a id="wallet-endpoints"></a>
+### 接口列表
+
+- `GET /api/v1/futures/wallet/ledger` —— 查询**本人**资金流水。
+  - 鉴权：User（需登录；身份**强制取自 Token**，忽略任何 `user_id` 参数，防止冒充查询他人流水）。
+  - 查询参数（可选）：`asset`（按资产过滤）、`limit`（截断条数，0/不传为全部）。
+  - 响应：`data = { entries: LedgerEntry[] }`，**按时间倒序（最新在前）**，仅含调用者本人跨全部资产的流水。
+  - 错误：401 未认证；500 服务端内部异常。
+
+> **架构说明**：本仓库账本为各服务**内嵌实例**。本接口返回的是合约钱包账本中该用户的流水（充值 / 提现 / 转账 / 资金费 / 强平 / 坏账补缴等钱包级变动）。现货成交、OTC 成交各自写入独立的账本实例，未在本接口聚合；如需统一全量资金流水，需建设跨服务的共享账本 / 聚合层（更大的重构）。
+
+<a id="wallet-frontend"></a>
+### 前端对接
+
+- 类型与封装见 `src/api/client.ts`：`walletLedger(params?)`、类型 `LedgerEntry`。
+- 页面 `src/pages/Wallet.tsx` 钱包页新增「资金流水」分区，表格展示时间 / 资产 / 类型 / 变动(±) / 余额 / 关联单号，支持按资产或业务类型前端筛选。
+
+---
+
 <a id="errors"></a>
 ## 错误码总览
 
@@ -583,5 +629,7 @@ go build -o bin/otc ./cmd/otc
 | Wealth | 401 | 4010 | 未认证 / Token 非法 |
 | Wealth | 400 | 4000/4001/4002 | 请求非法 / 参数校验 / 业务规则（product not found、not open、below min、insufficient balance、not owner、already redeemed、locked 等） |
 | Wealth | 500 | 5000 | 服务端内部异常（持久化 / 账本转账失败） |
+| Wallet | 401 | 401 | 未认证 / Token 非法 |
+| Wallet | 500 | 500 | 服务端内部异常（账本读取） |
 
-> 注：OTC 与 Wealth 使用带业务子码（4010/4030/4000/…、5000）的 `code`；用户服务与公告服务当前 `code` 直接复用 HTTP 状态码（401/400/403/404/500）。两者均遵循统一 `{code,message,data}` 信封。
+> 注：OTC 与 Wealth 使用带业务子码（4010/4030/4000/…、5000）的 `code`；用户服务、公告服务与合约钱包（Wallet）当前 `code` 直接复用 HTTP 状态码（401/400/403/404/500）。两者均遵循统一 `{code,message,data}` 信封。

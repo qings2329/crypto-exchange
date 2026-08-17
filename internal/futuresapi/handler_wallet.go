@@ -45,6 +45,9 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.DELETE("/api/v1/futures/wallet/withdraw/address", s.handleWithdrawAddressDelete)
 	r.GET("/api/v1/futures/wallet/withdraw/addresses", s.handleWithdrawAddresses)
 	r.GET("/api/v1/futures/wallet/balance", s.handleWalletBalance)
+	// 用户侧资金流水（本人，按 token uid 过滤；忽略请求体 user_id 防冒充，F4）。
+	// 可选 ?asset= 按资产过滤、?limit= 截断条数（0/不传表示全部）。倒序（最新在前）。
+	r.GET("/api/v1/futures/wallet/ledger", s.handleLedgerHistory)
 	r.GET("/api/v1/futures/wallet/fee", s.handleWalletFee)
 	r.GET("/api/v1/futures/wallet/baddebt", s.handleBadDebt)
 	r.POST("/api/v1/futures/wallet/baddebt/repay", s.handleBadDebtRepay)
@@ -707,6 +710,33 @@ func (s *Server) handleWalletBalance(c *gin.Context) {
 		return
 	}
 	response.JSON(c, s.walletSummary(uid, asset))
+}
+
+// handleLedgerHistory 用户侧资金流水（本人）。身份强制来自鉴权 token（F4），
+// 忽略任何请求体/查询中的 user_id，杜绝冒充查询他人流水。可选 asset/limit 过滤。
+func (s *Server) handleLedgerHistory(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
+	asset := c.Query("asset")
+	limit, _ := strconv.Atoi(c.Query("limit"))
+
+	entries := s.ledgerSvc.UserHistory(uid)
+	if asset != "" {
+		filtered := make([]ledger.Entry, 0, len(entries))
+		for _, e := range entries {
+			if e.Asset == asset {
+				filtered = append(filtered, e)
+			}
+		}
+		entries = filtered
+	}
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	response.JSON(c, gin.H{"entries": entries})
 }
 
 // handleWalletFee 手续费估算：按多链/多资产费率模型返回某笔提现的手续费。
