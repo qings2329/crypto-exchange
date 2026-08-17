@@ -13,6 +13,7 @@ package wealth
 
 import (
 	"errors"
+	"math/big"
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/settlement"
@@ -102,20 +103,48 @@ type WealthHolding struct {
 }
 
 // YieldTo 计算从 last_accrual_at（未计则取 created_at）到 t 的应计收益（连续计息，按小时）。
-// 纯函数，便于单测。年化按 8760 小时计。
+// 纯函数，便于单测。年化按 8760 小时计。内部委托 YieldToAmount 做定点整数运算（F2/F5 整数化），
+// 此处仅暴露人类单位视图。
 func (h *WealthHolding) YieldTo(t time.Time, annualRate float64) float64 {
+	return h.YieldToAmount(t, annualRate, h.Principal.Decimals).HumanFloat()
+}
+
+// YieldToAmount 计算从 last_accrual_at（未计则取 created_at）到 t 的应计收益（按小时连续计息），
+// 全程在定点整数空间运算，消除 Principal.HumanFloat() 的 float 精度丢失与每期浮点尾差累积
+// （#47 利息整数化）。年化按 8760 小时计。
+//
+// 公式（全 big.Int 整除，截断到最小单位）：
+//
+//	delta = principal.Value * rateScaled * nanos / (8760 * nanosPerHour * rateScale)
+//
+// 其中 rateScaled = round(annualRate * 1e8)（年化利率定点化，避免 float 参与每期乘法）、
+// nanos = 经过的纳秒数、nanosPerHour = 3.6e12、rateScale = 1e8。
+// 由于每个计息周期按自身起止时间增量计算并累加定点 delta，长期持有也不会产生浮点复利漂移。
+func (h *WealthHolding) YieldToAmount(t time.Time, annualRate float64, dec int) settlement.AssetAmount {
 	from := h.LastAccrualAt
 	if from.IsZero() {
 		from = h.CreatedAt
 	}
 	if t.Before(from) {
-		return 0
+		return settlement.AssetAmount{Decimals: dec}
 	}
-	hours := t.Sub(from).Hours()
-	if hours <= 0 {
-		return 0
+	nanos := t.Sub(from).Nanoseconds()
+	if nanos <= 0 {
+		return settlement.AssetAmount{Decimals: dec}
 	}
-	return h.Principal.HumanFloat() * annualRate * hours / 8760.0
+	// 年化利率定点化：rateScaled = round(annualRate * 1e8)。
+	rateScaled := int64(annualRate*1e8 + 0.5)
+	if rateScaled <= 0 {
+		return settlement.AssetAmount{Decimals: dec}
+	}
+	// delta = principal.Value * rateScaled * nanos / (8760 * 3.6e12 * 1e8)
+	num := new(big.Int).Mul(h.Principal.Value, big.NewInt(rateScaled))
+	num.Mul(num, big.NewInt(nanos))
+	den := big.NewInt(8760)
+	den.Mul(den, big.NewInt(3600*1e9)) // nanosPerHour
+	den.Mul(den, big.NewInt(1e8))       // 利率定点比例
+	delta := new(big.Int).Quo(num, den)
+	return settlement.AssetAmount{Value: delta, Decimals: dec}
 }
 
 // TotalValue 返回本金 + 已计收益（定点）。
