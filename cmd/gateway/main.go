@@ -42,6 +42,12 @@ func main() {
 // 抽出以便单测验证「matching 写端点不直连网关」的资金安全不变量。
 func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 	r := gin.New()
+	// 配置受信任代理后，c.ClientIP() 从 X-Forwarded-For 取真实客户端 IP；
+	// 留空则不信任任何代理，使用直连对端 IP（RemoteAddr）。这让审计 IP、全局限流
+	// 都能正确归因到真实来源（若网关自身也位于 CDN/LB 之后，需在此填入其 IP/CIDR）。
+	if err := r.SetTrustedProxies(cfg.Server.TrustedProxies); err != nil {
+		log.Fatal("set trusted proxies", zap.Error(err))
+	}
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
 	// 边缘鉴权：放行认证与公开行情端点，其余一律强制鉴权；后端服务再做二次校验（零信任）。
 	// Auth 追加在 Common 安全套件之后，确保所有响应（含 401）都带安全头、且被拒绝请求也被审计。

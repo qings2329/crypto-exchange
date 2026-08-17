@@ -6,6 +6,12 @@ server:
     - "http://localhost:5173"    # ce-frontend 用户前端（dev）
     - "http://localhost:5174"    # web-admin 管理后台前端（dev）
   max_body_bytes: 1048576        # 请求体上限（1 MiB）
+  # 受信任的反向代理/负载均衡 IP 或 CIDR。配置后 gin 的 c.ClientIP() 从
+  # X-Forwarded-For 取真实客户端 IP，使审计 IP、全局限流、admin 登录 IP 限流正确归因。
+  # 留空（默认）则不信任任何代理，直接使用直连对端 IP（RemoteAddr）——适合服务直连公网、
+  # 或前面没有反向代理的场景。若服务位于网关/LB/CDN 之后，必须在此填入其地址，否则
+  # 所有请求会被误判为同一个上游 IP（限流/审计失真、甚至误伤）。
+  trusted_proxies: []            # 例：["10.0.0.0/8", "192.168.1.10"]
   tls:
     cert_file: ""                # 同时配置 cert/key 才启用 HTTPS
     key_file: ""
