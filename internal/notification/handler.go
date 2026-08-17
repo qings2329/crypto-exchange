@@ -35,8 +35,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		g.POST("/read-all", h.readAll)    // 全部已读
 		g.POST("/publish", h.publish)     // 发布（演示/内部调用）
 	}
-	// 运营/排查：全部通知（同样需鉴权，真实部署应加 RBAC）。
-	r.GET("/api/v1/notification/admin/list", h.listAll)
+	// 运营/排查：全部通知（全局 Auth 已挂载；此处追加 AdminGuard，仅管理员可见全量通知，
+	// 避免任意登录用户越权读取他人通知内容）。
+	r.GET("/api/v1/notification/admin/list", middleware.AdminGuard(), h.listAll)
 }
 
 func uid(c *gin.Context) int64 {
