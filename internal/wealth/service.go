@@ -151,10 +151,22 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 }
 
 // accrueHolding 对单笔持仓按当前时间应计收益（定点累加，避免 float 复利漂移）。返回本轮回填的收益额。
+//
+// F3-1：应计收益同时 Debit SysWealth、Credit SysWealthYieldPayable（复式记账拆分），
+// 自此 SysWealth 余额恒等于「在管本金 - 用户应计收益负债」，赎回时收益经 SysWealthYieldPayable
+// 支出，不再由 SysWealth 静默透支偿付（原实现 Accrue 不落账，赎回会凭空兑付收益、虚高 SysWealth）。
+// 划转失败则不计入 AccruedYield（下个计息周期按 LastAccrualAt 重算补齐），避免账实不一致。
 func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Time) settlement.AssetAmount {
 	dec := settlement.AssetDecimalsByName(p.Asset)
 	delta := settlement.AssetAmountFromFloat(h.YieldTo(now, p.AnnualRate), dec)
 	if delta.Sign() > 0 {
+		ref := fmt.Sprintf("wealth_accrue product=%d holding=%d", p.ID, h.ID)
+		if err := s.ledger.Transfer(ledger.SysWealth, ledger.SysWealthYieldPayable, p.Asset, delta, "wealth_accrue", ref); err != nil {
+			if s.log != nil {
+				s.log.Error("wealth accrue: move yield failed", zap.Int64("user_id", h.UserID), zap.String("asset", p.Asset), zap.Error(err))
+			}
+			return settlement.AssetAmount{Decimals: dec}
+		}
 		h.AccruedYield = h.AccruedYield.Add(delta)
 		h.LastAccrualAt = now
 	}
@@ -189,7 +201,8 @@ func (s *Service) Accrue(now time.Time) (float64, error) {
 	return total, nil
 }
 
-// Redeem 用户赎回持仓：活期随时可赎；定期须到期。本金+应计收益从 SysWealth 支出给用户。
+// Redeem 用户赎回持仓：活期随时可赎；定期须到期。本金经 SysWealth、应计收益经
+// SysWealthYieldPayable 分别支出给用户（F3-1 拆分记账）。
 //
 // 幂等设计（与 otc/options/margin 一致）：先落终态（HoldingRedeemed）再 Transfer，Transfer 失败回滚状态；
 // 顶部终态短路实现幂等（重复赎回不再双付）。s.mu 串行化赎回以避免并发双付、并与后台 Accrue 互斥。
@@ -221,8 +234,9 @@ func (s *Service) Redeem(userID, holdingID int64) (*WealthHolding, error) {
 			return nil, ErrLocked
 		}
 	}
-	_ = s.accrueHolding(h, p, now) // 赎回前补齐到当前的收益
-	total := h.TotalValue()
+	_ = s.accrueHolding(h, p, now) // 赎回前补齐到当前的收益（含 SysWealth->SysWealthYieldPayable 划转）
+	principal := h.Principal
+	yield := h.AccruedYield
 	ref := fmt.Sprintf("wealth_redeem product=%d holding=%d user=%d", h.ProductID, holdingID, userID)
 
 	// 先落终态，再出金。
@@ -231,12 +245,28 @@ func (s *Service) Redeem(userID, holdingID int64) (*WealthHolding, error) {
 	if err := s.store.UpdateHolding(h); err != nil {
 		return nil, err
 	}
-	if err := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, total, "wealth_redeem", ref); err != nil {
-		// 回滚：恢复持有中状态（避免双付）。
-		h.Status = HoldingActive
-		h.RedeemedAt = time.Time{}
-		_ = s.store.UpdateHolding(h)
-		return nil, fmt.Errorf("redeem payout: %w", err)
+	// F3-1 拆分记账：本金经 SysWealth 支出，应计收益经 SysWealthYieldPayable 支出，
+	// 不再由 SysWealth 静默透支偿付收益（原实现本金收益混为一笔，赎回会凭空兑付收益、虚高 SysWealth）。
+	if principal.Sign() > 0 {
+		if err := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, principal, "wealth_redeem_principal", ref); err != nil {
+			// 回滚：恢复持有中状态（避免双付）。
+			h.Status = HoldingActive
+			h.RedeemedAt = time.Time{}
+			_ = s.store.UpdateHolding(h)
+			return nil, fmt.Errorf("redeem principal: %w", err)
+		}
+	}
+	if yield.Sign() > 0 {
+		if err := s.ledger.Transfer(ledger.SysWealthYieldPayable, userID, p.Asset, yield, "wealth_redeem_yield", ref); err != nil {
+			// 收益划转失败：回退本金与终态，保证不重复/不漏付。
+			if principal.Sign() > 0 {
+				_ = s.ledger.Transfer(userID, ledger.SysWealth, p.Asset, principal, "wealth_redeem_principal_rollback", ref)
+			}
+			h.Status = HoldingActive
+			h.RedeemedAt = time.Time{}
+			_ = s.store.UpdateHolding(h)
+			return nil, fmt.Errorf("redeem yield: %w", err)
+		}
 	}
 	return h, nil
 }

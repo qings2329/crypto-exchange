@@ -222,3 +222,38 @@ func TestSubscribeRejectsNaN(t *testing.T) {
 		}
 	}
 }
+
+// TestWealthAccrueMovesYieldToPayable F3-1：计息时收益须从 SysWealth 划转到
+// SysWealthYieldPayable，使 SysWealth 余额恒等于「本金 - 已计收益」，赎回不再凭空兑付收益。
+func TestWealthAccrueMovesYieldToPayable(t *testing.T) {
+	svc, l := newTestService()
+	p := mustProduct(svc, TypeCurrent, 0.876, 0, 100) // 876% 年化 => 1%/h
+	h, err := svc.Subscribe(1, p.ID, 1000)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	// 申购后本金 1000 入 SysWealth，应计收益负债账户为空。
+	if sys, _, _ := l.Balance(ledger.SysWealth, "USDT"); !eqAmt(sys, 1000, "USDT") {
+		t.Fatalf("custody wrong: %v want 1000", sys)
+	}
+	if pay, _, _ := l.Balance(ledger.SysWealthYieldPayable, "USDT"); pay.Sign() != 0 {
+		t.Fatalf("payable should be 0 before accrue: %v", pay)
+	}
+	// 让持仓从 100 小时前起算，计息 100h*1%/h ≈ 10 收益。
+	h.CreatedAt = time.Now().Add(-100 * time.Hour)
+	h.LastAccrualAt = h.CreatedAt
+	_ = svc.store.UpdateHolding(h)
+	if _, err := svc.Accrue(time.Now()); err != nil {
+		t.Fatalf("accrue: %v", err)
+	}
+	got, _ := svc.store.GetHolding(h.ID)
+	// 应计收益负债账户余额 == 持仓已计收益（精确定点对账）。
+	if pay, _, _ := l.Balance(ledger.SysWealthYieldPayable, "USDT"); pay.Cmp(got.AccruedYield) != 0 {
+		t.Fatalf("SysWealthYieldPayable %v != accrued yield %v", pay, got.AccruedYield)
+	}
+	// SysWealth 余额 == 本金 - 已计收益（invariant）。
+	wantSys := h.Principal.Sub(got.AccruedYield)
+	if sys, _, _ := l.Balance(ledger.SysWealth, "USDT"); sys.Cmp(wantSys) != 0 {
+		t.Fatalf("SysWealth %v != principal-yield %v", sys, wantSys)
+	}
+}
