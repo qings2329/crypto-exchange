@@ -231,6 +231,20 @@ func AssetDecimalsByName(asset string) int {
 	}
 }
 
+// KnownAsset 判断资产是否在标准 decimals 表中（与 AssetDecimalsByName 口径一致）。
+// 用于边界校验：拒绝未知/不受支持的资产，避免账本按默认 8 位小数缩放导致精度错配，
+// 或在未知资产上凭空铸造/销毁余额（F5 资产白名单）。
+//
+// 注意：本函数与 AssetDecimalsByName 的 case 必须保持同步——新增受支持资产时两处都要改。
+func KnownAsset(asset string) bool {
+	switch asset {
+	case "BTC", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20":
+		return true
+	default:
+		return false
+	}
+}
+
 // Neg 返回金额的相反数（Value 取负，Decimals 不变）。
 func (a AssetAmount) Neg() AssetAmount {
 	if a.Value == nil {
