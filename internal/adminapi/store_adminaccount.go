@@ -25,6 +25,8 @@ type AdminAccount struct {
 	RoleID       int64
 	TOTPSecret   string // base32；绑定 GA 但未启用时暂存于此
 	TOTPEnabled  bool
+	FailedAttempts int  // 连续登录失败次数（成功登录清零）；达到阈值触发锁定
+	LockedUntil   int64 // 锁定到期 unix 秒；0 表示未锁定（防暴力破解）
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -333,11 +335,12 @@ func SeedBootstrap(store AdminStore, bootstrapUsername, bootstrapHash string) er
 			PermCoinRead, PermCoinWrite, PermDepositRead, PermWithdrawApproval,
 			PermNotificationManage, PermLedgerRead, PermServiceRead,
 			PermTradeRead, PermTradeManage,
+			PermApiKeyRead, PermApiKeyManage,
 		}},
 		{RoleOperator, "只读操作员", []string{
 			PermDashboardView, PermUserRead, PermSymbolRead, PermChainRead,
 			PermCoinRead, PermDepositRead, PermLedgerRead, PermServiceRead,
-			PermTradeRead,
+			PermTradeRead, PermApiKeyRead,
 		}},
 	}
 	for _, d := range defs {
