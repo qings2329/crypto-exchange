@@ -1,6 +1,7 @@
 package matching
 
 import (
+	"math"
 	"testing"
 )
 
@@ -60,4 +61,35 @@ func approx(a, b, eps float64) bool {
 		d = -d
 	}
 	return d <= eps
+}
+
+// F5：非法订单（nil/非正数量/负价/NaN/Inf）在引擎层被拒绝，不得进入撮合、不得污染订单簿。
+func TestMatchNowRejectsInvalidOrders(t *testing.T) {
+	e := NewEngine(nil, nil)
+	e.Register("BTC_USDT")
+
+	invalid := []*Order{
+		nil,
+		{Side: Buy, Price: 50000, Qty: 0},
+		{Side: Buy, Price: 50000, Qty: -1},
+		{Side: Buy, Price: math.NaN(), Qty: 1},
+		{Side: Buy, Price: math.Inf(1), Qty: 1},
+		{Side: Buy, Price: -1, Qty: 1},
+		{Side: Buy, Price: 50000, Qty: math.NaN()},
+		{Side: Buy, Price: 50000, StopPrice: math.Inf(1), Qty: 1},
+	}
+	for i, o := range invalid {
+		if tr, _ := e.MatchNow("BTC_USDT", o, false); tr != nil {
+			t.Fatalf("case %d: invalid order must be rejected (nil trades), got %d trades", i, len(tr))
+		}
+	}
+
+	// 合法市价单（price=0）不被拒：先同步挂一笔限价买单，再市价卖应成交。
+	rest := &Order{ID: 1, UserID: 1, Side: Buy, Price: 100, Qty: 1, Time: 1}
+	e.MatchNow("BTC_USDT", rest, true)
+	market := &Order{ID: 2, UserID: 2, Side: Sell, Price: 0, Qty: 1, Time: 2}
+	tr, fully := e.MatchNow("BTC_USDT", market, false)
+	if tr == nil || len(tr) == 0 || !fully {
+		t.Fatalf("valid market order should fill, got trades=%d fully=%v", len(tr), fully)
+	}
 }

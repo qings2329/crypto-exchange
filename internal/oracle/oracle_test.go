@@ -1,6 +1,8 @@
 package oracle
 
 import (
+	"context"
+	"math"
 	"testing"
 )
 
@@ -109,5 +111,57 @@ func TestOracleKeepsLastOnFailure(t *testing.T) {
 	or.pollAll()
 	if v, ok := or.IndexPrice("BTC_USDT_PERP"); !ok || !approx(v, 50005, 1e-6) {
 		t.Fatalf("after failure want to keep 50005, got %.2f ok=%v", v, ok)
+	}
+}
+
+// 自定义喂价源，用于注入异常值 / panic，验证聚合与轮询的健壮性。
+type feedFn struct {
+	name string
+	f    func(ctx context.Context, symbol string) (float64, error)
+}
+
+func (ff feedFn) Name() string { return ff.name }
+func (ff feedFn) Fetch(ctx context.Context, symbol string) (float64, error) {
+	return ff.f(ctx, symbol)
+}
+
+// F5：喂价源返回 NaN/Inf 必须被拒绝，不得污染指数价（原 `p<=0` 无法拦截 NaN/Inf）。
+func TestOracleRejectsNonFiniteFeed(t *testing.T) {
+	o := New(Config{
+		MinFeeds: 1,
+		Feeds: map[string][]PriceFeed{
+			"BTC_USDT": {
+				feedFn{name: "nan", f: func(context.Context, string) (float64, error) { return math.NaN(), nil }},
+				feedFn{name: "inf", f: func(context.Context, string) (float64, error) { return math.Inf(1), nil }},
+				feedFn{name: "ok", f: func(context.Context, string) (float64, error) { return 50000, nil }},
+			},
+		},
+	})
+	o.pollAll()
+	v, ok := o.IndexPrice("BTC_USDT")
+	if !ok || !validFeedPrice(v) {
+		t.Fatalf("index must be valid finite price, got %v ok=%v", v, ok)
+	}
+	if !approx(v, 50000, 1e-6) {
+		t.Fatalf("index should aggregate to 50000, got %v", v)
+	}
+}
+
+// F5：喂价源 ParseFunc panic 不得拖垮轮询 goroutine（panic 被 recover 捕获，其余源仍生效）。
+func TestOraclePanicFeedRecovered(t *testing.T) {
+	o := New(Config{
+		MinFeeds: 1,
+		Feeds: map[string][]PriceFeed{
+			"BTC_USDT": {
+				feedFn{name: "panic", f: func(context.Context, string) (float64, error) { panic("boom") }},
+				feedFn{name: "ok", f: func(context.Context, string) (float64, error) { return 50000, nil }},
+			},
+		},
+	})
+	// 不应有 panic 传播到调用方（pollSymbol 内部 recover）。
+	o.pollAll()
+	v, ok := o.IndexPrice("BTC_USDT")
+	if !ok || !approx(v, 50000, 1e-6) {
+		t.Fatalf("after panic feed, index should still be 50000, got %v ok=%v", v, ok)
 	}
 }

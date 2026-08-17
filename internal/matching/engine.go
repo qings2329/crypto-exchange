@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -152,6 +153,10 @@ func (e *Engine) Submit(symbol string, o *Order) bool {
 	if !ok {
 		return false
 	}
+	// F5：非法订单拒绝接入，避免异常数值经 WAL/订单簿扩散。
+	if !validOrder(o) {
+		return false
+	}
 	if e.store != nil {
 		if o.ID == 0 {
 			if id, err := e.store.NextOrderID(context.Background()); err == nil {
@@ -215,11 +220,37 @@ func (e *Engine) Cancel(symbol string, orderID int64) bool {
 // 持久化：接入 Store 时，强平单与普通订单一致写入 WAL（EventSubmit），
 // 因此崩溃恢复能重放该成交，补齐原 §17 已知的"强平流动性不写 WAL"缺口；
 // 恢复经 Recover 重放 EventSubmit 时并不触发 onTrade，故不会重复结算。
+// validOrder 校验订单数值合法性（F5 防御纵深）：数量必须为正且有限；价格、触发价、
+// 限价必须为有限且非负（Price=0 表示市价单，允许）。非法订单拒绝进入撮合，
+// 避免 NaN/负价污染订单簿或产生异常成交（HTTP 入口虽已拦，引擎层再兜底）。
+func validOrder(o *Order) bool {
+	if o == nil {
+		return false
+	}
+	if math.IsNaN(o.Qty) || math.IsInf(o.Qty, 0) || o.Qty <= 0 {
+		return false
+	}
+	if math.IsNaN(o.Price) || math.IsInf(o.Price, 0) || o.Price < 0 {
+		return false
+	}
+	if math.IsNaN(o.StopPrice) || math.IsInf(o.StopPrice, 0) || o.StopPrice < 0 {
+		return false
+	}
+	if math.IsNaN(o.StopLimit) || math.IsInf(o.StopLimit, 0) || o.StopLimit < 0 {
+		return false
+	}
+	return true
+}
+
 func (e *Engine) MatchNow(symbol string, o *Order, rest bool) ([]Trade, bool) {
 	e.mu.RLock()
 	ba, ok := e.books[symbol]
 	e.mu.RUnlock()
 	if !ok {
+		return nil, false
+	}
+	// F5：非法订单直接拒绝，不进入撮合（避免异常数值破坏订单簿/成交）。
+	if !validOrder(o) {
 		return nil, false
 	}
 	if e.store != nil {
@@ -253,6 +284,10 @@ func (e *Engine) SetMarkPrice(symbol string, price float64) []Trade {
 	ba, ok := e.books[symbol]
 	e.mu.RUnlock()
 	if !ok {
+		return nil
+	}
+	// F5：拒绝非有限或非正标记价，避免 NaN 污染最近成交价并导致止盈止损单误触发。
+	if math.IsNaN(price) || math.IsInf(price, 0) || price <= 0 {
 		return nil
 	}
 	return ba.book.SetLast(price)
