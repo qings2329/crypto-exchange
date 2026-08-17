@@ -9,6 +9,8 @@
 package ledger
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -17,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
@@ -130,6 +134,11 @@ type Ledger struct {
 	// 账本基建对调用方误用更健壮。仅当调用方显式传入非空 ref 时启用去重；ref 为空则保持
 	// 原"每次调用均生效"的语义（增量冻结 Unfreeze(prev)+Freeze(new) 因此完全不受影响）。
 	freezeSeen map[string]bool
+
+	// idemDB 可选：非空时幂等指纹持久化到 MySQL（#26），进程重启后仍可检测重复提交，
+	// 防止重启后同 ref 双付。nil 时仅用内存 map（原行为）。idemLedgerID 用于多账本实例隔离。
+	idemDB       *sql.DB
+	idemLedgerID string
 
 	// 对账巡检（定时对账探针）：reconMu 独立保护巡检状态，避免长持有 l.mu。
 	reconMu      sync.RWMutex
@@ -271,6 +280,55 @@ func New() *Ledger {
 	}
 }
 
+// SetIdempotencyDB 注入可选的幂等指纹持久化后端（#26）。db 通常与账本快照/风控共享同一
+// *sql.DB。ledgerID 为空时默认 "default"，用于多账本实例隔离。注入后，Transfer/Freeze 族
+// 在调用方传入非空 ref 时，除内存 map 外会把指纹写入 ce_ledger_idempotency（唯一约束）；
+// 进程重启后同一 ref 的重复提交仍可被检测并跳过，防止重启后双付。
+// 表结构由迁移保证就绪；此处再执行一次 CREATE TABLE IF NOT EXISTS 作为兜底（idempotent）。
+func (l *Ledger) SetIdempotencyDB(db *sql.DB, ledgerID string) error {
+	if ledgerID == "" {
+		ledgerID = "default"
+	}
+	if _, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS ce_ledger_idempotency (
+    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    ledger_id  VARCHAR(64)  NOT NULL,
+    kind       VARCHAR(16)  NOT NULL,
+    fp         VARCHAR(512) NOT NULL,
+    created_at DATETIME(3)  NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_ledger_kind_fp (ledger_id, kind, fp)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`); err != nil {
+		return fmt.Errorf("ensure ce_ledger_idempotency: %w", err)
+	}
+	l.idemDB = db
+	l.idemLedgerID = ledgerID
+	return nil
+}
+
+// idemSeenDB 查询某指纹是否已持久化（#26）。未配置 DB 时返回 false（靠内存 map 判定）。
+func (l *Ledger) idemSeenDB(kind, fp string) bool {
+	if l.idemDB == nil {
+		return false
+	}
+	var dummy int
+	err := l.idemDB.QueryRowContext(context.Background(),
+		"SELECT 1 FROM ce_ledger_idempotency WHERE ledger_id=? AND kind=? AND fp=? LIMIT 1",
+		l.idemLedgerID, kind, fp).Scan(&dummy)
+	return err == nil
+}
+
+// idemPersistDB 把已成功的幂等操作指纹持久化（#26）。INSERT IGNORE 容忍并发唯一约束冲突；
+// 未配置 DB 时为 no-op。
+func (l *Ledger) idemPersistDB(kind, fp string) {
+	if l.idemDB == nil {
+		return
+	}
+	_, _ = l.idemDB.ExecContext(context.Background(),
+		"INSERT IGNORE INTO ce_ledger_idempotency (ledger_id, kind, fp, created_at) VALUES (?,?,?,?)",
+		l.idemLedgerID, kind, fp, time.Now())
+}
+
 // SetOutflowRestricted 设置/解除某用户某资产的出金限制（有未冲抵坏账时限制，强制先补缴）。
 func (l *Ledger) SetOutflowRestricted(userID int64, asset string, restricted bool) {
 	l.mu.Lock()
@@ -369,7 +427,7 @@ func (l *Ledger) Freeze(userID int64, asset string, amount settlement.AssetAmoun
 	var fp string
 	if ref != "" {
 		fp = freezeFingerprint("freeze", userID, asset, amount, ref)
-		if l.freezeSeen[fp] {
+		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
 			return nil
 		}
 	}
@@ -381,6 +439,7 @@ func (l *Ledger) Freeze(userID int64, asset string, amount settlement.AssetAmoun
 	a.Frozen = a.Frozen.Add(amount)
 	if ref != "" {
 		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
 }
@@ -401,7 +460,7 @@ func (l *Ledger) Unfreeze(userID int64, asset string, amount settlement.AssetAmo
 	var fp string
 	if ref != "" {
 		fp = freezeFingerprint("unfreeze", userID, asset, amount, ref)
-		if l.freezeSeen[fp] {
+		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
 			return nil
 		}
 	}
@@ -413,6 +472,7 @@ func (l *Ledger) Unfreeze(userID int64, asset string, amount settlement.AssetAmo
 	a.Available = a.Available.Add(amount)
 	if ref != "" {
 		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
 }
@@ -434,7 +494,7 @@ func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount settlement.As
 	var fp string
 	if ref != "" {
 		fp = freezeFingerprint("freezewithdraw", userID, asset, amount, ref)
-		if l.freezeSeen[fp] {
+		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
 			return nil
 		}
 	}
@@ -446,6 +506,7 @@ func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount settlement.As
 	a.WithdrawFrozen = a.WithdrawFrozen.Add(amount)
 	if ref != "" {
 		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
 }
@@ -466,7 +527,7 @@ func (l *Ledger) UnfreezeWithdraw(userID int64, asset string, amount settlement.
 	var fp string
 	if ref != "" {
 		fp = freezeFingerprint("unfreezewithdraw", userID, asset, amount, ref)
-		if l.freezeSeen[fp] {
+		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
 			return nil
 		}
 	}
@@ -478,6 +539,7 @@ func (l *Ledger) UnfreezeWithdraw(userID int64, asset string, amount settlement.
 	a.Available = a.Available.Add(amount)
 	if ref != "" {
 		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
 }
@@ -552,6 +614,9 @@ func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetA
 	if l.transferSeen[fp] {
 		return nil
 	}
+	if ref != "" && l.idemSeenDB("transfer", fp) {
+		return nil
+	}
 
 	fa := l.getOrCreateLocked(from, asset)
 	ta := l.getOrCreateLocked(to, asset)
@@ -561,6 +626,9 @@ func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetA
 	l.appendSideLocked(fa, amount.Neg(), biz, ref, &l.seq)
 	l.appendSideLocked(ta, amount, biz, ref, &l.seq)
 	l.transferSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+	if ref != "" {
+		l.idemPersistDB("transfer", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
+	}
 	return nil
 }
 

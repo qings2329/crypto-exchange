@@ -82,10 +82,17 @@ func main() {
 	if dsn != "" {
 		if db, derr := sql.Open("mysql", dsn); derr == nil {
 			if perr := db.Ping(); perr == nil {
-				if ms, merr := risk.NewMySQLStore(db); merr == nil {
-					riskSvc = risk.New(ms)
-					log.Info("risk store: mysql")
+			if ms, merr := risk.NewMySQLStore(db); merr == nil {
+				riskSvc = risk.New(ms)
+				log.Info("risk store: mysql")
+				// 账本操作级幂等指纹持久化（#26）：与风控共享同一 *sql.DB，
+				// 重启后同 ref 的重复转账/冻结可被检测并跳过，防双付。
+				if ierr := ledgerSvc.SetIdempotencyDB(db, "futures"); ierr != nil {
+					log.Warn("ledger idempotency db init failed", zap.Error(ierr))
 				} else {
+					log.Info("ledger idempotency: mysql")
+				}
+			} else {
 					log.Warn("risk mysql migrate failed, fallback to mem", zap.Error(merr))
 					_ = db.Close()
 				}
