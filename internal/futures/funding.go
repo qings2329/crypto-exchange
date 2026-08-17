@@ -20,8 +20,8 @@ const (
 // PremiumIndex 溢价指数 = (标记价 - 指数价) / 指数价。
 // 反映合约相对现货的溢价/折价程度。
 func PremiumIndex(mark, index float64) float64 {
-	if index <= 0 {
-		return 0
+	if index <= 0 || !validFinite(mark) || !validFinite(index) {
+		return 0 // F5：非法行情直接归零，避免 NaN/Inf 污染费率
 	}
 	return (mark - index) / index
 }
@@ -29,6 +29,9 @@ func PremiumIndex(mark, index float64) float64 {
 // FundingRate 资金费率 = 名义利率 + 限幅后的溢价成分(EMA)。
 // 费率 > 0：多头向空头支付；费率 < 0：空头向多头支付。
 func FundingRate(interest, emaPremium float64) float64 {
+	if !validFinite(interest) || !validFinite(emaPremium) {
+		return 0 // F5：异常输入归零，避免费率变为 NaN 后落账为 0
+	}
 	c := emaPremium
 	if c > PremiumClamp {
 		c = PremiumClamp
@@ -72,10 +75,11 @@ type fundingState struct {
 // FundingManager 资金费率管理器：维护各交易对的指数价、溢价指数 EMA、费率，
 // 并在结算周期触发对所有持仓的资金费用结算。
 type FundingManager struct {
-	mu       sync.RWMutex
-	states   map[string]*fundingState
-	interval time.Duration
-	history  []FundingEvent
+	mu          sync.RWMutex
+	states      map[string]*fundingState
+	interval    time.Duration
+	history     []FundingEvent
+	lastSettled map[string]int64 // 每交易对最近一次成功结算所在周期起点（纳秒），用于同周期幂等防重（F1）
 }
 
 // NewFundingManager 创建资金费率管理器；interval 传 0 时使用默认 8h。
@@ -84,8 +88,9 @@ func NewFundingManager(interval time.Duration) *FundingManager {
 		interval = DefaultFundingInterval
 	}
 	return &FundingManager{
-		states:   make(map[string]*fundingState),
-		interval: interval,
+		states:      make(map[string]*fundingState),
+		interval:    interval,
+		lastSettled: make(map[string]int64),
 	}
 }
 
@@ -130,6 +135,10 @@ func (f *FundingManager) State(symbol string) (index, lastPremium, rate float64,
 // mark 为结算时刻的标记价格（来自 MarkPriceCalculator），premium 为溢价指数 EMA
 // （同样来自 MarkPriceCalculator），positions 为当前持仓。
 // 返回结算事件；钱包扣减由调用方（cmd/futures）根据 Payments 接入 Ledger 完成。
+//
+// 同周期幂等（F1）：仅在进入新的结算周期（intervalStart）时才真正结算，重复触发
+// （行情循环重入、服务重启）不会导致资金费被二次扣收；ev.Time 设为周期起点，
+// 供调用方生成稳定幂等 Ref 并对接账本 OpTransfer 去重。
 func (f *FundingManager) Settle(symbol string, mark, premium float64, positions []Position) FundingEvent {
 	f.mu.RLock()
 	s, ok := f.states[symbol]
@@ -138,6 +147,22 @@ func (f *FundingManager) Settle(symbol string, mark, premium float64, positions 
 	if !ok {
 		return ev
 	}
+	// F5：非法标记价直接跳过本轮结算，避免据 NaN/Inf 算出异常资金费。
+	if !validMark(mark) {
+		return ev
+	}
+	// F1：同周期仅结算一次。
+	now := time.Now().UnixNano()
+	intervalStart := now - (now % int64(f.interval))
+	f.mu.Lock()
+	if f.lastSettled[symbol] == intervalStart {
+		f.mu.Unlock()
+		return ev // 本周期已结算，跳过（不重复扣费）
+	}
+	f.lastSettled[symbol] = intervalStart
+	f.mu.Unlock()
+	ev.Time = intervalStart // 稳定周期标识，供调用方生成幂等 Ref
+
 	s.mu.Lock()
 	index := s.indexPrice
 	rate := FundingRate(InterestRatePerInterval, premium)
@@ -152,12 +177,20 @@ func (f *FundingManager) Settle(symbol string, mark, premium float64, positions 
 	payments := make([]FundingPayment, 0, len(positions))
 	for _, p := range positions {
 		notional := p.Notional(mark)
+		if !validFinite(notional) {
+			continue // F5：异常名义价值跳过该持仓
+		}
 		var pay float64
 		if p.Side == Long {
 			pay = -notional * rate // 多头付出
 		} else {
 			pay = notional * rate // 空头收取
 		}
+		if !validFinite(pay) {
+			continue // F5：异常资金费跳过该持仓
+		}
+		// F2：吸附到 USDT 最小精度，使账本转账额精确、无亚聪偏差。
+		pay = roundSatoshi(pay)
 		payments = append(payments, FundingPayment{
 			UserID:   p.UserID,
 			Side:     p.Side,

@@ -1,8 +1,65 @@
 package futures
 
 import (
+	"math"
 	"testing"
 )
+
+// 演示：异常标记价（NaN/Inf/≤0）不得触发强平，避免据其算出 NaN 盈亏静默落账为 0（F5）。
+func TestUpdateMarkPriceRejectsInvalidMark(t *testing.T) {
+	sym := "BTC_USDT_PERP"
+	liq := NewLiquidator(nil)
+	liq.Register(sym)
+	book, _ := liq.Book(sym)
+	book.Open(7001, sym, Long, 1, 50000, 5000, 10, 0)
+
+	if got := liq.UpdateMarkPrice(sym, math.NaN()); got != nil {
+		t.Fatalf("NaN mark should return nil, got %v", got)
+	}
+	if got := liq.UpdateMarkPrice(sym, math.Inf(1)); got != nil {
+		t.Fatalf("+Inf mark should return nil, got %v", got)
+	}
+	if got := liq.UpdateMarkPrice(sym, 0); got != nil {
+		t.Fatalf("zero mark should return nil, got %v", got)
+	}
+	if _, ok := book.pos[7001]; !ok {
+		t.Fatal("position must remain after invalid marks")
+	}
+	// 仅正常低价才触发强平。
+	if evs := liq.UpdateMarkPrice(sym, 40000); len(evs) != 1 {
+		t.Fatalf("valid low mark should liquidate, got %d events", len(evs))
+	}
+}
+
+// 演示：穿仓瀑布各分层在账本精度下精确求和等于穿仓额（F2）。
+// 使用一个带亚聪尾巴的穿仓亏损，验证四舍五入后 保险+ADL+社会化+残差 == 穿仓额。
+func TestDeficitWaterfallRoundingExact(t *testing.T) {
+	sym := "BTC_USDT_PERP"
+	liq := NewLiquidator(nil)
+	liq.Register(sym)
+	book, _ := liq.Book(sym)
+	liq.SetInsuranceProvider(func() float64 { return 0 }) // 保险为 0，全走 ADL/社会化
+
+	// 被强平方：穿仓亏损带亚聪尾巴 5000.000000004
+	book.Open(7001, sym, Long, 1, 50000, 5000, 10, 0)
+	// ADL 对手与盈利方，确保覆盖全部缺口
+	book.Open(7002, sym, Short, 1, 42000, 5000, 10, 0) // 盈利 2000
+	book.Open(7003, sym, Long, 1, 30000, 5000, 10, 0)   // 盈利 10000
+
+	evs := liq.UpdateMarkPrice(sym, 40000)
+	if len(evs) != 1 {
+		t.Fatalf("应强平 1 个，实际 %d", len(evs))
+	}
+	ev := evs[0]
+	// 四舍五入后穿仓额应为 5000（尾巴被吸收）
+	if !approx(ev.Deficit, 5000, 1e-6) {
+		t.Fatalf("穿仓额应四舍五入为 5000，实际 %.10f", ev.Deficit)
+	}
+	sum := ev.InsuranceCovered + ev.ADLCovered + ev.Socialized + ev.Residual
+	if !approx(sum, ev.Deficit, 1e-9) {
+		t.Fatalf("分层之和应精确等于穿仓额: sum=%.10f deficit=%.10f", sum, ev.Deficit)
+	}
+}
 
 // 演示：开 10x 多仓，价格下跌触发强平。
 func TestLiquidationLong(t *testing.T) {

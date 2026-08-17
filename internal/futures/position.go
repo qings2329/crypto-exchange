@@ -358,6 +358,10 @@ const DefaultPartialLiqRatio = 1.0
 // 用于强平把强平单送入撮合引擎成交后的持仓回填。
 // 返回：实现盈亏 realized、穿仓亏损 deficit、是否清仓 fullyClosed。
 func (p *Position) closeBy(price, qty float64) (realized, deficit float64, fullyClosed bool) {
+	// F5：成交价异常（NaN/Inf/≤0）直接不改持仓、不产生盈亏/穿仓，避免 NaN 经边界截断静默归零。
+	if !validMark(price) {
+		return 0, 0, p.Size <= 1e-9
+	}
 	if qty > p.Size {
 		qty = p.Size
 	}
