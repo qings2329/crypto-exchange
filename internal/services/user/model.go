@@ -43,8 +43,21 @@ type User struct {
 	TFAEnabled   bool
 	EmailVerified bool
 	PhoneVerified bool
+	Nickname     string // 昵称（个人设置可编辑，可选）
+	Avatar       string // 头像 URL（个人设置可编辑，可选）
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+}
+
+// UserPreferences 是用户个人偏好设置（与核心账户解耦，独立存储）。
+type UserPreferences struct {
+	UserID        int64
+	Language      string // 界面语言，如 zh-CN / en
+	Theme         string // 主题，如 light / dark
+	NotifyOrder   bool   // 订单相关通知
+	NotifySecurity bool  // 安全相关通知（登录/改密等）
+	NotifyMarketing bool // 营销推送
+	UpdatedAt     time.Time
 }
 
 // VerifyCode 是一次性验证码（邮箱/短信）。
@@ -99,4 +112,9 @@ var (
 	ErrKYCNotPending   = errors.New("kyc submission not pending")
 	ErrFrozen          = errors.New("user frozen")
 	ErrRefreshInvalid  = errors.New("invalid refresh token")
+	ErrSamePassword    = errors.New("new password must differ from current")
+	ErrInvalidPref     = errors.New("invalid preferences")
+	ErrNicknameTooLong = errors.New("nickname too long")
+	ErrAvatarTooLong   = errors.New("avatar url too long")
+	ErrPasswordTooShort = errors.New("password too short")
 )

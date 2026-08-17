@@ -85,6 +85,37 @@ var OtcMigrations = []migrate.Migration{
 		Up: `ALTER TABLE ce_otc_orders MODIFY crypto_amount VARCHAR(64) NOT NULL DEFAULT '0'`,
 		Down: `ALTER TABLE ce_otc_orders MODIFY crypto_amount DOUBLE NOT NULL DEFAULT 0`,
 	},
+	{
+		Version: 9605,
+		Name:    "create_ce_otc_messages",
+		Up: `CREATE TABLE IF NOT EXISTS ce_otc_messages (
+				id         BIGINT       NOT NULL AUTO_INCREMENT,
+				order_id   BIGINT       NOT NULL,
+				sender_id  BIGINT       NOT NULL,
+				content    TEXT         NOT NULL,
+				created_at DATETIME(3)  NOT NULL,
+				PRIMARY KEY (id),
+				INDEX idx_order (order_id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		Down: `DROP TABLE IF EXISTS ce_otc_messages`,
+	},
+	{
+		Version: 9606,
+		Name:    "create_ce_otc_proofs",
+		Up: `CREATE TABLE IF NOT EXISTS ce_otc_proofs (
+				id           BIGINT       NOT NULL AUTO_INCREMENT,
+				order_id     BIGINT       NOT NULL,
+				uploader_id  BIGINT       NOT NULL,
+				file_name    VARCHAR(255) NOT NULL DEFAULT '',
+				content_type VARCHAR(128) NOT NULL DEFAULT '',
+				size         BIGINT       NOT NULL DEFAULT 0,
+				url          VARCHAR(512) NOT NULL DEFAULT '',
+				created_at   DATETIME(3)  NOT NULL,
+				PRIMARY KEY (id),
+				INDEX idx_order (order_id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		Down: `DROP TABLE IF EXISTS ce_otc_proofs`,
+	},
 }
 
 // NewMySQLStore 打开 MySQL 并跑迁移，返回 MySQL 版 Store。

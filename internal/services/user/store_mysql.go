@@ -21,10 +21,12 @@ func isDuplicate(err error) bool {
 
 // 用户模块迁移版本号（与 ledger 的 9001/9002 错开，避免 ce_schema_migrations 冲突）。
 const (
-	userMigVerUsers   = 9101
-	userMigVerCodes   = 9102
-	userMigVerRefresh = 9103
-	userMigVerKYC     = 9104
+	userMigVerUsers     = 9101
+	userMigVerCodes     = 9102
+	userMigVerRefresh   = 9103
+	userMigVerKYC       = 9104
+	userMigVerProfile   = 9105
+	userMigVerPrefs     = 9106
 )
 
 // UserMigrations 是用户模块的建表迁移，运行时由 main 调 migrate.New(db, UserMigrations).Up()。
@@ -101,6 +103,29 @@ var UserMigrations = []migrate.Migration{
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		Down: "DROP TABLE IF EXISTS ce_user_kyc;",
 	},
+	{
+		Version: userMigVerProfile,
+		Name:    "alter_ce_users_profile",
+		Up: `ALTER TABLE ce_users ADD COLUMN nickname VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE ce_users ADD COLUMN avatar VARCHAR(512) NOT NULL DEFAULT '';`,
+		Down: `ALTER TABLE ce_users DROP COLUMN avatar;
+ALTER TABLE ce_users DROP COLUMN nickname;`,
+	},
+	{
+		Version: userMigVerPrefs,
+		Name:    "create_ce_user_preferences",
+		Up: `CREATE TABLE IF NOT EXISTS ce_user_preferences (
+    user_id         BIGINT       NOT NULL,
+    language        VARCHAR(32)  NOT NULL DEFAULT 'zh-CN',
+    theme           VARCHAR(32)  NOT NULL DEFAULT 'light',
+    notify_order    TINYINT      NOT NULL DEFAULT 1,
+    notify_security TINYINT      NOT NULL DEFAULT 1,
+    notify_marketing TINYINT     NOT NULL DEFAULT 0,
+    updated_at      DATETIME(3)  NOT NULL,
+    PRIMARY KEY (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		Down: "DROP TABLE IF EXISTS ce_user_preferences;",
+	},
 }
 
 // mysqlStore 是 Store 的 MySQL 实现。
@@ -128,11 +153,11 @@ func NewMySQLStore(dsn string) (Store, error) {
 func (s *mysqlStore) CreateUser(u *User) error {
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO ce_users (email, phone, pass_hash, status, kyc_level, tfa_secret, tfa_enabled, email_verified, phone_verified, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?)`,
+		`INSERT INTO ce_users (email, phone, pass_hash, status, kyc_level, tfa_secret, tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
 		nullIfEmpty(u.Email), nullIfEmpty(u.Phone), u.PassHash, int(u.Status), int(u.KYCLevel),
 		u.TFASecret, boolToInt(u.TFAEnabled), boolToInt(u.EmailVerified), boolToInt(u.PhoneVerified),
-		now, now)
+		u.Nickname, u.Avatar, now, now)
 	if err != nil {
 		if isDuplicate(err) {
 			return ErrUserExists
@@ -150,15 +175,15 @@ func (s *mysqlStore) CreateUser(u *User) error {
 }
 
 func (s *mysqlStore) GetByEmail(email string) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, created_at, updated_at FROM ce_users WHERE email = ?`, email)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users WHERE email = ?`, email)
 }
 
 func (s *mysqlStore) GetByPhone(phone string) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, created_at, updated_at FROM ce_users WHERE phone = ?`, phone)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users WHERE phone = ?`, phone)
 }
 
 func (s *mysqlStore) GetByID(id int64) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, created_at, updated_at FROM ce_users WHERE id = ?`, id)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users WHERE id = ?`, id)
 }
 
 func (s *mysqlStore) scanUser(query string, args ...interface{}) (*User, error) {
@@ -168,11 +193,11 @@ func (s *mysqlStore) scanUser(query string, args ...interface{}) (*User, error) 
 
 func (s *mysqlStore) scanUserRow(row scanner) (*User, error) {
 	var u User
-	var email, phone, tfaSecret sql.NullString
+	var email, phone, tfaSecret, nickname, avatar sql.NullString
 	var tfaEnabled, emailVerified, phoneVerified int
 	err := row.Scan(
 		&u.ID, &email, &phone, &u.PassHash, &u.Status, &u.KYCLevel,
-		&tfaSecret, &tfaEnabled, &emailVerified, &phoneVerified, &u.CreatedAt, &u.UpdatedAt)
+		&tfaSecret, &tfaEnabled, &emailVerified, &phoneVerified, &nickname, &avatar, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -185,6 +210,8 @@ func (s *mysqlStore) scanUserRow(row scanner) (*User, error) {
 	u.TFAEnabled = tfaEnabled == 1
 	u.EmailVerified = emailVerified == 1
 	u.PhoneVerified = phoneVerified == 1
+	u.Nickname = nickname.String
+	u.Avatar = avatar.String
 	return &u, nil
 }
 
@@ -201,10 +228,10 @@ func (s *mysqlStore) UpdateUser(u *User) error {
 	u.UpdatedAt = time.Now()
 	res, err := s.db.Exec(
 		`UPDATE ce_users SET email=NULLIF(?,''), phone=NULLIF(?,''), pass_hash=?, status=?, kyc_level=?,
-		 tfa_secret=NULLIF(?,''), tfa_enabled=?, email_verified=?, phone_verified=?, updated_at=? WHERE id=?`,
+		 tfa_secret=NULLIF(?,''), tfa_enabled=?, email_verified=?, phone_verified=?, nickname=?, avatar=?, updated_at=? WHERE id=?`,
 		u.Email, u.Phone, u.PassHash, int(u.Status), int(u.KYCLevel),
 		u.TFASecret, boolToInt(u.TFAEnabled), boolToInt(u.EmailVerified), boolToInt(u.PhoneVerified),
-		u.UpdatedAt, u.ID)
+		u.Nickname, u.Avatar, u.UpdatedAt, u.ID)
 	if err != nil {
 		return err
 	}
@@ -216,7 +243,7 @@ func (s *mysqlStore) UpdateUser(u *User) error {
 
 func (s *mysqlStore) ListAll() ([]*User, error) {
 	rows, err := s.db.Query(
-		`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, created_at, updated_at FROM ce_users ORDER BY id`)
+		`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -352,6 +379,41 @@ func (s *mysqlStore) UpdateKYC(k *KYCSubmission) error {
 		return err
 	}
 	return nil
+}
+
+func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
+	var p UserPreferences
+	var lang, theme sql.NullString
+	var notifyOrder, notifySecurity, notifyMarketing int
+	err := s.db.QueryRow(
+		`SELECT user_id, language, theme, notify_order, notify_security, notify_marketing, updated_at
+		 FROM ce_user_preferences WHERE user_id=?`, userID).
+		Scan(&p.UserID, &lang, &theme, &notifyOrder, &notifySecurity, &notifyMarketing, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.Language = lang.String
+	p.Theme = theme.String
+	p.NotifyOrder = notifyOrder == 1
+	p.NotifySecurity = notifySecurity == 1
+	p.NotifyMarketing = notifyMarketing == 1
+	return &p, nil
+}
+
+func (s *mysqlStore) UpdatePreferences(p *UserPreferences) error {
+	p.UpdatedAt = time.Now()
+	_, err := s.db.Exec(
+		`INSERT INTO ce_user_preferences (user_id, language, theme, notify_order, notify_security, notify_marketing, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE language=VALUES(language), theme=VALUES(theme),
+		 notify_order=VALUES(notify_order), notify_security=VALUES(notify_security),
+		 notify_marketing=VALUES(notify_marketing), updated_at=VALUES(updated_at)`,
+		p.UserID, p.Language, p.Theme, boolToInt(p.NotifyOrder), boolToInt(p.NotifySecurity),
+		boolToInt(p.NotifyMarketing), p.UpdatedAt)
+	return err
 }
 
 // ---- 辅助 ----

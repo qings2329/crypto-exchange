@@ -1,7 +1,11 @@
 package otc
 
 import (
+	"io"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -28,6 +32,12 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 		api.GET("/admin/orders", middleware.AdminGuard(), s.handleAdminOrders)
 		api.GET("/counterparties", s.handleListCounterparties)
 		api.GET("/admin/reconcile", middleware.AdminGuard(), s.handleReconcile)
+		// 订单沟通与付款凭证（订单参与方可见）
+		api.GET("/orders/:id/messages", s.handleListMessages)
+		api.POST("/orders/:id/messages", s.handleSendMessage)
+		api.GET("/orders/:id/proofs", s.handleListProofs)
+		api.POST("/orders/:id/proofs", s.handleUploadProof)
+		api.GET("/orders/:id/proofs/:file", s.handleGetProof)
 	}
 }
 
@@ -279,4 +289,147 @@ func (s *Service) handleReconcile(c *gin.Context) {
 
 func parseOrderID(c *gin.Context) (int64, error) {
 	return strconv.ParseInt(c.Param("id"), 10, 64)
+}
+
+// writeOrderErr 将订单相关错误映射为 HTTP 状态：非参与方 403，订单不存在 404，其余 400。
+func writeOrderErr(c *gin.Context, err error) {
+	switch err {
+	case ErrNotParty:
+		response.Error(c, 403, 4030, err.Error())
+	case ErrOrderNotFound:
+		response.Error(c, 404, 4040, err.Error())
+	default:
+		response.Error(c, 400, 4002, err.Error())
+	}
+}
+
+// ---- 订单沟通 / 付款凭证 ----
+
+func (s *Service) handleListMessages(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 4010, "unauthorized")
+		return
+	}
+	id, err := parseOrderID(c)
+	if err != nil {
+		response.Error(c, 400, 4000, "invalid order id")
+		return
+	}
+	list, err := s.ListMessages(id, uid)
+	if err != nil {
+		writeOrderErr(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"messages": list})
+}
+
+func (s *Service) handleSendMessage(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 4010, "unauthorized")
+		return
+	}
+	id, err := parseOrderID(c)
+	if err != nil {
+		response.Error(c, 400, 4000, "invalid order id")
+		return
+	}
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, 400, 4000, "invalid body")
+		return
+	}
+	m, err := s.SendMessage(id, uid, req.Content)
+	if err != nil {
+		writeOrderErr(c, err)
+		return
+	}
+	response.JSON(c, m)
+}
+
+func (s *Service) handleListProofs(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 4010, "unauthorized")
+		return
+	}
+	id, err := parseOrderID(c)
+	if err != nil {
+		response.Error(c, 400, 4000, "invalid order id")
+		return
+	}
+	list, err := s.ListProofs(id, uid)
+	if err != nil {
+		writeOrderErr(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"proofs": list})
+}
+
+func (s *Service) handleUploadProof(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 4010, "unauthorized")
+		return
+	}
+	id, err := parseOrderID(c)
+	if err != nil {
+		response.Error(c, 400, 4000, "invalid order id")
+		return
+	}
+	file, err := c.FormFile("file")
+	if err != nil {
+		response.Error(c, 400, 4000, "file required")
+		return
+	}
+	f, err := file.Open()
+	if err != nil {
+		response.Error(c, 500, 5000, err.Error())
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		response.Error(c, 500, 5000, err.Error())
+		return
+	}
+	p, err := s.UploadProof(id, uid, file.Filename, file.Header.Get("Content-Type"), data)
+	if err != nil {
+		writeOrderErr(c, err)
+		return
+	}
+	response.JSON(c, p)
+}
+
+// handleGetProof 提供已上传凭证文件的下载（仅订单参与方可访问）。
+func (s *Service) handleGetProof(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 4010, "unauthorized")
+		return
+	}
+	id, err := parseOrderID(c)
+	if err != nil {
+		response.Error(c, 400, 4000, "invalid order id")
+		return
+	}
+	if _, err := s.orderPartyGuard(id, uid); err != nil {
+		writeOrderErr(c, err)
+		return
+	}
+	file := filepath.Base(c.Param("file")) // 防目录穿越：仅取 basename
+	if file == "" || file == "." || file == string(os.PathSeparator) {
+		response.Error(c, 400, 4000, "invalid file")
+		return
+	}
+	full := filepath.Join(s.uploadDir, file)
+	// 二次兜底：确保解析结果仍在 uploadDir 内。
+	if !strings.HasPrefix(full, s.uploadDir) {
+		response.Error(c, 400, 4000, "invalid file")
+		return
+	}
+	c.File(full)
 }

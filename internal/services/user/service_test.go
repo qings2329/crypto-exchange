@@ -205,3 +205,111 @@ func latestCode(svc *Service, target, purpose string) (string, error) {
 func verifierVerify(svc *Service, token string) (int64, bool) {
 	return svc.verifier.Verify(token)
 }
+
+// registerTestUser 注册并返回用户 ID（用于设置类测试前置）。
+func registerTestUser(t *testing.T, svc *Service, email, password string) int64 {
+	t.Helper()
+	if err := svc.SendCode(email, PurposeRegister); err != nil {
+		t.Fatalf("send code: %v", err)
+	}
+	code, err := latestCode(svc, email, PurposeRegister)
+	if err != nil {
+		t.Fatalf("get code: %v", err)
+	}
+	if _, err := svc.Register(email, password, code); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	u, err := svc.store.GetByEmail(email)
+	if err != nil {
+		t.Fatalf("get by email: %v", err)
+	}
+	return u.ID
+}
+
+func TestUpdateProfile(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "bob@example.com", "secret123")
+	str := func(s string) *string { return &s }
+
+	if err := svc.UpdateProfile(id, str("Bobby"), str("https://x/y.png")); err != nil {
+		t.Fatalf("update profile: %v", err)
+	}
+	u, _, _ := svc.GetProfile(id)
+	if u.Nickname != "Bobby" || u.Avatar != "https://x/y.png" {
+		t.Fatalf("profile not persisted: %+v", u)
+	}
+
+	// 仅清空昵称（头像不变）
+	if err := svc.UpdateProfile(id, str(""), nil); err != nil {
+		t.Fatalf("clear nickname: %v", err)
+	}
+	u, _, _ = svc.GetProfile(id)
+	if u.Nickname != "" || u.Avatar != "https://x/y.png" {
+		t.Fatalf("nickname not cleared / avatar changed: %+v", u)
+	}
+
+	// 昵称超长应失败
+	long := string(make([]rune, 33))
+	if err := svc.UpdateProfile(id, str(long), nil); err == nil {
+		t.Fatal("expected nickname-too-long error")
+	}
+}
+
+func TestChangePassword(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "carol@example.com", "secret123")
+
+	// 旧密码错误
+	if err := svc.ChangePassword(id, "wrong", "newpass1"); err != ErrWrongPassword {
+		t.Fatalf("expected ErrWrongPassword, got %v", err)
+	}
+
+	// 与旧密码相同应被拒
+	if err := svc.ChangePassword(id, "secret123", "secret123"); err != ErrSamePassword {
+		t.Fatalf("expected ErrSamePassword, got %v", err)
+	}
+
+	// 成功改密，且旧密码不可用、新密码可用
+	if err := svc.ChangePassword(id, "secret123", "newpass1"); err != nil {
+		t.Fatalf("change password: %v", err)
+	}
+	if _, err := svc.Login("carol@example.com", "secret123", ""); err != ErrWrongPassword {
+		t.Fatalf("old password should fail, got %v", err)
+	}
+	if _, err := svc.Login("carol@example.com", "newpass1", ""); err != nil {
+		t.Fatalf("new password should work: %v", err)
+	}
+}
+
+func TestPreferences(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "dave@example.com", "secret123")
+
+	// 未设置时返回默认偏好
+	def, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get preferences: %v", err)
+	}
+	if def.Language != "zh-CN" || !def.NotifyOrder || def.NotifyMarketing {
+		t.Fatalf("unexpected defaults: %+v", def)
+	}
+
+	// 更新偏好
+	in := &UserPreferences{
+		Language:       "en",
+		Theme:          "dark",
+		NotifyOrder:    false,
+		NotifySecurity: true,
+		NotifyMarketing: true,
+	}
+	if err := svc.UpdatePreferences(id, in); err != nil {
+		t.Fatalf("update preferences: %v", err)
+	}
+	got, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get preferences after update: %v", err)
+	}
+	if got.Language != "en" || got.Theme != "dark" || got.NotifyOrder || !got.NotifyMarketing {
+		t.Fatalf("preferences not persisted: %+v", got)
+	}
+}

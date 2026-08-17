@@ -268,3 +268,72 @@ func TestReconcilePerAsset(t *testing.T) {
 		t.Fatalf("expected 1 stuck order (pending), got %d", len(stuck))
 	}
 }
+
+// newTestServiceAt 与 newTestService 相同，但允许指定凭证落盘目录（用临时目录避免污染仓库）。
+func newTestServiceAt(dir string) (*Service, *ledger.Ledger) {
+	store := NewMemStore()
+	l := ledger.New()
+	for _, uid := range []int64{1, 2} {
+		_ = l.Deposit(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), "seed")
+		_ = l.Deposit(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), "seed")
+	}
+	svc := NewService(store, l, Config{UploadDir: dir}, zap.NewNop(), func(string) (float64, bool) { return 0, false })
+	return svc, l
+}
+
+func TestSendAndListMessage(t *testing.T) {
+	svc, _ := newTestService()
+	ad := mustSellAd(svc)
+	o, err := svc.TakeOrder(ad.ID, 2, 60000, "bank")
+	if err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	if _, err := svc.SendMessage(o.ID, 1, "hi from seller"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if _, err := svc.SendMessage(o.ID, 2, "hi from buyer"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	ms, err := svc.ListMessages(o.ID, 1)
+	if err != nil || len(ms) != 2 {
+		t.Fatalf("list: %v len=%d", err, len(ms))
+	}
+	if ms[0].SenderID != 1 {
+		t.Fatalf("message order wrong: %+v", ms)
+	}
+	// 非参与方拒绝。
+	if _, err := svc.SendMessage(o.ID, 99, "intrude"); err == nil {
+		t.Fatal("non-party should be rejected")
+	}
+	// 空消息拒绝。
+	if _, err := svc.SendMessage(o.ID, 1, "  "); err == nil {
+		t.Fatal("empty message should be rejected")
+	}
+}
+
+func TestUploadAndListProof(t *testing.T) {
+	svc, _ := newTestServiceAt(t.TempDir())
+	ad := mustSellAd(svc)
+	o, err := svc.TakeOrder(ad.ID, 2, 60000, "bank")
+	if err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	p, err := svc.UploadProof(o.ID, 2, "pay.png", "image/png", []byte("fake-bytes"))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if p.URL == "" {
+		t.Fatalf("proof url empty: %+v", p)
+	}
+	ps, err := svc.ListProofs(o.ID, 1)
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("list: %v len=%d", err, len(ps))
+	}
+	if ps[0].FileName != "pay.png" {
+		t.Fatalf("proof name wrong: %+v", ps[0])
+	}
+	// 非参与方拒绝。
+	if _, err := svc.UploadProof(o.ID, 99, "x.png", "image/png", []byte("x")); err == nil {
+		t.Fatal("non-party should be rejected")
+	}
+}

@@ -204,6 +204,66 @@ func (s *mysqlStore) ListCounterparties(userID int64) ([]*OtcCounterparty, error
 	return scanCounterparties(rows)
 }
 
+// --- 订单沟通 / 付款凭证 ---
+
+func (s *mysqlStore) CreateMessage(m *OtcMessage) error {
+	now := time.Now()
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = now
+	}
+	res, err := s.db.Exec(`
+		INSERT INTO ce_otc_messages (order_id, sender_id, content, created_at)
+		VALUES (?, ?, ?, ?)`,
+		m.OrderID, m.SenderID, m.Content, m.CreatedAt)
+	if err != nil {
+		return err
+	}
+	if id, err := res.LastInsertId(); err == nil {
+		m.ID = id
+	}
+	return nil
+}
+
+func (s *mysqlStore) ListMessages(orderID int64) ([]*OtcMessage, error) {
+	rows, err := s.db.Query(`
+		SELECT id, order_id, sender_id, content, created_at
+		FROM ce_otc_messages WHERE order_id = ? ORDER BY id`, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
+}
+
+func (s *mysqlStore) CreateProof(p *OtcProof) error {
+	now := time.Now()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	res, err := s.db.Exec(`
+		INSERT INTO ce_otc_proofs (order_id, uploader_id, file_name, content_type, size, url, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		p.OrderID, p.UploaderID, p.FileName, p.ContentType, p.Size, p.URL, p.CreatedAt)
+	if err != nil {
+		return err
+	}
+	if id, err := res.LastInsertId(); err == nil {
+		p.ID = id
+	}
+	return nil
+}
+
+func (s *mysqlStore) ListProofs(orderID int64) ([]*OtcProof, error) {
+	rows, err := s.db.Query(`
+		SELECT id, order_id, uploader_id, file_name, content_type, size, url, created_at
+		FROM ce_otc_proofs WHERE order_id = ? ORDER BY id`, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanProofs(rows)
+}
+
 // --- 扫描辅助 ---
 
 func scanAd(row *sql.Row) (*OtcAdvertisement, error) {
@@ -323,6 +383,30 @@ func scanCounterparties(rows *sql.Rows) ([]*OtcCounterparty, error) {
 			return nil, err
 		}
 		out = append(out, &cp)
+	}
+	return out, rows.Err()
+}
+
+func scanMessages(rows *sql.Rows) ([]*OtcMessage, error) {
+	out := make([]*OtcMessage, 0)
+	for rows.Next() {
+		var m OtcMessage
+		if err := rows.Scan(&m.ID, &m.OrderID, &m.SenderID, &m.Content, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &m)
+	}
+	return out, rows.Err()
+}
+
+func scanProofs(rows *sql.Rows) ([]*OtcProof, error) {
+	out := make([]*OtcProof, 0)
+	for rows.Next() {
+		var p OtcProof
+		if err := rows.Scan(&p.ID, &p.OrderID, &p.UploaderID, &p.FileName, &p.ContentType, &p.Size, &p.URL, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &p)
 	}
 	return out, rows.Err()
 }

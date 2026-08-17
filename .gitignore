@@ -5,3 +5,6 @@ bin/
 vendor/
 .idea/
 .vscode/
+
+# 运行时上传产物目录（otc 付款凭证等）
+internal/otc/uploads/

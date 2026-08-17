@@ -17,6 +17,7 @@ type memStore struct {
 	codeSeq   int64
 	refreshes map[string]*RefreshToken
 	kycs      map[int64]*KYCSubmission
+	prefs     map[int64]*UserPreferences
 }
 
 // NewMemStore 构造内存存储。
@@ -27,6 +28,7 @@ func NewMemStore() Store {
 		byPhone:   make(map[string]int64),
 		refreshes: make(map[string]*RefreshToken),
 		kycs:      make(map[int64]*KYCSubmission),
+		prefs:     make(map[int64]*UserPreferences),
 	}
 }
 
@@ -228,6 +230,26 @@ func (s *memStore) UpdateKYC(k *KYCSubmission) error {
 	defer s.mu.Unlock()
 	cp := *k
 	s.kycs[k.UserID] = &cp
+	return nil
+}
+
+func (s *memStore) GetPreferences(userID int64) (*UserPreferences, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.prefs[userID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	cp := *p
+	return &cp, nil
+}
+
+func (s *memStore) UpdatePreferences(p *UserPreferences) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.UpdatedAt = time.Now()
+	cp := *p
+	s.prefs[p.UserID] = &cp
 	return nil
 }
 
