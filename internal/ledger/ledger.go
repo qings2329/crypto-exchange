@@ -414,31 +414,17 @@ func (l *Ledger) Balance(userID int64, asset string) (available, frozen settleme
 // refs 为可选幂等引用：传入非空 ref 时，相同指纹（op|user|asset|amount|ref）的重复调用
 // 视为已结算、直接跳过（no-op），作为账本层纵深防双付（F1）；ref 为空则保持原"每次调用均生效"语义。
 func (l *Ledger) Freeze(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
-	if amount.Sign() < 0 {
-		return fmt.Errorf("freeze amount must be >= 0")
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
 	var ref string
 	if len(refs) > 0 {
 		ref = refs[0]
 	}
-	var fp string
-	if ref != "" {
-		fp = freezeFingerprint("freeze", userID, asset, amount, ref)
-		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
-			return nil
-		}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fp, err := l.freezeOpCoreLocked("freeze", userID, asset, amount, ref)
+	if err != nil {
+		return err
 	}
-	a := l.getOrCreateLocked(userID, asset)
-	if a.Available.Cmp(amount) < 0 {
-		return fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
-	}
-	a.Available = a.Available.Sub(amount)
-	a.Frozen = a.Frozen.Add(amount)
 	if ref != "" {
-		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
 		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
@@ -447,31 +433,17 @@ func (l *Ledger) Freeze(userID int64, asset string, amount settlement.AssetAmoun
 // Unfreeze 解冻到可用余额（平仓释放保证金）。冻结不足返回错误。
 // refs 为可选幂等引用（语义同 Freeze）：非空 ref 时相同指纹的重复调用为 no-op。
 func (l *Ledger) Unfreeze(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
-	if amount.Sign() < 0 {
-		return fmt.Errorf("unfreeze amount must be >= 0")
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
 	var ref string
 	if len(refs) > 0 {
 		ref = refs[0]
 	}
-	var fp string
-	if ref != "" {
-		fp = freezeFingerprint("unfreeze", userID, asset, amount, ref)
-		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
-			return nil
-		}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fp, err := l.freezeOpCoreLocked("unfreeze", userID, asset, amount, ref)
+	if err != nil {
+		return err
 	}
-	a := l.getOrCreateLocked(userID, asset)
-	if a.Frozen.Cmp(amount) < 0 {
-		return fmt.Errorf("insufficient frozen balance")
-	}
-	a.Frozen = a.Frozen.Sub(amount)
-	a.Available = a.Available.Add(amount)
 	if ref != "" {
-		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
 		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
@@ -481,31 +453,17 @@ func (l *Ledger) Unfreeze(userID int64, asset string, amount settlement.AssetAmo
 // Frozen 互不干扰）。可用不足返回错误。
 // refs 为可选幂等引用（语义同 Freeze）：非空 ref 时相同指纹的重复调用为 no-op。
 func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
-	if amount.Sign() < 0 {
-		return fmt.Errorf("freeze withdraw amount must be >= 0")
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
 	var ref string
 	if len(refs) > 0 {
 		ref = refs[0]
 	}
-	var fp string
-	if ref != "" {
-		fp = freezeFingerprint("freezewithdraw", userID, asset, amount, ref)
-		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
-			return nil
-		}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fp, err := l.freezeOpCoreLocked("freezewithdraw", userID, asset, amount, ref)
+	if err != nil {
+		return err
 	}
-	a := l.getOrCreateLocked(userID, asset)
-	if a.Available.Cmp(amount) < 0 {
-		return fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
-	}
-	a.Available = a.Available.Sub(amount)
-	a.WithdrawFrozen = a.WithdrawFrozen.Add(amount)
 	if ref != "" {
-		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
 		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
@@ -514,31 +472,17 @@ func (l *Ledger) FreezeWithdraw(userID int64, asset string, amount settlement.As
 // UnfreezeWithdraw 解冻提现冻结到可用余额（提现失败回退或回滚后退回可用）。冻结不足返回错误。
 // refs 为可选幂等引用（语义同 Freeze）：非空 ref 时相同指纹的重复调用为 no-op。
 func (l *Ledger) UnfreezeWithdraw(userID int64, asset string, amount settlement.AssetAmount, refs ...string) error {
-	if amount.Sign() < 0 {
-		return fmt.Errorf("unfreeze withdraw amount must be >= 0")
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// F1 幂等（纵深防双付）：调用方显式传入非空 ref 时，相同指纹的重复操作视为已结算、跳过。
 	var ref string
 	if len(refs) > 0 {
 		ref = refs[0]
 	}
-	var fp string
-	if ref != "" {
-		fp = freezeFingerprint("unfreezewithdraw", userID, asset, amount, ref)
-		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
-			return nil
-		}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fp, err := l.freezeOpCoreLocked("unfreezewithdraw", userID, asset, amount, ref)
+	if err != nil {
+		return err
 	}
-	a := l.getOrCreateLocked(userID, asset)
-	if a.WithdrawFrozen.Cmp(amount) < 0 {
-		return fmt.Errorf("insufficient withdraw frozen balance")
-	}
-	a.WithdrawFrozen = a.WithdrawFrozen.Sub(amount)
-	a.Available = a.Available.Add(amount)
 	if ref != "" {
-		l.freezeSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
 		l.idemPersistDB("freeze", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
 	return nil
@@ -557,29 +501,17 @@ func (l *Ledger) WithdrawFrozenBalance(userID int64, asset string) (withdrawFroz
 
 // CreditAvailable 增加可用余额（入账，如充值、收到资金费、平仓释放盈亏）。
 func (l *Ledger) CreditAvailable(userID int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
-	if amount.Sign() < 0 {
-		return fmt.Errorf("credit amount must be >= 0")
-	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	a := l.getOrCreateLocked(userID, asset)
-	a.Available = a.Available.Add(amount)
-	l.appendLocked(a, amount, biz, ref)
-	return nil
+	return l.creditCoreLocked(userID, asset, amount, biz, ref)
 }
 
 // DebitAvailable 减少可用余额（出账，如支付资金费、提现）。
 // 骨架允许余额转为负数以承载坏账（真实交易所需风控拦截）；生产应在此前做余额校验。
 func (l *Ledger) DebitAvailable(userID int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
-	if amount.Sign() < 0 {
-		return fmt.Errorf("debit amount must be >= 0")
-	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	a := l.getOrCreateLocked(userID, asset)
-	a.Available = a.Available.Sub(amount)
-	l.appendLocked(a, amount.Neg(), biz, ref)
-	return nil
+	return l.debitCoreLocked(userID, asset, amount, biz, ref)
 }
 
 // transferFingerprint 计算一次"完整转账操作"的幂等指纹。
@@ -596,36 +528,236 @@ func freezeFingerprint(op string, userID int64, asset string, amount settlement.
 	return fmt.Sprintf("%s|%d|%s|%s|%d|%s", op, userID, asset, amount.Value.String(), amount.Decimals, ref)
 }
 
-// Transfer 从 from 可用余额转到 to 可用余额，两边各记一条相反数流水。
-func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
+// --- 原子批量操作（事务）---------------------------------------------------
+// 上层（futures/options/margin/wealth）常需组合多个账本操作（如开仓 Freeze + Transfer 盈亏 +
+// 手续费 Credit）构成一笔"业务事务"。若逐个调用公开方法，中途任一步失败会留下半成品状态
+// （部分冻结/部分转账），破坏资金恒等，且难以回滚。Batch 在单次持锁内原子执行整组操作，
+// 任意一步失败即整体回滚（账户余额、幂等 map、审计流水、序号全部还原），实现"全有或全无"。
+// 幂等指纹仅在所有步骤成功后才持久化到 DB（回滚窗口内不落库），保证失败可安全重试。
+
+// OpKind 标识批量操作类型。
+type OpKind int
+
+const (
+	OpTransfer OpKind = iota
+	OpFreeze
+	OpUnfreeze
+	OpFreezeWithdraw
+	OpUnfreezeWithdraw
+	OpCredit
+	OpDebit
+)
+
+// Op 一个原子账本操作的描述（在 Batch 的持锁上下文中执行，无独立加锁）。
+type Op struct {
+	Kind   OpKind
+	From   int64 // OpTransfer 的付款方
+	To     int64 // OpTransfer 的收款方
+	User   int64 // 其余操作的账户主体
+	Asset  string
+	Amount settlement.AssetAmount
+	Biz    string // 业务类型（流水 BizType）
+	Ref    string // 可选幂等引用（仅 Transfer/Freeze 系列用于内存去重；Credit/Debit 忽略）
+}
+
+// ledgerSnapshot 是 Batch 回滚所需的账本可变状态深拷贝。
+type ledgerSnapshot struct {
+	accounts     map[string]*Account
+	transferSeen map[string]bool
+	freezeSeen   map[string]bool
+	logLen       int
+	seq          int64
+}
+
+// snapshotLocked 在已持锁时深拷贝回滚所需状态（调用方须已持 l.mu）。
+func (l *Ledger) snapshotLocked() ledgerSnapshot {
+	acc := make(map[string]*Account, len(l.accounts))
+	for k, v := range l.accounts {
+		cp := *v
+		acc[k] = &cp
+	}
+	ts := make(map[string]bool, len(l.transferSeen))
+	for k, v := range l.transferSeen {
+		ts[k] = v
+	}
+	fs := make(map[string]bool, len(l.freezeSeen))
+	for k, v := range l.freezeSeen {
+		fs[k] = v
+	}
+	return ledgerSnapshot{accounts: acc, transferSeen: ts, freezeSeen: fs, logLen: len(l.log), seq: l.seq}
+}
+
+// restoreLocked 在已持锁时还原回滚状态（调用方须已持 l.mu）。
+// 截断审计流水到快照长度、恢复序号，使回滚后的账本与执行前完全一致（含审计轨迹）。
+func (l *Ledger) restoreLocked(s ledgerSnapshot) {
+	l.accounts = s.accounts
+	l.transferSeen = s.transferSeen
+	l.freezeSeen = s.freezeSeen
+	l.log = l.log[:s.logLen]
+	l.seq = s.seq
+}
+
+// transferCoreLocked 在已持锁时执行转账核心：幂等内存判定 + 余额变动 + 记流水 + 登记内存指纹。
+// 返回指纹供调用方（公开方法或 Batch）在整组成功后才持久化到 DB。调用方须已持 l.mu。
+func (l *Ledger) transferCoreLocked(from, to int64, asset string, amount settlement.AssetAmount, biz, ref string) (string, error) {
 	if amount.Sign() < 0 {
-		return fmt.Errorf("transfer amount must be >= 0")
+		return "", fmt.Errorf("transfer amount must be >= 0")
 	}
 	if from == to {
-		return fmt.Errorf("transfer to self")
+		return "", fmt.Errorf("transfer to self")
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// F1 幂等（纵深防双花）：同一"完整转账操作"指纹重复提交 → 已结算，直接跳过。
-	// 上层（spot/options/otc/...）各自已有业务幂等；此处为账本层最后一道防线，
-	// 即使上层失效，相同转账也不会被应用两次。两腿交易指纹不同，不受影响。
 	fp := transferFingerprint(from, to, asset, amount, biz, ref)
 	if l.transferSeen[fp] {
-		return nil
+		return "", nil
 	}
 	if ref != "" && l.idemSeenDB("transfer", fp) {
-		return nil
+		return "", nil
 	}
-
 	fa := l.getOrCreateLocked(from, asset)
 	ta := l.getOrCreateLocked(to, asset)
-	// 允许 from 余额转负（坏账），保证资金费闭环的借贷恒等
 	fa.Available = fa.Available.Sub(amount)
 	ta.Available = ta.Available.Add(amount)
 	l.appendSideLocked(fa, amount.Neg(), biz, ref, &l.seq)
 	l.appendSideLocked(ta, amount, biz, ref, &l.seq)
-	l.transferSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
+	l.transferSeen[fp] = true
+	return fp, nil
+}
+
+// freezeOpCoreLocked 在已持锁时执行冻结类操作核心（Freeze/Unfreeze/FreezeWithdraw/
+// UnfreezeWithdraw）。返回指纹供成功后持久化。调用方须已持 l.mu。
+func (l *Ledger) freezeOpCoreLocked(op string, userID int64, asset string, amount settlement.AssetAmount, ref string) (string, error) {
+	if amount.Sign() < 0 {
+		return "", fmt.Errorf("%s amount must be >= 0", op)
+	}
+	var fp string
+	if ref != "" {
+		fp = freezeFingerprint(op, userID, asset, amount, ref)
+		if l.freezeSeen[fp] || l.idemSeenDB("freeze", fp) {
+			return "", nil
+		}
+	}
+	a := l.getOrCreateLocked(userID, asset)
+	switch op {
+	case "freeze":
+		if a.Available.Cmp(amount) < 0 {
+			return "", fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
+		}
+		a.Available = a.Available.Sub(amount)
+		a.Frozen = a.Frozen.Add(amount)
+	case "unfreeze":
+		if a.Frozen.Cmp(amount) < 0 {
+			return "", fmt.Errorf("insufficient frozen balance")
+		}
+		a.Frozen = a.Frozen.Sub(amount)
+		a.Available = a.Available.Add(amount)
+	case "freezewithdraw":
+		if a.Available.Cmp(amount) < 0 {
+			return "", fmt.Errorf("insufficient available balance: have %s want %s", a.Available.HumanString(), amount.HumanString())
+		}
+		a.Available = a.Available.Sub(amount)
+		a.WithdrawFrozen = a.WithdrawFrozen.Add(amount)
+	case "unfreezewithdraw":
+		if a.WithdrawFrozen.Cmp(amount) < 0 {
+			return "", fmt.Errorf("insufficient withdraw frozen balance")
+		}
+		a.WithdrawFrozen = a.WithdrawFrozen.Sub(amount)
+		a.Available = a.Available.Add(amount)
+	default:
+		return "", fmt.Errorf("unknown freeze op: %s", op)
+	}
+	if ref != "" {
+		l.freezeSeen[fp] = true
+	}
+	return fp, nil
+}
+
+// creditCoreLocked / debitCoreLocked 在已持锁时执行单边入账/出账核心（与公开方法语义一致）。
+// Credit/Debit 不做 ref 去重（单笔操作无"重复提交"语义），故不返回指纹。调用方须已持 l.mu。
+func (l *Ledger) creditCoreLocked(userID int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
+	if amount.Sign() < 0 {
+		return fmt.Errorf("credit amount must be >= 0")
+	}
+	a := l.getOrCreateLocked(userID, asset)
+	a.Available = a.Available.Add(amount)
+	l.appendLocked(a, amount, biz, ref)
+	return nil
+}
+
+func (l *Ledger) debitCoreLocked(userID int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
+	if amount.Sign() < 0 {
+		return fmt.Errorf("debit amount must be >= 0")
+	}
+	a := l.getOrCreateLocked(userID, asset)
+	a.Available = a.Available.Sub(amount)
+	l.appendLocked(a, amount.Neg(), biz, ref)
+	return nil
+}
+
+// Batch 原子执行一组账本操作（全有或全无）。任一步失败则整体回滚到执行前状态
+// （账户余额、幂等 map、审计流水、序号全部还原），返回首个错误；全部成功后才把
+// 带 ref 操作的幂等指纹持久化到 DB（回滚窗口内不落库，保证可安全重试）。
+// 调用方须已持 l.mu（本方法自行加锁，亦可嵌套在持锁上下文中经各 core 复用）。
+func (l *Ledger) Batch(ops []Op) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	snap := l.snapshotLocked()
+	type pendingFP struct{ kind, fp string }
+	var pending []pendingFP
+	for _, op := range ops {
+		fp, kind, err := l.applyOpLocked(op)
+		if err != nil {
+			l.restoreLocked(snap)
+			return err
+		}
+		if fp != "" {
+			pending = append(pending, pendingFP{kind, fp})
+		}
+	}
+	// 全部成功：幂等指纹落库（INSERT IGNORE 容忍并发/重启重复）。
+	for _, p := range pending {
+		l.idemPersistDB(p.kind, p.fp)
+	}
+	return nil
+}
+
+// applyOpLocked 在已持锁时分发执行单个批量操作，返回其幂等指纹与种类。Credit/Debit 返回
+// 空指纹（无 ref 去重）。调用方须已持 l.mu。
+func (l *Ledger) applyOpLocked(op Op) (fp, kind string, err error) {
+	switch op.Kind {
+	case OpTransfer:
+		fp, err = l.transferCoreLocked(op.From, op.To, op.Asset, op.Amount, op.Biz, op.Ref)
+		return fp, "transfer", err
+	case OpFreeze:
+		fp, err = l.freezeOpCoreLocked("freeze", op.User, op.Asset, op.Amount, op.Ref)
+		return fp, "freeze", err
+	case OpUnfreeze:
+		fp, err = l.freezeOpCoreLocked("unfreeze", op.User, op.Asset, op.Amount, op.Ref)
+		return fp, "freeze", err
+	case OpFreezeWithdraw:
+		fp, err = l.freezeOpCoreLocked("freezewithdraw", op.User, op.Asset, op.Amount, op.Ref)
+		return fp, "freeze", err
+	case OpUnfreezeWithdraw:
+		fp, err = l.freezeOpCoreLocked("unfreezewithdraw", op.User, op.Asset, op.Amount, op.Ref)
+		return fp, "freeze", err
+	case OpCredit:
+		err = l.creditCoreLocked(op.User, op.Asset, op.Amount, op.Biz, op.Ref)
+		return "", "credit", err
+	case OpDebit:
+		err = l.debitCoreLocked(op.User, op.Asset, op.Amount, op.Biz, op.Ref)
+		return "", "debit", err
+	default:
+		return "", "", fmt.Errorf("unknown batch op kind: %d", op.Kind)
+	}
+}
+
+// Transfer 从 from 可用余额转到 to 可用余额，两边各记一条相反数流水。
+func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fp, err := l.transferCoreLocked(from, to, asset, amount, biz, ref)
+	if err != nil {
+		return err
+	}
 	if ref != "" {
 		l.idemPersistDB("transfer", fp) // 持久化指纹（#26）：重启后仍可检测重复，防双付。
 	}
