@@ -40,6 +40,7 @@ type freezeRec struct {
 	quote       string
 	frozenQuote settlement.AssetAmount // 买方预冻结的计价资产（price*qty），随成交递减
 	frozenBase  settlement.AssetAmount // 卖方预冻结的基础资产（qty），随成交递减
+	clientOID   string                 // 下单幂等键（F1），落库时透传，结算递减重 Upsert 时保留
 }
 
 // depthRow 是深度聚合后的单行，便于 JSON 序列化与前端渲染。

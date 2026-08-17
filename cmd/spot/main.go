@@ -21,6 +21,7 @@ import (
 // 本文件不含业务逻辑。
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
+	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN for spot order persistence (overrides config)")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -50,6 +51,27 @@ func main() {
 
 	server := spot.NewServer(ledgerSvc, cfg, log)
 	defer server.Close()
+
+	// 订单持久化：配置了 DSN 则连 MySQL 并跑迁移，重启后据此恢复 clientOIDMap（防重启+重试双冻）；
+	// 否则纯内存（演示），重启间隙幂等映射清零。
+	dsn := *mysqlDSN
+	if dsn == "" {
+		dsn = cfg.MySQL.DSN
+	}
+	if dsn != "" {
+		if spotStore, serr := spot.NewMySQLStore(dsn); serr != nil {
+			log.Warn("spot mysql store unavailable, fallback to in-memory (restart idempotency unprotected)",
+				zap.String("dsn", dsn), zap.Error(serr))
+		} else {
+			server.SetStore(spotStore)
+			if recs, lerr := spotStore.LoadOrders(); lerr != nil {
+				log.Warn("spot load orders failed", zap.Error(lerr))
+			} else if len(recs) > 0 {
+				server.RestoreOrders(recs)
+				log.Info("spot restored idempotency map from persisted orders", zap.Int("orders", len(recs)))
+			}
+		}
+	}
 
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
 
