@@ -79,7 +79,7 @@ make run-gateway
 
 ## API 文档
 
-各业务线对外接口（OTC 场外交易、用户个人设置等）统一索引见 [docs/API.md](docs/API.md)。
+各业务线对外接口（OTC 场外交易、用户个人设置、公告模块等）统一索引见 [docs/API.md](docs/API.md)；公告模块的运维操作示例（curl）见 [docs/announcement_guide.md](docs/announcement_guide.md)，单元测试说明见 [docs/announcement_test.md](docs/announcement_test.md)。
 
 ## 合约交易（futures）
 

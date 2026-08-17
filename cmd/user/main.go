@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/coldlar/crypto-exchange/internal/announcement"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -39,9 +40,25 @@ func main() {
 	svc := user.NewService(store, verifier, user.NewLogNotifier(), user.Config{})
 	h := user.NewHandler(svc, verifier)
 
+	// 公告模块：与用户模块共用同一数据库（同一份 ce_schema_migrations，版本号已错开）。
+	// 优先 MySQL；DSN 缺失则降级为内存实现（重启即丢，仅开发用）。
+	var aStore announcement.Store
+	if cfg.MySQL.DSN != "" {
+		aStore, err = announcement.NewMySQLStore(cfg.MySQL.DSN)
+		if err != nil {
+			log.Warn("announcement: mysql unavailable, fallback to in-memory store", zap.Error(err))
+		}
+	}
+	if aStore == nil {
+		aStore = announcement.NewMemStore()
+	}
+	aSvc := announcement.NewService(aStore)
+	aH := announcement.NewHandler(aSvc)
+
 	r := gin.New()
 	r.Use(middleware.Common(log, cfg)...)
 	h.Register(r)
+	aH.Register(r, verifier)
 
 	addr := ":8081"
 	log.Info("user service starting", zap.String("addr", addr))
