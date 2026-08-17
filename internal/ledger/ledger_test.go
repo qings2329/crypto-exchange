@@ -1554,3 +1554,76 @@ func TestWithdrawBroadcastConcurrent(t *testing.T) {
 		t.Fatalf("expected %d reuses, got %d", n-1, reuses)
 	}
 }
+
+// countBizRef 统计账本流水中指定 biz+ref 的条数（每笔 Transfer 写入借/贷 2 条）。
+func countBizRef(l *ledger.Ledger, biz, ref string) int {
+	n := 0
+	for _, e := range l.Log() {
+		if e.BizType == biz && e.Ref == ref {
+			n++
+		}
+	}
+	return n
+}
+
+// TestTransferIdempotent 同参 Transfer 重复提交为幂等 no-op：余额不变、流水不翻倍。
+func TestTransferIdempotent(t *testing.T) {
+	l := ledger.New()
+	_ = l.Deposit(1, "USDT", amt("USDT", 10000), "seed1")
+	_ = l.Deposit(2, "USDT", amt("USDT", 0), "seed2")
+
+	if err := l.Transfer(1, 2, "USDT", amt("USDT", 100), "trade", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 9900, 0)
+	assertBalance(t, l, 2, "USDT", 100, 0)
+	if got := countBizRef(l, "trade", "r1"); got != 2 {
+		t.Fatalf("after 1st transfer expect 2 entries, got %d", got)
+	}
+
+	// 重试同一笔转账：必须幂等跳过，不双付。
+	if err := l.Transfer(1, 2, "USDT", amt("USDT", 100), "trade", "r1"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 9900, 0) // 余额不变
+	assertBalance(t, l, 2, "USDT", 100, 0)
+	if got := countBizRef(l, "trade", "r1"); got != 2 {
+		t.Fatalf("after retry expect still 2 entries (no double pay), got %d", got)
+	}
+}
+
+// TestTransferTwoLegsSameRef 同一交易两腿复用同一 ref 时，两条腿都应生效（不被误杀）。
+// 这证明"按完整元组去重"而非"按 (biz,ref) 去重"——后者会跳过第二条腿。
+func TestTransferTwoLegsSameRef(t *testing.T) {
+	l := ledger.New()
+	_ = l.Deposit(1, "USDT", amt("USDT", 10000), "seed1")
+	_ = l.Deposit(2, "BTC", amt("BTC", 10), "seed2")
+
+	// 计价腿：买方付 USDT；基础腿：卖方付 BTC；两腿共用 ref "r"。
+	if err := l.Transfer(1, 2, "USDT", amt("USDT", 100), "trade", "r"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Transfer(2, 1, "BTC", amt("BTC", 1), "trade", "r"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 9900, 0)
+	assertBalance(t, l, 1, "BTC", 1, 0)
+	assertBalance(t, l, 2, "USDT", 100, 0)
+	assertBalance(t, l, 2, "BTC", 9, 0)
+}
+
+// TestTransferDistinctRefsApply 不同 ref 的转账各自结算，互不影响。
+func TestTransferDistinctRefsApply(t *testing.T) {
+	l := ledger.New()
+	_ = l.Deposit(1, "USDT", amt("USDT", 1000), "seed1")
+	_ = l.Deposit(2, "USDT", amt("USDT", 0), "seed2")
+
+	if err := l.Transfer(1, 2, "USDT", amt("USDT", 100), "x", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Transfer(1, 2, "USDT", amt("USDT", 50), "x", "b"); err != nil {
+		t.Fatal(err)
+	}
+	assertBalance(t, l, 1, "USDT", 850, 0)
+	assertBalance(t, l, 2, "USDT", 150, 0)
+}

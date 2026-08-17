@@ -107,6 +107,13 @@ type Ledger struct {
 	seq        int64
 	log        []Entry
 
+	// transferSeen 是转账操作指纹 -> 已结算 的幂等集合（纵深防双花）。
+	// 指纹 = from|to|asset|amount|decimals|biz|ref，覆盖一次"完整转账操作"；
+	// 同一指纹重复提交视为已结算、直接跳过（no-op），避免上层幂等失效时账本双付。
+	// 注意：同一交易的两条腿（from/to 互换、asset 不同）指纹天然不同，互不干扰，
+	// 故按"完整元组"去重而非按 (biz,ref) 去重——后者会误杀多腿交易（见 #20）。
+	transferSeen map[string]bool
+
 	// 对账巡检（定时对账探针）：reconMu 独立保护巡检状态，避免长持有 l.mu。
 	reconMu      sync.RWMutex
 	reconStats   ReconStats
@@ -231,6 +238,7 @@ func New() *Ledger {
 	return &Ledger{
 		accounts:             make(map[string]*Account),
 		restricted:           make(map[string]bool),
+		transferSeen:         make(map[string]bool),
 		badDebtByUser:        make(map[string]settlement.AssetAmount),
 		socializeProposals:   make(map[string]*SocializeProposal),
 		hotWallet:            make(map[string]settlement.AssetAmount),
@@ -429,6 +437,13 @@ func (l *Ledger) DebitAvailable(userID int64, asset string, amount settlement.As
 	return nil
 }
 
+// transferFingerprint 计算一次"完整转账操作"的幂等指纹。
+// 覆盖 from/to/asset/金额(最小单位+小数)/biz/ref 全部维度，使同一笔转账的两次提交
+// 得到相同指纹（可去重），而同一交易的两腿（from/to 互换、asset 不同）指纹不同（不被误杀）。
+func transferFingerprint(from, to int64, asset string, amount settlement.AssetAmount, biz, ref string) string {
+	return fmt.Sprintf("%d|%d|%s|%s|%d|%s|%s", from, to, asset, amount.Value.String(), amount.Decimals, biz, ref)
+}
+
 // Transfer 从 from 可用余额转到 to 可用余额，两边各记一条相反数流水。
 func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetAmount, biz, ref string) error {
 	if amount.Sign() < 0 {
@@ -439,6 +454,15 @@ func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetA
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// F1 幂等（纵深防双花）：同一"完整转账操作"指纹重复提交 → 已结算，直接跳过。
+	// 上层（spot/options/otc/...）各自已有业务幂等；此处为账本层最后一道防线，
+	// 即使上层失效，相同转账也不会被应用两次。两腿交易指纹不同，不受影响。
+	fp := transferFingerprint(from, to, asset, amount, biz, ref)
+	if l.transferSeen[fp] {
+		return nil
+	}
+
 	fa := l.getOrCreateLocked(from, asset)
 	ta := l.getOrCreateLocked(to, asset)
 	// 允许 from 余额转负（坏账），保证资金费闭环的借贷恒等
@@ -446,6 +470,7 @@ func (l *Ledger) Transfer(from, to int64, asset string, amount settlement.AssetA
 	ta.Available = ta.Available.Add(amount)
 	l.appendSideLocked(fa, amount.Neg(), biz, ref, &l.seq)
 	l.appendSideLocked(ta, amount, biz, ref, &l.seq)
+	l.transferSeen[fp] = true // 成功后登记指纹；失败不登记，允许后续合法重试。
 	return nil
 }
 
