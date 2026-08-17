@@ -11,9 +11,13 @@ type memStore struct {
 	ads               map[int64]*OtcAdvertisement
 	orders            map[int64]*OtcOrder
 	counterparties    map[string]*OtcCounterparty // key: userID:counterpartyID
+	messages          map[int64]*OtcMessage
+	proofs            map[int64]*OtcProof
 	nextAdID          int64
 	nextOrderID       int64
 	nextCounterpartyID int64
+	nextMessageID     int64
+	nextProofID       int64
 }
 
 // NewMemStore 构造内存 Store。
@@ -22,9 +26,13 @@ func NewMemStore() Store {
 		ads:               make(map[int64]*OtcAdvertisement),
 		orders:            make(map[int64]*OtcOrder),
 		counterparties:    make(map[string]*OtcCounterparty),
+		messages:          make(map[int64]*OtcMessage),
+		proofs:            make(map[int64]*OtcProof),
 		nextAdID:          1,
 		nextOrderID:       1,
 		nextCounterpartyID: 1,
+		nextMessageID:     1,
+		nextProofID:       1,
 	}
 }
 
@@ -211,4 +219,81 @@ func (s *memStore) ListCounterparties(userID int64) ([]*OtcCounterparty, error) 
 		}
 	}
 	return out, nil
+}
+
+// --- 订单沟通 / 付款凭证 ---
+
+func (s *memStore) CreateMessage(m *OtcMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m.ID == 0 {
+		m.ID = s.nextMessageID
+		s.nextMessageID++
+	}
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = time.Now()
+	}
+	cp := *m
+	s.messages[cp.ID] = &cp
+	return nil
+}
+
+func (s *memStore) ListMessages(orderID int64) ([]*OtcMessage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*OtcMessage, 0)
+	for _, m := range s.messages {
+		if m.OrderID == orderID {
+			cp := *m
+			out = append(out, &cp)
+		}
+	}
+	// 按创建时间升序返回
+	sortMessages(out)
+	return out, nil
+}
+
+func (s *memStore) CreateProof(p *OtcProof) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.ID == 0 {
+		p.ID = s.nextProofID
+		s.nextProofID++
+	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = time.Now()
+	}
+	cp := *p
+	s.proofs[cp.ID] = &cp
+	return nil
+}
+
+func (s *memStore) ListProofs(orderID int64) ([]*OtcProof, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*OtcProof, 0)
+	for _, p := range s.proofs {
+		if p.OrderID == orderID {
+			cp := *p
+			out = append(out, &cp)
+		}
+	}
+	sortProofs(out)
+	return out, nil
+}
+
+func sortMessages(ms []*OtcMessage) {
+	for i := 1; i < len(ms); i++ {
+		for j := i; j > 0 && ms[j-1].CreatedAt.After(ms[j].CreatedAt); j-- {
+			ms[j-1], ms[j] = ms[j], ms[j-1]
+		}
+	}
+}
+
+func sortProofs(ps []*OtcProof) {
+	for i := 1; i < len(ps); i++ {
+		for j := i; j > 0 && ps[j-1].CreatedAt.After(ps[j].CreatedAt); j-- {
+			ps[j-1], ps[j] = ps[j], ps[j-1]
+		}
+	}
 }

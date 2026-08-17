@@ -19,4 +19,10 @@ type Store interface {
 	UpsertCounterparty(cp *OtcCounterparty) error
 	GetCounterparty(userID, counterpartyID int64) (*OtcCounterparty, error)
 	ListCounterparties(userID int64) ([]*OtcCounterparty, error)
+
+	// --- 订单沟通 / 付款凭证 ---
+	CreateMessage(m *OtcMessage) error
+	ListMessages(orderID int64) ([]*OtcMessage, error)
+	CreateProof(p *OtcProof) error
+	ListProofs(orderID int64) ([]*OtcProof, error)
 }

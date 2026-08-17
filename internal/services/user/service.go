@@ -469,6 +469,103 @@ func (s *Service) GetProfile(userID int64) (*User, *KYCSubmission, error) {
 	return u, k, nil
 }
 
+// ---- 个人设置 ----
+
+const (
+	maxNicknameLen = 32
+	maxAvatarLen   = 512
+)
+
+// UpdateProfile 更新用户可编辑资料（昵称/头像）。传 nil 表示不修改该字段；
+// 传空字符串表示清空该字段。仅对提供的字段做长度校验。
+func (s *Service) UpdateProfile(userID int64, nickname, avatar *string) error {
+	u, err := s.store.GetByID(userID)
+	if err != nil {
+		return err
+	}
+	if nickname != nil {
+		if len([]rune(*nickname)) > maxNicknameLen {
+			return ErrNicknameTooLong
+		}
+		u.Nickname = *nickname
+	}
+	if avatar != nil {
+		if len(*avatar) > maxAvatarLen {
+			return ErrAvatarTooLong
+		}
+		u.Avatar = *avatar
+	}
+	return s.store.UpdateUser(u)
+}
+
+// ChangePassword 在登录态下修改密码：校验旧密码，且不允许与旧密码相同。
+// 修改成功后吊销该用户所有 refresh token，强制重新登录。
+func (s *Service) ChangePassword(userID int64, oldPwd, newPwd string) error {
+	u, err := s.store.GetByID(userID)
+	if err != nil {
+		return err
+	}
+	if !s.checkPassword(u.PassHash, oldPwd) {
+		return ErrWrongPassword
+	}
+	if s.checkPassword(u.PassHash, newPwd) {
+		return ErrSamePassword
+	}
+	if len(newPwd) < s.cfg.MinPwdLen {
+		return ErrPasswordTooShort
+	}
+	hash, err := s.hashPassword(newPwd)
+	if err != nil {
+		return err
+	}
+	u.PassHash = hash
+	if err := s.store.UpdateUser(u); err != nil {
+		return err
+	}
+	return s.store.DeleteUserRefreshes(userID)
+}
+
+// GetPreferences 取回用户偏好；若不存在则返回默认值（不视为错误）。
+func (s *Service) GetPreferences(userID int64) (*UserPreferences, error) {
+	p, err := s.store.GetPreferences(userID)
+	if err == ErrNotFound {
+		return &UserPreferences{
+			UserID:         userID,
+			Language:       "zh-CN",
+			Theme:          "light",
+			NotifyOrder:    true,
+			NotifySecurity: true,
+			NotifyMarketing: false,
+		}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// UpdatePreferences 写入用户偏好设置。
+func (s *Service) UpdatePreferences(userID int64, in *UserPreferences) error {
+	if in == nil {
+		return ErrInvalidPref
+	}
+	if in.Language != "" && len(in.Language) > 32 {
+		return ErrInvalidPref
+	}
+	if in.Theme != "" && len(in.Theme) > 32 {
+		return ErrInvalidPref
+	}
+	p := &UserPreferences{
+		UserID:         userID,
+		Language:       in.Language,
+		Theme:          in.Theme,
+		NotifyOrder:    in.NotifyOrder,
+		NotifySecurity: in.NotifySecurity,
+		NotifyMarketing: in.NotifyMarketing,
+	}
+	return s.store.UpdatePreferences(p)
+}
+
 // ---- 管理后台聚合接口（供 cmd/admin 调用）----
 
 // ListAll 返回全量用户（管理后台用户与账户管理用）。

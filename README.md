@@ -77,6 +77,10 @@ make run-gateway
 
 完整的待开发任务与优先级见 [docs/DEVELOPMENT_TASKS.md](docs/DEVELOPMENT_TASKS.md)（含 P0 安全/资金闭环、P1 合约完善、P2 业务线等 17 项）。
 
+## API 文档
+
+各业务线对外接口（OTC 场外交易、用户个人设置等）统一索引见 [docs/API.md](docs/API.md)。
+
 ## 合约交易（futures）
 
 强平骨架位于 `internal/futures`，服务入口 `cmd/futures`（监听 `:8083`）。

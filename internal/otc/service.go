@@ -3,6 +3,9 @@ package otc
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 type Config struct {
 	Asset              string        // 默认加密资产（演示用 BTC）
 	ReconcileInterval  time.Duration // 后台对账轮询间隔
+	UploadDir          string        // 付款凭证文件落盘目录（默认 uploads/otc）
 }
 
 // PriceFunc 取资产参考价（当前 OTC 核心流程不强制依赖行情，预留扩展）。返回 (price, ok)。
@@ -23,11 +27,12 @@ type PriceFunc func(asset string) (float64, bool)
 
 // Service 是场外交易业务逻辑层，仅依赖 Store 接口与 ledger，不直接拼 SQL。
 type Service struct {
-	store   Store
-	ledger  *ledger.Ledger
-	cfg     Config
-	log     *zap.Logger
-	priceFn PriceFunc
+	store     Store
+	ledger    *ledger.Ledger
+	cfg       Config
+	log       *zap.Logger
+	priceFn   PriceFunc
+	uploadDir string
 
 	mu   sync.Mutex
 	stop chan struct{}
@@ -41,13 +46,17 @@ func NewService(store Store, ledgerSvc *ledger.Ledger, cfg Config, log *zap.Logg
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = 60 * time.Second
 	}
+	if cfg.UploadDir == "" {
+		cfg.UploadDir = "uploads/otc"
+	}
 	return &Service{
-		store:   store,
-		ledger:  ledgerSvc,
-		cfg:     cfg,
-		log:     log,
-		priceFn: priceFn,
-		stop:    make(chan struct{}),
+		store:     store,
+		ledger:    ledgerSvc,
+		cfg:       cfg,
+		log:       log,
+		priceFn:   priceFn,
+		uploadDir: cfg.UploadDir,
+		stop:      make(chan struct{}),
 	}
 }
 
@@ -332,6 +341,95 @@ func (s *Service) GetCounterparty(userID, counterpartyID int64) (*OtcCounterpart
 // ListCounterparties 列出某用户的全部对手方信用。
 func (s *Service) ListCounterparties(userID int64) ([]*OtcCounterparty, error) {
 	return s.store.ListCounterparties(userID)
+}
+
+// --- 订单沟通 / 付款凭证 ---
+
+// sendOrReadGuard 复用：消息/凭证都要求调用者是订单参与方（maker 或 taker）。
+func (s *Service) orderPartyGuard(orderID, userID int64) (*OtcOrder, error) {
+	o, err := s.store.GetOrder(orderID)
+	if err != nil {
+		return nil, err
+	}
+	if o.MakerID != userID && o.TakerID != userID {
+		return nil, ErrNotParty
+	}
+	return o, nil
+}
+
+// SendMessage 由订单一方发送一条沟通消息（落库，不限订单状态）。
+func (s *Service) SendMessage(orderID, senderID int64, content string) (*OtcMessage, error) {
+	if _, err := s.orderPartyGuard(orderID, senderID); err != nil {
+		return nil, err
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, fmt.Errorf("message content required")
+	}
+	if len([]rune(content)) > 2000 {
+		return nil, fmt.Errorf("message too long")
+	}
+	m := &OtcMessage{OrderID: orderID, SenderID: senderID, Content: content, CreatedAt: time.Now()}
+	if err := s.store.CreateMessage(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ListMessages 列出订单全部沟通消息（按时间升序）。
+func (s *Service) ListMessages(orderID, userID int64) ([]*OtcMessage, error) {
+	if _, err := s.orderPartyGuard(orderID, userID); err != nil {
+		return nil, err
+	}
+	return s.store.ListMessages(orderID)
+}
+
+// UploadProof 由订单一方上传付款凭证：文件落本地磁盘，仅持久化元数据与可访问 URL。
+func (s *Service) UploadProof(orderID, uploaderID int64, fileName, contentType string, data []byte) (*OtcProof, error) {
+	if _, err := s.orderPartyGuard(orderID, uploaderID); err != nil {
+		return nil, err
+	}
+	if fileName == "" || len(data) == 0 {
+		return nil, fmt.Errorf("proof file required")
+	}
+	if len(data) > 10<<20 {
+		return nil, fmt.Errorf("proof too large (max 10MB)")
+	}
+	if err := os.MkdirAll(s.uploadDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir upload dir: %w", err)
+	}
+	// 文件名安全化：保留原扩展名（截断到 8 字符以内），主体用订单号+纳秒时间戳，避免覆盖/穿越。
+	ext := filepath.Ext(fileName)
+	if len(ext) > 8 {
+		ext = ""
+	}
+	stored := fmt.Sprintf("%d_%d%s", orderID, time.Now().UnixNano(), ext)
+	full := filepath.Join(s.uploadDir, stored)
+	if err := os.WriteFile(full, data, 0o600); err != nil {
+		return nil, fmt.Errorf("write proof: %w", err)
+	}
+	p := &OtcProof{
+		OrderID:     orderID,
+		UploaderID:  uploaderID,
+		FileName:    fileName,
+		ContentType: contentType,
+		Size:        int64(len(data)),
+		URL:         "/api/v1/otc/orders/" + itoa(orderID) + "/proofs/" + stored,
+		CreatedAt:   time.Now(),
+	}
+	if err := s.store.CreateProof(p); err != nil {
+		_ = os.Remove(full)
+		return nil, err
+	}
+	return p, nil
+}
+
+// ListProofs 列出订单全部付款凭证元数据。
+func (s *Service) ListProofs(orderID, userID int64) ([]*OtcProof, error) {
+	if _, err := s.orderPartyGuard(orderID, userID); err != nil {
+		return nil, err
+	}
+	return s.store.ListProofs(orderID)
 }
 
 // Reconcile 对账：按资产分别返回中央托管账户余额（应恒为 0）与仍未释放托管的订单（pending/paid/disputed）。

@@ -43,6 +43,10 @@ func (h *Handler) Register(r *gin.Engine) {
 	auth := g.Group("")
 	auth.Use(middleware.Auth(h.verifier))
 	auth.GET("/me", h.me)
+	auth.PUT("/me", h.updateProfile)
+	auth.POST("/password", h.changePassword)
+	auth.GET("/preferences", h.getPreferences)
+	auth.PUT("/preferences", h.updatePreferences)
 	auth.POST("/tfa/setup", h.tfaSetup)
 	auth.POST("/tfa/enable", h.tfaEnable)
 	auth.POST("/tfa/disable", h.tfaDisable)
@@ -215,6 +219,8 @@ func (h *Handler) me(c *gin.Context) {
 		"user_id":        u.ID,
 		"email":          u.Email,
 		"phone":          u.Phone,
+		"nickname":       u.Nickname,
+		"avatar":         u.Avatar,
 		"status":         u.Status,
 		"kyc_level":      u.KYCLevel,
 		"tfa_enabled":    u.TFAEnabled,
@@ -232,6 +238,64 @@ func (h *Handler) tfaSetup(c *gin.Context) {
 		return
 	}
 	response.JSON(c, gin.H{"secret": secret, "otpauth_uri": uri, "message": "scan qr then enable with code"})
+}
+
+func (h *Handler) updateProfile(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	var req struct {
+		Nickname *string `json:"nickname"`
+		Avatar   *string `json:"avatar"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "invalid body")
+		return
+	}
+	if err := h.svc.UpdateProfile(uid, req.Nickname, req.Avatar); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"ok": true})
+}
+
+func (h *Handler) changePassword(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.OldPassword == "" || req.NewPassword == "" {
+		response.Error(c, http.StatusBadRequest, 400, "old_password and new_password required")
+		return
+	}
+	if err := h.svc.ChangePassword(uid, req.OldPassword, req.NewPassword); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"ok": true, "message": "password changed, please re-login"})
+}
+
+func (h *Handler) getPreferences(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	p, err := h.svc.GetPreferences(uid)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, p)
+}
+
+func (h *Handler) updatePreferences(c *gin.Context) {
+	uid, _ := middleware.UserID(c)
+	var req UserPreferences
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "invalid body")
+		return
+	}
+	if err := h.svc.UpdatePreferences(uid, &req); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"ok": true})
 }
 
 func (h *Handler) tfaEnable(c *gin.Context) {
@@ -438,7 +502,8 @@ func fail(c *gin.Context, err error) {
 	case ErrWrongPassword, ErrTFAFailed, ErrTFARequired:
 		response.Error(c, http.StatusUnauthorized, 401, err.Error())
 	case ErrUserExists, ErrInvalidCode, ErrCodeExpired, ErrCodeConsumed,
-		ErrTFANotEnabled, ErrKYCPending, ErrKYCNotPending, ErrInvalidAccount, ErrFrozen:
+		ErrTFANotEnabled, ErrKYCPending, ErrKYCNotPending, ErrInvalidAccount, ErrFrozen,
+		ErrSamePassword, ErrInvalidPref, ErrNicknameTooLong, ErrAvatarTooLong, ErrPasswordTooShort:
 		response.Error(c, http.StatusBadRequest, 400, err.Error())
 	default:
 		response.Error(c, http.StatusInternalServerError, 500, err.Error())

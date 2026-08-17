@@ -1,8 +1,11 @@
 package otc
 
 import (
+	"bytes"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +66,84 @@ func TestResolveRequiresAdmin(t *testing.T) {
 	// 管理员：应成功裁决。
 	if w := doResolve(adminTok); w.Code != http.StatusOK {
 		t.Fatalf("admin resolve should succeed, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// TestMessageAndProofEndpoints 验证订单沟通与付款凭证的 HTTP 接口：发送/列出消息、上传/列出/下载凭证，
+// 以及非订单参与方必须被拒绝（403）。
+func TestMessageAndProofEndpoints(t *testing.T) {
+	r, verifier, svc := newTestServer()
+	ad := mustSellAd(svc)
+	o, err := svc.TakeOrder(ad.ID, 2, 60000, "bank")
+	if err != nil {
+		t.Fatalf("take: %v", err)
+	}
+	tok1 := verifier.IssueRole(1, "user", time.Hour)
+	tok2 := verifier.IssueRole(2, "user", time.Hour)
+	tokOther := verifier.IssueRole(99, "user", time.Hour)
+
+	// 发送消息。
+	sendMsg := func(tok, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/otc/orders/"+itoa(o.ID)+"/messages", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+	if w := sendMsg(tok1, `{"content":"hi from seller"}`); w.Code != http.StatusOK {
+		t.Fatalf("send msg: %d %s", w.Code, w.Body.String())
+	}
+	if w := sendMsg(tokOther, `{"content":"x"}`); w.Code != http.StatusForbidden {
+		t.Fatalf("non-party send msg should 403, got %d", w.Code)
+	}
+
+	// 列出消息。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/otc/orders/"+itoa(o.ID)+"/messages", nil)
+	req.Header.Set("Authorization", "Bearer "+tok2)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list msg: %d %s", w.Code, w.Body.String())
+	}
+
+	// 上传凭证（multipart）。
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "pay.png")
+	fw.Write([]byte("fake-bytes"))
+	_ = mw.Close()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/otc/orders/"+itoa(o.ID)+"/proofs", &buf)
+	req2.Header.Set("Content-Type", mw.FormDataContentType())
+	req2.Header.Set("Authorization", "Bearer "+tok2)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("upload proof: %d %s", w2.Code, w2.Body.String())
+	}
+
+	// 非参与方上传凭证必须 403。
+	var buf3 bytes.Buffer
+	mw3 := multipart.NewWriter(&buf3)
+	fw3, _ := mw3.CreateFormFile("file", "x.png")
+	fw3.Write([]byte("x"))
+	_ = mw3.Close()
+	req3 := httptest.NewRequest(http.MethodPost, "/api/v1/otc/orders/"+itoa(o.ID)+"/proofs", &buf3)
+	req3.Header.Set("Content-Type", mw3.FormDataContentType())
+	req3.Header.Set("Authorization", "Bearer "+tokOther)
+	w3 := httptest.NewRecorder()
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusForbidden {
+		t.Fatalf("non-party upload proof should 403, got %d", w3.Code)
+	}
+
+	// 列出凭证。
+	req4 := httptest.NewRequest(http.MethodGet, "/api/v1/otc/orders/"+itoa(o.ID)+"/proofs", nil)
+	req4.Header.Set("Authorization", "Bearer "+tok1)
+	w4 := httptest.NewRecorder()
+	r.ServeHTTP(w4, req4)
+	if w4.Code != http.StatusOK {
+		t.Fatalf("list proof: %d %s", w4.Code, w4.Body.String())
 	}
 }
 

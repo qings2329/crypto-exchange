@@ -26,4 +26,8 @@ type Store interface {
 	SaveKYC(k *KYCSubmission) error
 	GetKYC(userID int64) (*KYCSubmission, error)
 	UpdateKYC(k *KYCSubmission) error
+
+	// 个人偏好设置
+	GetPreferences(userID int64) (*UserPreferences, error)
+	UpdatePreferences(p *UserPreferences) error
 }

@@ -155,3 +155,25 @@ type OtcCounterparty struct {
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
+
+// OtcMessage 是 OTC 订单内的沟通消息（买卖双方在订单可见范围内互发）。
+type OtcMessage struct {
+	ID        int64     `json:"id"`
+	OrderID   int64     `json:"order_id"`
+	SenderID  int64     `json:"sender_id"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// OtcProof 是 OTC 订单的付款凭证元数据。文件本体落到本地磁盘（uploadDir），
+// 仅持久化元信息与可访问的 URL，供订单另一方查看。
+type OtcProof struct {
+	ID          int64     `json:"id"`
+	OrderID     int64     `json:"order_id"`
+	UploaderID  int64     `json:"uploader_id"`
+	FileName    string    `json:"file_name"`
+	ContentType string    `json:"content_type"`
+	Size        int64     `json:"size"`
+	URL         string    `json:"url"` // 可下载的相对路径
+	CreatedAt   time.Time `json:"created_at"`
+}
