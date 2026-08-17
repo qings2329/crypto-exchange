@@ -236,7 +236,7 @@
 
 ## 2026-08-17 — risk 限额字段定点化 + 负金额校验（F2）
 
-- **状态**：`internal/risk` 已修复 F2 建议项——`RiskRule.MaxAmountPerDay` 由 `float64` 改为 `settlement.AssetAmount`，并新增提现/下单的负金额（含零）校验。**注意：risk 当前未接入实际提现/下单强制路径（仅 risk 服务自闭环），但接入前必须先消除浮点漂移与负金额绕过。** commit 待提交。
+- **状态**：`internal/risk` 已修复 F2 建议项——`RiskRule.MaxAmountPerDay` 由 `float64` 改为 `settlement.AssetAmount`，并新增提现/下单的负金额（含零）校验。**注意：risk 当前未接入实际提现/下单强制路径（仅 risk 服务自闭环），但接入前必须先消除浮点漂移与负金额绕过。** 提交 `6885d1c`。
 
 ### 字段与存储
 - `RiskRule.MaxAmountPerDay` 改 `settlement.AssetAmount`；经 `AssetAmount.MarshalJSON`/`UnmarshalJSON` 在网络上**仍为 JSON 数字**（如 `1000`），前端无需改动。
