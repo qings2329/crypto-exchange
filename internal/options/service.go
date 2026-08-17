@@ -272,10 +272,10 @@ func (s *Service) Exercise(userID, positionID int64) error {
 	}
 	dec := settlement.AssetDecimalsByName(c.QuoteAsset)
 	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot)*p.Quantity, dec)
-	payoff := itvAmt.Sub(p.PremiumTotal())
-	if payoff.Sign() < 0 {
-		payoff = settlement.AssetAmount{Decimals: dec}
-	}
+	// 中性 CCP：long 开仓时已付权利金给 SysOptions（short 收权利金亦经 SysOptions），
+	// 行权时由 SysOptions 支付全部内在价值，不再扣减权利金。原 .Sub(PremiumTotal()) 属
+	// 双重计权利金（long 既已付过又从收益里再扣），F3-1 修复。payoff 即内在价值，恒 >=0。
+	payoff := itvAmt
 	// 先落终态，再动钱。
 	p.Status = StatusExercised
 	p.UpdatedAt = now
@@ -334,10 +334,8 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 	}
 
 	if p.Side == SideLong {
-		payoff := itvAmt.Sub(p.PremiumTotal())
-		if payoff.Sign() < 0 {
-			payoff = settlement.AssetAmount{Decimals: dec}
-		}
+		// 中性 CCP：long 行权/结算时由 SysOptions 支付全部内在价值（不再扣权利金，F3-1）。
+		payoff := itvAmt
 		if payoff.Sign() > 0 {
 			ref := fmt.Sprintf("option_settle_long pos=%d", positionID)
 			if err := s.ledger.Transfer(ledger.SysOptions, p.UserID, quote, payoff, "option_payoff", ref); err != nil {
