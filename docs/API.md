@@ -5,6 +5,8 @@
 
 - **OTC 场外交易**：服务 `cmd/otc`，前缀 `/api/v1/otc`（见 [OTC 模块](#otc)）。
 - **用户个人设置**：服务 `internal/services/user`，前缀 `/api/v1/user`（见 [用户设置模块](#user)）。
+- **公告模块**：服务 `internal/announcement`（挂载于用户服务 `cmd/user`，共用同一数据库），前缀 `/api/v1/announcement`（见 [公告模块](#ann)）。
+- **理财资管**：服务 `internal/wealth`（独立二进制 `cmd/wealth`，监听 `:8092`），前缀 `/api/v1/wealth`（见 [理财模块](#wealth)）。
 
 ---
 
@@ -15,6 +17,10 @@
   - [基础约定](#otc-basics) · [数据模型](#otc-models) · [接口列表](#otc-endpoints) · [错误码](#otc-errors) · [部署与运行](#otc-deploy)
 - [用户个人设置模块](#user)
   - [基础约定](#user-basics) · [数据模型](#user-models) · [接口列表](#user-endpoints) · [错误映射](#user-errors) · [存储与迁移](#user-store) · [前端对接](#user-frontend)
+- [公告模块](#ann)
+  - [基础约定](#ann-basics) · [数据模型](#ann-models) · [接口列表](#ann-endpoints) · [错误映射](#ann-errors) · [存储与迁移](#ann-store) · [前端对接](#ann-frontend)
+- [理财资管模块](#wealth)
+  - [基础约定](#wealth-basics) · [数据模型](#wealth-models) · [接口列表](#wealth-endpoints) · [错误映射](#wealth-errors) · [存储与迁移](#wealth-store) · [前端对接](#wealth-frontend)
 - [错误码总览](#errors)
 
 ---
@@ -315,9 +321,245 @@ go build -o bin/otc ./cmd/otc
 <a id="user-frontend"></a>
 ## 用户设置前端对接
 
-- 类型与封装见 `src/api/client.ts`：`userMe`、`userUpdateProfile({nickname?, avatar?})`、`userChangePassword(old, new)`、`userGetPreferences`、`userUpdatePreferences(prefs)`。
-- 页面 `src/pages/Settings.tsx`：三块（资料/改密/偏好）；改密成功后清除本地 token 并跳登录（后端已吊销 refresh）。
+- 类型与封装见 `src/api/client.ts`：`userMe`、`userUpdateProfile({nickname?, avatar?})`、`userChangePassword(old, new)`、`userGetPreferences`、`userUpdatePreferences(prefs)`、`userTfaSetup`/`userTfaEnable`/`userTfaDisable`、`userKycSubmit`/`userKycGet`（及类型 `KycPayload`/`UserKyc`）。
+- 页面 `src/pages/Settings.tsx` 作为账户中心，含五块：
+  1. **资料**：昵称/头像，`userUpdateProfile`。
+  2. **修改密码**：`userChangePassword`；成功后清除本地 token 并跳登录（后端已吊销 refresh）。
+  3. **两步验证 (TFA)**：`userTfaSetup` 获取密钥 → `userTfaEnable` 启用；已启用时 `userTfaDisable` 关闭（均验动态码）。
+  4. **KYC 认证**：`userKycGet` 展示等级与已提交材料；`userKycSubmit` 提交/重新提交（审核中不可重复提交）。
+  5. **偏好设置**：`userUpdatePreferences`；保存后**立即生效**——主题通过 `document.documentElement[data-theme]` 切换浅色/深色 CSS 变量，语言写入 `document.documentElement.lang`（全文 i18n 为独立工作），通知开关持久化供后端 Notifier 消费。
 - `userUpdateProfile` 仅传需修改字段（未提供键不出现在请求体），后端按部分更新处理。
+- 应用默认主题为深色（`:root` 变量）；选择 `light` 时叠加 `[data-theme="light"]` 变量覆盖。
+
+---
+
+<a id="ann"></a>
+# 公告模块
+
+> 服务：`internal/announcement`，作为独立包挂载于用户服务 `cmd/user`（前缀 `/api/v1/announcement`）。
+> 与用户模块**共用同一数据库**（同一份 `ce_schema_migrations`），迁移版本号 **9401** 与用户模块 9101–9106 错开。
+> 范围：站内公告的发布、列表（公开/管理）、编辑、删除。
+
+<a id="ann-basics"></a>
+## 公告基础约定
+
+- **Base URL**：`/api/v1/announcement`
+- **认证**：公开列表 `/list` 免鉴权；管理接口 `/admin/*` 需 `middleware.Auth` + `middleware.AdminGuard`（admin 角色）。
+- 统一响应信封见 [通用约定](#common)。
+
+<a id="ann-models"></a>
+## 公告数据模型
+
+### Announcement
+
+```json
+{
+  "id": 1, "level": "maintenance", "title": "系统升级通知",
+  "content": "今晚 22:00 起维护 30 分钟", "active": true,
+  "published_at": "2026-08-17T22:00:00Z", "created_at": "2026-08-17T10:00:00Z",
+  "updated_at": "2026-08-17T10:00:00Z"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| id | 主键 |
+| level | 等级：`info`（公告）/ `warning`（提醒）/ `maintenance`（维护），影响前端 badge 样式 |
+| title | 标题（必填，≤ 128 字符） |
+| content | 正文（可空，≤ 4096 字符） |
+| active | 是否对外发布（草稿=false 不出现在公开列表） |
+| published_at | 发布时间；草稿为 0 值字符串；切到发布态且无该值时自动填充为当前时间 |
+
+<a id="ann-endpoints"></a>
+## 公告接口列表
+
+路径省略前缀 `/api/v1/announcement`。鉴权：`Public`=免鉴权；`Admin`=需管理员（`Auth + AdminGuard`）。
+
+#### GET `/list`
+公开公告列表（仅已发布 `active=true`），按发布时间倒序。鉴权：Public；响应：`{ "announcements": [...] }`（数组元素为 `Announcement`）。首页公告横幅、公告页均消费此接口。
+
+#### GET `/admin`
+全量公告列表（含草稿）。鉴权：Admin；响应：`{ "announcements": [...] }`。
+
+#### POST `/admin`
+创建公告。鉴权：Admin；请求体（字段均可选，但 `title` 必填）：
+
+```json
+{ "level": "maintenance", "title": "系统升级通知", "content": "今晚维护", "active": true }
+```
+
+响应：`data` = `Announcement`。校验失败 → `400`（见 [错误映射](#ann-errors)）。`active=true` 且 `published_at` 缺省时自动填充。
+
+#### PUT `/admin/:id`
+更新公告（部分更新：仅提供的字段生效）。鉴权：Admin；请求体同上；响应：`data` = `Announcement`。id 不存在 → `404`。
+
+#### DELETE `/admin/:id`
+删除公告。鉴权：Admin；响应：`{ "ok": true }`；id 不存在 → `404`。
+
+<a id="ann-errors"></a>
+## 公告错误映射
+
+`fail()` 映射：
+
+| HTTP | 触发错误（message） | 场景 |
+| --- | --- | --- |
+| 401 | — | 未认证（管理接口缺 Token） |
+| 403 | `insufficient role` | 非 admin 调用 `/admin/*` |
+| 400 | `title required`（ErrTitleRequired） | 创建时未提供 title |
+| 400 | `title too long`（ErrTitleTooLong） | title 超过 128 字符 |
+| 400 | `content too long`（ErrContentTooLong） | content 超过 4096 字符 |
+| 400 | `invalid level (info/warning/maintenance)`（ErrInvalidLevel） | level 非法 |
+| 404 | `announcement not found`（ErrNotFound） | 更新/删除的 id 不存在 |
+| 500 | default | 服务端内部异常 |
+
+<a id="ann-store"></a>
+## 公告存储与迁移
+
+- `Store` 抽象（`MySQL` + `内存`），内存实现用于单测/无 DB 开发；生产用 MySQL。
+- 迁移版本 **9401** `create_ce_announcements`：新建 `ce_announcements`
+  （`id` 主键、`level VARCHAR(16)`、`title VARCHAR(128)`、`content TEXT`、`active TINYINT`、
+  `published_at DATETIME(3)`、`created_at`/`updated_at`，索引 `idx_active_published(active, published_at)`）。
+- 与用户模块共用同一数据库实例，因此两者共享 `ce_schema_migrations`；版本号 9401 与用户的 9101–9106 互不重叠，迁移幂等、可重入。
+- 在 `cmd/user` 中：`cfg.MySQL.DSN` 非空时分别开 `user.NewMySQLStore(dsn)` 与 `announcement.NewMySQLStore(dsn)`（各自运行自己的迁移）；DSN 缺失则两者均降级为内存实现。
+
+<a id="ann-frontend"></a>
+## 公告前端对接
+
+- 类型与封装见 `src/api/client.ts`：`listAnnouncements()`（公开）、`adminListAnnouncements()`、`adminCreateAnnouncement(payload)`、`adminUpdateAnnouncement(id, payload)`、`adminDeleteAnnouncement(id)`，及类型 `Announcement`/`AnnouncementInput`/`AnnouncementLevel`。
+- 页面：
+  - `src/pages/Home.tsx` 首页大盘：欢迎语 + 平台公告横幅（消费 `listAnnouncements`）+ 模块快捷入口 + 账户概览（消费 `userMe`）。已设为默认路由 `/home`。
+  - `src/pages/Announcements.tsx` 公告管理：增删改查（需 admin 角色；无权限时列表接口返回 403，由错误提示展示）。
+- 导航栏新增「首页 /home」「公告 /announcements」。
+- 公告等级 badge 样式（`info` 绿 / `warning` 黄 / `maintenance` 蓝）见 `src/styles.css` 的 `.ann-badge.*`。
+
+> 面向运维/管理员的「操作示例（curl）与字段校验」见 [`announcement_guide.md`](./announcement_guide.md)。
+> 单元测试运行方式与用例清单见 [`announcement_test.md`](./announcement_test.md)。
+
+---
+
+<a id="wealth"></a>
+# 理财资管模块
+
+> 服务：`internal/wealth`，独立二进制 `cmd/wealth`（监听 `:8092`），路由前缀 `/api/v1/wealth`。
+> 范围：理财产品发行/上下架、用户认购/赎回、持仓与收益计提（中央托管模型）。
+
+<a id="wealth-basics"></a>
+## 理财基础约定
+
+- **Base URL**：`/api/v1/wealth`
+- **认证**：所有接口均经 `middleware.Auth` 鉴权（Bearer Token）；`/products` 创建与 `/admin/*` 还需 `AdminGuard`（admin 角色）。
+- **中央托管模型**：用户认购时本金从个人可用余额转入 `SysWealth`；赎回时本金+已计收益从 `SysWealth` 支出给用户。收益按「本金 × 年化 × 持有小时 / 8760」连续计息（定点累加，避免 float 漂移）；定期产品到期前锁定不可赎。
+
+<a id="wealth-models"></a>
+## 理财数据模型
+
+### WealthProduct（理财产品）
+
+```json
+{
+  "id": 1, "name": "USDT 稳健增利", "asset": "USDT", "type": "fixed",
+  "annual_rate": 0.05, "duration_days": 30, "min_amount": 100,
+  "status": "open", "created_at": "2026-08-17T10:00:00Z", "updated_at": "2026-08-17T10:00:00Z"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| id | 主键 |
+| name | 产品名称 |
+| asset | 底层资产（如 `USDT`），本金与收益计价单位 |
+| type | `current`（活期，可随时赎回）/ `fixed`（定期，到期前锁定） |
+| annual_rate | 年化收益率（0.05 = 5%） |
+| duration_days | 锁定期限（天）；活期为 0 |
+| min_amount | 起购金额 |
+| status | `open`（申购中）/ `closed`（已下架） |
+
+### WealthHolding（用户持仓）
+
+```json
+{
+  "id": 10, "user_id": 7, "product_id": 1, "asset": "USDT",
+  "principal": 1000, "accrued_yield": 4.12, "status": "active",
+  "created_at": "2026-08-17T10:00:00Z", "last_accrual_at": "2026-08-18T10:00:00Z",
+  "redeemed_at": null, "updated_at": "2026-08-18T10:00:00Z"
+}
+```
+
+> `principal` / `accrued_yield` 由后端按**人类可读十进制数字**序列化（JSON 数字），前端按 `number` 处理即可。
+> `status`：`active`（持有中，可赎回/计息）/ `funding`（瞬态：本金转入中）/ `redeemed`（已赎回，终态）。
+
+<a id="wealth-endpoints"></a>
+## 理财接口列表
+
+路径省略前缀 `/api/v1/wealth`。鉴权：`User`=需登录；`Admin`=需管理员（`Auth + AdminGuard`）。
+
+#### GET `/products`
+理财产品列表。鉴权：User；查询参数 `status`（可选，`open`/`closed`）。响应：`{ "products": [...] }`。前端认购下拉仅用 `open` 产品。
+
+#### POST `/products`
+创建产品（发行）。鉴权：Admin；请求体：
+
+```json
+{ "name": "USDT 稳健增利", "asset": "USDT", "type": "fixed",
+  "annual_rate": 0.05, "duration_days": 30, "min_amount": 100 }
+```
+
+- `type` 必为 `current`/`fixed`；`annual_rate`/`duration_days` 须 ≥ 0；否则 → `4001`。
+- 响应：`data` = `WealthProduct`；业务错误（如重复） → `4002`。
+
+#### POST `/subscribe`
+认购。鉴权：User；请求体：`{ "product_id": 1, "amount": 1000 }`。
+- 校验：金额 > 0、产品存在且 `open`、金额 ≥ 起购额（定点比较）、用户可用余额充足；否则 → `4001`/`4002`。
+- 行为：先落 `funding` 瞬态持仓 → 本金 `user → SysWealth` → 置为 `active`；任一失败回滚。
+- 响应：`data` = `WealthHolding`（status=`active`）。
+
+#### POST `/redeem`
+赎回。鉴权：User；请求体：`{ "holding_id": 10 }`。
+- 校验：须为本人持仓（`ErrNotOwner`）、须为 `active`（重复赎回短路返回 `ErrAlreadyRedeemed`）、定期须到期（否则 `ErrLocked`）。
+- 行为：赎回前补齐截至当前的收益 → 本金+收益 `SysWealth → user` → 置 `redeemed` 并写 `redeemed_at`（幂等）。
+- 响应：`data` = `WealthHolding`（status=`redeemed`）。
+
+#### GET `/holdings`
+我的持仓。鉴权：User；响应：`{ "holdings": [...] }`（仅本人）。
+
+#### GET `/admin/holdings`
+全量持仓（管理视图）。鉴权：Admin；响应：`{ "holdings": [...] }`。
+
+#### POST `/admin/accrue`
+手动计提收益（通常由后台循环自动执行）。鉴权：Admin；响应：`{ "accrued": <本轮回填总收益（人类单位）> }`。
+
+<a id="wealth-errors"></a>
+## 理财错误映射
+
+错误响应形如 `{ "code": <码>, "message": "<描述>", "data": null }`；各接口直接以 `response.Error` 返回以下码：
+
+| HTTP | code | 触发场景 / message |
+| --- | --- | --- |
+| 401 | 4010 | 缺失/非法 Token（`unauthorized`） |
+| 400 | 4000 | 请求体非法（JSON 解析失败） |
+| 400 | 4001 | 参数校验：`type must be current or fixed` / `annual_rate must be >= 0` / `duration_days must be >= 0` / `product_id/amount required` / `holding_id required` |
+| 400 | 4002 | 业务规则错误（`message` 为具体原因）：product not found、product not open、amount below product minimum、insufficient available balance、not the holding owner、holding already redeemed、fixed product is still locked before maturity、amount must be positive 等 |
+| 500 | 5000 | 服务端内部异常（持久化/账本转账等） |
+
+<a id="wealth-store"></a>
+## 理财存储与迁移
+
+- `Store` 抽象（MySQL + 内存），内存实现用于单测/无 DB 演示；生产用 MySQL。
+- 迁移版本 **97xx**（与全局错开）：
+  - **9701** `create_ce_wealth_products`：产品表（id/name/asset/type/annual_rate/duration_days/min_amount/status/时间，索引 `idx_status`）。
+  - **9702** `create_ce_wealth_holdings`：持仓表（id/user_id/product_id/principal/accrued_yield/status/时间，索引 `idx_user`/`idx_product`）。
+  - **9703** `alter_ce_wealth_holdings_fixedpoint`：本金/收益由 `DOUBLE` 改为 `VARCHAR(64)` 定点存储（避免 float 精度漂移），新增 `asset` 列用于扫描时推导小数位。
+- `cmd/wealth/main.go` 装配：配置 DSN 则连 MySQL 并跑迁移，否则内存；并启动后台 `RunLoop` 周期调用 `Accrue` 持续计提收益。
+
+<a id="wealth-frontend"></a>
+## 理财前端对接
+
+- 类型与封装见 `src/api/client.ts`：`wealthProducts()`、`wealthHoldings()`、`wealthSubscribe(productId, amount)`、`wealthRedeem(holdingId)`，及类型 `WealthProduct`/`WealthHolding` 等。
+- 页面 `src/pages/Wealth.tsx`：
+  - **认购**：从「申购中(open)」产品下拉选择，输入金额（前端校验 > 0 且 ≥ 起购额），调用 `wealthSubscribe`。
+  - **我的持仓**：表格展示本金/已计收益/状态；对 `active` 持仓显示「赎回」按钮，调用 `wealthRedeem`（非活跃项禁用）。
+- 路由 `/wealth` 已注册，导航栏含「理财」。
+- 注意：认购前需管理员先 `POST /api/v1/wealth/products` 发行产品，否则前端下拉为空、无法认购。
 
 ---
 
@@ -334,5 +576,12 @@ go build -o bin/otc ./cmd/otc
 | User | 401 | 401 | 未认证 / 凭证错误 / 2FA 缺失 |
 | User | 400 | 400 | 参数/业务前置校验失败、设置专用客户端错误 |
 | User | 500 | 500 | 服务端内部异常 |
+| Announcement | 403 | 403 | 非 admin 调用 `/admin/*` |
+| Announcement | 404 | 404 | 公告不存在 |
+| Announcement | 400 | 400 | title/content 超长、level 非法、title 缺失 |
+| Announcement | 500 | 500 | 服务端内部异常 |
+| Wealth | 401 | 4010 | 未认证 / Token 非法 |
+| Wealth | 400 | 4000/4001/4002 | 请求非法 / 参数校验 / 业务规则（product not found、not open、below min、insufficient balance、not owner、already redeemed、locked 等） |
+| Wealth | 500 | 5000 | 服务端内部异常（持久化 / 账本转账失败） |
 
-> 注：OTC 使用带业务子码（4010/4030/…）的 `code`；用户服务当前 `code` 直接复用 HTTP 状态码（401/400/500）。两者均遵循统一 `{code,message,data}` 信封。
+> 注：OTC 与 Wealth 使用带业务子码（4010/4030/4000/…、5000）的 `code`；用户服务与公告服务当前 `code` 直接复用 HTTP 状态码（401/400/403/404/500）。两者均遵循统一 `{code,message,data}` 信封。
