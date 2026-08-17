@@ -48,7 +48,7 @@ type matcherClient interface {
 //   - F1 并发成交串行化（settleFill 全程持 freezeMu），消除 freezeRec 竞态。
 //   - F5 拒绝 price<=0 订单；结算纵深拦截零/负额转账。
 //   - F2 预冻结额以 settlement.AssetAmount 跟踪，结算钳位到真实剩余，消除浮点漂移/残留。
-//   - F3 结算顺序固定 Unfreeze→Transfer，失败补偿回滚；提供 admin/reconcile 对账。
+//   - F3 两腿结算经账本 Batch 原子执行（解冻+转账整体回滚），提供 admin/reconcile 对账。
 type Server struct {
 	log    *zap.Logger
 	client matcherClient
@@ -165,17 +165,6 @@ func (s *Server) handleOrder(c *gin.Context) {
 		return
 	}
 
-	// F1 下单幂等：同 uid+client_oid 已存在则返回已有 order_id，不重复冻结/提交。
-	if req.ClientOID != "" {
-		s.freezeMu.Lock()
-		if oid, exists := s.clientOIDMap[fmt.Sprintf("%d:%s", uid, req.ClientOID)]; exists {
-			s.freezeMu.Unlock()
-			response.JSON(c, gin.H{"order_id": oid, "status": "accepted", "idempotent": true})
-			return
-		}
-		s.freezeMu.Unlock()
-	}
-
 	o := &matching.Order{
 		UserID: uid, // F4：身份来自 token。
 		Side:   side,
@@ -188,14 +177,25 @@ func (s *Server) handleOrder(c *gin.Context) {
 		Leverage: req.Leverage,
 	}
 
-	// 预冻结（先写 openOrders 再 Submit，避免成交事件早到漏结算）。
+	// F1 下单幂等 + 防并发双冻：将「幂等键检查 → 预冻结 → 提交 → 登记」整体置于 freezeMu
+	// 临界区内，杜绝同 client_oid 在"检查通过"与"实际冻结"之间的竞态窗口。此前两段不在同一
+	// 锁内，并发重试会各自通过检查并重复 Freeze，导致用户资金被双重冻结。
+	s.freezeMu.Lock()
+	if req.ClientOID != "" {
+		key := fmt.Sprintf("%d:%s", uid, req.ClientOID)
+		if oid, exists := s.clientOIDMap[key]; exists {
+			s.freezeMu.Unlock()
+			response.JSON(c, gin.H{"order_id": oid, "status": "accepted", "idempotent": true})
+			return
+		}
+	}
+	// 预冻结（临界区内执行，与提交/登记原子，避免成交事件早到漏结算与双冻）。
 	rec, err := s.reserveOnOpen(uid, side, req.Price, req.Qty, req.Symbol)
 	if err != nil {
+		s.freezeMu.Unlock()
 		response.Error(c, 400, 400, "insufficient balance: "+err.Error())
 		return
 	}
-
-	s.freezeMu.Lock()
 	if !s.client.Submit(req.Symbol, o) {
 		// 撮合不可用，回滚预冻结，避免资金被错误锁定。
 		s.releaseRemaining(rec)
@@ -306,7 +306,7 @@ func (s *Server) handleCancel(c *gin.Context) {
 // 若对应订单有预冻结，则先释放已成交部分再转账，保证「冻结→解冻→划转」资金闭环。
 //
 // 资金安全整改：全程持 freezeMu 串行（F1 竞态）；成交去重（F1 重放双付）；
-// 顺序固定 Unfreeze→Transfer、失败补偿回滚（F3 原子性）；结算额钳位到真实剩余（F2）；
+// 两腿结算经账本 Batch 原子执行、任一失败整组回滚（F3 原子性）；结算额钳位到真实剩余（F2）；
 // 零/负额拦截（F5 纵深）。
 func (s *Server) settleFill(symbol string, t matching.Trade) error {
 	base, quote, ok := splitSymbol(symbol)
@@ -345,46 +345,41 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 	if buyRec != nil && quoteAmt.Cmp(buyRec.frozenQuote) > 0 {
 		quoteAmt = buyRec.frozenQuote // F2 钳位到真实剩余，消除累计漂移/残留。
 	}
-	if !quoteAmt.IsZero() {
-		if buyRec != nil {
-			if err := s.ledgerSvc.Unfreeze(buyer, quote, quoteAmt); err != nil {
-				return fmt.Errorf("unfreeze buyer quote: %w", err)
-			}
-		}
-		if err := s.ledgerSvc.Transfer(buyer, seller, quote, quoteAmt, "spot_trade", ref); err != nil {
-			if buyRec != nil { // 补偿回滚：重新冻结，使可安全重试。
-				_ = s.ledgerSvc.Freeze(buyer, quote, quoteAmt)
-			}
-			return fmt.Errorf("settle buyer leg: %w", err)
-		}
-		if buyRec != nil {
-			buyRec.frozenQuote = buyRec.frozenQuote.Sub(quoteAmt)
-		}
-	}
-
 	// 基础腿：卖方支付 base（先解冻后转账）。
 	baseAmt := settlement.AssetAmountFromFloat(t.Qty, settlement.AssetDecimalsByName(base))
 	if sellRec != nil && baseAmt.Cmp(sellRec.frozenBase) > 0 {
 		baseAmt = sellRec.frozenBase
 	}
+
+	// F3 原子结算：两条腿（解冻+转账）整体经账本 Batch 执行，任一失败即整组回滚，
+	// 杜绝"计价腿成功、基础腿失败"造成的部分结算（买方付讫却未收到基础资产、卖方凭空获利）。
+	// 两条 Transfer 共用同一 ref，但指纹含 from/to/asset/amount，互不冲突（见 ledger.transferFingerprint）。
+	var ops []ledger.Op
+	if !quoteAmt.IsZero() {
+		if buyRec != nil {
+			ops = append(ops, ledger.Op{Kind: ledger.OpUnfreeze, User: buyer, Asset: quote, Amount: quoteAmt})
+		}
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: buyer, To: seller, Asset: quote, Amount: quoteAmt, Biz: "spot_trade", Ref: ref})
+	}
 	if !baseAmt.IsZero() {
 		if sellRec != nil {
-			if err := s.ledgerSvc.Unfreeze(seller, base, baseAmt); err != nil {
-				return fmt.Errorf("unfreeze seller base: %w", err)
-			}
+			ops = append(ops, ledger.Op{Kind: ledger.OpUnfreeze, User: seller, Asset: base, Amount: baseAmt})
 		}
-		if err := s.ledgerSvc.Transfer(seller, buyer, base, baseAmt, "spot_trade", ref); err != nil {
-			if sellRec != nil {
-				_ = s.ledgerSvc.Freeze(seller, base, baseAmt)
-			}
-			return fmt.Errorf("settle seller leg: %w", err)
-		}
-		if sellRec != nil {
-			sellRec.frozenBase = sellRec.frozenBase.Sub(baseAmt)
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: seller, To: buyer, Asset: base, Amount: baseAmt, Biz: "spot_trade", Ref: ref})
+	}
+	if len(ops) > 0 {
+		if err := s.ledgerSvc.Batch(ops); err != nil {
+			return fmt.Errorf("settle fill: %w", err)
 		}
 	}
 
-	// 全部成功：置去重标记，清理终态记录（释放 client_oid 映射，避免无界增长）。
+	// 全部成功：更新本地预冻结记录 + 去重标记，清理终态记录（释放 client_oid 映射，避免无界增长）。
+	if buyRec != nil {
+		buyRec.frozenQuote = buyRec.frozenQuote.Sub(quoteAmt)
+	}
+	if sellRec != nil {
+		sellRec.frozenBase = sellRec.frozenBase.Sub(baseAmt)
+	}
 	s.settledRefs[ref] = true
 	s.maybeCleanupLocked(t.TakerOID)
 	s.maybeCleanupLocked(t.MakerOID)

@@ -185,3 +185,74 @@ func TestPartialFillThenCancel(t *testing.T) {
 		t.Fatalf("ledger unbalanced")
 	}
 }
+
+// 测试6（F1 重放幂等）：同一笔成交重复结算应被 settledRefs 去重，余额与冻结不变。
+// 回归：确认 Batch 路径下重放不会二次转账（双付）。
+func TestSettleFillReplayIdempotent(t *testing.T) {
+	s := newTestServer()
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	s.openOrders[101] = buyRec
+	s.openOrders[202] = sellRec
+
+	trade := matching.Trade{
+		Price: 100, Qty: 1, TakerSide: matching.Buy,
+		TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202,
+	}
+	if err := s.settleFill("BTC_USDT", trade); err != nil {
+		t.Fatalf("first settleFill failed: %v", err)
+	}
+	// 重放同一笔成交。
+	if err := s.settleFill("BTC_USDT", trade); err != nil {
+		t.Fatalf("replay settleFill failed: %v", err)
+	}
+	// 买方最终：USDT=99900（付 100），BTC=1；卖方：BTC=9，USDT=100。与单次结算一致。
+	if b, _, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(b, 99900, "USDT") {
+		t.Fatalf("buyer USDT should stay 99900 after replay, got %v", b)
+	}
+	if b, _, _ := s.ledgerSvc.Balance(1, "BTC"); !eqAmt(b, 1, "BTC") {
+		t.Fatalf("buyer BTC should stay 1 after replay, got %v", b)
+	}
+	if u, _, _ := s.ledgerSvc.Balance(2, "USDT"); !eqAmt(u, 100, "USDT") {
+		t.Fatalf("seller USDT should stay 100 after replay, got %v", u)
+	}
+	if !s.ledgerSvc.IsBalanced() {
+		t.Fatalf("ledger unbalanced after replay")
+	}
+}
+
+// 测试7（F2 钳位）：预冻结额大于实际成交额时，结算只划转真实成交部分，
+// 剩余冻结保留，账本保持平衡。验证 Batch 路径下钳位逻辑仍然生效。
+func TestSettleFillClampToFrozen(t *testing.T) {
+	s := newTestServer()
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+
+	// 卖方预冻结 5 BTC（多于本次成交的 1 BTC）。
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 5, "BTC_USDT")
+	s.openOrders[101] = buyRec
+	s.openOrders[202] = sellRec
+
+	trade := matching.Trade{
+		Price: 100, Qty: 1, TakerSide: matching.Buy,
+		TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202,
+	}
+	if err := s.settleFill("BTC_USDT", trade); err != nil {
+		t.Fatalf("settleFill failed: %v", err)
+	}
+	// 买方：USDT 99900，BTC 1（按成交 1 而非冻结 5）。
+	if b, _, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(b, 99900, "USDT") {
+		t.Fatalf("buyer USDT wrong: %v", b)
+	}
+	// 卖方：只转出 1 BTC（钳位），剩余冻结 4 BTC。可用 = 10-5(冻结)+1(解冻)-1(转出)=5，冻结=4。
+	if a, f, _ := s.ledgerSvc.Balance(2, "BTC"); !eqAmt(a, 5, "BTC") || !eqAmt(f, 4, "BTC") {
+		t.Fatalf("seller BTC wrong: avail=%v frozen=%v", a, f)
+	}
+	if !s.ledgerSvc.IsBalanced() {
+		t.Fatalf("ledger unbalanced after clamp settle")
+	}
+}
