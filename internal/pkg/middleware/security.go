@@ -89,14 +89,19 @@ func Audit(log *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-// AuthWithSkips 在 Auth 基础上，对以指定前缀开头的路径放行（用于公开端点，
-// 如行情查询、健康检查、登录注册）。其余路径仍强制鉴权。
+// AuthWithSkips 在 Auth 基础上，对指定公开端点放行（如行情查询、健康检查、登录注册），
+// 其余路径仍强制鉴权。
+//
+// 安全说明：放行匹配采用「精确路径」或「路径分段边界」(pre + "/") 两种方式，
+// 而非裸前缀匹配。裸前缀（strings.HasPrefix）会让形如 /api/v1/spot/depthXxx 的
+// 敏感兄弟路由也被免鉴权，构成潜在鉴权绕过。改为分段边界后，仅 pre 本身及其子路径
+// (pre/...) 可免鉴权，避免前缀混淆绕过。
 func AuthWithSkips(v *TokenVerifier, skipPrefixes ...string) gin.HandlerFunc {
 	auth := Auth(v)
 	return func(c *gin.Context) {
 		p := c.Request.URL.Path
 		for _, pre := range skipPrefixes {
-			if strings.HasPrefix(p, pre) {
+			if p == pre || strings.HasPrefix(p, pre+"/") {
 				c.Next()
 				return
 			}

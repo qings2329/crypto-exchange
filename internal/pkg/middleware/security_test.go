@@ -163,4 +163,11 @@ func TestAuthWithSkips(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("protected path should pass with token, got %d", w.Code)
 	}
+
+	// 前缀扩展的兄弟路径（如 /api/v1/spot/depthXxx）不得被免鉴权（防前缀混淆绕过）。
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/spot/depthXxx", nil))
+	if w.Code != 401 {
+		t.Errorf("prefix-extension sibling should NOT be skipped (expect 401), got %d", w.Code)
+	}
 }
