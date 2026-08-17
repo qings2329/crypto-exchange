@@ -931,6 +931,21 @@ func (l *Ledger) History(userID int64, asset string) []Entry {
 	return out
 }
 
+// UserHistory 返回某用户全部资产的资金流水（跨资产），按时间倒序（最新在前）。
+// 与 History(userID, asset) 不同，本方法不限定资产，用于「我的资金流水」这类用户侧聚合视图。
+func (l *Ledger) UserHistory(userID int64) []Entry {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := make([]Entry, 0, len(l.log))
+	for _, e := range l.log {
+		if e.UserID == userID {
+			out = append(out, e)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Time > out[j].Time })
+	return out
+}
+
 // Log 返回全局流水（审计/对账用）。
 func (l *Ledger) Log() []Entry {
 	l.mu.RLock()
