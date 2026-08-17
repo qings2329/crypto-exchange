@@ -11,6 +11,8 @@ package margin
 import (
 	"errors"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // 领域错误。
@@ -38,20 +40,20 @@ const (
 
 // MarginAccount 是一条杠杆账户记录（单用户 + 单借入资产）。
 type MarginAccount struct {
-	UserID           int64        `json:"user_id"`
-	Asset            string       `json:"asset"`             // 借入资产，如 BTC
-	CollateralAsset  string       `json:"collateral_asset"`  // 抵押资产，如 USDT
-	CollateralAmount float64      `json:"collateral_amount"` // 已冻结抵押数量
-	Debt             float64      `json:"debt"`              // 借入本金
-	InterestAccrued  float64      `json:"interest_accrued"`  // 累计利息
-	Leverage         int          `json:"leverage"`
-	Status           AccountStatus `json:"status"`
-	LastAccrual      time.Time    `json:"last_accrual"`
-	CreatedAt        time.Time    `json:"created_at"`
-	UpdatedAt        time.Time    `json:"updated_at"`
+	UserID           int64                      `json:"user_id"`
+	Asset            string                     `json:"asset"`             // 借入资产，如 BTC
+	CollateralAsset  string                     `json:"collateral_asset"`  // 抵押资产，如 USDT
+	CollateralAmount settlement.AssetAmount     `json:"collateral_amount"` // 已冻结抵押数量
+	Debt             settlement.AssetAmount     `json:"debt"`              // 借入本金
+	InterestAccrued  settlement.AssetAmount     `json:"interest_accrued"`  // 累计利息
+	Leverage         int                        `json:"leverage"`
+	Status           AccountStatus              `json:"status"`
+	LastAccrual      time.Time                  `json:"last_accrual"`
+	CreatedAt        time.Time                  `json:"created_at"`
+	UpdatedAt        time.Time                  `json:"updated_at"`
 }
 
-// TotalOwed 返回当前应还总额（本金 + 利息）。
-func (a *MarginAccount) TotalOwed() float64 {
-	return a.Debt + a.InterestAccrued
+// TotalOwed 返回当前应还总额（本金 + 利息，定点）。
+func (a *MarginAccount) TotalOwed() settlement.AssetAmount {
+	return a.Debt.Add(a.InterestAccrued)
 }

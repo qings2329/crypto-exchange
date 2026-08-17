@@ -37,7 +37,7 @@ func TestBorrowAndRepay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
-	if a.Debt != 1.0 || a.Leverage != 5 {
+	if a.Debt.HumanFloat() != 1.0 || a.Leverage != 5 {
 		t.Fatalf("unexpected account: %+v", a)
 	}
 	// 抵押 = 1/5 = 0.2 USDT 应被冻结，BTC 1.0 应进可用。
@@ -90,8 +90,8 @@ func TestAccrueInterest(t *testing.T) {
 	svc.accrue(a)
 	// 利息 = 10 * 0.0001 * 10 = 0.01
 	want := 10.0 * 0.0001 * 10
-	if a.InterestAccrued < want-1e-9 || a.InterestAccrued > want+1e-9 {
-		t.Fatalf("interest accrued = %.8f, want %.8f", a.InterestAccrued, want)
+	if a.InterestAccrued.HumanFloat() < want-1e-9 || a.InterestAccrued.HumanFloat() > want+1e-9 {
+		t.Fatalf("interest accrued = %.8f, want %.8f", a.InterestAccrued.HumanFloat(), want)
 	}
 }
 
@@ -168,8 +168,8 @@ func TestBorrowRejectDuplicateActive(t *testing.T) {
 	for _, a := range list {
 		if a.Asset == "BTC" {
 			n++
-			if a.Debt != 1.0 {
-				t.Fatalf("unexpected debt after duplicate borrow: %v", a.Debt)
+			if a.Debt.HumanFloat() != 1.0 {
+				t.Fatalf("unexpected debt after duplicate borrow: %v", a.Debt.HumanFloat())
 			}
 		}
 	}

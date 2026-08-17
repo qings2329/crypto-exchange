@@ -3,6 +3,8 @@ package options
 import (
 	"database/sql"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // mysqlStore 是 MySQL 版 Store。表名 ce_option_contracts / ce_option_positions 已遵守 ce_ 前缀约定。
@@ -66,9 +68,10 @@ func (s *mysqlStore) UpsertPosition(p *OptionPosition) error {
 	if p.ID == 0 {
 		res, err := s.db.Exec(`
 			INSERT INTO ce_option_positions
-				(user_id, contract_id, side, quantity, premium, margin, status, opened_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			p.UserID, p.ContractID, string(p.Side), p.Quantity, p.Premium, p.Margin,
+				(user_id, contract_id, side, quantity, quote_asset, premium, margin, status, opened_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			p.UserID, p.ContractID, string(p.Side), p.Quantity, p.QuoteAsset,
+			p.Premium.HumanString(), p.Margin.HumanString(),
 			string(p.Status), p.OpenedAt, p.UpdatedAt)
 		if err != nil {
 			return err
@@ -80,27 +83,29 @@ func (s *mysqlStore) UpsertPosition(p *OptionPosition) error {
 	}
 	_, err := s.db.Exec(`
 		INSERT INTO ce_option_positions
-			(id, user_id, contract_id, side, quantity, premium, margin, status, opened_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			(id, user_id, contract_id, side, quantity, quote_asset, premium, margin, status, opened_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 			user_id=VALUES(user_id), contract_id=VALUES(contract_id), side=VALUES(side),
-			quantity=VALUES(quantity), premium=VALUES(premium), margin=VALUES(margin),
+			quantity=VALUES(quantity), quote_asset=VALUES(quote_asset),
+			premium=VALUES(premium), margin=VALUES(margin),
 			status=VALUES(status), opened_at=VALUES(opened_at), updated_at=VALUES(updated_at)`,
-		p.ID, p.UserID, p.ContractID, string(p.Side), p.Quantity, p.Premium, p.Margin,
+		p.ID, p.UserID, p.ContractID, string(p.Side), p.Quantity, p.QuoteAsset,
+		p.Premium.HumanString(), p.Margin.HumanString(),
 		string(p.Status), p.OpenedAt, p.UpdatedAt)
 	return err
 }
 
 func (s *mysqlStore) GetPosition(id int64) (*OptionPosition, error) {
 	row := s.db.QueryRow(`
-		SELECT id, user_id, contract_id, side, quantity, premium, margin, status, opened_at, updated_at
+		SELECT id, user_id, contract_id, side, quantity, quote_asset, premium, margin, status, opened_at, updated_at
 		FROM ce_option_positions WHERE id = ?`, id)
 	return scanPosition(row)
 }
 
 func (s *mysqlStore) ListPositions(userID int64) ([]*OptionPosition, error) {
 	rows, err := s.db.Query(`
-		SELECT id, user_id, contract_id, side, quantity, premium, margin, status, opened_at, updated_at
+		SELECT id, user_id, contract_id, side, quantity, quote_asset, premium, margin, status, opened_at, updated_at
 		FROM ce_option_positions WHERE user_id = ? ORDER BY id`, userID)
 	if err != nil {
 		return nil, err
@@ -111,7 +116,7 @@ func (s *mysqlStore) ListPositions(userID int64) ([]*OptionPosition, error) {
 
 func (s *mysqlStore) ListAllPositions() ([]*OptionPosition, error) {
 	rows, err := s.db.Query(`
-		SELECT id, user_id, contract_id, side, quantity, premium, margin, status, opened_at, updated_at
+		SELECT id, user_id, contract_id, side, quantity, quote_asset, premium, margin, status, opened_at, updated_at
 		FROM ce_option_positions ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -122,7 +127,7 @@ func (s *mysqlStore) ListAllPositions() ([]*OptionPosition, error) {
 
 func (s *mysqlStore) ListAllOpen() ([]*OptionPosition, error) {
 	rows, err := s.db.Query(`
-		SELECT id, user_id, contract_id, side, quantity, premium, margin, status, opened_at, updated_at
+		SELECT id, user_id, contract_id, side, quantity, quote_asset, premium, margin, status, opened_at, updated_at
 		FROM ce_option_positions WHERE status = ? ORDER BY id`, string(StatusOpen))
 	if err != nil {
 		return nil, err
@@ -170,17 +175,31 @@ func scanContracts(rows *sql.Rows) ([]*OptionContract, error) {
 	return out, rows.Err()
 }
 
+// parseOptionAmount 把存储的 premium/margin 字符串（AssetAmount.HumanString）按持仓计价资产
+// 的小数位解析为 AssetAmount。
+func parseOptionAmount(s, quoteAsset string) settlement.AssetAmount {
+	dec := settlement.AssetDecimalsByName(quoteAsset)
+	aa, err := settlement.AssetAmountFromString(s, dec)
+	if err != nil {
+		return settlement.AssetAmount{Decimals: dec}
+	}
+	return aa.ToDecimals(dec)
+}
+
 func scanPosition(row *sql.Row) (*OptionPosition, error) {
 	var p OptionPosition
-	var side, status string
+	var side, status, quoteAsset, premiumStr, marginStr string
 	err := row.Scan(&p.ID, &p.UserID, &p.ContractID, &side, &p.Quantity,
-		&p.Premium, &p.Margin, &status, &p.OpenedAt, &p.UpdatedAt)
+		&quoteAsset, &premiumStr, &marginStr, &status, &p.OpenedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrPositionNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	p.QuoteAsset = quoteAsset
+	p.Premium = parseOptionAmount(premiumStr, quoteAsset)
+	p.Margin = parseOptionAmount(marginStr, quoteAsset)
 	p.Side = PositionSide(side)
 	p.Status = PositionStatus(status)
 	return &p, nil
@@ -190,11 +209,14 @@ func scanPositions(rows *sql.Rows) ([]*OptionPosition, error) {
 	out := make([]*OptionPosition, 0)
 	for rows.Next() {
 		var p OptionPosition
-		var side, status string
+		var side, status, quoteAsset, premiumStr, marginStr string
 		if err := rows.Scan(&p.ID, &p.UserID, &p.ContractID, &side, &p.Quantity,
-			&p.Premium, &p.Margin, &status, &p.OpenedAt, &p.UpdatedAt); err != nil {
+			&quoteAsset, &premiumStr, &marginStr, &status, &p.OpenedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
+		p.QuoteAsset = quoteAsset
+		p.Premium = parseOptionAmount(premiumStr, quoteAsset)
+		p.Margin = parseOptionAmount(marginStr, quoteAsset)
 		p.Side = PositionSide(side)
 		p.Status = PositionStatus(status)
 		out = append(out, &p)

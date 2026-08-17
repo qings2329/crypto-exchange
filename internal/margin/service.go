@@ -99,9 +99,9 @@ func (s *Service) Borrow(userID int64, asset string, amount float64, leverage in
 		UserID:           userID,
 		Asset:            asset,
 		CollateralAsset:  s.cfg.CollateralAsset,
-		CollateralAmount: collateral,
-		Debt:             amount,
-		InterestAccrued:  0,
+		CollateralAmount: collAmt,
+		Debt:             amt,
+		InterestAccrued:  settlement.AssetAmount{Decimals: settlement.AssetDecimalsByName(asset)},
 		Leverage:         leverage,
 		Status:           StatusActive,
 		LastAccrual:      time.Now(),
@@ -143,36 +143,35 @@ func (s *Service) Repay(userID int64, asset string, amount float64) error {
 	}
 	s.accrue(a)
 	total := a.TotalOwed()
-	if total <= 0 {
+	if total.IsZero() {
 		return ErrNothingOwed
 	}
-	repay := amount
-	if repay > total {
-		repay = total
+	dec := settlement.AssetDecimalsByName(asset)
+	repayAmt := settlement.AssetAmountFromFloat(amount, dec)
+	if repayAmt.Cmp(total) > 0 {
+		repayAmt = total
 	}
 	avail, _, ok := s.ledger.Balance(userID, asset)
-	if !ok || avail.Cmp(settlement.AssetAmountFromFloat(repay, settlement.AssetDecimalsByName(asset))) < 0 {
+	if !ok || avail.Cmp(repayAmt) < 0 {
 		return ErrInsufficientBalance
 	}
 
-	// 计算新状态。
-	principal := repay
-	if principal > a.Debt {
-		principal = a.Debt
+	// 计算新状态（定点，去除 1e-9 浮点容差）。
+	principalAmt := repayAmt.Min(a.Debt)
+	interestPortion := repayAmt.Sub(principalAmt)
+	newDebt := a.Debt.Sub(principalAmt)
+	newInterest := a.InterestAccrued.Sub(interestPortion)
+	if newInterest.Sign() < 0 {
+		newInterest = settlement.AssetAmount{Decimals: dec}
 	}
-	newDebt := a.Debt - principal
-	newInterest := a.InterestAccrued - (repay - principal)
-	if newInterest < 0 {
-		newInterest = 0
-	}
-	closing := newDebt <= 1e-9 && newInterest <= 1e-9
+	closing := newDebt.IsZero() && newInterest.IsZero()
 
 	// 保存旧快照用于回滚，先落新状态。
 	prev := *a
 	a.Debt = newDebt
 	a.InterestAccrued = newInterest
 	if closing {
-		a.CollateralAmount = 0
+		a.CollateralAmount = settlement.AssetAmount{Decimals: settlement.AssetDecimalsByName(a.CollateralAsset)}
 		a.Status = StatusClosed
 	}
 	a.UpdatedAt = time.Now()
@@ -182,24 +181,26 @@ func (s *Service) Repay(userID int64, asset string, amount float64) error {
 
 	// 动钱：扣还款。
 	ref := fmt.Sprintf("margin_repay uid=%d asset=%s", userID, asset)
-	if err := s.ledger.DebitAvailable(userID, asset, settlement.AssetAmountFromFloat(repay, settlement.AssetDecimalsByName(asset)), "margin_repay", ref); err != nil {
+	if err := s.ledger.DebitAvailable(userID, asset, repayAmt, "margin_repay", ref); err != nil {
 		*a = prev
 		_ = s.store.UpsertAccount(a)
 		return err
 	}
 	// 还清则解冻抵押（best-effort，与原实现一致）。
-	if closing && prev.CollateralAmount > 0 {
-		_ = s.ledger.Unfreeze(userID, a.CollateralAsset, settlement.AssetAmountFromFloat(prev.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset)))
+	if closing && prev.CollateralAmount.Sign() > 0 {
+		_ = s.ledger.Unfreeze(userID, a.CollateralAsset, prev.CollateralAmount)
 	}
 	return nil
 }
 
-// accrue 按小时利率把利息累计到利息字段（就地修改 a）。
+// accrue 按小时利率把利息累计到利息字段（定点累加，避免 float 复利漂移）。
 func (s *Service) accrue(a *MarginAccount) {
 	now := time.Now()
 	hours := now.Sub(a.LastAccrual).Hours()
-	if hours > 0 && a.Debt > 0 {
-		a.InterestAccrued += a.Debt * s.cfg.HourlyRate * hours
+	if hours > 0 && a.Debt.Sign() > 0 {
+		dec := settlement.AssetDecimalsByName(a.Asset)
+		delta := settlement.AssetAmountFromFloat(a.Debt.HumanFloat()*s.cfg.HourlyRate*hours, dec)
+		a.InterestAccrued = a.InterestAccrued.Add(delta)
 		a.LastAccrual = now
 	} else if hours > 0 {
 		a.LastAccrual = now
@@ -230,11 +231,11 @@ func (s *Service) LiquidationPrice(userID int64, asset string) (float64, error) 
 		return 0, ErrAccountLiquidated
 	}
 	s.accrue(a)
-	if a.Debt <= 0 {
+	if a.Debt.IsZero() {
 		return 0, nil
 	}
 	// 抵押价值 /(债务 * 维持率)
-	return a.CollateralAmount / (a.Debt * s.cfg.MaintenanceRatio), nil
+	return a.CollateralAmount.HumanFloat() / (a.Debt.HumanFloat() * s.cfg.MaintenanceRatio), nil
 }
 
 // Liquidate 评估并在越界时执行强平：收回借出资产、罚没部分抵押入保险基金、剩余解冻。
@@ -271,10 +272,10 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 	}
 
 	// 计算强平动作金额。
-	collAmt := settlement.AssetAmountFromFloat(a.CollateralAmount, settlement.AssetDecimalsByName(a.CollateralAsset))
-	penaltyAmt := settlement.AssetAmountFromFloat(a.CollateralAmount*s.cfg.LiquidationPenalty, settlement.AssetDecimalsByName(a.CollateralAsset))
+	collAmt := a.CollateralAmount
+	penaltyAmt := settlement.AssetAmountFromFloat(a.CollateralAmount.HumanFloat()*s.cfg.LiquidationPenalty, settlement.AssetDecimalsByName(a.CollateralAsset))
 	avail, _, ok2 := s.ledger.Balance(userID, asset)
-	seize := settlement.AssetAmountFromFloat(a.Debt, settlement.AssetDecimalsByName(asset))
+	seize := a.Debt
 	if !ok2 || avail.Cmp(seize) < 0 {
 		seize = avail
 	}
@@ -282,9 +283,9 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 
 	// 先落终态，再动钱。
 	prev := *a
-	a.CollateralAmount = 0
-	a.Debt = 0
-	a.InterestAccrued = 0
+	a.CollateralAmount = settlement.AssetAmount{Decimals: settlement.AssetDecimalsByName(a.CollateralAsset)}
+	a.Debt = settlement.AssetAmount{Decimals: settlement.AssetDecimalsByName(a.Asset)}
+	a.InterestAccrued = settlement.AssetAmount{Decimals: settlement.AssetDecimalsByName(a.Asset)}
 	a.Status = StatusLiquidated
 	a.UpdatedAt = time.Now()
 	if err := s.store.UpsertAccount(a); err != nil {
@@ -298,7 +299,7 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 			return false, err
 		}
 	}
-	if prev.CollateralAmount > 0 {
+	if prev.CollateralAmount.Sign() > 0 {
 		if err := s.ledger.Unfreeze(userID, a.CollateralAsset, collAmt); err != nil {
 			// 解冻失败：恢复抵押与终态。
 			*a = prev
@@ -310,7 +311,7 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 	if penaltyAmt.Sign() > 0 {
 		if err := s.ledger.Transfer(userID, ledger.SysInsurance, a.CollateralAsset, penaltyAmt, "margin_liq_penalty", ref); err != nil {
 			// 罚没失败：重新冻结抵押并恢复终态。
-			if prev.CollateralAmount > 0 {
+			if prev.CollateralAmount.Sign() > 0 {
 				_ = s.ledger.Freeze(userID, a.CollateralAsset, collAmt)
 			}
 			*a = prev

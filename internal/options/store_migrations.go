@@ -47,6 +47,20 @@ var OptionsMigrations = []migrate.Migration{
 			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 		Down: `DROP TABLE IF EXISTS ce_option_positions`,
 	},
+	{
+		// F2：premium/margin 由 DOUBLE 改为 VARCHAR(64) 以字符串精确存储 AssetAmount.HumanString
+		// （最小单位十进制），避免 float64 列精度丢失；新增 quote_asset 列用于扫描时推导小数位。
+		Version: 9503,
+		Name:    "alter_ce_option_positions_fixedpoint",
+		Up: `ALTER TABLE ce_option_positions
+				ADD COLUMN quote_asset VARCHAR(16) NOT NULL DEFAULT '' AFTER quantity,
+				MODIFY premium VARCHAR(64) NOT NULL DEFAULT '0',
+				MODIFY margin  VARCHAR(64) NOT NULL DEFAULT '0'`,
+		Down: `ALTER TABLE ce_option_positions
+				MODIFY premium DOUBLE NOT NULL DEFAULT 0,
+				MODIFY margin  DOUBLE NOT NULL DEFAULT 0,
+				DROP COLUMN quote_asset`,
+	},
 }
 
 // NewMySQLStore 打开 MySQL 并跑迁移，返回 MySQL 版 Store。

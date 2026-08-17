@@ -56,7 +56,7 @@ func TestOpenLongPaysPremium(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open long: %v", err)
 	}
-	if p.Side != SideLong || p.Quantity != 2 || p.Premium != 1000 {
+	if p.Side != SideLong || p.Quantity != 2 || p.Premium.HumanFloat() != 1000 {
 		t.Fatalf("unexpected position: %+v", p)
 	}
 	// 用户可用扣 2*1000=2000；系统对手方收 2000。
@@ -78,8 +78,8 @@ func TestOpenShortFrozenAndReceivesPremium(t *testing.T) {
 		t.Fatalf("open short: %v", err)
 	}
 	// 保证金 = strike*size*qty*ratio = 40000*1*2*0.3 = 24000。
-	if p.Margin < 23999 || p.Margin > 24001 {
-		t.Fatalf("unexpected margin: %.4f", p.Margin)
+	if p.Margin.HumanFloat() < 23999 || p.Margin.HumanFloat() > 24001 {
+		t.Fatalf("unexpected margin: %.4f", p.Margin.HumanFloat())
 	}
 	avail, frozen, _ := l.Balance(uid, "USDT")
 	// 可用 = 100000 - 24000(冻结) + 2000(权利金) = 78000。

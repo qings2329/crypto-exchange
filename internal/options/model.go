@@ -11,6 +11,8 @@ package options
 import (
 	"errors"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // 领域错误。
@@ -107,14 +109,16 @@ type OptionPosition struct {
 	ContractID int64          `json:"contract_id"`
 	Side       PositionSide   `json:"side"`       // long(买方) / short(卖方)
 	Quantity   float64        `json:"quantity"`   // 持有张数
-	Premium    float64        `json:"premium"`    // 开仓权利金单价（每张）
-	Margin     float64        `json:"margin"`     // 卖方冻结的保证金（quote 计）
+	QuoteAsset string         `json:"quote_asset"` // 计价资产（premium/margin 的计价单位，扫描时推导小数位）
+	Premium    settlement.AssetAmount `json:"premium"` // 开仓权利金单价（每张，quote 计）
+	Margin     settlement.AssetAmount `json:"margin"`  // 卖方冻结的保证金（quote 计）
 	Status     PositionStatus `json:"status"`
 	OpenedAt   time.Time      `json:"opened_at"`
 	UpdatedAt  time.Time      `json:"updated_at"`
 }
 
-// PremiumTotal 返回该持仓支付/收取的权利金总额（quote 计）。
-func (p *OptionPosition) PremiumTotal() float64 {
-	return p.Premium * p.Quantity
+// PremiumTotal 返回该持仓支付/收取的权利金总额（quote 计，定点）。
+func (p *OptionPosition) PremiumTotal() settlement.AssetAmount {
+	dec := settlement.AssetDecimalsByName(p.QuoteAsset)
+	return settlement.AssetAmountFromFloat(p.Premium.HumanFloat()*p.Quantity, dec)
 }

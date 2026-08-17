@@ -67,7 +67,9 @@ func TestRedeemPaysYield(t *testing.T) {
 
 	// 直接构造一笔"已持有 1 年"的持仓以稳定测应计收益。
 	store := svc.store
-	h := &WealthHolding{UserID: 1, ProductID: p.ID, Principal: 1000, Status: HoldingActive,
+	h := &WealthHolding{UserID: 1, ProductID: p.ID, Asset: "USDT",
+		Principal: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		Status:    HoldingActive,
 		CreatedAt: time.Now().Add(-365 * 24 * time.Hour), LastAccrualAt: time.Now().Add(-365 * 24 * time.Hour)}
 	if err := store.CreateHolding(h); err != nil {
 		t.Fatalf("seed holding: %v", err)
@@ -117,7 +119,9 @@ func TestAccrueUpdatesYield(t *testing.T) {
 	p := mustProduct(svc, TypeCurrent, 0.876, 0, 100) // 876% 年化 => 1% 每小时
 
 	store := svc.store
-	h := &WealthHolding{UserID: 2, ProductID: p.ID, Principal: 1000, Status: HoldingActive,
+	h := &WealthHolding{UserID: 2, ProductID: p.ID, Asset: "USDT",
+		Principal: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		Status:    HoldingActive,
 		CreatedAt: time.Now().Add(-100 * time.Hour), LastAccrualAt: time.Now().Add(-100 * time.Hour)}
 	if err := store.CreateHolding(h); err != nil {
 		t.Fatalf("seed holding: %v", err)
@@ -132,16 +136,18 @@ func TestAccrueUpdatesYield(t *testing.T) {
 		t.Fatalf("accrued wrong: %.4f want ~10", total)
 	}
 	got, _ := svc.store.GetHolding(h.ID)
-	if got.AccruedYield < 9.9 || got.AccruedYield > 10.1 {
-		t.Fatalf("holding accrued_yield wrong: %.4f", got.AccruedYield)
+	if got.AccruedYield.HumanFloat() < 9.9 || got.AccruedYield.HumanFloat() > 10.1 {
+		t.Fatalf("holding accrued_yield wrong: %.4f", got.AccruedYield.HumanFloat())
 	}
 	_ = l
 }
 
 func TestYieldToPure(t *testing.T) {
-	h := &WealthHolding{Principal: 1000, LastAccrualAt: time.Now().Add(-100 * time.Hour)}
-	// 年化 0.876 => 0.01% 每小时 => 0.1/小时；100 小时收益 ≈10。
+	h := &WealthHolding{
+		Principal:      settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		LastAccrualAt: time.Now().Add(-100 * time.Hour)}
 	got := h.YieldTo(time.Now(), 0.876)
+	// 年化 0.876 => 0.01% 每小时 => 0.1/小时；100 小时收益 ≈10。
 	if got < 9.9 || got > 10.1 {
 		t.Fatalf("YieldTo wrong: %.4f want ~10", got)
 	}
@@ -152,7 +158,9 @@ func TestRedeemIdempotent(t *testing.T) {
 	svc, l := newTestService()
 	p := mustProduct(svc, TypeCurrent, 0.365, 0, 100) // 365% 年化
 	store := svc.store
-	h := &WealthHolding{UserID: 1, ProductID: p.ID, Principal: 1000, Status: HoldingActive,
+	h := &WealthHolding{UserID: 1, ProductID: p.ID, Asset: "USDT",
+		Principal: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("USDT")),
+		Status:    HoldingActive,
 		CreatedAt: time.Now().Add(-365 * 24 * time.Hour), LastAccrualAt: time.Now().Add(-365 * 24 * time.Hour)}
 	if err := store.CreateHolding(h); err != nil {
 		t.Fatalf("seed: %v", err)
