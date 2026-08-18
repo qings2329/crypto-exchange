@@ -30,6 +30,7 @@ func main() {
 	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN for copytrade persistence (overrides config)")
 	spotURL := flag.String("spot-url", "http://127.0.0.1:8082", "spot 服务基址（复制下单目标）")
 	futuresURL := flag.String("futures-url", "http://127.0.0.1:8084", "futures 服务基址")
+	addr := flag.String("addr", ":8099", "HTTP listen addr")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -115,9 +116,9 @@ func main() {
 		os.Exit(0)
 	}()
 
-	addr := ":8099"
-	log.Info("copytrade starting", zap.String("addr", addr))
-	if err := r.Run(addr); err != nil {
+	listenAddr := *addr
+	log.Info("copytrade starting", zap.String("addr", listenAddr))
+	if err := r.Run(listenAddr); err != nil {
 		log.Fatal("server exited", zap.Error(err))
 	}
 }
