@@ -24,6 +24,7 @@ const (
 	ChainETH  Chain = "ETH"
 	ChainTRON Chain = "TRON"
 	ChainBTC  Chain = "BTC"
+	ChainSOL  Chain = "SOL"
 )
 
 // emitSendTimeout 是 emit 向订阅者投递事件时的最大阻塞时长。订阅者因背压长期不消费时，
@@ -404,6 +405,10 @@ func GenerateAddress(userID int64, chain Chain) string {
 
 // mockDepositAddress 生成确定性的模拟充值地址（未配置 HD 派生时的 fail-degraded 占位）。
 func mockDepositAddress(userID int64, chain Chain) string {
+	if chain == ChainSOL {
+		// Solana 风格地址（ed25519 base58），即便未配置 HD 派生也给出真实形态地址。
+		return deriveSolanaAddress(userID)
+	}
 	h := sha256.Sum256([]byte(fmt.Sprintf("%d-%s", userID, chain)))
 	return fmt.Sprintf("%s_%s", chain, hex.EncodeToString(h[:])[:24])
 }

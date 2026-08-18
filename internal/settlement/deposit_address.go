@@ -78,6 +78,9 @@ func (g *DepositAddressGenerator) Address(userID int64, chain Chain) (string, er
 			return deriveP2PKHAddress(pub), nil
 		}
 		return deriveP2WPKHAddress(pub), nil
+	case ChainSOL:
+		// Solana 用 Ed25519，无法从 secp256k1 xpub 派生，按 userID 确定性派生（见 solana.go）。
+		return deriveSolanaAddress(userID), nil
 	default:
 		return "", fmt.Errorf("充值地址派生不支持链 %s", chain)
 	}
