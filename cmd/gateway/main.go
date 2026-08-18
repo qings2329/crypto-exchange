@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -65,6 +66,10 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		"/api/v1/market/depth",
 		"/api/v1/market/trades",
 		"/api/v1/market/klines",
+		// 管理后台（cmd/admin）用独立 admin token 鉴权，不走普通用户鉴权域；
+		// 整段豁免后由 admin 后端自行校验 admin token（零信任：后端二次校验）。
+		// 这样 web-admin 可经网关统一入口访问 /api/admin/*（含新增的 /api/admin/apikeys）。
+		"/api/admin",
 	))...)
 
 	// 反向代理工厂（含 WebSocket 升级透传）。
@@ -97,6 +102,14 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		r.Any(path, proxy(target))
 	}
 
+	// 管理后台（cmd/admin）反代：admin 是独立鉴权域（admin token），不在 cfg.Services 内，
+	// 故单独反代。目标地址由 admin.addr 推导（同机部署，演示/默认即 localhost:<port>）；
+	// 仅当配置了 admin.addr 才启用，未配置则与之前一致（admin 仅直连 :8095）。
+	// 边缘鉴权已在上方 AuthWithSkips 对 /api/admin 整段豁免，admin 后端再做 admin 鉴权。
+	if a := cfg.Admin.Addr; a != "" {
+		r.Any("/api/admin/*path", proxy(adminProxyTarget(a)))
+	}
+
 	// §18.1 网关层收敛：把撮合权威 cmd/matching 纳入网关统一入口，便于健康检查与
 	// 行情/订单查询的统一寻址；但只暴露只读/行情端点（depth/ws/orders/trades/health）。
 	// /order、/cancel、/match-now 等写端点刻意不代理——订单提交必须经 spot/futures，
@@ -113,6 +126,21 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 	}
 
 	return r
+}
+
+// adminProxyTarget 把 admin 监听地址（如 ":8095" 或 "127.0.0.1:8095"）推导为反代目标 URL。
+// admin 监听地址通常不含 scheme，这里补 http://；同机演示部署直接补 localhost。
+func adminProxyTarget(addr string) string {
+	switch {
+	case addr == "":
+		return ""
+	case strings.HasPrefix(addr, "http://"), strings.HasPrefix(addr, "https://"):
+		return addr
+	case strings.HasPrefix(addr, ":"):
+		return "http://localhost" + addr
+	default:
+		return "http://" + addr
+	}
 }
 
 // proxyWriter 包装 gin 的 ResponseWriter，安全补全 httputil.ReverseProxy 所需的接口。
