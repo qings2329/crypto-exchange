@@ -28,3 +28,6 @@ internal/otc/uploads/
 /copytrade
 /user
 /hsm-signing-service
+
+# agent worktree / 会话占位目录（非仓库内容）
+.codebuddy/
