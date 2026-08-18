@@ -138,6 +138,11 @@ func (s *mysqlStore) UpdateDelegation(d *StakingDelegation) error {
 	return err
 }
 
+func (s *mysqlStore) DeleteDelegation(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM ce_staking_delegations WHERE id = ?`, id)
+	return err
+}
+
 // ---- 奖励 ----
 
 func (s *mysqlStore) CreateReward(r *StakingReward) error {

@@ -93,6 +93,84 @@ func TestStakingLifecycle(t *testing.T) {
 	}
 }
 
+// TestSubscribeUniqueRefNoDoubleDedupe 验证 F1 修复：同一用户对同一产品多次质押，
+// 每笔委托的本金锁定 ref 锚定各自委托 ID（stake_lock:<id>），互不复用，故每笔都真实锁
+// 定本金、不漏锁。早期版本用 stake:<user>:<product> 作 ref，第二次质押会被账本幂等去重
+// 跳过、导致 SysStaking 少记本金——此处断言两笔均锁定。
+func TestSubscribeUniqueRefNoDoubleDedupe(t *testing.T) {
+	svc, l, store := newTestService()
+	dec := settlement.AssetDecimalsByName("ETH")
+	p := &StakingProduct{
+		Name: "ETH", Chain: "eth", Validator: "v", ContractAddr: "c",
+		Asset: "ETH", MinAmount: settlement.NewAssetAmount(big.NewInt(0), dec), Status: ProductActive,
+	}
+	if err := store.CreateProduct(p); err != nil {
+		t.Fatal(err)
+	}
+	seed := settlement.AssetAmountFromFloat(20, dec)
+	if err := l.ReceiveOnChain(1, "ETH", seed, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	amt := settlement.AssetAmountFromFloat(5, dec)
+	d1, err := svc.Subscribe(1, p.ID, amt)
+	if err != nil {
+		t.Fatalf("subscribe1: %v", err)
+	}
+	d2, err := svc.Subscribe(1, p.ID, amt)
+	if err != nil {
+		t.Fatalf("subscribe2: %v", err)
+	}
+	if d1.ID == d2.ID {
+		t.Fatal("expected distinct delegation IDs")
+	}
+	if sk, _, _ := l.Balance(ledger.SysStaking, "ETH"); sk.Cmp(settlement.AssetAmountFromFloat(10, dec)) != 0 {
+		t.Fatalf("SysStaking = %s, want 10 (two locks)", sk.HumanString())
+	}
+	if av, _, _ := l.Balance(1, "ETH"); av.Cmp(settlement.AssetAmountFromFloat(10, dec)) != 0 {
+		t.Fatalf("user balance = %s, want 10", av.HumanString())
+	}
+}
+
+// TestStakingReconcile 验证 F3 业务对账：完整生命周期后，在押本金与已归集奖励应分别与
+// SysStaking / SysStakingReward 账本账户逐笔对平（偏差全为 0）。
+func TestStakingReconcile(t *testing.T) {
+	svc, l, store := newTestService()
+	dec := settlement.AssetDecimalsByName("ETH")
+	p := &StakingProduct{
+		Name: "ETH", Chain: "eth", Validator: "v", ContractAddr: "c",
+		Asset: "ETH", MinAmount: settlement.NewAssetAmount(big.NewInt(0), dec), Status: ProductActive,
+	}
+	if err := store.CreateProduct(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.ReceiveOnChain(1, "ETH", settlement.AssetAmountFromFloat(10, dec), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	d, err := svc.Subscribe(1, p.ID, settlement.AssetAmountFromFloat(5, dec))
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if _, err := svc.Accrue(time.Now()); err != nil {
+		t.Fatalf("accrue: %v", err)
+	}
+	if _, err := svc.Unbond(1, d.ID); err != nil {
+		t.Fatalf("unbond: %v", err)
+	}
+	if _, err := svc.Release(1, d.ID); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	// 释放后委托已离开在押集合，账本应完全回零 -> 对账偏差为 0。
+	dev := svc.Reconcile()
+	for asset, v := range dev {
+		if v.Sign() != 0 {
+			t.Fatalf("reconcile deviation on %s = %s, want 0", asset, v.HumanString())
+		}
+	}
+	if !l.IsBalanced() {
+		t.Fatal("ledger not globally balanced after full lifecycle")
+	}
+}
+
 // TestSubscribeBelowMin 验证 F5 边界：低于起质押额被拒。
 func TestSubscribeBelowMin(t *testing.T) {
 	svc, _, store := newTestService()

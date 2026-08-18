@@ -24,6 +24,7 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 		api.GET("/holdings", s.handleMyDelegations)
 		api.GET("/admin/holdings", middleware.AdminGuard(), s.handleAdminDelegations)
 		api.POST("/admin/accrue", middleware.AdminGuard(), s.handleAccrue)
+		api.GET("/admin/reconcile", middleware.AdminGuard(), s.handleReconcile)
 	}
 }
 
@@ -190,4 +191,18 @@ func (s *Service) handleAccrue(c *gin.Context) {
 		return
 	}
 	response.JSON(c, gin.H{"accrued": total})
+}
+
+// handleReconcile 暴露质押业务对账结果（仅管理员，见 AdminGuard）：返回各资产偏差，
+// 全部为 0 表示业务托管/负债与账本系统账户逐笔对平（F3）。
+func (s *Service) handleReconcile(c *gin.Context) {
+	dev := s.Reconcile()
+	balanced := true
+	for _, v := range dev {
+		if v.Sign() != 0 {
+			balanced = false
+			break
+		}
+	}
+	response.JSON(c, gin.H{"balanced": balanced, "deviation": dev})
 }
