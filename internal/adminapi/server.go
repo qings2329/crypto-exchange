@@ -8,6 +8,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/coldlar/crypto-exchange/internal/announcement"
+	"github.com/coldlar/crypto-exchange/internal/apikeys"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -28,6 +29,7 @@ type Server struct {
 	catalog     CatalogStore   // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
 	annH       *announcement.Handler // 公告管理（与用户服务共用同一份 ce_announcements 表与迁移版本 9401）
 	auditStore AuditStore    // 管理员操作审计日志（MySQL 优先，失败回退内存）
+	apiKeyStore apikeys.Store // API Key 管理（管理员为任意用户签发/吊销）
 	loginLimiter *loginIPLimiter // 基于 IP 的登录限流（防单 IP 爆破 + 缓解账户锁定 DoS）
 }
 
@@ -96,6 +98,9 @@ func NewServer(cfg *config.Config) *Server {
 		log.Printf("[admin] WARNING: audit logs persisted in memory only; restart resets them. Configure mysql.dsn for real persistence.")
 	}
 
+	// API Key 管理存储：优先 MySQL；DSN 缺失或连接/迁移失败则降级为内存实现。
+	apiKeyStore := apikeys.NewStore(cfg.MySQL.DSN)
+
 	return &Server{
 		cfg:         cfg,
 		verifier:    verifier,
@@ -106,6 +111,7 @@ func NewServer(cfg *config.Config) *Server {
 		catalog:     catalog,
 		annH:        annH,
 		auditStore:  auditStore,
+		apiKeyStore: apiKeyStore,
 		loginLimiter: newLoginIPLimiter(
 			cfg.Admin.LoginRateLimitPerIP,
 			time.Duration(cfg.Admin.LoginRateWindowSec)*time.Second,
@@ -213,5 +219,14 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 
 		// 审计日志（需 audit:read 权限）
 		admin.GET("/audit-logs", middleware.RequirePerm(PermAuditRead), s.handleAuditLogs)
+
+		// API Key 管理（管理员为任意用户签发/吊销）。读需 apikey:read，签发/吊销需 apikey:manage（高危）。
+		apikeys := admin.Group("/apikeys", middleware.RequirePerm(PermApiKeyRead))
+		{
+			apikeys.GET("", s.listApiKeys)
+			apikeys.GET("/:id", s.getApiKey)
+			apikeys.POST("", middleware.RequirePerm(PermApiKeyManage), s.createApiKey)
+			apikeys.DELETE("/:id", middleware.RequirePerm(PermApiKeyManage), s.revokeApiKey)
+		}
 	}
 }

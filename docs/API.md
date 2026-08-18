@@ -496,6 +496,30 @@ go build -o bin/otc ./cmd/otc
 | PUT | `/api/admin/admins/:id` | 改派角色 / 改状态，`{ "role_id"?, "status"?" }` | `admin:manage` |
 | POST | `/api/admin/admins/:id/activate` · `/disable` · `/reset-password` | 激活 / 禁用 / 重置密码 | `admin:manage` |
 
+<a id="admin-apikeys"></a>
+## API Key 管理（cmd/admin）
+
+管理员可为任意用户签发 / 列出 / 查询 / 吊销 API Key。读操作受 `apikey:read` 守卫，
+签发与吊销受 `apikey:manage` 守卫（高危）。密钥采用「明文一次性返回 + 仅存哈希」模型：
+
+> 路由入口：接口同时可由管理后端直连（`cmd/admin :8095`，开发态 web-admin 经 `:5174` 代理）
+> 与经由统一网关（`/api/admin/apikeys`，网关对 `/api/admin` 整段豁免普通用户鉴权、改由
+> admin 后端校验 admin token）两种方式访问；网关层仍叠加安全头 / 审计等通用中间件。
+
+- 明文 Key 形如 `cxk_<prefix>_<secret>`，仅在**创建接口的响应**中返回一次；
+- 存储层只保存 `sha256(明文 Key)`（`key_hash`）与前缀 `prefix`，永不保存明文；
+- 校验方（网关 / 用户服务）拿到明文后解析 prefix+secret，重算哈希并经 `GetByKeyHash`
+  比对，并校验 `status == active`；本模块不提供在线校验接口，仅负责签发与吊销。
+
+| 方法 | 路径 | 说明 | 权限 |
+| --- | --- | --- | --- |
+| GET | `/api/admin/apikeys` | API Key 列表（分页包络 `{ "items": [...], "total": n }`），支持 `?user_id=` 过滤 | `apikey:read` |
+| POST | `/api/admin/apikeys` | 为某用户签发 Key，`{ "user_id": int, "label": string, "permissions"?: string[] }`；响应 `{ "key": "<明文，仅此一次>", "api_key": {...视图} }` | `apikey:manage` |
+| GET | `/api/admin/apikeys/:id` | 单条 Key 详情（视图不含 `key_hash`） | `apikey:read` |
+| DELETE | `/api/admin/apikeys/:id` | 吊销指定 Key（`status -> revoked`，记录 `revoked_at`）；已吊销返回 409，不存在返回 404 | `apikey:manage` |
+
+列表项 / 详情视图字段：`id, user_id, label, prefix, permissions[], status("active"|"revoked"),
+created_by, created_at, last_used_at?, revoked_at?`。吊销为软删除，保留审计轨迹。
 
 <a id="ann-frontend"></a>
 ## 公告前端对接
