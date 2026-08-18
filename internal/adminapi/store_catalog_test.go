@@ -136,7 +136,7 @@ func TestSeedCatalogIdempotent(t *testing.T) {
 	if syms, _ := s.ListSymbols(); len(syms) != 3 {
 		t.Fatalf("首次 seed 应写入 3 个交易对，实际 %d", len(syms))
 	}
-	if chs, _ := s.ListChains(); len(chs) != 3 {
+	if chs, _ := s.ListChains(); len(chs) != 5 {
 		t.Fatalf("首次 seed 应写入 3 条公链，实际 %d", len(chs))
 	}
 	// 再次 seed 不应重复（按 symbol 幂等 / 列表非 0 即跳过）。

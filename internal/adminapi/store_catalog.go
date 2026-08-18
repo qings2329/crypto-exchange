@@ -22,7 +22,7 @@ type CatalogStore interface {
 
 	// 公链
 	ListChains() ([]Chain, error)
-	CreateChain(ch Chain) (Chain, error)       // 分配 ID + UpdatedAt
+	CreateChain(ch Chain) (Chain, error)              // 分配 ID + UpdatedAt
 	UpdateChain(id int64, patch Chain) (Chain, error) // 部分更新；不存在返回 ErrCatalogNotFound
 
 	// 币种
@@ -231,6 +231,8 @@ func SeedCatalog(store CatalogStore) error {
 			{Name: "Bitcoin", Symbol: "BTC", Confirmations: 3, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
 			{Name: "Ethereum", Symbol: "ETH", Confirmations: 12, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
 			{Name: "Tron", Symbol: "TRX", Confirmations: 20, DepositEnabled: true, WithdrawEnabled: false, UpdatedAt: now},
+			{Name: "Litecoin", Symbol: "LTC", Confirmations: 6, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
+			{Name: "Dogecoin", Symbol: "DOGE", Confirmations: 6, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
 		} {
 			if _, err := store.CreateChain(ch); err != nil {
 				return err
@@ -243,6 +245,8 @@ func SeedCatalog(store CatalogStore) error {
 			{Symbol: "BTC", Name: "Bitcoin", Chain: "Bitcoin", Precision: 8, WithdrawFee: 0.0005, UpdatedAt: now},
 			{Symbol: "ETH", Name: "Ethereum", Chain: "Ethereum", Precision: 18, WithdrawFee: 0.01, UpdatedAt: now},
 			{Symbol: "USDT", Name: "Tether", Chain: "Ethereum", Precision: 6, WithdrawFee: 1, UpdatedAt: now},
+			{Symbol: "LTC", Name: "Litecoin", Chain: "Litecoin", Precision: 8, WithdrawFee: 0.001, UpdatedAt: now},
+			{Symbol: "DOGE", Name: "Dogecoin", Chain: "Dogecoin", Precision: 8, WithdrawFee: 1.0, UpdatedAt: now},
 		} {
 			if _, err := store.CreateCoin(c); err != nil {
 				return err
