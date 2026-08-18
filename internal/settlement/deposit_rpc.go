@@ -90,6 +90,8 @@ func (s *JSONRPCDepositScanner) scanChain(ctx context.Context, w DepositWatch) (
 		return s.scanBTC(ctx, w)
 	case ChainTRON:
 		return s.scanTRON(ctx, w)
+	case ChainSOL:
+		return s.scanSOL(ctx, w)
 	default:
 		return nil, fmt.Errorf("unsupported chain %s", w.Chain)
 	}

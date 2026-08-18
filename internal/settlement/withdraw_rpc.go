@@ -58,6 +58,11 @@ type HotWalletConfig struct {
 	// 自动构造并注册真实后端，无需部署方手写 RegisterExternalSigner）。敏感字段（endpoint
 	// 含访问凭据、public_key）经环境变量注入，不写进 configs/config.yaml。
 	HSM HSMConfig `yaml:"hsm"`
+	// SolanaKey 是 Solana（Ed25519）热钱包私钥（base58 或 hex），仅软件签名器演示用；生产
+	// 应替换为 HSM/KMS 后端（RegisterExternalSolanaSigner），私钥永不离开安全域。敏感字段经
+	// 环境变量 SOLANA_HOTWALLET_KEY 注入，不写进 configs/config.yaml。配了 SOL 端点且非空时，
+	// SOL 提现走「离线签名 → SendRaw」主路径；否则回退 fail-degraded。
+	SolanaKey string `yaml:"solana_key"`
 	// Deposit 是「给用户生成充值地址」的 HD 派生配置：进程只持账户级 xpub（HSM 导出），
 	// 按 userID 非硬化派生子地址。未配置 → GenerateAddress 回退确定性 mock（fail-degraded）。
 	// 敏感 xpub 经环境变量 DEPOSIT_XPUB 注入，不写进 configs/config.yaml。
@@ -119,8 +124,8 @@ type ETHStateSource interface {
 // SignerSources 是离线签名器可选的「外部状态源」集合：BTC 的 UTXO 源、ETH 的 Nonce/Gas 源、
 // TRON 的参考区块源。均为可选；未注入时签名器按 UnsignedTx 内联字段 / 配置默认值兜底（fail-degraded）。
 type SignerSources struct {
-	UTXOSource UTXOSource     // BTC 真实签名按自身地址向节点查询未花费输出（listunspent）。
-	ETHState   ETHStateSource // ETH 真实 Nonce/Gas 管理（eth_getTransactionCount / eth_gasPrice）。
+	UTXOSource UTXOSource      // BTC 真实签名按自身地址向节点查询未花费输出（listunspent）。
+	ETHState   ETHStateSource  // ETH 真实 Nonce/Gas 管理（eth_getTransactionCount / eth_gasPrice）。
 	TRONState  TRONStateSource // TRON 真实签名取参考区块/时间戳（getnowblock），签名哈希源。
 }
 
@@ -312,6 +317,16 @@ func (c *JSONRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string)
 			return "", fmt.Errorf("tron 广播被拒: code=%s message=%s", out.Code, out.Message)
 		}
 		return out.Txid, nil
+	case ChainSOL:
+		// rawHex 实为 SolanaSigner 产出的 base58 编码已签交易（Solana sendTransaction 默认收 base58）。
+		res, err := c.rpc(ctx, chain, "sendTransaction", []interface{}{
+			rawHex,
+			map[string]interface{}{"encoding": "base58", "skipPreflight": false},
+		})
+		if err != nil {
+			return "", err
+		}
+		return string(bytes.Trim(res, `"`)), nil
 	default:
 		return "", fmt.Errorf("unsupported chain %s", chain)
 	}
@@ -348,7 +363,7 @@ func (c *JSONRPCClient) NowBlock(ctx context.Context, chain Chain) (int64, strin
 		return 0, "", 0, err
 	}
 	var r struct {
-		BlockID string `json:"blockID"`
+		BlockID     string `json:"blockID"`
 		BlockHeader struct {
 			RawData struct {
 				Number    int64 `json:"number"`
@@ -482,6 +497,37 @@ func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash s
 			return conf, nil
 		}
 		return 0, nil
+	case ChainSOL:
+		// getSignatureStatuses 取该签名当前确认数（可能为 null→0）；链重组/节点偏差返回负值
+		// 时钳制为 0（#10），避免状态机误判已确认而提前入账。
+		res, err := c.rpc(ctx, chain, "getSignatureStatuses", []interface{}{
+			[]string{txHash},
+			map[string]interface{}{"searchTransactionHistory": true},
+		})
+		if err != nil {
+			return 0, err
+		}
+		var r struct {
+			Value []struct {
+				Confirmations      *int        `json:"confirmations"`
+				ConfirmationStatus string      `json:"confirmationStatus"`
+				Err                interface{} `json:"err"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal(res, &r); err != nil {
+			return 0, fmt.Errorf("solana 确认状态解析失败: %w", err)
+		}
+		if len(r.Value) == 0 || r.Value[0].Err != nil {
+			return 0, nil // 尚未上链 / 失败
+		}
+		conf := 0
+		if r.Value[0].Confirmations != nil {
+			conf = *r.Value[0].Confirmations
+		}
+		if conf < 0 { // 重组钳制（#10）
+			return 0, nil
+		}
+		return conf, nil
 	default:
 		return 0, fmt.Errorf("unsupported chain %s", chain)
 	}
@@ -596,6 +642,30 @@ func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Ch
 	return g.MockWithdrawGateway.SubmitWithdraw(userID, asset, chain, amount, fee, address, willFail)
 }
 
+// chainSigner 按链把离线签名路由到对应签名器：SOL 走 Ed25519（SolanaSigner），其余走
+// secp256k1 真实签名器（realSigner，覆盖 ETH/BTC/TRON）。让单一网关既能处理 SOL 又能处理
+// 既有链，无需为 SOL 单独改造 SubmitWithdraw 的调用路径。
+type chainSigner struct {
+	base Signer // ETH/BTC/TRON（secp256k1 realSigner；可为 nil）
+	sol  Signer // SOL（Ed25519 SolanaSigner；可为 nil——未配置时 SOL 提现回退 fail-degraded）
+}
+
+func (c *chainSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
+	if tx.Chain == ChainSOL {
+		if c.sol == nil {
+			return "", fmt.Errorf("SOL 离线签名器未配置（需 SOLANA_HOTWALLET_KEY）")
+		}
+		return c.sol.Sign(ctx, tx)
+	}
+	if c.base == nil {
+		return "", fmt.Errorf("离线签名器未配置")
+	}
+	return c.base.Sign(ctx, tx)
+}
+
+// 确保 chainSigner 实现 Signer 接口（编译期检查）。
+var _ Signer = (*chainSigner)(nil)
+
 // NewWithdrawGateway 按配置选择链上提现网关实现：启用且配置了 RPC 端点时返回
 // RPCWithdrawGateway（真实广播 + 真实确认轮询），否则返回 MockWithdrawGateway（全部模拟）。
 func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
@@ -625,10 +695,20 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 		if _, ok := conf.Endpoints[string(ChainTRON)]; ok {
 			sources.TRONState = client // *JSONRPCClient 实现 TRONStateSource（getnowblock）
 		}
+		// 离线签名器：secp256k1（ETH/BTC/TRON）为基座；若配置了 SOL 端点与 SOL 私钥，
+		// 叠加 Ed25519 签名器并按链分发（chainSigner）。未配 SOL 私钥时 SOL 提现回退 fail-degraded。
+		signer := NewSignerWithSource(conf.HotWallet, sources)
+		if _, ok := conf.Endpoints[string(ChainSOL)]; ok && conf.HotWallet.SolanaKey != "" {
+			if solSigner, err := NewSolanaSigner(conf.HotWallet.SolanaKey); err == nil {
+				// 注入最近区块哈希来源（真实节点 getLatestBlockhash）；离线/不可达由签名器 fail-degraded。
+				solSigner.SetBlockhashSource(client.SolanaRecentBlockHash)
+				signer = &chainSigner{base: signer, sol: solSigner}
+			}
+		}
 		return &RPCWithdrawGateway{
 			MockWithdrawGateway: mg,
 			client:              client,
-			signer:              NewSignerWithSource(conf.HotWallet, sources),
+			signer:              signer,
 		}
 	}
 	// 离线签名边界未启用（纯 mock 网关）时也尝试装配 HD 充值地址派生（配置驱动）。

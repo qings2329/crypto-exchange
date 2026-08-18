@@ -241,6 +241,12 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("DEPOSIT_XPUB"); v != "" {
 		c.Settlement.ChainRPC.HotWallet.Deposit.XPUB = v
 	}
+	// Solana（Ed25519）热钱包私钥（软件签名器演示用）。敏感信息从环境变量注入，不写进
+	// configs/config.yaml；生产应替换为 HSM/KMS 后端（RegisterExternalSolanaSigner）。
+	// 仅当同时配置了 CHAIN_RPC_ENDPOINT_SOL 时，SOL 提现才走离线签名主路径。
+	if v := os.Getenv("SOLANA_HOTWALLET_KEY"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.SolanaKey = v
+	}
 	return &c, nil
 }
 
