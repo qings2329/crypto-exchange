@@ -49,9 +49,13 @@ func NewService(store Store, l *ledger.Ledger, backend ChainBackend, cfg Config,
 	return &Service{store: store, ledger: l, backend: backend, cfg: cfg, log: log}
 }
 
-// Subscribe 用户委托质押：校验 -> 账本锁定本金(SysStaking) -> 链上质押广播 -> 落委托。
-// F2 定点：金额全 AssetAmount；F5 校验：正数/起质押额/资产白名单；F3 原子：锁本金与链上广播
-// 任一失败均回退账本（方向相反，指纹不同，不会被账本幂等去重误吞）。
+// Subscribe 用户委托质押：校验 -> 落委托(占唯一ID) -> 账本锁定本金(SysStaking) -> 链上质押广播。
+// F1 幂等：本金锁定的 ref 锚定到具体委托 ID（stake_lock:<id>），与委托一一对应；
+//   解锁/重质押均生成新委托与新 ref，不会被账本历史指纹误去重而漏锁（早期版本用
+//   stake:<user>:<product> 作 ref，用户解质押后再质押同产品时 ref 已持久化，导致新委托
+//   本金未被锁定、账本少记本金——已修复）。重试同一委托因 ref 已落库而安全跳过。
+// F2 定点：金额全 AssetAmount；F5 校验：正数/起质押额/资产白名单；F3 原子：任一环节失败
+//   均回退（方向相反、biz 不同，指纹不同，不被去重误吞）并删除半成品委托。
 func (s *Service) Subscribe(userID, productID int64, amount settlement.AssetAmount) (*StakingDelegation, error) {
 	if amount.Sign() <= 0 {
 		return nil, ErrInvalidAmount
@@ -71,31 +75,37 @@ func (s *Service) Subscribe(userID, productID int64, amount settlement.AssetAmou
 		return nil, ErrBelowMinAmount
 	}
 
-	ref := fmt.Sprintf("stake:%d:%d", userID, productID)
-	// 1) 账本锁定本金。
-	if err := s.ledger.Transfer(userID, ledger.SysStaking, p.Asset, amount, "stake_lock", ref); err != nil {
-		return nil, err
-	}
-	// 2) 链上质押广播。
-	txHash, err := s.backend.Stake(context.Background(), p.Chain, p.ContractAddr,
-		fmt.Sprintf("%d", userID), p.Validator, amount)
-	if err != nil {
-		// 回退锁定的本金（方向相反，指纹不同，不被去重）。
-		_ = s.ledger.Transfer(ledger.SysStaking, userID, p.Asset, amount, "stake_lock_revert", ref)
-		return nil, fmt.Errorf("stake on chain: %w", err)
-	}
-	// 3) 落委托。
+	// 1) 先落委托占得稳定唯一 ID，作为后续锁本金的幂等锚点。
 	d := &StakingDelegation{
 		UserID:    userID,
 		ProductID: productID,
 		Principal:  amount,
 		Status:     DelegationActive,
-		TxHash:     txHash,
 		CreatedAt:  time.Now().Unix(),
 	}
 	if err := s.store.CreateDelegation(d); err != nil {
-		// 委托落库失败：回退本金。
+		return nil, err
+	}
+	ref := fmt.Sprintf("stake_lock:%d", d.ID)
+	// 2) 账本锁定本金（ref 唯一，幂等安全）。
+	if err := s.ledger.Transfer(userID, ledger.SysStaking, p.Asset, amount, "stake_lock", ref); err != nil {
+		_ = s.store.DeleteDelegation(d.ID)
+		return nil, err
+	}
+	// 3) 链上质押广播。
+	txHash, err := s.backend.Stake(context.Background(), p.Chain, p.ContractAddr,
+		fmt.Sprintf("%d", userID), p.Validator, amount)
+	if err != nil {
+		// 回退锁定的本金（方向相反、biz 不同，指纹不同，不被去重）。
 		_ = s.ledger.Transfer(ledger.SysStaking, userID, p.Asset, amount, "stake_lock_revert", ref)
+		_ = s.store.DeleteDelegation(d.ID)
+		return nil, fmt.Errorf("stake on chain: %w", err)
+	}
+	d.TxHash = txHash
+	if err := s.store.UpdateDelegation(d); err != nil {
+		// 委托落库失败：回退本金并删除半成品委托。
+		_ = s.ledger.Transfer(ledger.SysStaking, userID, p.Asset, amount, "stake_lock_revert", ref)
+		_ = s.store.DeleteDelegation(d.ID)
 		return nil, err
 	}
 	return d, nil
@@ -216,6 +226,46 @@ func (s *Service) Accrue(now time.Time) (settlement.AssetAmount, error) {
 		total = total.Add(rew)
 	}
 	return total, nil
+}
+
+// Reconcile 业务对账（F3）：校验「在押委托本金之和 == SysStaking 余额」且
+// 「已归集奖励之和 == SysStakingReward 余额」，返回各资产偏差（0 表示平衡）。
+// 偏差非 0 意味着业务状态与账本不一致，应触发告警排查。与全局账本复式平衡探针互补：
+// 全局探针只保证借贷和为 0，本方法进一步保证业务托管/负债与账本账户逐笔对平。
+func (s *Service) Reconcile() map[string]settlement.AssetAmount {
+	dev := make(map[string]settlement.AssetAmount)
+	delegs, err := s.store.ListAllDelegations()
+	if err != nil {
+		return dev
+	}
+	wantStaking := make(map[string]settlement.AssetAmount)
+	wantReward := make(map[string]settlement.AssetAmount)
+	for _, d := range delegs {
+		p, perr := s.store.GetProduct(d.ProductID)
+		if perr != nil {
+			continue
+		}
+		// 仅未释放（active/unbonding）委托仍在账本占用本金/累积未付奖励负债；
+		// 已释放(unbonded)委托的本金与奖励已在 Release 时发还用户，不再计入应负债。
+		if d.Status == DelegationActive || d.Status == DelegationUnbonding {
+			wantStaking[p.Asset] = wantStaking[p.Asset].Add(d.Principal)
+			rews, _ := s.store.ListRewardsByDelegation(d.ID)
+			for _, r := range rews {
+				wantReward[p.Asset] = wantReward[p.Asset].Add(r.Amount)
+			}
+		}
+	}
+	for asset, want := range wantStaking {
+		av, fr, _ := s.ledger.Balance(ledger.SysStaking, asset)
+		got := av.Add(fr)
+		dev[asset] = dev[asset].Add(got.Sub(want))
+	}
+	for asset, want := range wantReward {
+		av, fr, _ := s.ledger.Balance(ledger.SysStakingReward, asset)
+		got := av.Add(fr)
+		dev[asset] = dev[asset].Add(got.Sub(want))
+	}
+	return dev
 }
 
 // RunLoop 后台奖励归集循环（ticker 驱动），ctx 取消即退出。

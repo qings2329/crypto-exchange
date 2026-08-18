@@ -14,6 +14,7 @@ type Store interface {
 	ListDelegationsByUser(uid int64) ([]*StakingDelegation, error)
 	ListAllDelegations() ([]*StakingDelegation, error)
 	UpdateDelegation(d *StakingDelegation) error
+	DeleteDelegation(id int64) error
 
 	// 奖励
 	CreateReward(r *StakingReward) error

@@ -131,6 +131,14 @@ func (s *mysqlStore) ListOrdersByStrategy(sid int64) ([]*BotOrder, error) {
 	return scanOrders(rows)
 }
 
+func (s *mysqlStore) CountOrdersByStrategy(sid int64) (int64, error) {
+	var n int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM ce_bot_orders WHERE strategy_id = ?`, sid).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // ---- 扫描辅助 ----
 
 func scanStrategy(row *sql.Row) (*BotStrategy, error) {

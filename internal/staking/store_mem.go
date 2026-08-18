@@ -122,6 +122,16 @@ func (m *MemStore) ListAllDelegations() ([]*StakingDelegation, error) {
 	return out, nil
 }
 
+func (m *MemStore) DeleteDelegation(id int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.delegations[id]; !ok {
+		return ErrDelegationNotFound
+	}
+	delete(m.delegations, id)
+	return nil
+}
+
 func (m *MemStore) UpdateDelegation(d *StakingDelegation) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

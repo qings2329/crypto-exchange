@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -102,13 +102,11 @@ type Config struct {
 
 // Service 交易机器人服务。
 type Service struct {
-	store  Store
-	price  PriceSource
-	exec   OrderExecutor
-	cfg    Config
-	log    *zap.Logger
-	mu     sync.Mutex
-	rounds map[int64]int64 // strategyID -> 已执行轮次（F1 幂等 / 越仓控制）
+	store Store
+	price PriceSource
+	exec  OrderExecutor
+	cfg   Config
+	log   *zap.Logger
 }
 
 // NewService 构造机器人服务。
@@ -119,7 +117,7 @@ func NewService(store Store, price PriceSource, exec OrderExecutor, cfg Config, 
 	if exec == nil {
 		exec = NewHTTPExecutor("", "")
 	}
-	return &Service{store: store, price: price, exec: exec, cfg: cfg, log: log, rounds: map[int64]int64{}}
+	return &Service{store: store, price: price, exec: exec, cfg: cfg, log: log}
 }
 
 // CreateStrategy 创建策略（F5 参数校验），默认 stopped，需显式启动。
@@ -216,14 +214,18 @@ func (s *Service) Tick(ctx context.Context, id int64) error {
 }
 
 // tick 执行单个策略的一轮：依类型产生下单信号，代用户下单。
-// F1 幂等：client_oid = bot:strategyID:round，下游 spot/futures 后端去重；
-// F4 授权：代下单用策略绑定的用户 token，下游校验 token->userID，杜绝越权；
-// F5/越仓：累计额达 MaxPosition 即暂停本轮。
+// F1 幂等：client_oid = bot:strategyID:round，round 取「该策略已持久化订单数」——
+//   订单成功入库后计数才增长，故 CreateOrder 失败重试时复用同一 client_oid，被下游 spot/futures
+//   幂等去重、不会重复下单；进程重启后从 DB 续接，不会与历史 client_oid 碰撞漏单；并发两轮以同一
+//   序号下单同样被下游去重。F4 授权：代下单用策略绑定的用户 token，下游校验 token->userID，杜绝越权。
+// F5/越仓：累计额达 MaxPosition 即暂停本轮；行情非法（NaN/Inf/非正）拒绝本轮下单。
 func (s *Service) tick(st *BotStrategy) error {
-	s.mu.Lock()
-	round := s.rounds[st.ID]
-	s.rounds[st.ID] = round + 1
-	s.mu.Unlock()
+	// F1：以持久化订单数作为本轮序号（成功入库才增长）。
+	count, err := s.store.CountOrdersByStrategy(st.ID)
+	if err != nil {
+		return err
+	}
+	round := count
 
 	if st.Params.MaxPosition > 0 && float64(round)*st.Params.OrderAmount >= st.Params.MaxPosition {
 		return nil
@@ -232,11 +234,15 @@ func (s *Service) tick(st *BotStrategy) error {
 	price := 0.0
 	switch st.Type {
 	case StrategyGrid, StrategyDCA, StrategyMA:
-		p, err := s.price.Price(string(st.Market), st.Symbol)
-		if err != nil {
-			return err
+		p, perr := s.price.Price(string(st.Market), st.Symbol)
+		if perr != nil {
+			return perr
 		}
 		price = p
+	}
+	// F5：行情非法（NaN/Inf/非正）直接拒绝本轮，避免脏价透传至下单与 qty 计算。
+	if math.IsNaN(price) || math.IsInf(price, 0) || price <= 0 {
+		return fmt.Errorf("bot: invalid price %.8f for %s", price, st.Symbol)
 	}
 
 	qty := st.Params.OrderAmount / maxf(price, 1e-8)

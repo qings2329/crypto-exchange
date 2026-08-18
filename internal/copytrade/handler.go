@@ -30,6 +30,7 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 		api.GET("/admin/copies", middleware.AdminGuard(), s.handleAdminCopies)
 		// 管理：在没有 Kafka 的环境下手动注入一笔撮合成交流以驱动复制（等价于发布到 exchange.trades）。
 		api.POST("/admin/simulate-trade", middleware.AdminGuard(), s.handleSimulateTrade)
+		api.GET("/admin/reconcile", middleware.AdminGuard(), s.handleReconcile)
 	}
 }
 
@@ -43,6 +44,10 @@ func (s *Service) handleSimulateTrade(c *gin.Context) {
 	}
 	if ev.Symbol == "" || ev.Price <= 0 || ev.Qty <= 0 {
 		response.Error(c, 400, 4001, "symbol/price/qty required")
+		return
+	}
+	if !validTradeEvent(ev) {
+		response.Error(c, 400, 4001, "invalid trade event (nan/inf/non-positive)")
 		return
 	}
 	s.OnTrade(c.Request.Context(), ev)
@@ -192,4 +197,18 @@ func (s *Service) handleAdminCopies(c *gin.Context) {
 		return
 	}
 	response.JSON(c, gin.H{"copies": list})
+}
+
+// handleReconcile 暴露跟单业务对账结果（仅管理员，见 AdminGuard）：返回各计价资产复制费
+// 偏差，全部为 0 表示平台复制费记账与 SysCopyTradeFee 账本账户逐笔对平（F3）。
+func (s *Service) handleReconcile(c *gin.Context) {
+	dev := s.Reconcile()
+	balanced := true
+	for _, v := range dev {
+		if v.Sign() != 0 {
+			balanced = false
+			break
+		}
+	}
+	response.JSON(c, gin.H{"balanced": balanced, "deviation": dev})
 }
