@@ -705,3 +705,13 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 > 资金安全：复制下单全部资金动作经 spot/futures 后端（F1/F4 复用）；平台复制费以 `settlement.AssetAmount` 定点（F2）从粉丝账户结算入 `SysCopyTradeFee`，幂等引用防双付（F1）；`processed` map + 库唯一键双重去重（F1 纵深）；非标准/未知计价资产的成交跳过（F5）。v1 仅支持现货跟单（`DefaultMarket=spot`），期货跟单为后续扩展。
 
 **验证（三条新业务线）**：`go build ./...` 全绿；`go vet` 新包无告警；`go test ./...` 全绿（含 `internal/staking`/`internal/bot`/`internal/copytrade` 的 F1–F5 专项用例）；`configs/config.yaml` 的 `services` 段已注册 `staking`(:8097)/`bot`(:8098)/`copytrade`(:8099) 经网关统一反代。
+
+## 31. 跨服务端到端测试（e2e，2026-08-18，已完成）
+
+新增 `e2e/e2e_test.go`（`scripts/e2e.sh` 包装）：在进程内以独立 `httptest` 服务拉起「下游 spot 订单服务」与 bot/copytrade 路由，二者**共享同一 `TokenVerifier`**，走真实 HTTP 验证跨服务资金安全不变量。
+
+- **下游 spot 订单桩**复刻 spot/futures `/api/v1/<market>/order` 契约：真实校验 Bearer token（F4）、记录每笔委托（含解析出的 `user_id`）并返回 `order_id`；不依赖 MySQL/Kafka，任意环境可跑。
+- `TestBotCrossServiceE2E`：用户经 bot 创建 DCA 策略并授权 token → `Tick` 强制驱动一轮 → 断言下游记录 1 笔委托，且 `user_id==42`（F4 token 透传解析正确，无越权）、`client_oid` 前缀 `bot:<id>:`（F1 幂等键落地）、订单参数正确；另验证他人启动被拒（F4 越权）。
+- `TestCopytradeCrossServiceE2E`：用户 10 注册带单 + 用户 7 关注并授权 → `OnTrade`（即订阅者回调入口）模拟用户 10 作为 taker 的成交 → 断言下游记录 1 笔**粉丝(用户 7)**委托（F4：以粉丝身份下单而非 lead）、方向与 lead 一致、`client_oid` 前缀 `copytrade:`（F1）；平台复制费 10 USDT 定点结算入 `SysCopyTradeFee`；重复事件不再复制（F1 幂等）。
+
+> 该 e2e 覆盖 bot→spot 与 copytrade→spot 两条真实跨服务 HTTP 边界；staking 为服务内复式记账（自身账本，无外部资金依赖），故未纳入跨服务 e2e。运行：`go test ./e2e/...` 或 `./scripts/e2e.sh -v`。
