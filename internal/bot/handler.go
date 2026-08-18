@@ -23,7 +23,24 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 		api.GET("/strategies/:id/orders", s.handleListOrders)
 		// 管理：全量策略查看（运维/风控用途）。
 		api.GET("/admin/strategies", middleware.AdminGuard(), s.handleAdminStrategies)
+		// 管理：强制触发一轮指定策略的下单（等价于后台 Run 循环的一轮），供集成测试/调试驱动；
+		// 仅对 active 策略生效（Service.Tick 内部校验）。
+		api.POST("/admin/strategies/:id/tick", middleware.AdminGuard(), s.handleAdminTick)
 	}
+}
+
+// handleAdminTick 供运维/调试强制驱动一轮指定策略的下单（跨服务集成测试的确定性触发点）。
+func (s *Service) handleAdminTick(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		response.Error(c, 400, 4001, "invalid id")
+		return
+	}
+	if err := s.Tick(c.Request.Context(), id); err != nil {
+		response.Error(c, 400, 4002, err.Error())
+		return
+	}
+	response.JSON(c, gin.H{"id": id, "status": "tick submitted"})
 }
 
 type createStrategyReq struct {
