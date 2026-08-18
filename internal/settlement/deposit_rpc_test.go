@@ -2,6 +2,7 @@ package settlement
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -132,6 +133,71 @@ func TestJSONRPCDepositScannerETH(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("no deposit event scanned from node")
+	}
+}
+
+// TestJSONRPCDepositScannerERC20 用 httptest 模拟节点 eth_getLogs 响应，验证 scanETH 的
+// ERC20 分支：按代币合约地址（非用户地址）过滤、用 Transfer 事件 topics 过滤 to==观察地址，
+// 并以配置 decimals 正确缩放日志 value。data 0x16e360 = 1500000 最小单位，decimals=6 → 1.5 USDT。
+func TestJSONRPCDepositScannerERC20(t *testing.T) {
+	const watchAddr = "0x1111111111111111111111111111111111111111"
+	const token = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+	toTopic := "0x0000000000000000000000001111111111111111111111111111111111111111"
+
+	var gotAddr, gotTopic string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Params []struct {
+				Address string   `json:"address"`
+				Topics  []string `json:"topics"`
+			} `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if len(req.Params) > 0 {
+			gotAddr = req.Params[0].Address
+			if len(req.Params[0].Topics) >= 3 {
+				gotTopic = req.Params[0].Topics[2]
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[` +
+			`{"transactionHash":"0xusdt1","data":"0x16e360"}` +
+			`]}`))
+	}))
+	defer srv.Close()
+
+	sc := NewJSONRPCDepositScanner(
+		NewJSONRPCClient(map[string]string{"ETH": srv.URL}),
+		[]DepositWatch{{Chain: ChainETH, Address: watchAddr, UserID: 9, Asset: "USDT", Token: token, Decimals: 6}},
+		20*time.Millisecond,
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := sc.Scan(ctx)
+	if err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		// 首次扫描已完成，eth_getLogs 请求参数（合约地址 + toTopic）必然已捕获。
+		if gotAddr != token {
+			t.Fatalf("eth_getLogs address should be token contract %q, got %q", token, gotAddr)
+		}
+		if gotTopic != toTopic {
+			t.Fatalf("eth_getLogs toTopic should be %q, got %q", toTopic, gotTopic)
+		}
+		if ev.UserID != 9 || ev.Asset != "USDT" || ev.Chain != ChainETH {
+			t.Fatalf("unexpected event identity: %+v", ev)
+		}
+		if !amtEq(ev.Amount, 1.5) {
+			t.Fatalf("expected amount 1.5 USDT (1500000 base units @6 decimals), got %v", ev.Amount)
+		}
+		if !strings.EqualFold(ev.TxHash, "0xusdt1") {
+			t.Fatalf("unexpected tx hash: %q", ev.TxHash)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no ERC20 deposit event scanned from node")
 	}
 }
 

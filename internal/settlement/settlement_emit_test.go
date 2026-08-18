@@ -92,3 +92,93 @@ func TestEmitBackpressureNotSilent(t *testing.T) {
 	}
 	_ = ch
 }
+
+// captureLog 临时把标准 logger 输出重定向到 buf，返回还原函数。多个提现日志测试复用。
+func captureLog(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	return buf, func() {
+		log.SetOutput(os.Stderr)
+		log.SetFlags(log.LstdFlags)
+	}
+}
+
+// TestWithdrawCreditedLogsMilestone 验证提现达最终确认时输出 credited 里程碑日志
+// （资金离场审计线索），而非在订阅健康时完全无声。
+func TestWithdrawCreditedLogsMilestone(t *testing.T) {
+	g := NewMockWithdrawGateway(1, time.Hour) // required=1，单次 tick 即 credited
+	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 10), AssetAmount{}, "addr", false); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	buf, restore := captureLog(t)
+	defer restore()
+	g.Tick() // -> broadcasting
+	g.Tick() // -> credited（模拟确认 +1/ tick，故需两次）
+	if !strings.Contains(buf.String(), "withdraw credited") {
+		t.Fatalf("提现达最终确认应输出 credited 里程碑日志，实际: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "withdraw broadcasting") {
+		t.Fatalf("提现进入确认追踪应输出 broadcasting 日志，实际: %q", buf.String())
+	}
+}
+
+// TestWithdrawReorgLogsRollback 验证已确认提现被重组丢弃时网关输出 WARN 回滚日志
+// （驱动账本 ReverseWithdraw 回拨的审计线索），而非静默。
+func TestWithdrawReorgLogsRollback(t *testing.T) {
+	g := NewMockWithdrawGateway(1, time.Hour)
+	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 10), AssetAmount{}, "addr", false); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	g.Tick() // -> broadcasting
+	g.Tick() // -> credited（模拟确认 +1/ tick，故需两次）
+	if len(g.WithdrawHistory()) == 0 || g.WithdrawHistory()[0].Status != WithdrawCredited {
+		t.Fatal("期望 reorg 前已 credited")
+	}
+	buf, restore := captureLog(t)
+	defer restore()
+	if _, err := g.WithdrawReorg(g.WithdrawHistory()[0].TxHash); err != nil {
+		t.Fatalf("reorg: %v", err)
+	}
+	if !strings.Contains(buf.String(), "REORG rollback") {
+		t.Fatalf("credited 提现重组应输出 REORG rollback WARN 日志，实际: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "ledger reversal required") {
+		t.Fatalf("回滚日志应标注需账本回拨，实际: %q", buf.String())
+	}
+}
+
+// TestWithdrawReorgDepthLogsRollback 验证深度组逐笔输出回滚 WARN 并附汇总日志。
+func TestWithdrawReorgDepthLogsRollback(t *testing.T) {
+	g := NewMockWithdrawGateway(2, time.Hour) // required=2
+	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 10), AssetAmount{}, "a", false); err != nil {
+		t.Fatalf("submit1: %v", err)
+	}
+	if _, err := g.SubmitWithdraw(2, "ETH", ChainETH, amt(ChainETH, 1), AssetAmount{}, "b", false); err != nil {
+		t.Fatalf("submit2: %v", err)
+	}
+	g.Tick() // height=1: broadcasting (conf 1)
+	g.Tick() // height=2: credited (conf 2)
+	credited := 0
+	for _, ev := range g.WithdrawHistory() {
+		if ev.Status == WithdrawCredited {
+			credited++
+		}
+	}
+	if credited != 2 {
+		t.Fatalf("期望 2 笔 credited，实际 %d", credited)
+	}
+	buf, restore := captureLog(t)
+	defer restore()
+	rolled := g.WithdrawReorgDepth(1) // 回退最近 1 区块（height=2 的两笔）
+	if len(rolled) != 2 {
+		t.Fatalf("期望深度重组回滚 2 笔，实际 %d", len(rolled))
+	}
+	if !strings.Contains(buf.String(), "REORG rollback") {
+		t.Fatalf("深度重组应逐笔输出 REORG rollback 日志，实际: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "depth reorg applied") {
+		t.Fatalf("深度重组应输出汇总日志，实际: %q", buf.String())
+	}
+}

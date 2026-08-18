@@ -156,6 +156,20 @@ func (s *realSigner) signETH(ctx context.Context, tx *UnsignedTx) (string, error
 		return "", err
 	}
 	valueWei := amountToWei(tx.Amount)
+	data := tx.Data
+	// ERC20 提现：to=代币合约、value=0、data=transfer(用户地址, 金额) 编码；gas 用 ERC20 典型值。
+	if tx.ContractAddress != "" {
+		contractBytes, err := parseETHAddress(tx.ContractAddress)
+		if err != nil {
+			return "", fmt.Errorf("invalid ERC20 contract address %q: %w", tx.ContractAddress, err)
+		}
+		toBytes = contractBytes
+		valueWei = big.NewInt(0)
+		data = encodeERC20Transfer(tx.To, tx.Amount)
+		if gasLimit == 0 {
+			gasLimit = 65000 // ERC20 transfer 典型 gas（覆盖原生默认 21000）
+		}
+	}
 
 	// 待签摘要：对未签字段做 RLP 编码后取 Keccak-256。EIP-155 下列表含 chainID 与两个 0 占位，
 	// legacy（chainID==0）下不含这三项。
@@ -165,7 +179,7 @@ func (s *realSigner) signETH(ctx context.Context, tx *UnsignedTx) (string, error
 		rlpBigInt(new(big.Int).SetUint64(gasLimit)),
 		rlpAddress(toBytes),
 		rlpBigInt(valueWei),
-		rlpBytes(tx.Data),
+		rlpBytes(data),
 	}
 	if chainID != 0 {
 		unsignedFields = append(unsignedFields,
@@ -210,7 +224,7 @@ func (s *realSigner) signETH(ctx context.Context, tx *UnsignedTx) (string, error
 		rlpBigInt(new(big.Int).SetUint64(gasLimit)),
 		rlpAddress(toBytes),
 		rlpBigInt(valueWei),
-		rlpBytes(tx.Data),
+		rlpBytes(data),
 		rlpBigInt(v),
 		rlpBigInt(r),
 		rlpBytes(sBytes),
@@ -261,6 +275,25 @@ func parseETHAddress(s string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid ETH address %q", s)
 	}
 	return b, nil
+}
+
+// leftPad32 把字节串左补 0 到 32 字节（右对齐），用于 ABI 编码定长类型（address/uint256）。
+func leftPad32(b []byte) []byte {
+	if len(b) >= 32 {
+		return b[len(b)-32:] // 超长截断高位（uint256 溢出情形，按 EVM 语义保留低 32 字节）
+	}
+	out := make([]byte, 32)
+	copy(out[32-len(b):], b)
+	return out
+}
+
+// encodeERC20Transfer 编码 ERC20 transfer(to, amount) 调用数据：4 字节 selector
+// (0xa9059cbb) + leftPad32(to) + leftPad32(amount 最小单位整数)。amount.Value 须为代币最小单位
+// 整数（由上游 ToDecimals 保证），无需再缩放。
+func encodeERC20Transfer(to string, amount AssetAmount) []byte {
+	toB, _ := parseETHAddress(to)
+	sel := mustHex("a9059cbb")
+	return append(append(sel, leftPad32(toB)...), leftPad32(amount.Value.Bytes())...)
 }
 
 // deriveETHAddress 由未压缩公钥派生 ETH 地址：keccak256(pubkey[1:]) 取后 20 字节。

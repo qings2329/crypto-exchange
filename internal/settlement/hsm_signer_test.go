@@ -1,6 +1,7 @@
 package settlement
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
@@ -337,4 +338,63 @@ func splitRLPList(b []byte) ([][]byte, error) {
 		pos = epos + elen
 	}
 	return items, nil
+}
+
+// assertERC20TxFields 断言已签 ETH raw tx 是 ERC20 transfer 调用：to=代币合约、value=0、
+// data=transfer(用户地址, 金额) 编码（selector 0xa9059cbb + pad32(to) + pad32(amount)）。
+func assertERC20TxFields(t *testing.T, raw, contract, userAddr string, amt AssetAmount) {
+	t.Helper()
+	b, err := hex.DecodeString(strings.TrimPrefix(raw, "0x"))
+	if err != nil {
+		t.Fatalf("hex decode raw: %v", err)
+	}
+	items, err := splitRLPList(b)
+	if err != nil {
+		t.Fatalf("split RLP: %v", err)
+	}
+	if len(items) < 6 {
+		t.Fatalf("need >=6 RLP items, got %d", len(items))
+	}
+	to, value, data := items[3], items[4], items[5]
+	if !bytes.Equal(to, mustHex(strings.TrimPrefix(contract, "0x"))) {
+		t.Fatalf("ERC20 to must be contract %s, got %x", contract, to)
+	}
+	if len(value) != 0 {
+		t.Fatalf("ERC20 value must be 0, got %x", value)
+	}
+	want := encodeERC20Transfer(userAddr, amt)
+	if !bytes.Equal(data, want) {
+		t.Fatalf("ERC20 data mismatch:\n got %x\nwant %x", data, want)
+	}
+	if !bytes.HasPrefix(data, mustHex("a9059cbb")) {
+		t.Fatalf("ERC20 data must start with transfer selector, got %x", data)
+	}
+}
+
+// TestSignETHERC20 验证 ERC20 提现经 signETH 正确编码为 transfer 合约调用：链上 to=代币
+// 合约、value=0、data=transfer(用户地址, 金额)（金额按代币 decimals=6 缩放后编码）。
+func TestSignETHERC20(t *testing.T) {
+	s, err := newRealSigner(HotWalletConfig{SignerKey: knownVectorPriv})
+	if err != nil {
+		t.Fatalf("newRealSigner: %v", err)
+	}
+	userAddr := "0x1111111111111111111111111111111111111111"
+	contract := "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+	amt6 := AssetAmount{Value: big.NewInt(1500000), Decimals: 6} // 1.5 USDT
+	tx := &UnsignedTx{
+		Chain:           ChainETH,
+		To:              userAddr,
+		Amount:          amt6,
+		Asset:           "USDT",
+		ContractAddress: contract,
+		Nonce:           9,
+		GasPriceWei:     20000000000,
+		GasLimit:        65000,
+		ChainID:         1,
+	}
+	raw, err := s.Sign(context.Background(), tx)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	assertERC20TxFields(t, raw, contract, userAddr, amt6)
 }

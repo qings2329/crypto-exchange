@@ -32,6 +32,12 @@ func (f *fakeRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string)
 	return f.hash, f.err
 }
 
+// BroadcastERC20 仅为满足 ChainRPCClient 接口（fakeRPCClient 用于非 ERC20 提现的网关测试，
+// 不会触发此路径）。ERC20 提现的端到端测试使用真实 *JSONRPCClient + httptest。
+func (f *fakeRPCClient) BroadcastERC20(ctx context.Context, chain Chain, contract, to string, amount AssetAmount) (string, error) {
+	return f.hash, f.err
+}
+
 // fakeSigner 是 Signer 的内存假实现，记录被调用并返回确定性 raw。
 type fakeSigner struct {
 	called bool
@@ -435,6 +441,63 @@ func TestNewWithdrawGatewayETHUsesNodeNonceGas(t *testing.T) {
 	}
 }
 
+// TestNewWithdrawGatewayETHERC20UsesOfflineSigner 验证 ERC20（USDT）提现经网关主路径走
+// 「离线签名 → SendRaw 广播」：构造 transfer 合约调用（to=合约、value=0、data=transfer 编码）。
+func TestNewWithdrawGatewayETHERC20UsesOfflineSigner(t *testing.T) {
+	var rawSeen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "eth_sendRawTransaction":
+			if len(req.Params) > 0 {
+				rawSeen = strings.Trim(string(req.Params[0]), `"`)
+			}
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0xethhash"}`))
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":null}`))
+		}
+	}))
+	defer srv.Close()
+
+	g := NewWithdrawGateway(ChainRPCConfig{
+		Enabled:   true,
+		Endpoints: map[string]string{"ETH": srv.URL},
+		HotWallet: HotWalletConfig{
+			Enabled: true, SignerType: "hsm", SignerKey: knownVectorPriv,
+			EthChainID: 1, EthGasPriceWei: 20000000000, EthGasLimit: 65000,
+		},
+		ERC20Tokens: map[string]ERC20TokenInfo{
+			"USDT": {Contract: "0xdAC17F958D2ee523a2206206994597C13D831ec7", Decimals: 6},
+		},
+	})
+	rg, ok := g.(*RPCWithdrawGateway)
+	if !ok {
+		t.Fatalf("enabled gateway should be *RPCWithdrawGateway, got %T", g)
+	}
+	if _, ok := rg.erc20["USDT"]; !ok {
+		t.Fatalf("ERC20 token registry not loaded into gateway")
+	}
+	userAddr := "0x1111111111111111111111111111111111111111"
+	// 1.5 USDT 经网关内部 ToDecimals(6) → 1500000 最小单位。
+	ev, err := rg.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), userAddr, false)
+	if err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if rawSeen == "" {
+		t.Fatalf("eth_sendRawTransaction did not receive raw (ERC20 should go through offline signer)")
+	}
+	if ev.TxHash != "0xethhash" {
+		t.Fatalf("expected real tx hash from SendRaw, got %q", ev.TxHash)
+	}
+	// 断言 raw 是 ERC20 transfer 调用（to=合约、value=0、data=transfer 编码，金额按 6 decimals 缩放）。
+	assertERC20TxFields(t, rawSeen, "0xdAC17F958D2ee523a2206206994597C13D831ec7", userAddr, amt(ChainETH, 1.5).ToDecimals(6))
+}
+
 // TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath 验证 BTC 提现经网关主路径走
 // 「真实 UTXO 拉取 → 离线签名 → SendRaw 广播」，不再回退节点侧 sendtoaddress：
 // 配置 RPC 端点 + hsm 签名器后，网关先用 listunspent 取 UTXO，做 SIGHASH_ALL 真实签名，
@@ -504,4 +567,135 @@ func TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath(t *testing.T) {
 	utxos := []UTXO{{TxID: strings.Repeat("a", 64), Vout: 0, Amount: 1.0, ScriptPubKey: ownScriptHex}}
 	verifyBTCSignatures(t, rawSeen, utxos, priv.PubKey().SerializeCompressed())
 	verifyBTCValueConservation(t, rawSeen, utxos, amt(ChainBTC, 0.5))
+}
+
+// failSigner 是 Signer 的内存假实现，Sign 始终返回错误，用于验证离线签名失败时的降级告警（G2）。
+type failSigner struct{ err error }
+
+func (f *failSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) { return "", f.err }
+
+// emptyRawSigner 是 Signer 的内存假实现，Sign 返回 ("", nil)（空 raw 无错误），用于验证
+// 离线签名器有意不离线签时的静默降级被 WARN 暴露（G2 补全项）。
+type emptyRawSigner struct{}
+
+func (e *emptyRawSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) { return "", nil }
+
+// TestSubmitWithdrawLogsERC20RoutedAndBroadcast 锁定 G1/G4：ERC20 提现须输出「routed」路由日志
+// 与「offline-signed broadcast OK」成功日志（含真实 txHash），便于对账与审计。
+func TestSubmitWithdrawLogsERC20RoutedAndBroadcast(t *testing.T) {
+	var rawSeen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+			Params []json.RawMessage
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "eth_sendRawTransaction" && len(req.Params) > 0 {
+			rawSeen = strings.Trim(string(req.Params[0]), `"`)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0xethhash"}`))
+	}))
+	defer srv.Close()
+	g := NewWithdrawGateway(ChainRPCConfig{
+		Enabled:   true,
+		Endpoints: map[string]string{"ETH": srv.URL},
+		HotWallet: HotWalletConfig{Enabled: true, SignerType: "hsm", SignerKey: knownVectorPriv, EthChainID: 1, EthGasPriceWei: 20000000000, EthGasLimit: 65000},
+		ERC20Tokens: map[string]ERC20TokenInfo{"USDT": {Contract: "0xdAC17F958D2ee523a2206206994597C13D831ec7", Decimals: 6}},
+	}).(*RPCWithdrawGateway)
+	buf, restore := captureLog(t)
+	defer restore()
+	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), "0x1111111111111111111111111111111111111111", false); err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if rawSeen == "" {
+		t.Fatal("eth_sendRawTransaction 未收到 raw")
+	}
+	if !strings.Contains(buf.String(), "ERC20 withdraw routed") {
+		t.Fatalf("期望 G1 ERC20 routed 日志，实际: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "withdraw broadcast OK (offline-signed)") {
+		t.Fatalf("期望 G4 离线签名广播成功日志，实际: %q", buf.String())
+	}
+}
+
+// TestSubmitWithdrawLogsERC20Misconfig 锁定 G1 高危自检：ETH 链上非原生资产未命中 ERC20 注册表时，
+// 须输出 ERROR（将作为原生 ETH 广播，资金错路），而非静默误转。
+func TestSubmitWithdrawLogsERC20Misconfig(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Hour),
+		client:              &fakeRPCClient{hash: "0xnative"},
+		signer:              nil,
+		erc20:               map[string]ERC20TokenInfo{"USDT": {Contract: "0xdAC17F958D2ee523a2206206994597C13D831ec7", Decimals: 6}},
+	}
+	buf, restore := captureLog(t)
+	defer restore()
+	if _, err := g.SubmitWithdraw(1, "USDC", ChainETH, amt(ChainETH, 1), AssetAmount{}, "0xaddr", false); err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if !strings.Contains(buf.String(), "not in ERC20 registry") {
+		t.Fatalf("期望 G1 注册表漏配 ERROR 日志，实际: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "will broadcast as NATIVE ETH") {
+		t.Fatalf("期望原生 ETH 错路告警，实际: %q", buf.String())
+	}
+}
+
+// TestSubmitWithdrawLogsMockFallback 锁定 G3：节点广播全部失败/RPC 不可达时，须输出 ERROR 告警
+// （回退模拟广播、实际未上链），而非静默报成功。
+func TestSubmitWithdrawLogsMockFallback(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Hour),
+		client:              &fakeRPCClient{err: errors.New("node unreachable")},
+		signer:              nil,
+		erc20:               map[string]ERC20TokenInfo{},
+	}
+	buf, restore := captureLog(t)
+	defer restore()
+	if _, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1), AssetAmount{}, "0xaddr", false); err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if !strings.Contains(buf.String(), "MOCK broadcast") {
+		t.Fatalf("期望 G3 模拟回退 ERROR 日志，实际: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "NO on-chain tx emitted") {
+		t.Fatalf("期望「未上链」标注，实际: %q", buf.String())
+	}
+}
+
+// TestSubmitWithdrawLogsOfflineSignFail 锁定 G2：离线签名失败须输出 WARN 并降级到节点侧签名广播。
+func TestSubmitWithdrawLogsOfflineSignFail(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Hour),
+		client:              &fakeRPCClient{hash: "0xnode"},
+		signer:              &failSigner{err: errors.New("hsm down")},
+		erc20:               map[string]ERC20TokenInfo{},
+	}
+	buf, restore := captureLog(t)
+	defer restore()
+	if _, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1), AssetAmount{}, "0xaddr", false); err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if !strings.Contains(buf.String(), "offline sign failed, falling back to node-signed broadcast") {
+		t.Fatalf("期望 G2 离线签名失败 WARN，实际: %q", buf.String())
+	}
+}
+
+// TestSubmitWithdrawLogsOfflineSignEmptyRaw 锁定 G2 补全项：离线签名器返回空 raw（无错误）的
+// 静默降级须补 WARN，避免「有意不离线签」不可见。
+func TestSubmitWithdrawLogsOfflineSignEmptyRaw(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Hour),
+		client:              &fakeRPCClient{hash: "0xnode"},
+		signer:              &emptyRawSigner{}, // Sign 返回 ("", nil)
+		erc20:               map[string]ERC20TokenInfo{},
+	}
+	buf, restore := captureLog(t)
+	defer restore()
+	if _, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1), AssetAmount{}, "0xaddr", false); err != nil {
+		t.Fatalf("SubmitWithdraw: %v", err)
+	}
+	if !strings.Contains(buf.String(), "offline signer returned empty raw, falling back") {
+		t.Fatalf("期望 G2 空 raw 降级 WARN，实际: %q", buf.String())
+	}
 }

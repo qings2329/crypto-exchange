@@ -97,8 +97,13 @@ func (s *JSONRPCDepositScanner) scanChain(ctx context.Context, w DepositWatch) (
 	}
 }
 
-// scanETH 用 eth_getLogs 拉取观察地址的入账 Transfer 日志，解析 value(wei)→amount。
+// scanETH 用 eth_getLogs 拉取观察地址的入账。w.Token 为空时按原生 ETH 处理（脚手架：以
+// 观察地址为合约地址过滤日志）；w.Token 非空时按 ERC20 处理：以代币合约地址过滤、并用
+// Transfer 事件 topics 过滤 to==观察地址，解析 value（最小单位，按 decimals 缩放）为 amount。
 func (s *JSONRPCDepositScanner) scanETH(ctx context.Context, w DepositWatch) ([]DepositEvent, error) {
+	if w.Token != "" {
+		return s.scanERC20(ctx, w)
+	}
 	res, err := s.client.rpc(ctx, ChainETH, "eth_getLogs", []interface{}{
 		map[string]interface{}{
 			"address":   w.Address,
@@ -132,6 +137,73 @@ func (s *JSONRPCDepositScanner) scanETH(ctx context.Context, w DepositWatch) ([]
 		})
 	}
 	return out, nil
+}
+
+// erc20TransferTopic 是 ERC20 Transfer(address,address,uint256) 事件的签名哈希（topic0）。
+const erc20TransferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+// scanERC20 用 eth_getLogs 拉取代币合约中 to==观察地址的 Transfer 入账，解析 value（最小单位）
+// 为 amount。decimals 优先取 w.Decimals，否则按资产名推断（USDT/USDC=6），再否则回退 18。
+func (s *JSONRPCDepositScanner) scanERC20(ctx context.Context, w DepositWatch) ([]DepositEvent, error) {
+	toTopic, ok := erc20ToTopic(w.Address)
+	if !ok {
+		return nil, fmt.Errorf("invalid ERC20 watch address %q", w.Address)
+	}
+	res, err := s.client.rpc(ctx, ChainETH, "eth_getLogs", []interface{}{
+		map[string]interface{}{
+			"address": w.Token,
+			"topics": []interface{}{
+				erc20TransferTopic,
+				nil, // from：任意
+				toTopic,
+			},
+			"fromBlock": "0x0",
+			"toBlock":   "latest",
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var logs []struct {
+		TransactionHash string `json:"transactionHash"`
+		Data            string `json:"data"`
+	}
+	if err := json.Unmarshal(res, &logs); err != nil {
+		return nil, err
+	}
+	decimals := w.Decimals
+	if decimals <= 0 {
+		decimals = AssetDecimalsByName(w.Asset)
+		if decimals <= 0 {
+			decimals = 18
+		}
+	}
+	out := make([]DepositEvent, 0, len(logs))
+	for _, l := range logs {
+		amount := hexToAmount(l.Data, decimals)
+		if amount.Sign() <= 0 {
+			continue
+		}
+		out = append(out, DepositEvent{
+			TxHash:  strings.Trim(l.TransactionHash, `"`),
+			UserID:  w.UserID,
+			Asset:   w.Asset,
+			Amount:  amount,
+			Chain:   ChainETH,
+			Address: w.Address,
+		})
+	}
+	return out, nil
+}
+
+// erc20ToTopic 把 20 字节地址左补齐为 32 字节 topic 形式（0x + 24个0 + 地址 hex），用于过滤
+// Transfer 事件的 to 字段。地址非法时返回 ok=false。
+func erc20ToTopic(addr string) (string, bool) {
+	a := strings.TrimPrefix(strings.ToLower(addr), "0x")
+	if len(a) != 40 {
+		return "", false
+	}
+	return "0x" + strings.Repeat("0", 64-len(a)) + a, true
 }
 
 // scanBTC 用 listsinceblock 拉取地址相关收款并解析 amount。
@@ -172,6 +244,11 @@ func (s *JSONRPCDepositScanner) scanBTC(ctx context.Context, w DepositWatch) ([]
 
 // weiToAmount 把 0x 十六进制 wei 字符串转为最小单位整数金额（18 decimals，#6，无 float 精度损失）。
 func weiToAmount(hex string) AssetAmount {
+	return hexToAmount(hex, 18)
+}
+
+// hexToAmount 把 0x 十六进制最小单位字符串按给定 decimals 转为 AssetAmount（#6，无 float 精度损失）。
+func hexToAmount(hex string, decimals int) AssetAmount {
 	h := strings.TrimSpace(strings.TrimPrefix(strings.Trim(hex, `"`), "0x"))
 	if h == "" {
 		return AssetAmount{}
@@ -180,7 +257,7 @@ func weiToAmount(hex string) AssetAmount {
 	if !ok {
 		return AssetAmount{}
 	}
-	return AssetAmount{Value: v, Decimals: 18}
+	return AssetAmount{Value: v, Decimals: decimals}
 }
 
 // scanTRON 用 TronGrid 风格 REST 拉取观察地址的 TRC20 转账（充值）：按合约地址过滤、
