@@ -58,6 +58,7 @@ func (c *Client) Submit(symbol string, o *matching.Order) bool {
 		"price":   o.Price,
 		"qty":     o.Qty,
 		"user_id": o.UserID,
+		"market":  o.Market,
 	}, &resp); err != nil {
 		return false
 	}

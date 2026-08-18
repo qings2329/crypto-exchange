@@ -22,6 +22,7 @@ import (
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
 	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN for spot order persistence (overrides config)")
+	addr := flag.String("addr", ":8082", "HTTP listen addr")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -83,9 +84,8 @@ func main() {
 	r.Use(middleware.Common(log, cfg)...)
 	server.RegisterRoutes(r, verifier)
 
-	addr := ":8082"
-	log.Info("spot service starting", zap.String("addr", addr))
-	if err := cfg.Listen(r, addr); err != nil {
+	log.Info("spot service starting", zap.String("addr", *addr))
+	if err := cfg.Listen(r, *addr); err != nil {
 		log.Fatal("server exited", zap.Error(err))
 	}
 }
