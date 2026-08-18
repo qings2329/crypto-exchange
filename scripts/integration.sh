@@ -10,6 +10,9 @@
 #      uid（F4 边界：下游 spot 以 token 校验 userID，杜绝越权）。
 #   2) 跟单 → 现货：带单高手成交事件注入（无 Kafka 时由 admin 端点模拟），粉丝复制单落到
 #      spot 且归属正确粉丝 uid（F4 边界），且重复事件不产生第二单（F1 幂等）。
+#   3) 链上质押生息（staking）：用户委托质押一笔资产（本金锁定到 SysStaking，复式记账），
+#      管理员触发一次奖励归集（accrue），链上待领奖励计入平台对用户欠付的 SysStakingReward
+#      负债；并验证解质押→释放把本金（及累计奖励）原子归还用户账本（F3）。
 #
 # 鉴权 token 由本脚本用「共享开发密钥」本地签发（与 TokenVerifier.HMAC-SHA256 完全一致），
 # 与线上各服务本地校验 token 的方式一致——因此无需 user 服务往返（user 不参与资金流）。
@@ -178,12 +181,13 @@ MATCH_PORT="$(free_port)"
 SPOT_PORT="$(free_port)"
 BOT_PORT="$(free_port)"
 COPY_PORT="$(free_port)"
+STAKE_PORT="$(free_port)"
 CFG_TMP="$(mktemp /tmp/ce-int-config.XXXX.yaml)"
 make_config "$CONFIG" "$CFG_TMP" "$MATCH_PORT"
 
 # ---- build binaries ----
 echo "== building binaries (go) =="
-for svc in matching spot bot copytrade; do
+for svc in matching spot bot copytrade staking; do
   echo "  building $svc ..."
   if ! go build -o "$BIN/$svc" "./cmd/$svc"; then
     echo "  [FAIL] build $svc"; FAILED=1; exit 1
@@ -191,28 +195,32 @@ for svc in matching spot bot copytrade; do
 done
 
 # ---- launch services（内存模式 + 空闲端口）----
-echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT) =="
+echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT stake=$STAKE_PORT) =="
 "$BIN/matching"  --config "$CFG_TMP" --mysql-dsn "" --addr ":$MATCH_PORT" >"$LOGDIR/matching.log"  2>&1 & PIDS+=($!)
 "$BIN/spot"      --config "$CFG_TMP" --mysql-dsn "" --addr ":$SPOT_PORT" >"$LOGDIR/spot.log"       2>&1 & PIDS+=($!)
 "$BIN/bot"       --config "$CFG_TMP" --mysql-dsn "" --addr ":$BOT_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/bot.log" 2>&1 & PIDS+=($!)
 "$BIN/copytrade" --config "$CFG_TMP" --mysql-dsn "" --addr ":$COPY_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/copytrade.log" 2>&1 & PIDS+=($!)
+"$BIN/staking"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$STAKE_PORT" >"$LOGDIR/staking.log"   2>&1 & PIDS+=($!)
 
 wait_for "http://127.0.0.1:$MATCH_PORT/health"                 "matching"  || FAILED=1
 wait_for_match_leader "http://127.0.0.1:$MATCH_PORT/health"     "matching"  || FAILED=1
 wait_for "http://127.0.0.1:$SPOT_PORT/api/v1/spot/depth"       "spot"      || FAILED=1
 wait_for "http://127.0.0.1:$BOT_PORT/api/v1/bot/strategies"    "bot"       || FAILED=1
 wait_for "http://127.0.0.1:$COPY_PORT/api/v1/copytrade/leads"  "copytrade" || FAILED=1
+wait_for "http://127.0.0.1:$STAKE_PORT/api/v1/staking/products" "staking"  || FAILED=1
 [ "$FAILED" -ne 0 ] && { echo "services failed to start"; exit 1; }
 
 SPOT="http://127.0.0.1:$SPOT_PORT"
 BOT="http://127.0.0.1:$BOT_PORT"
 COPY="http://127.0.0.1:$COPY_PORT"
+STAKE="http://127.0.0.1:$STAKE_PORT"
 
 # tokens: 共享开发密钥本地签发
 ADMIN_TOKEN="$(mint_token 999 admin)"
 BOT_USER_TOKEN="$(mint_token 2 user)"   # spot 内存账本预置 1-4 余额
 LEAD_TOKEN="$(mint_token 3 user)"       # 创建 lead
 FOLLOWER_TOKEN="$(mint_token 4 user)"   # 承接复制单（spot 内存账本有余额）
+STAKE_USER_TOKEN="$(mint_token 1 user)" # staking 内存账本预置 1-4 余额（uid=1 有 10 ETH）
 
 # ================= 流程 1：bot → spot =================
 echo "== flow 1: bot -> spot (F4 身份边界) =="
@@ -264,6 +272,65 @@ do_call POST "$COPY/api/v1/copytrade/admin/simulate-trade" "$ADMIN_TOKEN" \
 sleep 1
 do_call GET "$SPOT/api/v1/spot/orders" "$FOLLOWER_TOKEN" ""
 check "复制单幂等：重复事件未产生第二单 (F1)" "$([ "$(spot_symbol_count "$RESP_BODY")" = "1" ] && echo 1 || echo 0)"
+
+# ================= 流程 3：staking 充值锁仓 -> 奖励归集生息 -> 解质押释放 =================
+echo "== flow 3: staking 链上质押生息 (F2 定点 / F3 原子 / F4 鉴权) =="
+# 3.1 列出在售产品，取首个 product_id（启动时为种子 ETH 2.0 质押产品）
+do_call GET "$STAKE/api/v1/staking/products" "$STAKE_USER_TOKEN" ""
+check "staking list products -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+PRODUCT_ID="$(echo "$RESP_BODY" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); ps=d.get("data",{}).get("products",[])
+    print(ps[0]["id"] if ps else "")
+except Exception:
+    print("")')"
+check "staking product id parsed" "$([ -n "$PRODUCT_ID" ] && echo 1 || echo 0)"
+
+# 3.2 用户委托质押 1.0 ETH（本金从 uid=1 锁定到 SysStaking，复式记账）
+do_call POST "$STAKE/api/v1/staking/subscribe" "$STAKE_USER_TOKEN" \
+  '{"product_id":'"$PRODUCT_ID"',"amount":1.0}'
+check "staking subscribe -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+DELEG_ID="$(extract_id "$RESP_BODY")"
+check "staking delegation id parsed" "$([ -n "$DELEG_ID" ] && echo 1 || echo 0)"
+
+# 3.3 我的持仓应包含该委托：本金 1.0、状态 active
+do_call GET "$STAKE/api/v1/staking/holdings" "$STAKE_USER_TOKEN" ""
+check "staking my holdings -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+check "staking 持仓含 1.0 ETH active 委托" "$(echo "$RESP_BODY" | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin); ds=d.get("data",{}).get("delegations",[])
+    ok="1" if any(str(x.get("id"))=="'"$DELEG_ID"'" and abs(float(x.get("principal",0))-1.0)<1e-9 and x.get("status")=="active" for x in ds) else "0"
+    print(ok)
+except Exception:
+    print("0")')"
+
+# 3.4 管理员触发一次奖励归集（等价于后台 RunLoop 的某一轮）：链上待领奖励计入
+#     SysStakingReward 负债（平台对用户欠付），返回归集总额应 > 0。
+do_call POST "$STAKE/api/v1/staking/admin/accrue" "$ADMIN_TOKEN" ""
+check "staking admin accrue -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+check "staking 归集到正向奖励负债 (>0)" "$(echo "$RESP_BODY" | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin); a=d.get("data",{}).get("accrued",0)
+    try: v=float(a)
+    except Exception: v=0.0
+    print("1" if v>0 else "0")
+except Exception:
+    print("0")')"
+
+# 3.5 解质押 -> 释放：模拟后端已超额确认，本金与累计奖励经 ledger.Batch 原子归还用户账本。
+do_call POST "$STAKE/api/v1/staking/unbond" "$STAKE_USER_TOKEN" \
+  '{"delegation_id":'"$DELEG_ID"'}'
+check "staking unbond -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+do_call POST "$STAKE/api/v1/staking/release" "$STAKE_USER_TOKEN" \
+  '{"delegation_id":'"$DELEG_ID"'}'
+check "staking release -> 200 (本金+奖励原子归还)" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 释放后该委托状态应为 unbonded（终态），且再次 release 应幂等拒绝而非重复放款。
+do_call POST "$STAKE/api/v1/staking/release" "$STAKE_USER_TOKEN" \
+  '{"delegation_id":'"$DELEG_ID"'}'
+check "staking release 终态幂等：重复释放被拒 (非 200)" "$([ "$RESP_CODE" != "200" ] && echo 1 || echo 0)"
 
 echo "========================================="
 if [ "$FAILED" -eq 0 ]; then
