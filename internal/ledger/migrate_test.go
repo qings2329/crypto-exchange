@@ -200,22 +200,22 @@ func TestParseSnapshotVersionRouting(t *testing.T) {
 // TestValidateV1SnapshotAssets 验证未知资产预检：未知资产应告警，已知资产不应告警。
 func TestValidateV1SnapshotAssets(t *testing.T) {
 	v1 := ledgerSnapshotV1{
-		Accounts:      []*accountV1{{UserID: 1, Asset: "DOGE", Available: 100}},
-		BadDebtByUser: map[string]float64{"1:DOGE": 100},
+		Accounts:      []*accountV1{{UserID: 1, Asset: "ZZZ", Available: 100}},
+		BadDebtByUser: map[string]float64{"1:ZZZ": 100},
 		HotWallet:     map[string]float64{"USDT": 1.0}, // 已知资产，不告警
 	}
 	warns := ValidateV1SnapshotAssets(v1)
-	// 应至少包含 DOGE 的两条告警（account + bad_debt_by_user），且不应包含 USDT。
-	foundDOGE := 0
+	// 应至少包含 ZZZ 的两条告警（account + bad_debt_by_user），且不应包含 USDT/LTC/DOGE。
+	found := 0
 	for _, w := range warns {
-		if strings.Contains(w, "DOGE") {
-			foundDOGE++
+		if strings.Contains(w, "ZZZ") {
+			found++
 		}
-		if strings.Contains(w, "USDT") {
-			t.Fatalf("known asset USDT should not warn: %q", w)
+		if strings.Contains(w, "USDT") || strings.Contains(w, "LTC") || strings.Contains(w, "DOGE") {
+			t.Fatalf("known asset should not warn: %q", w)
 		}
 	}
-	if foundDOGE < 2 {
-		t.Fatalf("expected >=2 DOGE warnings (account + bad_debt_by_user), got %d: %v", foundDOGE, warns)
+	if found < 2 {
+		t.Fatalf("expected >=2 ZZZ warnings (account + bad_debt_by_user), got %d: %v", found, warns)
 	}
 }
