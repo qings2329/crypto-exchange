@@ -189,6 +189,10 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 当前管理员自身信息（含角色/权限）；任何已登录管理员可访问。
 		admin.GET("/me", s.adminMe)
 
+		// 当前管理员自身偏好（语言/主题/时区）；任何已登录管理员可访问。
+		admin.GET("/preferences", s.getAdminPreferences)
+		admin.PUT("/preferences", s.updateAdminPreferences)
+
 		// 当前管理员自管理：修改密码、绑定/启用/关闭 Google 验证器（本人操作）。
 		admin.POST("/password", s.changePassword)
 		admin.POST("/mfa/setup", s.setupMFA)

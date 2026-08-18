@@ -97,6 +97,41 @@ func (s *Server) adminMe(c *gin.Context) {
 	s.ok(c, me)
 }
 
+// getAdminPreferences 返回当前登录管理员的界面偏好（语言/主题/时区）。
+func (s *Server) getAdminPreferences(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		s.fail(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	p, err := s.adminStore.GetPreferences(uid)
+	if err != nil {
+		s.fail(c, http.StatusInternalServerError, "get preferences failed")
+		return
+	}
+	s.ok(c, p)
+}
+
+// updateAdminPreferences 更新当前登录管理员的界面偏好。
+func (s *Server) updateAdminPreferences(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		s.fail(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req AdminPreferences
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, http.StatusBadRequest, "invalid body")
+		return
+	}
+	req.AdminID = uid // 强制以当前登录管理员身份写入，避免越权
+	if err := s.adminStore.UpdatePreferences(&req); err != nil {
+		s.fail(c, http.StatusInternalServerError, "update preferences failed")
+		return
+	}
+	s.ok(c, gin.H{"ok": true})
+}
+
 // changePassword 修改当前登录管理员的密码（需校验旧密码）。
 func (s *Server) changePassword(c *gin.Context) {
 	uid, _ := middleware.UserID(c)
