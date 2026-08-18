@@ -24,5 +24,7 @@ internal/otc/uploads/
 /risk
 /settlement
 /staking
+/bot
+/copytrade
 /user
 /hsm-signing-service
