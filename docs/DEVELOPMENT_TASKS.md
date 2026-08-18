@@ -721,12 +721,13 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 为三条新业务线补齐跨服务边界验证：
 
 - **in-process e2e**（`e2e/e2e_test.go` + `scripts/e2e.sh`）：用真实 `TokenVerifier` + 下游 httptest gin 引擎，验证 bot/copytrade 代下单时**下游 spot 以 token 校验出的 userID 为准（F4）**且携带 `bot:`/`copytrade:` client_oid 前缀（F1），重复事件不复制（F1 幂等）。
-- **二进制集成脚本**（`scripts/integration.sh`）：编译并启动**真实二进制** `cmd/matching`+`cmd/spot`+`cmd/bot`+`cmd/copytrade`（内存模式：临时配置置空 MySQL DSN / Kafka brokers / Redis addr，无外部依赖），用真实 HTTP 驱动两条跨服务资金流：
+- **二进制集成脚本**（`scripts/integration.sh`）：编译并启动**真实二进制** `cmd/matching`+`cmd/spot`+`cmd/bot`+`cmd/copytrade`+`cmd/staking`（内存模式：临时配置置空 MySQL DSN / Kafka brokers / Redis addr，无外部依赖），用真实 HTTP 驱动三条资金流：
   1. bot → spot：用户授权 bot → 创建 DCA 策略 → 管理端点强制 tick → 订单落到 spot 且归属正确 uid（F4）。
   2. copytrade → spot：创建 lead + 关注 → 无 Kafka 时由**新增 admin 模拟端点**注入成交流 → 粉丝复制单落到 spot 且归属正确 uid（F4），重复事件不产生第二单（F1）。
+  3. staking 链上质押生息：列出在售产品 → 用户委托质押 1.0 ETH（本金锁定 `SysStaking`，复式记账 F2/F3）→ 管理员触发一次奖励归集（accrue，链上待领奖励计入 `SysStakingReward` 负债且总额 > 0）→ 解质押并释放（本金+累计奖励经 `ledger.Batch` 原子归还 F3）→ 终态重复释放被拒（F1 幂等）。
   - token 由脚本用共享开发密钥本地签发（与 `middleware.TokenVerifier` HMAC-SHA256 完全一致），故无需 user 服务往返。
-  - 各服务监听端口**动态选取空闲端口**（规避环境端口占用，如本机 8082 被 `goldot-signer` 占用）；为此给 `cmd/spot`/`cmd/bot`/`cmd/copytrade` 增加了 `--addr` 监听端口参数（matching 已有）。
-  - 新增管理/调试端点（仅供 AdminGuard）：`POST /api/v1/bot/admin/strategies/:id/tick`（强制一轮下单，等价于后台 Run 循环）、`POST /api/v1/copytrade/admin/simulate-trade`（注入一笔成交流驱动复制，等价于发布到 exchange.trades）。
+  - 各服务监听端口**动态选取空闲端口**（规避环境端口占用，如本机 8082 被 `goldot-signer` 占用）；为此给 `cmd/spot`/`cmd/bot`/`cmd/copytrade`/`cmd/staking` 增加了 `--addr` 监听端口参数（matching 已有）。
+  - 新增管理/调试端点（仅供 AdminGuard）：`POST /api/v1/bot/admin/strategies/:id/tick`（强制一轮下单，等价于后台 Run 循环）、`POST /api/v1/copytrade/admin/simulate-trade`（注入一笔成交流驱动复制，等价于发布到 exchange.trades）、`POST /api/v1/staking/admin/accrue`（手动触发一轮奖励归集，等价于后台 RunLoop）。
 - **修复真实 bug（跨服务 market 字段丢失）**：spot 下单经 `matching` HTTP `/order` 时，`matching` 客户端 `Submit` 与 `/order` handler 均未传输 `Market` 字段，导致撮合引擎存储的订单 `market=""`，spot `GET /orders` 按 `v.Market != "spot"` 过滤时把全部订单丢弃——用户查不到自己任何现货订单。已修复：客户端 `Submit` 增加 `"market": o.Market`，`/order` handler 读取并写入 `o.Market`。该 bug 由二进制集成脚本（真实链路）首次暴露，in-process e2e 因使用假下游未能覆盖。
 
 > 验证：`go build ./...`、`go vet`、`go test ./internal/matching/... ./internal/spot/... ./internal/bot/... ./internal/copytrade/... ./e2e/...` 全绿；`bash scripts/integration.sh` 全流程 ALL PASS。
