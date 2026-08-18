@@ -90,17 +90,23 @@ func TestWSAllSubscriberReceivesAll(t *testing.T) {
 	}
 }
 
-// 用例15e（WS 空 symbol 广播）：以空 symbol 广播时，推送至所有连接（含指定订阅的客户端）。
-func TestWSBroadcastEmptySymbolToAll(t *testing.T) {
+// 用例15e（WS 空 symbol 广播集成）：以空 symbol 广播，推送至所有连接，
+// 无论其订阅为具体 symbol（BTC_USDT / ETH_USDT）还是空订阅（全部）。
+// 三类异构订阅客户端均能收到，验证"symbol 为空表示推送给所有连接"的语义。
+func TestWSBroadcastEmptySymbolToAllConnections(t *testing.T) {
 	s := newTestServer()
 	s.hub = ws.NewHub()
 	r := setupRouter(s)
-	conn := wsDial(t, r, "BTC_USDT") // 仅订阅 BTC_USDT
+	cBTC := wsDial(t, r, "BTC_USDT")  // 具体订阅
+	cETH := wsDial(t, r, "ETH_USDT")  // 具体订阅（不同对）
+	cAll := wsDial(t, r, "")          // 空订阅 = 全部
 
-	// 修正前：空 symbol 仅推送给"空订阅"客户端，订阅 BTC_USDT 的客户端收不到。
-	got := wsExpectReceive(t, conn, s.hub, "", gin.H{"type": "global"})
-	if got["type"] != "global" {
-		t.Fatalf("expect type=global, got %v", got["type"])
+	// wsExpectReceive 内部以短超时循环重广播，规避注册竞态，无需 sleep。
+	for i, conn := range []*websocket.Conn{cBTC, cETH, cAll} {
+		got := wsExpectReceive(t, conn, s.hub, "", gin.H{"type": "global"})
+		if got["type"] != "global" {
+			t.Fatalf("client %d expect type=global, got %v", i, got["type"])
+		}
 	}
 }
 
