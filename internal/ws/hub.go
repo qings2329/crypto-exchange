@@ -93,8 +93,9 @@ func (c *Client) readPump(h *Hub) {
 	}
 }
 
-// Broadcast 向订阅了指定 symbol 的所有客户端推送消息。
-// symbol 为空表示推送给所有连接；客户端订阅了多个 symbol 时，任一匹配即推送。
+// Broadcast 向订阅了指定 symbol 的客户端推送消息。
+// symbol 为空表示推送给所有连接；客户端订阅了多个 symbol 时，任一匹配即推送；
+// 客户端空订阅（未指定 symbol）时同样接收所有广播。
 func (h *Hub) Broadcast(symbol string, payload interface{}) {
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -103,7 +104,8 @@ func (h *Hub) Broadcast(symbol string, payload interface{}) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.clients {
-		if len(c.symbols) == 0 || containsSymbol(c.symbols, symbol) {
+		// 空 symbol 广播给所有连接；否则仅推送给订阅了该 symbol（或空订阅/全部）的客户端。
+		if symbol == "" || len(c.symbols) == 0 || containsSymbol(c.symbols, symbol) {
 			select {
 			case c.send <- b:
 			default: // 发送缓冲满则丢弃，避免阻塞撮合
