@@ -54,6 +54,10 @@ const (
 
 	// 审计日志
 	PermAuditRead = "audit:read" // 查看管理员操作审计日志
+
+	// API Key 管理（管理员为任意用户签发/吊销 API Key）
+	PermApiKeyRead  = "apikey:read"  // 查看 API Key 列表与详情
+	PermApiKeyManage = "apikey:manage" // 签发/吊销 API Key（高危）
 )
 
 // PermissionDef 是权限字典中的一条展示元数据。
@@ -92,6 +96,9 @@ var allPermissionDefs = []PermissionDef{
 
 	{Key: PermAdminManage, Name: "管理员管理", Group: "系统"},
 	{Key: PermRoleManage, Name: "角色与权限管理", Group: "系统"},
+
+	{Key: PermApiKeyRead, Name: "查看 API Key", Group: "系统"},
+	{Key: PermApiKeyManage, Name: "管理 API Key（签发/吊销）", Group: "系统"},
 
 	{Key: PermAuditRead, Name: "查看审计日志", Group: "审计"},
 }
