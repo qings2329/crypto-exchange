@@ -2607,7 +2607,7 @@ func migrateMapInt(m map[int64]float64, dec int) map[int64]settlement.AssetAmoun
 // knownAsset 判断资产是否在标准 decimals 表中（与 AssetDecimalsByName 口径一致）。
 func knownAsset(asset string) bool {
 	switch asset {
-	case "BTC", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20":
+	case "BTC", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20", "LTC", "DOGE":
 		return true
 	}
 	return false

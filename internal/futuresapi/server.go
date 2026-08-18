@@ -235,6 +235,8 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	s.feeModel.Register(settlement.ChainETH, "ETH", 0.001, 0)
 	s.feeModel.Register(settlement.ChainBTC, "BTC", 0.0005, 0)
 	s.feeModel.Register(settlement.ChainTRON, "USDT", 1, 0)
+	s.feeModel.Register(settlement.ChainLTC, "LTC", 0.001, 0)   // 原生 LTC（8 位小数，对标 BTC 尘额）
+	s.feeModel.Register(settlement.ChainDOGE, "DOGE", 1.0, 0)   // 原生 DOGE（8 位小数）
 
 	// 链上充提网关及其事件监听。充值/提现网关均按配置在「真实 RPC」与「模拟」间切换
 	// （T-03 链上 RPC 半边脚手架，fail-degraded：未配置回退模拟）。
