@@ -31,6 +31,16 @@ type AdminAccount struct {
 	UpdatedAt    time.Time
 }
 
+// AdminPreferences 是管理员自身的界面偏好（语言/主题/时区），按 admin_id 持久化，
+// 与个人偏好对应 user 服务的 UserPreferences。空串 timezone 表示跟随系统。
+type AdminPreferences struct {
+	AdminID       int64     `json:"admin_id"`
+	Language      string    `json:"language"`       // 如 zh-CN / en
+	Theme         string    `json:"theme"`          // 如 light / dark
+	Timezone      string    `json:"timezone"`       // IANA 时区；空串表示跟随系统
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
 // Role 是自定义角色（含其分配的权限集合）。
 type Role struct {
 	ID          int64
@@ -73,6 +83,10 @@ type AdminStore interface {
 	// 角色权限
 	SetRolePermissions(roleID int64, perms []string) error
 	GetRolePermissions(roleID int64) ([]string, error)
+
+	// 偏好
+	GetPreferences(adminID int64) (*AdminPreferences, error)
+	UpdatePreferences(p *AdminPreferences) error
 }
 
 // ---- 内存实现（无 MySQL 时回退） ----
@@ -86,6 +100,7 @@ type memAdminStore struct {
 	roles    map[int64]*Role
 	roleByName map[string]int64
 	rolePerms map[int64][]string
+	prefs    map[int64]*AdminPreferences
 }
 
 // NewMemAdminStore 构造内存实现（启动 seed 由调用方负责）。
@@ -96,6 +111,7 @@ func NewMemAdminStore() AdminStore {
 		roles:      map[int64]*Role{},
 		roleByName: map[string]int64{},
 		rolePerms:  map[int64][]string{},
+		prefs:      map[int64]*AdminPreferences{},
 	}
 }
 
@@ -289,6 +305,28 @@ func (s *memAdminStore) GetRolePermissions(roleID int64) ([]string, error) {
 	cp := make([]string, len(p))
 	copy(cp, p)
 	return cp, nil
+}
+
+// GetPreferences 返回管理员偏好；未设置过时返回零值（语言/主题/时区均为空串）。
+func (s *memAdminStore) GetPreferences(adminID int64) (*AdminPreferences, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.prefs[adminID]
+	if !ok {
+		return &AdminPreferences{AdminID: adminID}, nil
+	}
+	cp := *p
+	return &cp, nil
+}
+
+// UpdatePreferences 写入（不存在则插入）管理员偏好。
+func (s *memAdminStore) UpdatePreferences(p *AdminPreferences) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.UpdatedAt = time.Now()
+	cp := *p
+	s.prefs[p.AdminID] = &cp
+	return nil
 }
 
 // NewAdminStore 优先返回 MySQL 实现；若 DSN 为空或连接/迁移失败，则回退内存实现

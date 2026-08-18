@@ -16,6 +16,7 @@ const (
 	adminMigVerRoles    = 9202
 	adminMigVerRolePerms = 9203
 	adminMigVerLoginLock = 9204
+	adminMigVerPrefs    = 9205
 )
 
 // AdminMigrations 是管理员模块的建表迁移，运行时由 NewMySQLAdminStore 应用。
@@ -73,6 +74,20 @@ var AdminMigrations = []migrate.Migration{
 		Down: `ALTER TABLE ce_admin_accounts
     DROP COLUMN failed_attempts,
     DROP COLUMN locked_until;`,
+	},
+	{
+		// 管理员自身界面偏好（语言/主题/时区），按 admin_id 持久化，支持跨设备同步。
+		Version: adminMigVerPrefs,
+		Name:    "create_ce_admin_preferences",
+		Up: `CREATE TABLE IF NOT EXISTS ce_admin_preferences (
+    admin_id    BIGINT       NOT NULL,
+    language    VARCHAR(32)  NOT NULL DEFAULT 'zh-CN',
+    theme       VARCHAR(32)  NOT NULL DEFAULT 'light',
+    timezone    VARCHAR(64)  NOT NULL DEFAULT '' COMMENT 'IANA 时区；空字符串表示跟随系统',
+    updated_at  DATETIME(3)  NOT NULL,
+    PRIMARY KEY (admin_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		Down: "DROP TABLE IF EXISTS ce_admin_preferences;",
 	},
 }
 
@@ -378,4 +393,36 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// GetPreferences 返回管理员偏好；未设置过时返回零值（语言/主题/时区均为空串）。
+func (s *mysqlAdminStore) GetPreferences(adminID int64) (*AdminPreferences, error) {
+	var p AdminPreferences
+	var lang, theme, tz sql.NullString
+	err := s.db.QueryRow(
+		`SELECT admin_id, language, theme, timezone, updated_at
+		 FROM ce_admin_preferences WHERE admin_id = ?`, adminID).
+		Scan(&p.AdminID, &lang, &theme, &tz, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return &AdminPreferences{AdminID: adminID}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.Language = lang.String
+	p.Theme = theme.String
+	p.Timezone = tz.String
+	return &p, nil
+}
+
+// UpdatePreferences 写入（不存在则插入）管理员偏好。
+func (s *mysqlAdminStore) UpdatePreferences(p *AdminPreferences) error {
+	p.UpdatedAt = time.Now()
+	_, err := s.db.Exec(
+		`INSERT INTO ce_admin_preferences (admin_id, language, theme, timezone, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE language=VALUES(language), theme=VALUES(theme),
+		 timezone=VALUES(timezone), updated_at=VALUES(updated_at)`,
+		p.AdminID, p.Language, p.Theme, p.Timezone, p.UpdatedAt)
+	return err
 }

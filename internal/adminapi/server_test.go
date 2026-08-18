@@ -44,6 +44,25 @@ func postJSON(t *testing.T, r *gin.Engine, path, token string, body interface{})
 	return w.Code, env.Data
 }
 
+// putJSON 发送 JSON（PUT）并解析 {code,data} 信封。
+func putJSON(t *testing.T, r *gin.Engine, path, token string, body interface{}) (int, interface{}) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var env struct {
+		Code int         `json:"code"`
+		Data interface{} `json:"data"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	return w.Code, env.Data
+}
+
 // getJSON 发送 GET 并解析 {code,data} 信封。
 func getJSON(t *testing.T, r *gin.Engine, path, token string) (int, interface{}) {
 	t.Helper()
@@ -206,5 +225,55 @@ func TestAdminLoginIPRateLimit(t *testing.T) {
 	// 3) 不同 IP-B 仍被放行（独立计数，证明按 IP 限流）
 	if code := loginAs("10.0.0.2"); code != http.StatusUnauthorized {
 		t.Fatalf("ipB attempt: expected 401 (independent bucket), got %d", code)
+	}
+}
+
+// TestAdminPreferences 验证管理员偏好（语言/主题/时区）的读写往返：
+// 默认空值 → 写入具体值 → 读回一致 → 改回空串（跟随系统）被保留。
+func TestAdminPreferences(t *testing.T) {
+	r, _ := newTestServer(t)
+
+	// 登录拿 token
+	_, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "admin123"})
+	tok, _ := data.(map[string]interface{})["token"].(string)
+	if tok == "" {
+		t.Fatal("expected non-empty admin token")
+	}
+
+	// 默认偏好：未设置时为空值
+	code, d := getJSON(t, r, "/api/admin/preferences", tok)
+	if code != http.StatusOK {
+		t.Fatalf("get preferences: expected 200, got %d", code)
+	}
+	pref := d.(map[string]interface{})
+	if pref["language"] != "" || pref["theme"] != "" || pref["timezone"] != "" {
+		t.Fatalf("expected empty default preferences, got %+v", pref)
+	}
+
+	// 写入具体偏好
+	code, _ = putJSON(t, r, "/api/admin/preferences", tok, map[string]string{
+		"language": "en", "theme": "midnight", "timezone": "Asia/Tokyo",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("put preferences: expected 200, got %d", code)
+	}
+	code, d = getJSON(t, r, "/api/admin/preferences", tok)
+	if code != http.StatusOK {
+		t.Fatalf("get preferences after update: expected 200, got %d", code)
+	}
+	pref = d.(map[string]interface{})
+	if pref["language"] != "en" || pref["theme"] != "midnight" || pref["timezone"] != "Asia/Tokyo" {
+		t.Fatalf("preferences not persisted: %+v", pref)
+	}
+
+	// 改回空串（跟随系统）应被保留
+	code, _ = putJSON(t, r, "/api/admin/preferences", tok, map[string]string{"timezone": ""})
+	if code != http.StatusOK {
+		t.Fatalf("put preferences clear: expected 200, got %d", code)
+	}
+	_, d = getJSON(t, r, "/api/admin/preferences", tok)
+	pref = d.(map[string]interface{})
+	if pref["timezone"] != "" {
+		t.Fatalf("expected empty timezone after clear, got %v", pref["timezone"])
 	}
 }
