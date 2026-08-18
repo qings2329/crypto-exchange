@@ -116,6 +116,21 @@ settlement:
         address: "0x0000000000000000000000000000000000000000"
         user_id: 1
         asset: ETH
+      # ERC20 代币监控（chain=ETH 且 token 非空 → 按代币合约地址 + Transfer 事件 topics 过滤
+      # to==address 扫描充值）。以下为主网真实合约地址示例，生产请替换为「用户绑定充值地址」
+      # （由 HD 派生服务生成）与对应代币合约；decimals 必须与链上代币一致，否则金额缩放错误。
+      - chain: ETH
+        address: "0x0000000000000000000000000000000000000001"
+        user_id: 1
+        asset: USDT
+        token: "0xdAC17F958D2ee523a2206206994597C13D831ec7" # USDT-ERC20 主网合约
+        decimals: 6
+      - chain: ETH
+        address: "0x0000000000000000000000000000000000000002"
+        user_id: 1
+        asset: USDC
+        token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" # USDC-ERC20 主网合约
+        decimals: 6
       - chain: BTC
         address: "bc1examplewatchaddress"
         user_id: 1
@@ -125,6 +140,14 @@ settlement:
         user_id: 1
         asset: USDT
         token: "TR7NHqjiehqjqTD9QgQsrQUDsV7qxXWm1f" # TRC20 合约地址（USDT-TRC20 主网）；空则默认此值
+    # erc20_tokens：ETH 链可提现 ERC20 资产注册表（asset -> 合约地址 + decimals）。提现时按
+    # asset 命中则构造 transfer 合约调用（to=合约、value=0、data=transfer 编码）；未命中按原生
+    # 资产处理。decimals 须与链上代币一致（如 USDT/USDC-ERC20=6），否则 transfer 金额缩放错误。
+    # 合约地址为主网示例，生产请替换为对应代币部署地址。
+    erc20_tokens:
+      USDT: {contract: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6}
+      USDC: {contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6}
+
     # hot_wallet：离线签名边界（T-03 热钱包/离线签名）。enabled=true 且 signer_type 配了
     # 时，提现走「离线签名→SendRaw 广播原始交易」（私钥不出域）。生产接 HSM/KMS 时，Sign 内部
     # 改为调用安全模块的签名 API（同一 Signer 接口），私钥永不离开安全域；当前仓库内的

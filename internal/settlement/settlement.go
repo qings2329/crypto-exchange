@@ -609,6 +609,7 @@ func (g *MockWithdrawGateway) tick() {
 	now := time.Now().UnixNano()
 	g.height++ // 模拟区块推进
 	done := make([]WithdrawEvent, 0)
+	started := make([]WithdrawEvent, 0)
 	for _, ev := range g.pending {
 		if ev.Status == WithdrawCredited || ev.Status == WithdrawFailed {
 			continue
@@ -623,6 +624,7 @@ func (g *MockWithdrawGateway) tick() {
 				ev.Status = WithdrawBroadcasting
 				ev.Confirmations = 1
 				ev.UpdatedAt = now
+				started = append(started, *ev)
 			}
 		case WithdrawBroadcasting:
 			// 真实节点可达时用链上确认数推进；否则（未配置/节点宕机）回退模拟 +1。
@@ -638,7 +640,16 @@ func (g *MockWithdrawGateway) tick() {
 	}
 	g.mu.Unlock()
 
+	// 生命周期里程碑日志（锁外，避免持锁做 I/O；与 emit 一致）。
+	for _, ev := range started {
+		log.Printf("[settlement] withdraw broadcasting (entering confirmation tracking): tx=%s user=%d asset=%s chain=%s amount=%s",
+			ev.TxHash, ev.UserID, ev.Asset, ev.Chain, ev.Amount.HumanString())
+	}
 	for _, ev := range done {
+		if ev.Status == WithdrawCredited {
+			log.Printf("[settlement] withdraw credited (final confirmation reached): tx=%s user=%d asset=%s chain=%s amount=%s confirmations=%d block=%d",
+				ev.TxHash, ev.UserID, ev.Asset, ev.Chain, ev.Amount.HumanString(), ev.Confirmations, ev.BlockHeight)
+		}
 		g.emit(ev)
 	}
 }
@@ -733,6 +744,9 @@ func (g *MockWithdrawGateway) WithdrawReorg(txHash string) (*WithdrawEvent, erro
 		ev.Status = WithdrawOrphaned
 		ev.UpdatedAt = time.Now().UnixNano()
 		g.mu.Unlock()
+		// 高危资金事件：已最终确认的提现被链上重组丢弃，需驱动账本 ReverseWithdraw 回拨冻结余额。
+		log.Printf("[settlement] WARN withdraw REORG rollback: tx=%s user=%d asset=%s chain=%s amount=%s (credited tx orphaned, ledger reversal required)",
+			ev.TxHash, ev.UserID, ev.Asset, ev.Chain, ev.Amount.HumanString())
 		g.emitWithdrawRollback(*ev)
 		return ev, nil
 	case WithdrawBroadcasting:
@@ -741,6 +755,8 @@ func (g *MockWithdrawGateway) WithdrawReorg(txHash string) (*WithdrawEvent, erro
 		ev.Status = WithdrawPending
 		ev.UpdatedAt = time.Now().UnixNano()
 		g.mu.Unlock()
+		log.Printf("[settlement] withdraw reorg window reset: tx=%s user=%d asset=%s chain=%s (broadcasting tx dropped, re-broadcast pending)",
+			ev.TxHash, ev.UserID, ev.Asset, ev.Chain)
 		return ev, nil
 	default: // WithdrawPending 等：未广播，无重组对象
 		g.mu.Unlock()
@@ -760,6 +776,7 @@ func (g *MockWithdrawGateway) WithdrawReorgDepth(depth int) []WithdrawEvent {
 	now := time.Now().UnixNano()
 	var rolled []WithdrawEvent
 	cutoff := g.height - depth + 1
+	resetCount := 0
 	for _, ev := range g.pending {
 		switch ev.Status {
 		case WithdrawCredited:
@@ -773,12 +790,22 @@ func (g *MockWithdrawGateway) WithdrawReorgDepth(depth int) []WithdrawEvent {
 			ev.Confirmations = 0
 			ev.Status = WithdrawPending
 			ev.UpdatedAt = now
+			resetCount++
 		}
 	}
 	if g.height >= depth {
 		g.height -= depth
 	}
 	g.mu.Unlock()
+	// 逐笔回滚日志（锁外）+ 汇总，便于审计「哪些已确认提现被深度重组回拨」。
+	for _, ev := range rolled {
+		log.Printf("[settlement] WARN withdraw REORG rollback (depth=%d): tx=%s user=%d asset=%s chain=%s amount=%s (credited tx orphaned, ledger reversal required)",
+			depth, ev.TxHash, ev.UserID, ev.Asset, ev.Chain, ev.Amount.HumanString())
+	}
+	if len(rolled) > 0 || resetCount > 0 {
+		log.Printf("[settlement] withdraw depth reorg applied: depth=%d rolled=%d reset=%d newHeight=%d",
+			depth, len(rolled), resetCount, g.height)
+	}
 	for _, ev := range rolled {
 		g.emitWithdrawRollback(ev)
 	}

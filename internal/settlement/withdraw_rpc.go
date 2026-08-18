@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -34,6 +35,16 @@ type ChainRPCConfig struct {
 	// 「离线签名 → SendRaw 广播原始交易」路径（私钥不出域）；未启用则回退节点侧签名广播
 	// （fail-degraded）。生产签名器接 HSM/KMS。
 	HotWallet HotWalletConfig `yaml:"hot_wallet"`
+	// ERC20Tokens 是 ETH 链可提现 ERC20 资产注册表：asset -> 合约地址 + decimals。提现时按
+	// asset 命中则构造 transfer 合约调用（to=合约、value=0、data=transfer 编码）；未命中则按
+	// 原生资产处理。decimals 须与链上代币一致，否则 transfer 的 amount 缩放错误（金额错乱）。
+	ERC20Tokens map[string]ERC20TokenInfo `yaml:"erc20_tokens"`
+}
+
+// ERC20TokenInfo 是 ETH 链上可提现 ERC20 资产的注册信息（合约地址 + 小数位）。
+type ERC20TokenInfo struct {
+	Contract string `yaml:"contract"`
+	Decimals int    `yaml:"decimals"`
 }
 
 // HotWalletConfig 是离线签名边界配置。生产填 HSM/KMS 类型；脚手架 "stub" 仅演示边界。
@@ -171,8 +182,13 @@ type DepositWatch struct {
 	Address string `yaml:"address"`
 	UserID  int64  `yaml:"user_id"`
 	Asset   string `yaml:"asset"`
-	// Token 是 TRC20 合约地址（仅 chain=TRON 时用于过滤对应代币）；空则默认 USDT-TRC20 主网合约。
+	// Token 是代币合约地址：chain=TRON 时过滤 TRC20；chain=ETH 且非空时走 scanETH 的 ERC20
+	// 分支（按合约地址 + Transfer 事件 topics 过滤 to==Address）。空则按原生资产处理。
 	Token string `yaml:"token"`
+	// Decimals 是 ERC20 代币小数位（仅 chain=ETH 且 Token 非空时用于把日志 value 正确缩放）。
+	// 缺省按 AssetDecimalsByName(asset) 推断（USDT/USDC=6），仍不能确定则回退 18。原生资产
+	// 无需配置（由 AssetDecimals 按链确定）。
+	Decimals int `yaml:"decimals"`
 }
 
 // ChainRPCClient 抽象单链 RPC 广播能力（T-03 链上 RPC 半边）。生产实现直连节点；
@@ -184,6 +200,9 @@ type ChainRPCClient interface {
 	// SendRaw 广播一笔已离线签名的原始交易（raw hex），返回交易哈希。离线签名边界主路径：
 	// 签名在 Signer（HSM/KMS）内完成，节点仅负责广播。
 	SendRaw(ctx context.Context, chain Chain, rawHex string) (txHash string, err error)
+	// BroadcastERC20 是 ERC20 提现的节点侧签名回退广播（fail-degraded）：构造 eth_sendTransaction，
+	// to=代币合约、value=0、data=transfer 编码。仅由网关在 ERC20 提现且未走离线签名时调用。
+	BroadcastERC20(ctx context.Context, chain Chain, contract, to string, amount AssetAmount) (txHash string, err error)
 }
 
 // JSONRPCClient 是 ChainRPCClient 的通用 JSON-RPC 实现，按链映射到对应节点方法
@@ -274,6 +293,25 @@ func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, a
 	default:
 		return "", fmt.Errorf("unsupported chain %s", chain)
 	}
+}
+
+// BroadcastERC20 是 ERC20 提现的节点侧签名回退广播（fail-degraded）：构造 eth_sendTransaction，
+// to=代币合约、value=0、data=transfer(用户地址, 金额) 编码。仅在未配置离线签名器或离线签名失败
+// 时由网关回退调用，避免把代币当原生 ETH 转给用户地址造成资金错误。
+func (c *JSONRPCClient) BroadcastERC20(ctx context.Context, chain Chain, contract, to string, amount AssetAmount) (string, error) {
+	if chain != ChainETH {
+		return "", fmt.Errorf("ERC20 broadcast only supported for ETH (got %s)", chain)
+	}
+	data := fmt.Sprintf("0x%x", encodeERC20Transfer(to, amount))
+	log.Printf("[settlement] ERC20 BroadcastERC20: chain=%s contract=%s to=%s amount=%s (min units) data=%s",
+		chain, contract, to, amount.Value.String(), data)
+	res, err := c.rpc(ctx, chain, "eth_sendTransaction", []interface{}{
+		map[string]interface{}{"to": contract, "value": "0x0", "data": data},
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(bytes.Trim(res, `"`)), nil
 }
 
 // SendRaw 广播一笔已离线签名的原始交易，返回交易哈希（离线签名边界主路径）。
@@ -620,24 +658,84 @@ type RPCWithdrawGateway struct {
 	*MockWithdrawGateway
 	client ChainRPCClient
 	signer Signer // 离线签名器（可选）；nil → 回退节点侧签名广播
+	// erc20 是 ETH 链可提现 ERC20 资产注册表（asset -> 合约地址 + decimals），由配置注入；
+	// 提现时按 asset 命中则构造 transfer 合约调用。空表示未配置 ERC20 提现（仅原生资产）。
+	erc20 map[string]ERC20TokenInfo
 }
 
 // SubmitWithdraw 优先走离线签名边界（有 Signer 时：签名→SendRaw 广播并取回真实 TxHash）；
 // 无 Signer 或签名/广播失败时回退节点侧签名广播（Broadcast）；RPC 仍不可达则回退模拟。
 func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, willFail bool) (*WithdrawEvent, error) {
+	// 构造待签名交易：ERC20（chain=ETH 且注册表命中）时 to 仍为最终用户地址，但携带合约地址
+	// 与按代币 decimals 缩放后的金额，由签名器编码为 transfer 合约调用。
+	var tx *UnsignedTx
+	if info, ok := g.erc20[asset]; ok && chain == ChainETH {
+		// ERC20 合约调用路径：记录合约/收款/链上最小单位金额/decimals，便于对账与异常排查。
+		log.Printf("[settlement] ERC20 withdraw routed: user=%d asset=%s chain=%s to=%s contract=%s amount=%s (min units) decimals=%d",
+			userID, asset, chain, address, info.Contract, amount.ToDecimals(info.Decimals).Value.String(), info.Decimals)
+		tx = &UnsignedTx{
+			Chain:          chain,
+			To:             address,
+			Amount:         amount.ToDecimals(info.Decimals),
+			Asset:          asset,
+			ContractAddress: info.Contract,
+		}
+	} else {
+		// 高危自检：ETH 链上非原生资产却未命中 ERC20 注册表，将作为原生 ETH 广播，
+		// 造成「代币当 ETH 转出」的资金错误。注册表漏配时此处必须显式 ERROR 暴露。
+		if chain == ChainETH && asset != "ETH" {
+			log.Printf("[settlement] ERROR withdraw asset %s on ETH not in ERC20 registry; will broadcast as NATIVE ETH (possible fund misroute): user=%d to=%s amount=%s",
+				asset, userID, address, amount.HumanString())
+		}
+		tx = &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset}
+	}
 	if g.client != nil {
+		// 主路径：离线签名（HSM）→ 广播已签原始交易。
 		if g.signer != nil {
-			if raw, err := g.signer.Sign(context.Background(), &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset}); err == nil && raw != "" {
-				if h, err := g.client.SendRaw(context.Background(), chain, raw); err == nil && h != "" {
+			raw, serr := g.signer.Sign(context.Background(), tx)
+			if serr != nil {
+				log.Printf("[settlement] WARN offline sign failed, falling back to node-signed broadcast: user=%d asset=%s chain=%s to=%s err=%v",
+					userID, asset, chain, address, serr)
+			} else if raw != "" {
+				h, berr := g.client.SendRaw(context.Background(), chain, raw)
+				if berr != nil {
+					log.Printf("[settlement] WARN offline-signed SendRaw failed, falling back to node-signed broadcast: user=%d asset=%s chain=%s err=%v",
+						userID, asset, chain, berr)
+				} else if h != "" {
+					log.Printf("[settlement] withdraw broadcast OK (offline-signed): tx=%s user=%d asset=%s chain=%s to=%s",
+						h, userID, asset, chain, address)
 					return g.MockWithdrawGateway.SubmitWithdrawWithHash(userID, asset, chain, amount, fee, address, willFail, h)
 				}
+			} else {
+				// 离线签名器返回空 raw（无错误）：视为有意不离线签，回退节点侧签名广播——
+				// 此前此处静默回退，现补 WARN 以免降级不可见（G2）。
+				log.Printf("[settlement] WARN offline signer returned empty raw, falling back to node-signed broadcast: user=%d asset=%s chain=%s to=%s",
+					userID, asset, chain, address)
 			}
-			// 离线签名/广播失败：回退节点侧签名广播（fail-degraded）。
 		}
-		if h, err := g.client.Broadcast(context.Background(), chain, address, amount); err == nil && h != "" {
+		// 回退路径：节点侧签名广播（fail-degraded）。ERC20 必须用 BroadcastERC20（to=合约、data=transfer），
+		// 不可用原生 Broadcast（会把代币当原生 ETH 转给用户地址，造成资金错误）。
+		if info, ok := g.erc20[asset]; ok && chain == ChainETH {
+			h, berr := g.client.BroadcastERC20(context.Background(), chain, info.Contract, address, tx.Amount)
+			if berr != nil {
+				log.Printf("[settlement] WARN ERC20 node broadcast failed: user=%d asset=%s chain=%s contract=%s to=%s err=%v",
+					userID, asset, chain, info.Contract, address, berr)
+			} else if h != "" {
+				log.Printf("[settlement] ERC20 withdraw broadcast OK (node-signed fallback): tx=%s user=%d asset=%s chain=%s contract=%s to=%s",
+					h, userID, asset, chain, info.Contract, address)
+				return g.MockWithdrawGateway.SubmitWithdrawWithHash(userID, asset, chain, amount, fee, address, willFail, h)
+			}
+		} else if h, berr := g.client.Broadcast(context.Background(), chain, address, amount); berr != nil {
+			log.Printf("[settlement] WARN node broadcast failed: user=%d asset=%s chain=%s to=%s err=%v",
+				userID, asset, chain, address, berr)
+		} else if h != "" {
+			log.Printf("[settlement] withdraw broadcast OK (node-signed): tx=%s user=%d asset=%s chain=%s to=%s",
+				h, userID, asset, chain, address)
 			return g.MockWithdrawGateway.SubmitWithdrawWithHash(userID, asset, chain, amount, fee, address, willFail, h)
 		}
-		// RPC 不可达：回退模拟广播（fail-degraded），由调用方日志侧记录告警。
+		// RPC 不可达/全部失败：回退模拟广播（fail-degraded）——模拟广播不会真正上链，务必 ERROR 告警。
+		log.Printf("[settlement] ERROR withdraw RPC unavailable, falling back to MOCK broadcast (NO on-chain tx emitted): user=%d asset=%s chain=%s to=%s",
+			userID, asset, chain, address)
 	}
 	return g.MockWithdrawGateway.SubmitWithdraw(userID, asset, chain, amount, fee, address, willFail)
 }
@@ -709,6 +807,7 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 			MockWithdrawGateway: mg,
 			client:              client,
 			signer:              signer,
+			erc20:               conf.ERC20Tokens,
 		}
 	}
 	// 离线签名边界未启用（纯 mock 网关）时也尝试装配 HD 充值地址派生（配置驱动）。
