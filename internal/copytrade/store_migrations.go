@@ -57,4 +57,14 @@ var Migrations = []migrate.Migration{
 		)`,
 		Down: `DROP TABLE IF EXISTS ce_copytrade_copies`,
 	},
+	{
+		// F2 定点化：复制费改为定点存储（值+小数位），消除 DOUBLE 浮点漂移。
+		Version: 9808,
+		Up: `ALTER TABLE ce_copytrade_copies
+			ADD COLUMN fee_value BIGINT NOT NULL DEFAULT 0,
+			ADD COLUMN fee_decimals INT NOT NULL DEFAULT 0`,
+		Down: `ALTER TABLE ce_copytrade_copies
+			DROP COLUMN fee_value,
+			DROP COLUMN fee_decimals`,
+	},
 }

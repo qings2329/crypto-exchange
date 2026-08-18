@@ -2,6 +2,7 @@ package copytrade
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
@@ -161,5 +162,59 @@ func TestOnTradeMakerSideReversal(t *testing.T) {
 	}
 	if mock.calls[0].side != "sell" {
 		t.Errorf("maker lead should be reversed to sell, got %s", mock.calls[0].side)
+	}
+}
+
+// F5：NaN/Inf/非正价格或数量的脏成交事件应被丢弃，不复制、不收费。
+func TestOnTradeRejectsInvalidEvent(t *testing.T) {
+	svc, mock, _, lg := newTestService()
+	if _, err := svc.CreateLead(1, "alice", ""); err != nil {
+		t.Fatalf("create lead: %v", err)
+	}
+	if _, err := svc.RegisterFollow(2, 1, 1, 0, "tok-follower-2"); err != nil {
+		t.Fatalf("follow: %v", err)
+	}
+	bad := []mq.TradeEvent{
+		{Symbol: "BTC_USDT", Price: math.NaN(), Qty: 1, TakerID: 1, MakerID: 99, TakerSide: "buy", Ts: 1},
+		{Symbol: "BTC_USDT", Price: math.Inf(1), Qty: 1, TakerID: 1, MakerID: 99, TakerSide: "buy", Ts: 1},
+		{Symbol: "BTC_USDT", Price: -5, Qty: 1, TakerID: 1, MakerID: 99, TakerSide: "buy", Ts: 1},
+		{Symbol: "BTC_USDT", Price: 100, Qty: 0, TakerID: 1, MakerID: 99, TakerSide: "buy", Ts: 1},
+		{Symbol: "", Price: 100, Qty: 1, TakerID: 1, MakerID: 99, TakerSide: "buy", Ts: 1},
+	}
+	for i, ev := range bad {
+		svc.OnTrade(context.Background(), ev)
+		if len(mock.calls) != 0 {
+			t.Fatalf("case %d: invalid event should not replicate, calls=%d", i, len(mock.calls))
+		}
+		_, feeBal, _ := lg.Balance(ledger.SysCopyTradeFee, "USDT")
+		if !feeBal.IsZero() {
+			t.Fatalf("case %d: no fee for invalid event, fee=%v", i, feeBal)
+		}
+	}
+}
+
+// F2/F3：平台复制费定点入账后，业务侧记录的定点费用之和应与 SysCopyTradeFee 账本余额对平。
+func TestCopyTradeReconcile(t *testing.T) {
+	svc, mock, _, lg := newTestService()
+	if _, err := svc.CreateLead(1, "alice", ""); err != nil {
+		t.Fatalf("create lead: %v", err)
+	}
+	if _, err := svc.RegisterFollow(2, 1, 1, 0, "tok-follower-2"); err != nil {
+		t.Fatalf("follow: %v", err)
+	}
+	ev := mq.TradeEvent{Symbol: "BTC_USDT", Price: 10000, Qty: 2, TakerID: 1, MakerID: 99, TakerSide: "buy", Ts: 1700000000000}
+	svc.OnTrade(context.Background(), ev)
+	if len(mock.calls) != 1 {
+		t.Fatalf("want 1 call, got %d", len(mock.calls))
+	}
+	// 复制费 = 20000 * 0.001 = 20 USDT，应为定点 20_000_000（decimals=6）。
+	feeAvail, _, _ := lg.Balance(ledger.SysCopyTradeFee, "USDT")
+	want := settlement.AssetAmountFromFloat(20, settlement.AssetDecimalsByName("USDT"))
+	if feeAvail.Cmp(want) != 0 {
+		t.Fatalf("SysCopyTradeFee = %s, want %s", feeAvail.HumanString(), want.HumanString())
+	}
+	dev := svc.Reconcile()
+	if v, ok := dev["USDT"]; ok && v.Sign() != 0 {
+		t.Fatalf("reconcile deviation USDT = %s, want 0", v.HumanString())
 	}
 }

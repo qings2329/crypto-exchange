@@ -3,6 +3,8 @@ package copytrade
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/big"
 	"sync"
 	"time"
 
@@ -143,6 +145,14 @@ func (s *Service) MyCopies(uid int64) ([]*CopyRecord, error) { return s.store.Li
 // F5 边界：仅处理计价资产已知的现货交易对，且名义额超过下限才复制；
 // 平台复制费以定点（settlement.AssetAmount）从粉丝账户结算入 SysCopyTradeFee。
 func (s *Service) OnTrade(ctx context.Context, ev mq.TradeEvent) {
+	// F5：成交事件数值合法性前置校验（NaN/Inf/非正价格或数量、空交易对直接丢弃），
+	// 防止脏事件透传到代下单与复制费计算，避免 NaN/Inf 污染订单与账本。
+	if !validTradeEvent(ev) {
+		if s.log != nil {
+			s.log.Warn("copytrade: drop invalid trade event", zap.String("symbol", ev.Symbol))
+		}
+		return
+	}
 	eid := eventID(ev)
 	s.mu.Lock()
 	if s.processed[eid] {
@@ -220,23 +230,72 @@ func (s *Service) replicate(ctx context.Context, ev mq.TradeEvent, f *Follow, le
 	rec.Status = CopyDone
 
 	// F2/F1 平台复制费结算：fee = followerNotional * CopyFeeRate，定点入账 SysCopyTradeFee。
+	// 费率以 1e8 缩放整数参与定点乘法（fee = notionalAmt * ratePPM / 1e8），消除浮点名义额
+	// 参与资金路径带来的漂移；ref 按 (follow, event) 固定，ledger 去重保证重试不双收费。
 	if s.ledger != nil && followerNotional > 0 {
-		fee := followerNotional * s.cfg.CopyFeeRate
 		dec := settlement.AssetDecimalsByName(quote)
-		amt := settlement.AssetAmountFromFloat(fee, dec)
-		ref := fmt.Sprintf("copytrade:%d:%s", f.ID, eid)
-		if terr := s.ledger.Transfer(f.FollowerID, ledger.SysCopyTradeFee, quote, amt, "copytrade_fee", ref); terr != nil {
-			// 粉丝在 copytrade 账本余额不足：仅记录告警，不阻断已下的市价单。
-			if s.log != nil {
-				s.log.Warn("copytrade: fee transfer failed (insufficient copytrade balance?)",
-					zap.Int64("follower", f.FollowerID), zap.Error(terr))
+		notionalAmt := settlement.AssetAmountFromFloat(followerNotional, dec)
+		ratePPM := int64(math.Round(s.cfg.CopyFeeRate * 1e8))
+		feeVal := new(big.Int).Mul(notionalAmt.Value, big.NewInt(ratePPM))
+		feeVal.Div(feeVal, big.NewInt(1e8))
+		amt := settlement.AssetAmount{Value: feeVal, Decimals: dec}
+		rec.FeeAmount = amt
+		if amt.Sign() > 0 {
+			ref := fmt.Sprintf("copytrade:%d:%s", f.ID, eid)
+			if terr := s.ledger.Transfer(f.FollowerID, ledger.SysCopyTradeFee, quote, amt, "copytrade_fee", ref); terr != nil {
+				// 粉丝在 copytrade 账本余额不足：仅记录告警，不阻断已下的市价单。
+				if s.log != nil {
+					s.log.Warn("copytrade: fee transfer failed (insufficient copytrade balance?)",
+						zap.Int64("follower", f.FollowerID), zap.Error(terr))
+				}
+				rec.FeeAmount = settlement.AssetAmount{}
 			}
-			rec.FeeAmount = 0
-		} else {
-			rec.FeeAmount = fee
 		}
 	}
 	_ = s.store.CreateCopy(rec)
+}
+
+// validTradeEvent 校验成交事件数值合法性（F5）：交易对非空、价格与数量为正且非 NaN/Inf。
+func validTradeEvent(ev mq.TradeEvent) bool {
+	if ev.Symbol == "" {
+		return false
+	}
+	if math.IsNaN(ev.Price) || math.IsNaN(ev.Qty) {
+		return false
+	}
+	if math.IsInf(ev.Price, 0) || math.IsInf(ev.Qty, 0) {
+		return false
+	}
+	if ev.Price <= 0 || ev.Qty <= 0 {
+		return false
+	}
+	return true
+}
+
+// Reconcile 业务对账（F3）：校验「各计价资产已入账复制费之和 == SysCopyTradeFee 余额」，
+// 返回各资产偏差（0 表示平衡）。偏差非 0 意味着平台复制费记账与账本账户不一致，应告警排查。
+func (s *Service) Reconcile() map[string]settlement.AssetAmount {
+	dev := make(map[string]settlement.AssetAmount)
+	copies, err := s.store.ListAllCopies()
+	if err != nil {
+		return dev
+	}
+	want := make(map[string]settlement.AssetAmount)
+	for _, c := range copies {
+		if c.Status == CopyDone && c.FeeAmount.Sign() > 0 {
+			asset := quoteAsset(c.Symbol)
+			if asset == "" {
+				continue
+			}
+			want[asset] = want[asset].Add(c.FeeAmount)
+		}
+	}
+	for asset, w := range want {
+		av, fr, _ := s.ledger.Balance(ledger.SysCopyTradeFee, asset)
+		got := av.Add(fr)
+		dev[asset] = dev[asset].Add(got.Sub(w))
+	}
+	return dev
 }
 
 // eventID 由成交字段生成稳定指纹，用于 F1 全局去重。
