@@ -238,3 +238,30 @@ func TestConfigureDepositAddresses(t *testing.T) {
 		t.Fatalf("xpub 非法不应清空已注册生成器")
 	}
 }
+
+// TestDepositAddressHDDerivationLTCAndDOGE 验证 HD 派生对 LTC（ltc1 segwit）/DOGE（D… p2pkh）
+// 的地址格式正确；DOGE 无原生 segwit，即使配置 p2wpkh 也强制回退 p2pkh。
+func TestDepositAddressHDDerivationLTCAndDOGE(t *testing.T) {
+	xpub := deriveTestXPUB(t)
+	gen, err := NewDepositAddressGenerator(DepositConfig{XPUB: xpub, LTCAddressType: "p2wpkh", DOGEAddressType: "p2pkh"})
+	if err != nil {
+		t.Fatalf("NewDepositAddressGenerator: %v", err)
+	}
+	ltcRe := regexp.MustCompile(`^ltc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+$`)
+	dogeRe := regexp.MustCompile(`^D[1-9A-HJ-NP-Za-km-z]+$`)
+	for _, uid := range []int64{1, 2, 100} {
+		ltc, err := gen.Address(uid, ChainLTC)
+		if err != nil || !ltcRe.MatchString(ltc) {
+			t.Fatalf("LTC Address(%d) 非法: %q err=%v", uid, ltc, err)
+		}
+		doge, err := gen.Address(uid, ChainDOGE)
+		if err != nil || !dogeRe.MatchString(doge) {
+			t.Fatalf("DOGE Address(%d) 非法: %q err=%v", uid, doge, err)
+		}
+	}
+	// DOGE 即使配置 segwit 也强制 p2pkh（D…）。
+	genD, _ := NewDepositAddressGenerator(DepositConfig{XPUB: xpub, DOGEAddressType: "p2wpkh"})
+	if d, err := genD.Address(1, ChainDOGE); err != nil || d[0] != 'D' {
+		t.Fatalf("DOGE 应强制 p2pkh(D…), got %q err=%v", d, err)
+	}
+}

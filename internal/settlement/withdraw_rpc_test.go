@@ -699,3 +699,48 @@ func TestSubmitWithdrawLogsOfflineSignEmptyRaw(t *testing.T) {
 		t.Fatalf("期望 G2 空 raw 降级 WARN，实际: %q", buf.String())
 	}
 }
+
+// TestJSONRPCClientConfirmationsLTCAndDOGE 复用 BTC 的 getrawtransaction 路径验证 LTC/DOGE
+// 确认数解析（含负值钳制，见 #10）。
+func TestJSONRPCClientConfirmationsLTCAndDOGE(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"confirmations":4}}`))
+	}))
+	defer srv.Close()
+	for _, chain := range []Chain{ChainLTC, ChainDOGE} {
+		c := NewJSONRPCClient(map[string]string{string(chain): srv.URL})
+		conf, err := c.Confirmations(context.Background(), chain, "txid")
+		if err != nil {
+			t.Fatalf("%s confirmations failed: %v", chain, err)
+		}
+		if conf != 4 {
+			t.Fatalf("%s expected 4 confirmations, got %d", chain, conf)
+		}
+	}
+}
+
+// TestJSONRPCClientSendRawLTCAndDOGE 验证 LTC/DOGE 经 sendrawtransaction 广播原始交易。
+func TestJSONRPCClientSendRawLTCAndDOGE(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var req struct{ Method string `json:"method"` }
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Method == "sendrawtransaction" {
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"ltcdogetxhash"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":null}`))
+	}))
+	defer srv.Close()
+	for _, chain := range []Chain{ChainLTC, ChainDOGE} {
+		c := NewJSONRPCClient(map[string]string{string(chain): srv.URL})
+		h, err := c.SendRaw(context.Background(), chain, "deadbeef")
+		if err != nil {
+			t.Fatalf("%s SendRaw failed: %v", chain, err)
+		}
+		if h != "ltcdogetxhash" {
+			t.Fatalf("%s SendRaw got %q", chain, h)
+		}
+	}
+}

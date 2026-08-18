@@ -201,10 +201,10 @@ func (a *AssetAmount) UnmarshalJSON(b []byte) error {
 }
 
 // AssetDecimals 返回某链某资产的标准小数位（与现有扫描器口径一致）：
-// ETH=18(wei)、BTC=8(satoshi)、TRON=6(sun)；其余默认 8。
+// ETH=18(wei)、BTC/LTC/DOGE=8(satoshi)、TRON=6(sun)；其余默认 8。
 func AssetDecimals(chain Chain, asset string) int {
 	switch chain {
-	case ChainBTC:
+	case ChainBTC, ChainLTC, ChainDOGE:
 		return 8
 	case ChainETH:
 		return 18
@@ -223,10 +223,10 @@ func AssetDecimals(chain Chain, asset string) int {
 
 // AssetDecimalsByName 按资产名返回标准小数位（不依赖链上下文），供 ledger 等无 chain
 // 信息的模块把 float 金额包装为 AssetAmount，以及旧快照迁移使用。
-// BTC=8、ETH=18、USDT/USDC/TRX/TRON=6，其余默认 8。
+// BTC/LTC/DOGE=8、ETH=18、USDT/USDC/TRX/TRON=6，其余默认 8。
 func AssetDecimalsByName(asset string) int {
 	switch asset {
-	case "BTC":
+	case "BTC", "LTC", "DOGE":
 		return 8
 	case "ETH":
 		return 18
@@ -246,7 +246,7 @@ func AssetDecimalsByName(asset string) int {
 // 注意：本函数与 AssetDecimalsByName 的 case 必须保持同步——新增受支持资产时两处都要改。
 func KnownAsset(asset string) bool {
 	switch asset {
-	case "BTC", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20", "SOL":
+	case "BTC", "LTC", "DOGE", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20", "SOL":
 		return true
 	default:
 		return false

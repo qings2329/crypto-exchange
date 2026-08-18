@@ -107,6 +107,11 @@ settlement:
       # TRON：java-tron 全节点 HTTP（默认 8090）`http://127.0.0.1:8090`，或 TronGrid
       # 公网 `https://api.trongrid.io`（免费额度无需 key，高频需 API key header）。
       TRON: ""
+      # LTC：litecoind RPC（默认 9332），`http://<rpcuser>:<rpcpass>@127.0.0.1:9332`。
+      LTC: ""
+      # DOGE：dogecoind RPC（默认 22555），`http://<rpcuser>:<rpcpass>@127.0.0.1:22555`。
+      # 注：DOGE 无原生 segwit，充值/提现地址仅 base58 P2PKH（D…），离线签名走 P2PKH 路径。
+      DOGE: ""
     required_confirmations: 2
     poll_interval_sec: 2
     # watch_addresses：充值监听的「地址→用户」映射（生产由热钱包/地址派生服务生成）。
@@ -140,6 +145,14 @@ settlement:
         user_id: 1
         asset: USDT
         token: "TR7NHqjiehqjqTD9QgQsrQUDsV7qxXWm1f" # TRC20 合约地址（USDT-TRC20 主网）；空则默认此值
+      - chain: LTC
+        address: "ltc1examplewatchaddress"
+        user_id: 1
+        asset: LTC
+      - chain: DOGE
+        address: "Dexamplewatchaddress"
+        user_id: 1
+        asset: DOGE
     # erc20_tokens：ETH 链可提现 ERC20 资产注册表（asset -> 合约地址 + decimals）。提现时按
     # asset 命中则构造 transfer 合约调用（to=合约、value=0、data=transfer 编码）；未命中按原生
     # 资产处理。decimals 须与链上代币一致（如 USDT/USDC-ERC20=6），否则 transfer 金额缩放错误。

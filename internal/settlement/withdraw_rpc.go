@@ -278,7 +278,7 @@ func (c *JSONRPCClient) Broadcast(ctx context.Context, chain Chain, to string, a
 			return "", err
 		}
 		return string(bytes.Trim(res, `"`)), nil
-	case ChainBTC:
+	case ChainBTC, ChainLTC, ChainDOGE:
 		res, err := c.rpc(ctx, chain, "sendtoaddress", []interface{}{to, amount})
 		if err != nil {
 			return "", err
@@ -327,7 +327,7 @@ func (c *JSONRPCClient) SendRaw(ctx context.Context, chain Chain, rawHex string)
 			return "", err
 		}
 		return string(bytes.Trim(res, `"`)), nil
-	case ChainBTC:
+	case ChainBTC, ChainLTC, ChainDOGE:
 		res, err := c.rpc(ctx, chain, "sendrawtransaction", []interface{}{rawHex})
 		if err != nil {
 			return "", err
@@ -493,7 +493,7 @@ func (c *JSONRPCClient) Confirmations(ctx context.Context, chain Chain, txHash s
 			return conf, nil
 		}
 		return 0, nil
-	case ChainBTC:
+	case ChainBTC, ChainLTC, ChainDOGE:
 		raw, err := c.rpc(ctx, chain, "getrawtransaction", []interface{}{txHash, true})
 		if err != nil {
 			return 0, err
@@ -784,7 +784,12 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 		//   - BTC 端点：注入 UTXO 源（listunspent），避免回退节点侧 sendtoaddress。
 		//   - ETH 端点：注入 Nonce/Gas 源（eth_getTransactionCount / eth_gasPrice），避免用过期/默认 Nonce/Gas。
 		var sources SignerSources
-		if _, ok := conf.Endpoints[string(ChainBTC)]; ok {
+		// UTXO 链（BTC/LTC/DOGE）任一端点存在即注入 UTXO 源；离线签名时按 tx.Chain 路由对应
+		// 节点（无端点则 Call 报错，回退内联 UTXO）。
+		_, btcOK := conf.Endpoints[string(ChainBTC)]
+		_, ltcOK := conf.Endpoints[string(ChainLTC)]
+		_, dogeOK := conf.Endpoints[string(ChainDOGE)]
+		if btcOK || ltcOK || dogeOK {
 			sources.UTXOSource = NewRPCUTXOSource(client)
 		}
 		if _, ok := conf.Endpoints[string(ChainETH)]; ok {

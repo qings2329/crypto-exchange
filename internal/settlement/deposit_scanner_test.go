@@ -142,18 +142,18 @@ func TestScanBTC(t *testing.T) {
 	defer node.Close()
 	s := NewJSONRPCDepositScanner(newScanClient(t, node.URL), nil, 0)
 	// 默认 mock 返回的 receive 地址是 "btcwatch"，用相同地址观察可命中。
-	evs, err := s.scanBTC(context.Background(), DepositWatch{UserID: 3, Asset: "BTC", Chain: ChainBTC, Address: "btcwatch"})
+	evs, err := s.scanUTXO(context.Background(), DepositWatch{UserID: 3, Asset: "BTC", Chain: ChainBTC, Address: "btcwatch"})
 	if err != nil {
-		t.Fatalf("scanBTC: %v", err)
+		t.Fatalf("scanUTXO: %v", err)
 	}
 	if len(evs) != 1 || !amtEq(evs[0].Amount, 0.5) || evs[0].TxHash != "btctx1" {
 		t.Fatalf("BTC 入账不符: %+v", evs)
 	}
 
 	// 观察地址与入账地址不一致 → 过滤（不产生错误，仅 0 条）。
-	evs2, err := s.scanBTC(context.Background(), DepositWatch{UserID: 3, Chain: ChainBTC, Address: "other"})
+	evs2, err := s.scanUTXO(context.Background(), DepositWatch{UserID: 3, Chain: ChainBTC, Address: "other"})
 	if err != nil {
-		t.Fatalf("scanBTC(地址不符): %v", err)
+		t.Fatalf("scanUTXO(地址不符): %v", err)
 	}
 	if len(evs2) != 0 {
 		t.Fatalf("地址不符应被过滤，got %d", len(evs2))
@@ -344,5 +344,35 @@ func TestSubmitDepositWithHash(t *testing.T) {
 	// 非法参数仍拒绝。
 	if _, err := g.SubmitDepositWithHash(0, "ETH", ChainETH, amt(ChainETH, 1.0), "0xw", "x"); err == nil {
 		t.Fatalf("zero user 应被拒绝")
+	}
+}
+
+// TestScanLTCAndDOGE 验证 UTXO 扫描按链路由：listsinceblock 返回的同一条入账在 LTC/DOGE
+// 下均能被解析，且 DepositEvent.Chain 正确（金额 8 位小数口径一致）。
+func TestScanLTCAndDOGE(t *testing.T) {
+	node := depositNodeMock(t, depositNodeOpts{})
+	defer node.Close()
+	client := NewJSONRPCClient(map[string]string{
+		string(ChainLTC):  node.URL,
+		string(ChainDOGE): node.URL,
+	})
+	s := NewJSONRPCDepositScanner(client, nil, 0)
+	// mock 的 listsinceblock 固定返回 address="btcwatch" 的 receive 入账（0.5），按链路由验证。
+	for _, chain := range []Chain{ChainLTC, ChainDOGE} {
+		evs, err := s.scanUTXO(context.Background(), DepositWatch{UserID: 3, Asset: string(chain), Chain: chain, Address: "btcwatch"})
+		if err != nil {
+			t.Fatalf("scanUTXO(%s): %v", chain, err)
+		}
+		if len(evs) != 1 || !amtEq(evs[0].Amount, 0.5) || evs[0].Chain != chain {
+			t.Fatalf("scanUTXO(%s) 入账不符: %+v", chain, evs)
+		}
+	}
+	// 地址不符 → 过滤（0 条）。
+	evs2, err := s.scanUTXO(context.Background(), DepositWatch{UserID: 3, Chain: ChainLTC, Address: "other"})
+	if err != nil {
+		t.Fatalf("scanUTXO(地址不符): %v", err)
+	}
+	if len(evs2) != 0 {
+		t.Fatalf("地址不符应被过滤，got %d", len(evs2))
 	}
 }

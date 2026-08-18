@@ -36,9 +36,9 @@ type UTXO struct {
 	ScriptPubKey string  `yaml:"script_pubkey" json:"script_pubkey"`
 }
 
-// UTXOSource 按地址查询未花费输出；为空时签名器使用 UnsignedTx.UTXOs 内联提供。
+// UTXOSource 按链与地址查询未花费输出；为空时签名器使用 UnsignedTx.UTXOs 内联提供。
 type UTXOSource interface {
-	ListUTXOs(ctx context.Context, addr string) ([]UTXO, error)
+	ListUTXOs(ctx context.Context, chain Chain, addr string) ([]UTXO, error)
 }
 
 // rpcUTXOSource 用 JSON-RPC listunspent 查询 UTXO（真实节点路径）。节点不可达时返回错误，
@@ -52,8 +52,8 @@ func NewRPCUTXOSource(client *JSONRPCClient) UTXOSource {
 	return &rpcUTXOSource{client: client}
 }
 
-func (r *rpcUTXOSource) ListUTXOs(ctx context.Context, addr string) ([]UTXO, error) {
-	res, err := r.client.Call(ctx, ChainBTC, "listunspent", []interface{}{0, 9999999, []string{addr}})
+func (r *rpcUTXOSource) ListUTXOs(ctx context.Context, chain Chain, addr string) ([]UTXO, error) {
+	res, err := r.client.Call(ctx, chain, "listunspent", []interface{}{0, 9999999, []string{addr}})
 	if err != nil {
 		return nil, err
 	}
@@ -333,9 +333,35 @@ func bech32ConvertBits(data []byte, fromBits, toBits uint, pad bool) ([]byte, er
 // ---------- 脚本 / 地址派生 ----------
 
 const (
-	btcPubKeyHashVersion = 0x00 // 主网 P2PKH
+	btcPubKeyHashVersion = 0x00 // 主网 P2PKH（BTC 默认；LTC=0x30、DOGE=0x1E 见 utxoParams）
 	btcDustSatoshi       = 546  // 低于此值的找零并入手续费（视为 dust）
 )
+
+// utxoChainParams 描述一条 UTXO 链（BTC/LTC/DOGE）的地址参数，是三者唯一差异所在：
+//   - p2pkhVersion：base58check P2PKH 地址的版本字节（BTC=0x00、LTC=0x30、DOGE=0x1E）。
+//   - bech32HRP：原生 segwit（P2WPKH）地址的 bech32 人类可读前缀；空串表示该链不支持
+//     segwit（DOGE 无原生 segwit）。
+//
+// 其余（secp256k1 曲线、SIGHASH_ALL、交易序列化、listsinceblock/sendrawtransaction/
+// getrawtransaction RPC）三者完全一致，故签名/扫描/广播逻辑按链查此表后完全复用。
+type utxoChainParams struct {
+	p2pkhVersion byte
+	bech32HRP    string
+}
+
+// utxoParams 返回某链的 UTXO 地址参数；非 UTXO 链（ETH/TRON/SOL）返回 ok=false。
+func utxoParams(chain Chain) (utxoChainParams, bool) {
+	switch chain {
+	case ChainBTC:
+		return utxoChainParams{p2pkhVersion: 0x00, bech32HRP: "bc"}, true
+	case ChainLTC:
+		return utxoChainParams{p2pkhVersion: 0x30, bech32HRP: "ltc"}, true
+	case ChainDOGE:
+		return utxoChainParams{p2pkhVersion: 0x1E, bech32HRP: ""}, true
+	default:
+		return utxoChainParams{}, false
+	}
+}
 
 // p2pkhScript 由 HASH160 公钥生成 P2PKH 锁定脚本：OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG。
 func p2pkhScript(h160 []byte) []byte {
@@ -347,16 +373,41 @@ func p2wpkhScript(h160 []byte) []byte {
 	return append([]byte{0x00, 0x14}, append([]byte{}, h160...)...)
 }
 
-// deriveP2PKHAddress / deriveP2WPKHAddress 由公钥派生对应地址（仅用于日志/ChangeAddress 默认）。
-func deriveP2PKHAddress(pub *secp256k1.PublicKey) string {
+// deriveP2PKHAddressFor 由公钥按给定 P2PKH version 字节派生 base58check 地址（链相关：
+// BTC=0x00、LTC=0x30、DOGE=0x1E）。
+func deriveP2PKHAddressFor(pub *secp256k1.PublicKey, version byte) string {
 	h160 := hash160(pub.SerializeCompressed())
-	return base58CheckEncode(append([]byte{btcPubKeyHashVersion}, h160...))
+	return base58CheckEncode(append([]byte{version}, h160...))
+}
+
+// deriveP2WPKHAddressFor 由公钥按给定 bech32 hrp 派生原生 segwit（P2WPKH）地址（BTC=bc、LTC=ltc）。
+func deriveP2WPKHAddressFor(pub *secp256k1.PublicKey, hrp string) string {
+	h160 := hash160(pub.SerializeCompressed())
+	data, _ := bech32ConvertBits(h160, 8, 5, true)
+	return bech32Encode(hrp, append([]byte{0x00}, data...))
+}
+
+// deriveUTXOAddress 按链参数选择默认充值/找零地址：支持 segwit 的链（BTC/LTC）在 preferSegwit
+// 时返回 P2WPKH，否则 P2PKH；DOGE 无原生 segwit，强制 P2PKH。
+func deriveUTXOAddress(pub *secp256k1.PublicKey, chain Chain, preferSegwit bool) string {
+	p, ok := utxoParams(chain)
+	if !ok {
+		return deriveP2PKHAddressFor(pub, btcPubKeyHashVersion)
+	}
+	if preferSegwit && p.bech32HRP != "" {
+		return deriveP2WPKHAddressFor(pub, p.bech32HRP)
+	}
+	return deriveP2PKHAddressFor(pub, p.p2pkhVersion)
+}
+
+// deriveP2PKHAddress / deriveP2WPKHAddress 是 BTC 便捷封装（默认 version=0x00、hrp=bc），
+// 仅供日志/默认找零与既有测试使用；其余链请走 deriveUTXOAddress / *For 系列。
+func deriveP2PKHAddress(pub *secp256k1.PublicKey) string {
+	return deriveP2PKHAddressFor(pub, btcPubKeyHashVersion)
 }
 
 func deriveP2WPKHAddress(pub *secp256k1.PublicKey) string {
-	h160 := hash160(pub.SerializeCompressed())
-	data, _ := bech32ConvertBits(h160, 8, 5, true)
-	return bech32Encode("bc", append([]byte{0x00}, data...))
+	return deriveP2WPKHAddressFor(pub, "bc")
 }
 
 // isP2WPKH / isP2PKH 判定 scriptPubKey 类型。
@@ -373,38 +424,47 @@ func scriptCodeFor(compPub []byte) []byte {
 	return p2pkhScript(hash160(compPub))
 }
 
-// addressToScriptPubKey 把 BTC 地址（base58 P2PKH 或 bech32 P2WPKH）解析为锁定脚本。
-func addressToScriptPubKey(addr string) ([]byte, error) {
-	if strings.HasPrefix(addr, "bc1") || strings.HasPrefix(addr, "tb1") || strings.HasPrefix(addr, "bcrt1") {
-		hrp, data, err := bech32Decode(addr)
-		if err != nil {
-			return nil, err
+// addressToScriptPubKeyFor 把某 UTXO 链的地址解析为锁定脚本：bech32（hrps 列表内的 hrp，
+// 如 BTC=bc、LTC=ltc）按 P2WPKH 解析，base58check 按 p2pkhVersion 解析。链参数化以支持
+// BTC/LTC（hrp=bc/ltc 且支持 segwit）与 DOGE（仅 base58 0x1E，无 segwit）。
+func addressToScriptPubKeyFor(addr string, p2pkhVersion byte, bech32HRPs []string) ([]byte, error) {
+	for _, hrpPrefix := range bech32HRPs {
+		if strings.HasPrefix(addr, hrpPrefix+"1") {
+			hrp, data, err := bech32Decode(addr)
+			if err != nil {
+				return nil, err
+			}
+			if len(data) == 0 {
+				return nil, errors.New("empty bech32 witness program")
+			}
+			version := data[0]
+			if version != 0 {
+				return nil, fmt.Errorf("unsupported witness version %d", version)
+			}
+			prog, err := bech32ConvertBits(data[1:], 5, 8, false)
+			if err != nil {
+				return nil, err
+			}
+			if len(prog) != 20 {
+				return nil, fmt.Errorf("witness program must be 20 bytes for P2WPKH, got %d", len(prog))
+			}
+			_ = hrp
+			return p2wpkhScript(prog), nil
 		}
-		if len(data) == 0 {
-			return nil, errors.New("empty bech32 witness program")
-		}
-		version := data[0]
-		if version != 0 {
-			return nil, fmt.Errorf("unsupported witness version %d", version)
-		}
-		prog, err := bech32ConvertBits(data[1:], 5, 8, false)
-		if err != nil {
-			return nil, err
-		}
-		if len(prog) != 20 {
-			return nil, fmt.Errorf("witness program must be 20 bytes for P2WPKH, got %d", len(prog))
-		}
-		_ = hrp
-		return p2wpkhScript(prog), nil
 	}
 	payload, err := base58CheckDecode(addr)
 	if err != nil {
 		return nil, err
 	}
-	if payload[0] != btcPubKeyHashVersion {
+	if payload[0] != p2pkhVersion {
 		return nil, fmt.Errorf("unsupported base58 version 0x%02x", payload[0])
 	}
 	return p2pkhScript(payload[1:21]), nil
+}
+
+// addressToScriptPubKey 是 BTC 便捷封装（hrp=bc/tb/bcrt、version=0x00），供日志与既有测试使用。
+func addressToScriptPubKey(addr string) ([]byte, error) {
+	return addressToScriptPubKeyFor(addr, btcPubKeyHashVersion, []string{"bc", "tb", "bcrt"})
 }
 
 // ---------- 交易构建 / 签名 / 序列化 ----------
@@ -561,42 +621,54 @@ func (b *btcTxBuilder) serialize() []byte {
 	return out
 }
 
-// signBTC 构造一笔 BTC 提现：选择 UTXO → 估算手续费 → 生成找零 → 逐输入 SIGHASH_ALL 签名 → 序列化。
-func (s *realSigner) signBTC(ctx context.Context, tx *UnsignedTx) (string, error) {
+// signUTXO 构造一笔 UTXO 链（BTC/LTC/DOGE）提现：选择 UTXO → 估算手续费 → 生成找零 →
+// 逐输入 SIGHASH_ALL 签名 → 序列化。地址参数（P2PKH version / bech32 hrp）按链查 utxoParams，
+// 签名/序列化逻辑三者完全复用。
+func (s *realSigner) signUTXO(ctx context.Context, tx *UnsignedTx) (string, error) {
 	compPub := s.key.Public().SerializeCompressed()
+
+	// 按链取地址参数；非 UTXO 链直接拒绝（ETH/TRON/SOL 走各自签名器）。
+	p, ok := utxoParams(tx.Chain)
+	if !ok {
+		return "", fmt.Errorf("离线签名不支持链 %s", tx.Chain)
+	}
+	bech32HRPs := []string(nil)
+	if p.bech32HRP != "" {
+		bech32HRPs = []string{p.bech32HRP}
+	}
 
 	// 1) 收集候选 UTXO：优先内联，其次 UTXO 源（按自身地址查询）。
 	utxos := tx.UTXOs
 	if len(utxos) == 0 && s.utxoSource != nil {
 		addr := tx.ChangeAddress
 		if addr == "" {
-			addr = deriveP2WPKHAddress(s.key.Public())
+			addr = deriveUTXOAddress(s.key.Public(), tx.Chain, true)
 		}
-		src, err := s.utxoSource.ListUTXOs(ctx, addr)
+		src, err := s.utxoSource.ListUTXOs(ctx, tx.Chain, addr)
 		if err != nil {
-			return "", fmt.Errorf("BTC 查询 UTXO 失败（回退节点侧签名）: %w", err)
+			return "", fmt.Errorf("%s 查询 UTXO 失败（回退节点侧签名）: %w", tx.Chain, err)
 		}
 		utxos = src
 	}
 	if len(utxos) == 0 {
-		return "", fmt.Errorf("BTC 真实签名缺少 UTXO（UnsignedTx.UTXOs 为空且无可用 UTXO 源）")
+		return "", fmt.Errorf("%s 真实签名缺少 UTXO（UnsignedTx.UTXOs 为空且无可用 UTXO 源）", tx.Chain)
 	}
 
 	targetSat := btcToSatoshiAmt(tx.Amount)
 	if targetSat <= 0 {
-		return "", fmt.Errorf("BTC 提现金额必须 > 0")
+		return "", fmt.Errorf("%s 提现金额必须 > 0", tx.Chain)
 	}
 
-	// 2) 解析收款与找零锁定脚本。
-	recipientScript, err := addressToScriptPubKey(tx.To)
+	// 2) 解析收款与找零锁定脚本（按链参数解析 P2PKH/P2WPKH）。
+	recipientScript, err := addressToScriptPubKeyFor(tx.To, p.p2pkhVersion, bech32HRPs)
 	if err != nil {
-		return "", fmt.Errorf("BTC 收款地址非法: %w", err)
+		return "", fmt.Errorf("%s 收款地址非法: %w", tx.Chain, err)
 	}
 	changeScript := recipientScript
 	if tx.ChangeAddress != "" {
-		changeScript, err = addressToScriptPubKey(tx.ChangeAddress)
+		changeScript, err = addressToScriptPubKeyFor(tx.ChangeAddress, p.p2pkhVersion, bech32HRPs)
 		if err != nil {
-			return "", fmt.Errorf("BTC 找零地址非法: %w", err)
+			return "", fmt.Errorf("%s 找零地址非法: %w", tx.Chain, err)
 		}
 	} else {
 		changeScript = p2wpkhScript(hash160(compPub)) // 默认回自身 P2WPKH

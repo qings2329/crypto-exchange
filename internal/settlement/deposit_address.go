@@ -22,14 +22,19 @@ type DepositConfig struct {
 	XPUB string `yaml:"xpub"`
 	// BTCAddressType BTC 地址类型："p2wpkh"（默认，bech32 bc1…）或 "p2pkh"（base58 1…）。
 	BTCAddressType string `yaml:"btc_address_type"`
+	// LTCAddressType LTC 地址类型："p2wpkh"（默认，bech32 ltc1…）或 "p2pkh"（base58 L/M…）。
+	LTCAddressType string `yaml:"ltc_address_type"`
+	// DOGEAddressType DOGE 地址类型：仅 "p2pkh"（base58 D…，DOGE 无原生 segwit）；
+	// 即使配 "p2wpkh" 也会强制回退 p2pkh。
+	DOGEAddressType string `yaml:"doge_address_type"`
 }
 
-// DepositAddressGenerator 按 userID 从配置 xpub 非硬化派生每用户真实充值地址（ETH/BTC/TRON）。
+// DepositAddressGenerator 按 userID 从配置 xpub 非硬化派生每用户真实充值地址（ETH/BTC/TRON/LTC/DOGE）。
 // 仅持公钥，符合「进程不持有私钥」的 HSM 模型。
 type DepositAddressGenerator struct {
-	mu      sync.Mutex  // 保护 master 的并发非硬化派生（go-bip32 的 Key 非线程安全）
-	master  *bip32.Key // 公钥（IsPrivate=false），派生边界在外部链级。
-	btcType string
+	mu       sync.Mutex             // 保护 master 的并发非硬化派生（go-bip32 的 Key 非线程安全）
+	master   *bip32.Key             // 公钥（IsPrivate=false），派生边界在外部链级。
+	addrType map[Chain]string       // 各 UTXO 链地址类型（p2wpkh/p2pkh）；缺省按链取默认
 }
 
 // NewDepositAddressGenerator 解析 xpub 构造生成器；xpub 非法/为空返回错误（→ 调用方 fail-degraded）。
@@ -44,11 +49,21 @@ func NewDepositAddressGenerator(conf DepositConfig) (*DepositAddressGenerator, e
 	if master.IsPrivate {
 		return nil, fmt.Errorf("deposit xpub 必须是公钥扩展密钥（不能含私钥）")
 	}
-	btcType := conf.BTCAddressType
-	if btcType == "" {
-		btcType = "p2wpkh"
+	addrType := map[Chain]string{
+		ChainBTC:  conf.BTCAddressType,
+		ChainLTC:  conf.LTCAddressType,
+		ChainDOGE: conf.DOGEAddressType,
 	}
-	return &DepositAddressGenerator{master: master, btcType: btcType}, nil
+	if addrType[ChainBTC] == "" {
+		addrType[ChainBTC] = "p2wpkh"
+	}
+	if addrType[ChainLTC] == "" {
+		addrType[ChainLTC] = "p2wpkh"
+	}
+	if addrType[ChainDOGE] == "" {
+		addrType[ChainDOGE] = "p2pkh"
+	}
+	return &DepositAddressGenerator{master: master, addrType: addrType}, nil
 }
 
 // Address 为用户派生充值地址：非硬化 Child(userID) → 子公钥 → 按链编码。
@@ -73,11 +88,20 @@ func (g *DepositAddressGenerator) Address(userID int64, chain Chain) (string, er
 		return deriveETHAddress(pub), nil
 	case ChainTRON:
 		return deriveTronAddress(pub), nil
-	case ChainBTC:
-		if g.btcType == "p2pkh" {
-			return deriveP2PKHAddress(pub), nil
+	case ChainBTC, ChainLTC, ChainDOGE:
+		// 按链参数 + 配置选择地址类型；DOGE 无原生 segwit，强制 P2PKH。
+		typ := g.addrType[chain]
+		if typ == "" {
+			typ = "p2wpkh"
 		}
-		return deriveP2WPKHAddress(pub), nil
+		if chain == ChainDOGE && typ != "p2pkh" {
+			typ = "p2pkh"
+		}
+		p, _ := utxoParams(chain)
+		if typ == "p2pkh" {
+			return deriveP2PKHAddressFor(pub, p.p2pkhVersion), nil
+		}
+		return deriveP2WPKHAddressFor(pub, p.bech32HRP), nil
 	case ChainSOL:
 		// Solana 用 Ed25519，无法从 secp256k1 xpub 派生，按 userID 确定性派生（见 solana.go）。
 		return deriveSolanaAddress(userID), nil

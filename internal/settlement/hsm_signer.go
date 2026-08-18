@@ -106,8 +106,8 @@ func (s *realSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
 	switch tx.Chain {
 	case ChainETH:
 		return s.signETH(ctx, tx)
-	case ChainBTC:
-		return s.signBTC(ctx, tx)
+	case ChainBTC, ChainLTC, ChainDOGE:
+		return s.signUTXO(ctx, tx)
 	case ChainTRON:
 		return s.signTRON(ctx, tx)
 	default:
