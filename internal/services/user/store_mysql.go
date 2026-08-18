@@ -27,6 +27,7 @@ const (
 	userMigVerKYC       = 9104
 	userMigVerProfile   = 9105
 	userMigVerPrefs     = 9106
+	userMigVerTz        = 9107
 )
 
 // UserMigrations 是用户模块的建表迁移，运行时由 main 调 migrate.New(db, UserMigrations).Up()。
@@ -125,6 +126,13 @@ ALTER TABLE ce_users DROP COLUMN nickname;`,
     PRIMARY KEY (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		Down: "DROP TABLE IF EXISTS ce_user_preferences;",
+	},
+	{
+		Version: userMigVerTz,
+		Name:    "alter_ce_user_preferences_timezone",
+		Up: `ALTER TABLE ce_user_preferences
+    ADD COLUMN timezone VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'IANA 时区；空字符串表示跟随系统';`,
+		Down: "ALTER TABLE ce_user_preferences DROP COLUMN timezone;",
 	},
 }
 
@@ -383,12 +391,12 @@ func (s *mysqlStore) UpdateKYC(k *KYCSubmission) error {
 
 func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
 	var p UserPreferences
-	var lang, theme sql.NullString
+	var lang, theme, tz sql.NullString
 	var notifyOrder, notifySecurity, notifyMarketing int
 	err := s.db.QueryRow(
-		`SELECT user_id, language, theme, notify_order, notify_security, notify_marketing, updated_at
+		`SELECT user_id, language, theme, timezone, notify_order, notify_security, notify_marketing, updated_at
 		 FROM ce_user_preferences WHERE user_id=?`, userID).
-		Scan(&p.UserID, &lang, &theme, &notifyOrder, &notifySecurity, &notifyMarketing, &p.UpdatedAt)
+		Scan(&p.UserID, &lang, &theme, &tz, &notifyOrder, &notifySecurity, &notifyMarketing, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -397,6 +405,7 @@ func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
 	}
 	p.Language = lang.String
 	p.Theme = theme.String
+	p.Timezone = tz.String
 	p.NotifyOrder = notifyOrder == 1
 	p.NotifySecurity = notifySecurity == 1
 	p.NotifyMarketing = notifyMarketing == 1
@@ -406,12 +415,12 @@ func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
 func (s *mysqlStore) UpdatePreferences(p *UserPreferences) error {
 	p.UpdatedAt = time.Now()
 	_, err := s.db.Exec(
-		`INSERT INTO ce_user_preferences (user_id, language, theme, notify_order, notify_security, notify_marketing, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON DUPLICATE KEY UPDATE language=VALUES(language), theme=VALUES(theme),
+		`INSERT INTO ce_user_preferences (user_id, language, theme, timezone, notify_order, notify_security, notify_marketing, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE language=VALUES(language), theme=VALUES(theme), timezone=VALUES(timezone),
 		 notify_order=VALUES(notify_order), notify_security=VALUES(notify_security),
 		 notify_marketing=VALUES(notify_marketing), updated_at=VALUES(updated_at)`,
-		p.UserID, p.Language, p.Theme, boolToInt(p.NotifyOrder), boolToInt(p.NotifySecurity),
+		p.UserID, p.Language, p.Theme, p.Timezone, boolToInt(p.NotifyOrder), boolToInt(p.NotifySecurity),
 		boolToInt(p.NotifyMarketing), p.UpdatedAt)
 	return err
 }
