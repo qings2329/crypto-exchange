@@ -133,7 +133,6 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 func (s *Server) handleOrder(c *gin.Context) {
 	var req struct {
 		Symbol    string  `json:"symbol"`
-		UserID    int64   `json:"user_id"` // 已废弃：身份必须来自 token（F4）
 		Side      string  `json:"side"`
 		Price     float64 `json:"price"`
 		Qty       float64 `json:"qty"`
@@ -273,7 +272,6 @@ func (s *Server) handleCancel(c *gin.Context) {
 	var req struct {
 		Symbol  string `json:"symbol"`
 		OrderID int64  `json:"order_id"`
-		UserID  int64  `json:"user_id"` // 已废弃：身份来自 token（F4）
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, 400, 400, "bad request")
