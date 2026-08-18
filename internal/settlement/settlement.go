@@ -25,6 +25,8 @@ const (
 	ChainTRON Chain = "TRON"
 	ChainBTC  Chain = "BTC"
 	ChainSOL  Chain = "SOL"
+	ChainLTC  Chain = "LTC"
+	ChainDOGE Chain = "DOGE"
 )
 
 // emitSendTimeout 是 emit 向订阅者投递事件时的最大阻塞时长。订阅者因背压长期不消费时，

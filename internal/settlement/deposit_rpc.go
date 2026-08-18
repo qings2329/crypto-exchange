@@ -86,8 +86,8 @@ func (s *JSONRPCDepositScanner) scanChain(ctx context.Context, w DepositWatch) (
 	switch w.Chain {
 	case ChainETH:
 		return s.scanETH(ctx, w)
-	case ChainBTC:
-		return s.scanBTC(ctx, w)
+	case ChainBTC, ChainLTC, ChainDOGE:
+		return s.scanUTXO(ctx, w)
 	case ChainTRON:
 		return s.scanTRON(ctx, w)
 	case ChainSOL:
@@ -206,9 +206,10 @@ func erc20ToTopic(addr string) (string, bool) {
 	return "0x" + strings.Repeat("0", 64-len(a)) + a, true
 }
 
-// scanBTC 用 listsinceblock 拉取地址相关收款并解析 amount。
-func (s *JSONRPCDepositScanner) scanBTC(ctx context.Context, w DepositWatch) ([]DepositEvent, error) {
-	res, err := s.client.rpc(ctx, ChainBTC, "listsinceblock", []interface{}{})
+// scanUTXO 用 listsinceblock 拉取 UTXO 链（BTC/LTC/DOGE）地址相关收款并解析 amount（8 位小数）。
+// 三者 RPC 方法完全一致，仅按 w.Chain 路由到对应节点端点。
+func (s *JSONRPCDepositScanner) scanUTXO(ctx context.Context, w DepositWatch) ([]DepositEvent, error) {
+	res, err := s.client.rpc(ctx, w.Chain, "listsinceblock", []interface{}{})
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +236,7 @@ func (s *JSONRPCDepositScanner) scanBTC(ctx context.Context, w DepositWatch) ([]
 			UserID:  w.UserID,
 			Asset:   w.Asset,
 			Amount:  amt,
-			Chain:   ChainBTC,
+			Chain:   w.Chain,
 			Address: w.Address,
 		})
 	}
