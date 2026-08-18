@@ -313,3 +313,53 @@ func TestPreferences(t *testing.T) {
 		t.Fatalf("preferences not persisted: %+v", got)
 	}
 }
+
+// TestPreferencesTimezone 验证偏好中的 timezone 字段可正确写入并读回，
+// 包括空串（跟随系统）语义，避免字段被静默丢弃。
+func TestPreferencesTimezone(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "tz@example.com", "secret123")
+
+	// 未设置时 timezone 默认为空串（跟随系统）
+	def, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get preferences: %v", err)
+	}
+	if def.Timezone != "" {
+		t.Fatalf("expected default timezone \"\", got %q", def.Timezone)
+	}
+
+	// 写入具体时区
+	in := &UserPreferences{
+		Language: "ja",
+		Theme:    "midnight",
+		Timezone: "Asia/Tokyo",
+	}
+	if err := svc.UpdatePreferences(id, in); err != nil {
+		t.Fatalf("update preferences: %v", err)
+	}
+	got, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get preferences after update: %v", err)
+	}
+	if got.Timezone != "Asia/Tokyo" {
+		t.Fatalf("timezone not persisted: got %q", got.Timezone)
+	}
+	// 同一次写入的语言/主题也应保持
+	if got.Language != "ja" || got.Theme != "midnight" {
+		t.Fatalf("language/theme drift: %+v", got)
+	}
+
+	// 改回空串（跟随系统）应被保留，而非回退成默认
+	in2 := &UserPreferences{Timezone: ""}
+	if err := svc.UpdatePreferences(id, in2); err != nil {
+		t.Fatalf("update timezone to empty: %v", err)
+	}
+	got2, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get preferences after clear: %v", err)
+	}
+	if got2.Timezone != "" {
+		t.Fatalf("expected empty timezone after clear, got %q", got2.Timezone)
+	}
+}
