@@ -269,6 +269,134 @@ func TestHandleOrderRejectsImpersonation(t *testing.T) {
 	}
 }
 
+// 用例5b（F4 正常撤单）：uid=1 撤本人订单 → 200，冻结释放、转发撮合并清理本地记录。
+func TestHandleCancelOwnOrderSuccess(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 100000, 0)
+	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT") // 冻结 100 USDT
+	s.openOrders[555] = rec
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","order_id":555}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/cancel", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expect 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if fm.cancelCalls != 1 {
+		t.Fatalf("expect cancel forwarded once, got %d", fm.cancelCalls)
+	}
+	s.freezeMu.Lock()
+	still := s.openOrders[555]
+	s.freezeMu.Unlock()
+	if still != nil {
+		t.Fatal("own order rec must be removed after cancel")
+	}
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 0, "USDT") {
+		t.Fatalf("frozen must be released, got %v", f)
+	}
+}
+
+// 用例5c（F4 回退核验-本人）：本地无记录但撮合引擎归属本人 → 撤单成功并转发。
+func TestHandleCancelGetOrderFallbackOwned(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 100000, 0)
+	// 本地 openOrders 无 123，但撮合引擎记为其归属 uid=1。
+	fm.orders = make(map[int64]matching.OrderView)
+	fm.orders[123] = matching.OrderView{ID: 123, UserID: 1, Symbol: "BTC_USDT", Market: "spot"}
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","order_id":123}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/cancel", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expect 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if fm.cancelCalls != 1 {
+		t.Fatalf("expect cancel forwarded once, got %d", fm.cancelCalls)
+	}
+}
+
+// 用例5d（F4 回退核验-越权）：本地无记录但撮合引擎归属他人 → 403，且不转发撤单。
+func TestHandleCancelGetOrderFallbackForbidden(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 100000, 0)
+	seed(s, 2, 0, 10)
+	fm.orders = make(map[int64]matching.OrderView)
+	fm.orders[123] = matching.OrderView{ID: 123, UserID: 2, Symbol: "BTC_USDT", Market: "spot"} // 属 uid=2
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","order_id":123}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/cancel", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1)) // 攻击者 uid=1
+	r.ServeHTTP(w, req)
+	if w.Code != 403 {
+		t.Fatalf("expect 403, got %d body=%s", w.Code, w.Body.String())
+	}
+	if fm.cancelCalls != 0 {
+		t.Fatalf("must not forward cancel, got %d", fm.cancelCalls)
+	}
+}
+
+// 用例3b（F5 余额不足）：可用余额不足以冻结 → 400，不提交、不冻结。
+func TestHandleOrderInsufficientBalance(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 50, 0) // 仅 50 USDT，买 100 USDT 不足
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","side":"buy","price":100,"qty":1}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/order", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expect 400, got %d body=%s", w.Code, w.Body.String())
+	}
+	if fm.submitCalls != 0 {
+		t.Fatalf("must not submit, got %d", fm.submitCalls)
+	}
+	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 0, "USDT") {
+		t.Fatalf("must not freeze, got %v", f)
+	}
+}
+
+// 用例3c（F2 sell 方向预冻结）：卖单冻结基础资产（BTC），提交撮合。
+func TestHandleOrderSellFreezesBase(t *testing.T) {
+	fm := &fakeMatcher{}
+	s := newTestServer()
+	s.client = fm
+	seed(s, 1, 0, 10) // 持有 10 BTC
+	r := setupRouter(s)
+
+	body := `{"symbol":"BTC_USDT","side":"sell","price":100,"qty":1}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/spot/order", strings.NewReader(body))
+	req.Header.Set("Authorization", authHeader(1))
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expect 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if fm.submitCalls != 1 {
+		t.Fatalf("expect submit once, got %d", fm.submitCalls)
+	}
+	if _, f, _ := s.ledgerSvc.Balance(1, "BTC"); !eqAmt(f, 1, "BTC") {
+		t.Fatalf("expect 1 BTC frozen, got %v", f)
+	}
+}
+
 // 用例5（F4 越权撤单）：uid=1 撤 uid=2 的订单 → 403，且不释放冻结、不转发撤单。
 func TestHandleCancelForbiddenForOtherUser(t *testing.T) {
 	fm := &fakeMatcher{}
