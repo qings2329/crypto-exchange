@@ -74,6 +74,9 @@ services:
   options: "http://127.0.0.1:8090"
   otc: "http://127.0.0.1:8091"
   wealth: "http://127.0.0.1:8092"
+  staking: "http://127.0.0.1:8097"
+  bot: "http://127.0.0.1:8098"
+  copytrade: "http://127.0.0.1:8099"
   settlement: "http://127.0.0.1:8086"
 
 # 清算/结算服务（cmd/settlement）：交易手续费清算配置。

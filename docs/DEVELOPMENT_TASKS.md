@@ -46,6 +46,10 @@
 | T-16 | 依赖组件实际接入 | `docker-compose` 声明了 MySQL/Redis/Kafka/InfluxDB/ES，但当前仅 MySQL 真正使用，其余未接入 | docker-compose.yml | **已落地（Kafka+Redis+InfluxDB+ES，见 §21/§22/§23/§24）**：Kafka 交易清算（§21）+ **Redis 集群级限流（§22）** + **InfluxDB 行情 K 线持久化（§23）** + **ES 成交检索（§24）** 均已接入；docker-compose 声明的全部中间件现已实际使用 |
 | T-17 | 对账 / 审计报表 | 基于 `Ledger` 流水做借贷恒等校验、对账与审计看板 | 资金安全闭环延伸 | **已完成**（`Ledger.Reconcile/IsBalanced/RunReconcileOnce` + 定时巡检 + `/wallet/reconcile` 端点 + Prometheus 指标已具备） |
 | T-18 | 安全加固（暂不引入中间件） | 统一安全中间件套件：审计日志、安全响应头、受控 CORS、请求体限制、边缘/入口鉴权与公开端点豁免、TLS 可配置；修复 spot/futures 无鉴权下单漏洞与 market/futures 端口冲突 | 安全审计发现 | **已完成**（见 §13） |
+| T-19 | 链上质押理财（staking） | 新增业务线：产品上架、用户质押/解押、链上广播、奖励归集、本金+奖励释放；复式记账到 `SysStaking`/`SysStakingReward` | 业务规划（2026-08-17 立项） | **已完成**（见 §28） |
+| T-20 | 交易机器人（bot） | 新增业务线：网格/定投/均线策略，代用户下单（复用 spot/futures 资金安全 F1/F4），tick 触发 + 越仓控制 | 业务规划（2026-08-17 立项） | **已完成**（见 §29） |
+| T-21 | 跟单（copytrade） | 新增业务线：带单高手注册、粉丝跟单、消费成交事件按比例复制下单、平台复制费结算到 `SysCopyTradeFee` | 业务规划（2026-08-17 立项） | **已完成**（见 §30） |
+
 
 ---
 
@@ -57,7 +61,12 @@
 
 > 所有涉及新建数据表的任务（T-04、T-12、T-14、T-15、T-17 等）一律遵守 `ce_` 前缀约定。
 
-## 5. 完成状态汇总（截至 2026-08-13）
+## 5. 完成状态汇总（截至 2026-08-18）
+
+- **已完成（本轮新增实现）**：T-01、T-02、T-04、T-10、T-11、T-12、T-13、T-15、T-14（margin / notification / risk / options / otc / wealth 业务线）；账户体系（user 服务）；**T-19 链上质押理财、T-20 交易机器人、T-21 跟单** 三条新业务线（2026-08-17 立项，2026-08-18 完成首版，见 §28/§29/§30）。
+- **已完成（代码原已具备，本轮验证）**：T-05、T-06、T-07、T-08、T-09、T-17。
+- **阻塞 / 待立项**：T-03（真实链上/预言机 RPC，依赖外部节点+合规）、T-16（Redis/Kafka/InfluxDB/ES 实际接入，随业务推进）。T-14 全部子业务线（settlement / margin / notification / risk / options / otc / wealth）均已实现并验证；其中除 settlement（纯 HTTP 费用/健康检查、无持久化）外均已跑远程 MySQL 冒烟（`ce_` 表经迁移建表并持久化）。
+- **新增 `cmd` 入口与网关反代**：`cmd/staking`(:8097)、`cmd/bot`(:8098)、`cmd/copytrade`(:8099) 均已在 `configs/config.yaml` 的 `services` 段注册，经网关 `/api/v1/<svc>/*` 统一反代（staking 此前遗漏注册，本次一并补上）。
 
 - **已完成（本轮新增实现）**：T-01、T-02、T-04、T-10、T-11、T-12、T-13、T-15、T-14（margin / notification / risk / options / otc / wealth 业务线）；账户体系（user 服务）由内存骨架升级为生产级（bcrypt 密码、HMAC-SHA256 鉴权打通 T-01、MySQL 持久化、2FA、KYC 状态机）。
 - **已完成（代码原已具备，本轮验证）**：T-05、T-06、T-07、T-08、T-09、T-17。
@@ -653,3 +662,46 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - `internal/settlement/deposit_address_test.go` / `deposit_address_race_test.go`：全局生成器还原为 `nil`。
 
 **验证**：`go build ./...`、`go vet ./internal/settlement/ ./internal/futuresapi/`、`go test -race -count=1 ./internal/settlement/ ./internal/futuresapi/` 全绿；`TestEmitBackpressureNotSilent` 触发 `DROPPED` 日志印证非静默路径生效。
+
+---
+
+## 28. 业务线落地：链上质押理财 staking（2026-08-18，已完成）
+
+新增业务线 `internal/staking` + `cmd/staking`（`:8097`）。用户质押链上资产获取奖励，复式记账锁定本金于 `SysStaking`、奖励负债记 `SysStakingReward`（账本系统账户 -10/-11）。
+
+- `model.go`：`StakingProduct`/`StakingDelegation`/`StakingReward`（金额一律 `settlement.AssetAmount` 定点）；状态机 `ProductActive/ProductClosed`、`DelegationActive/DelegationUnbonding/DelegationUnbonded`。
+- `store.go`/`store_mem.go`/`store_mysql.go`+`store_migrations.go`：`Store` 接口 + 内存/MySQL 实现；迁移版本 `9801`(`ce_staking_products`)/`9802`(`ce_staking_delegations`+`ce_staking_rewards`)，金额以 `BIGINT value + INT decimals` 自包含定点存储。
+- `service.go`：`ChainBackend` 可插拔（`MockBackend` 演示）；`Subscribe`（Transfer 用户→`SysStaking` + 链上广播 + 建委托，失败回滚）、`Unbond`（终态幂等短路）、`Release`（校验 `requiredConfirmations=12`，`ledger.Batch` 原子释放本金+奖励）、`Accrue`（后台奖励归集 `SysStaking`→`SysStakingReward`）、`RunLoop`。
+- `handler.go`：`/api/v1/staking` 路由组，`middleware.Auth` + 产品创建/奖励归集/全量查询 `AdminGuard`（F4）。
+- `cmd/staking/main.go`：装配层（ledger 种子充值、Store 选择、RunLoop、信号退出）。
+- 测试（`service_test.go`）：`TestStakingLifecycle`（质押→归集→解押→释放全资金链路，校验余额与 F1/F2/F3/F5）、`TestSubscribeBelowMin`。
+
+> 资金安全：直接复用 ledger 定点复式记账（F2），订阅/释放均走账本原子操作（F3），链上广播失败回滚（F1 纵深），资产白名单校验（F5）。
+
+## 29. 业务线落地：交易机器人 bot（2026-08-18，已完成）
+
+新增业务线 `internal/bot` + `cmd/bot`（`:8098`）。网格/定投/均线策略，代用户向 spot/futures 下单，**资金安全下沉到被代理的 spot/futures 服务**（F1 client_oid 幂等 / F4 token 鉴权），bot 自身不持有私钥或余额。
+
+- `model.go`：`Market`(spot/futures)/`StrategyType`(grid/dca/ma)/`BotParams`(按类型选参，JSON 存储)/`BotStrategy`(含 `UserToken` 授权凭证，`json:"-"` 不外显)/`BotOrder`(含 `ClientOID` 幂等键)。
+- `store.go`/`store_mem.go`/`store_mysql.go`+`store_migrations.go`：`Store` 接口 + 内存/MySQL；迁移 `9803`(`ce_bot_strategies`，params JSON 列)/`9804`(`ce_bot_orders`)。
+- `service.go`：`PriceSource` 可插拔(`MockPrice`)/`OrderExecutor`(`HTTPExecutor` 调 spot/futures `/order`，携带 client_oid + Bearer token)；`CreateStrategy`(F5 参数校验)/`StartStrategy`/`StopStrategy`(F4 归属校验)/`Run` ticker 循环/`tick`（F1 `client_oid=bot:strategyID:round` 下游去重、F4 用 `UserToken` 代下单、越仓 `MaxPosition` 封顶）。
+- `handler.go`：`/api/v1/bot` 路由组，`middleware.Auth` + 全量策略 `AdminGuard`。
+- `cmd/bot/main.go`：装配层（`--spot-url`/`--futures-url` 默认指向 :8082/:8084，RunLoop，信号退出）。
+- 测试（`service_test.go`）：`TestCreateStrategyF5Validation`（各策略参数边界）、`TestStartStopF4Owner`（越权拒绝）、`TestTickF1IdempotentKey`（client_oid + token 绑定）、`TestTickMaxPositionGuard`（越仓封顶）、`TestRunLoopDrivesActive`。
+
+> 资金安全：bot 不碰账本，全部资金动作经 spot/futures 后端（已 F1/F2/F3/F4/F5 硬化）；bot 仅持用户授权 token 与幂等 client_oid 两把"开关"，杜绝越权与双付。
+
+## 30. 业务线落地：跟单 copytrade（2026-08-18，已完成）
+
+新增业务线 `internal/copytrade` + `cmd/copytrade`（`:8099`）。带单高手注册、粉丝关注、消费撮合 `mq.TradeEvent`（已含 `TakerID`/`MakerID` 交易者标记）按比例复制成交给粉丝，平台复制费结算入 `SysCopyTradeFee`（账本系统账户 -12）。
+
+- `model.go`：`LeadTrader`/`Follow`(含 `FollowerToken` 授权凭证 `json:"-"`)//`CopyRecord`(含 `EventID`+`FollowID` 幂等键)；`quoteAsset()` 从 `BASE_QUOTE` 解析计价资产。
+- `store.go`/`store_mem.go`/`store_mysql.go`+`store_migrations.go`：`Store` 接口 + 内存/MySQL；迁移 `9805`(`ce_copytrade_leads`)/`9806`(`ce_copytrade_follows`)/`9807`(`ce_copytrade_copies`，`UNIQUE(event_id, follow_id)` 库层 F1 兜底)。
+- `service.go`：`OnTrade(ev)` 入口——全局 `processed` map 去重（F1），识别被跟单 lead（taker/maker 两个方向，maker 取反方向），逐粉丝 `replicate`：F5 名义额下限 + 计价资产白名单 + 封顶 `AllocatedAmount`；代粉丝以 `FollowerToken` 经 `HTTPExecutor` 下单（F4，下游 spot/futures 校验）；F2 定点平台复制费 `followerNotional*CopyFeeRate` 从粉丝账户结算入 `SysCopyTradeFee`。
+- `handler.go`：`/api/v1/copytrade` 路由组，`middleware.Auth` + 创建/关闭带单/关注/停止/管理全量查询 `AdminGuard`。
+- `cmd/copytrade/main.go`：装配层（copytrade 自身账本种子充值供复制费结算、订阅 `exchange.trades` topic 调 `OnTrade`、信号退出）。Kafka 构建 + 配置 brokers 时消费真实成交流；否则退回内存订阅器（复制不可用，仅 HTTP 管理端点照常）。
+- 测试（`service_test.go`）：`TestCloseStopF4Owner`(越权拒绝)、`TestOnTradeReplicatesAndFees`(F1 幂等 + F4 token 绑定 + 方向一致 + 复制费入 `SysCopyTradeFee`)、`TestOnTradeSkipsUnsupportedQuote`(F5 未知计价资产跳过)、`TestOnTradeSkipsBelowMin`(F5 粉尘单跳过)、`TestOnTradeMakerSideReversal`(maker 反向复制)。
+
+> 资金安全：复制下单全部资金动作经 spot/futures 后端（F1/F4 复用）；平台复制费以 `settlement.AssetAmount` 定点（F2）从粉丝账户结算入 `SysCopyTradeFee`，幂等引用防双付（F1）；`processed` map + 库唯一键双重去重（F1 纵深）；非标准/未知计价资产的成交跳过（F5）。v1 仅支持现货跟单（`DefaultMarket=spot`），期货跟单为后续扩展。
+
+**验证（三条新业务线）**：`go build ./...` 全绿；`go vet` 新包无告警；`go test ./...` 全绿（含 `internal/staking`/`internal/bot`/`internal/copytrade` 的 F1–F5 专项用例）；`configs/config.yaml` 的 `services` 段已注册 `staking`(:8097)/`bot`(:8098)/`copytrade`(:8099) 经网关统一反代。
