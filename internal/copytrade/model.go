@@ -1,6 +1,10 @@
 package copytrade
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
+)
 
 // LeadStatus 带单高手状态。
 type LeadStatus string
@@ -64,8 +68,8 @@ type CopyRecord struct {
 	Side           string     `json:"side"`
 	Price          float64    `json:"price"`
 	Qty            float64    `json:"qty"`
-	Notional       float64    `json:"notional"`       // 粉丝复制名义额（计价币）
-	FeeAmount      float64    `json:"fee_amount"`     // 平台复制费（计价币，结算入 SysCopyTradeFee）
+	Notional       float64    `json:"notional"`        // 粉丝复制名义额（计价币，仅用于下单尺寸/展示）
+	FeeAmount      settlement.AssetAmount `json:"fee_amount"` // 平台复制费（定点，结算入 SysCopyTradeFee）
 	ExchangeOrderID string    `json:"exchange_order_id"`
 	Status         CopyStatus `json:"status"`
 	CreatedAt      int64      `json:"created_at"`

@@ -2,10 +2,12 @@ package copytrade
 
 import (
 	"database/sql"
+	"math/big"
 	"strings"
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // mysqlStore 是跟单业务的 MySQL 实现。表名 ce_copytrade_leads / ce_copytrade_follows /
@@ -157,10 +159,10 @@ func (s *mysqlStore) ListAllFollows() ([]*Follow, error) {
 
 func (s *mysqlStore) CreateCopy(c *CopyRecord) error {
 	res, err := s.db.Exec(`INSERT INTO ce_copytrade_copies
-		(event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_amount, exchange_order_id, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_value, fee_decimals, exchange_order_id, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.EventID, c.LeadID, c.FollowID, c.FollowerID, c.Symbol, c.Side, c.Price, c.Qty,
-		c.Notional, c.FeeAmount, c.ExchangeOrderID, string(c.Status), c.CreatedAt)
+		c.Notional, c.FeeAmount.Value.Int64(), c.FeeAmount.Decimals, c.ExchangeOrderID, string(c.Status), c.CreatedAt)
 	if err != nil {
 		return err
 	}
@@ -171,24 +173,26 @@ func (s *mysqlStore) CreateCopy(c *CopyRecord) error {
 }
 
 func (s *mysqlStore) GetCopy(eventID string, followID int64) (*CopyRecord, error) {
-	row := s.db.QueryRow(`SELECT id, event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_amount, exchange_order_id, status, created_at
+	row := s.db.QueryRow(`SELECT id, event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_value, fee_decimals, exchange_order_id, status, created_at
 		FROM ce_copytrade_copies WHERE event_id = ? AND follow_id = ?`, eventID, followID)
 	var c CopyRecord
 	var status string
+	var feeVal, feeDec int64
 	err := row.Scan(&c.ID, &c.EventID, &c.LeadID, &c.FollowID, &c.FollowerID, &c.Symbol, &c.Side,
-		&c.Price, &c.Qty, &c.Notional, &c.FeeAmount, &c.ExchangeOrderID, &status, &c.CreatedAt)
+		&c.Price, &c.Qty, &c.Notional, &feeVal, &feeDec, &c.ExchangeOrderID, &status, &c.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	c.FeeAmount = settlement.AssetAmount{Value: big.NewInt(feeVal), Decimals: int(feeDec)}
 	c.Status = CopyStatus(status)
 	return &c, nil
 }
 
 func (s *mysqlStore) ListCopiesByFollower(uid int64) ([]*CopyRecord, error) {
-	rows, err := s.db.Query(`SELECT id, event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_amount, exchange_order_id, status, created_at
+	rows, err := s.db.Query(`SELECT id, event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_value, fee_decimals, exchange_order_id, status, created_at
 		FROM ce_copytrade_copies WHERE follower_id = ? ORDER BY id`, uid)
 	if err != nil {
 		return nil, err
@@ -198,7 +202,7 @@ func (s *mysqlStore) ListCopiesByFollower(uid int64) ([]*CopyRecord, error) {
 }
 
 func (s *mysqlStore) ListAllCopies() ([]*CopyRecord, error) {
-	rows, err := s.db.Query(`SELECT id, event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_amount, exchange_order_id, status, created_at
+	rows, err := s.db.Query(`SELECT id, event_id, lead_id, follow_id, follower_id, symbol, side, price, qty, notional, fee_value, fee_decimals, exchange_order_id, status, created_at
 		FROM ce_copytrade_copies ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -243,10 +247,12 @@ func scanCopies(rows *sql.Rows) ([]*CopyRecord, error) {
 	for rows.Next() {
 		var c CopyRecord
 		var status string
+		var feeVal, feeDec int64
 		if err := rows.Scan(&c.ID, &c.EventID, &c.LeadID, &c.FollowID, &c.FollowerID, &c.Symbol, &c.Side,
-			&c.Price, &c.Qty, &c.Notional, &c.FeeAmount, &c.ExchangeOrderID, &status, &c.CreatedAt); err != nil {
+			&c.Price, &c.Qty, &c.Notional, &feeVal, &feeDec, &c.ExchangeOrderID, &status, &c.CreatedAt); err != nil {
 			return nil, err
 		}
+		c.FeeAmount = settlement.AssetAmount{Value: big.NewInt(feeVal), Decimals: int(feeDec)}
 		c.Status = CopyStatus(status)
 		out = append(out, &c)
 	}

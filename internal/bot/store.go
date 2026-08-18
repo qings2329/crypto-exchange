@@ -11,4 +11,5 @@ type Store interface {
 
 	CreateOrder(o *BotOrder) error
 	ListOrdersByStrategy(sid int64) ([]*BotOrder, error)
+	CountOrdersByStrategy(sid int64) (int64, error)
 }

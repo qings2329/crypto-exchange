@@ -117,3 +117,15 @@ func (m *MemStore) ListOrdersByStrategy(sid int64) ([]*BotOrder, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
+
+func (m *MemStore) CountOrdersByStrategy(sid int64) (int64, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var n int64
+	for _, o := range m.orders {
+		if o.StrategyID == sid {
+			n++
+		}
+	}
+	return n, nil
+}

@@ -177,6 +177,12 @@ func Load(path string) (*Config, error) {
 		}
 		c.Settlement.ChainRPC.Endpoints["TRON"] = v
 	}
+	if v := os.Getenv("CHAIN_RPC_ENDPOINT_SOL"); v != "" {
+		if c.Settlement.ChainRPC.Endpoints == nil {
+			c.Settlement.ChainRPC.Endpoints = map[string]string{}
+		}
+		c.Settlement.ChainRPC.Endpoints["SOL"] = v
+	}
 	if v := os.Getenv("CHAIN_RPC_REQUIRED_CONFIRMATIONS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Settlement.ChainRPC.Required = n
@@ -234,6 +240,12 @@ func Load(path string) (*Config, error) {
 	// 注入，不写进 configs/config.yaml（与 HSM_PUBLIC_KEY 同一模式）。未设置时沿用 YAML 默认值。
 	if v := os.Getenv("DEPOSIT_XPUB"); v != "" {
 		c.Settlement.ChainRPC.HotWallet.Deposit.XPUB = v
+	}
+	// Solana（Ed25519）热钱包私钥（软件签名器演示用）。敏感信息从环境变量注入，不写进
+	// configs/config.yaml；生产应替换为 HSM/KMS 后端（RegisterExternalSolanaSigner）。
+	// 仅当同时配置了 CHAIN_RPC_ENDPOINT_SOL 时，SOL 提现才走离线签名主路径。
+	if v := os.Getenv("SOLANA_HOTWALLET_KEY"); v != "" {
+		c.Settlement.ChainRPC.HotWallet.SolanaKey = v
 	}
 	return &c, nil
 }
