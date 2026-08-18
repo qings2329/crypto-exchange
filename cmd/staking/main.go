@@ -25,6 +25,7 @@ import (
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
 	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN for staking persistence (overrides config)")
+	addr := flag.String("addr", ":8097", "HTTP listen addr")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -89,9 +90,8 @@ func main() {
 		cancel()
 	}()
 
-	addr := ":8097"
-	log.Info("staking starting", zap.String("addr", addr))
-	if err := r.Run(addr); err != nil {
+	log.Info("staking starting", zap.String("addr", *addr))
+	if err := r.Run(*addr); err != nil {
 		log.Fatal("server exited", zap.Error(err))
 	}
 }

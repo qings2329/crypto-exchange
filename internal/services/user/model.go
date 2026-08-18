@@ -51,13 +51,14 @@ type User struct {
 
 // UserPreferences 是用户个人偏好设置（与核心账户解耦，独立存储）。
 type UserPreferences struct {
-	UserID        int64
-	Language      string // 界面语言，如 zh-CN / en
-	Theme         string // 主题，如 light / dark
-	NotifyOrder   bool   // 订单相关通知
-	NotifySecurity bool  // 安全相关通知（登录/改密等）
-	NotifyMarketing bool // 营销推送
-	UpdatedAt     time.Time
+	UserID         int64     `json:"user_id"`
+	Language       string    `json:"language"`        // 界面语言，如 zh-CN / en
+	Theme          string    `json:"theme"`           // 主题，如 light / dark
+	Timezone       string    `json:"timezone"`        // IANA 时区；空字符串 "" 表示跟随系统
+	NotifyOrder    bool      `json:"notify_order"`    // 订单相关通知
+	NotifySecurity bool      `json:"notify_security"` // 安全相关通知（登录/改密等）
+	NotifyMarketing bool     `json:"notify_marketing"` // 营销推送
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // VerifyCode 是一次性验证码（邮箱/短信）。

@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
 )
 
@@ -27,7 +28,25 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 		api.GET("/admin/leads", middleware.AdminGuard(), s.handleAdminLeads)
 		api.GET("/admin/follows", middleware.AdminGuard(), s.handleAdminFollows)
 		api.GET("/admin/copies", middleware.AdminGuard(), s.handleAdminCopies)
+		// 管理：在没有 Kafka 的环境下手动注入一笔撮合成交流以驱动复制（等价于发布到 exchange.trades）。
+		api.POST("/admin/simulate-trade", middleware.AdminGuard(), s.handleSimulateTrade)
 	}
+}
+
+// handleSimulateTrade 供运维/调试在没有 Kafka 时手动注入一笔成交流，驱动跟单复制。
+// 仅 AdminGuard 可调用；语义等价于把该事件发布到 exchange.trades 后由订阅器转发给 OnTrade。
+func (s *Service) handleSimulateTrade(c *gin.Context) {
+	var ev mq.TradeEvent
+	if err := c.ShouldBindJSON(&ev); err != nil {
+		response.Error(c, 400, 4000, "invalid trade event")
+		return
+	}
+	if ev.Symbol == "" || ev.Price <= 0 || ev.Qty <= 0 {
+		response.Error(c, 400, 4001, "symbol/price/qty required")
+		return
+	}
+	s.OnTrade(c.Request.Context(), ev)
+	response.JSON(c, gin.H{"status": "replicated", "symbol": ev.Symbol})
 }
 
 type createLeadReq struct {

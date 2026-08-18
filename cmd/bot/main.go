@@ -25,6 +25,7 @@ func main() {
 	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN for bot persistence (overrides config)")
 	spotURL := flag.String("spot-url", "http://127.0.0.1:8082", "spot 服务基址（bot 下单目标）")
 	futuresURL := flag.String("futures-url", "http://127.0.0.1:8084", "futures 服务基址（bot 下单目标）")
+	addr := flag.String("addr", ":8098", "HTTP listen addr")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -75,9 +76,9 @@ func main() {
 		cancel()
 	}()
 
-	addr := ":8098"
-	log.Info("bot starting", zap.String("addr", addr))
-	if err := r.Run(addr); err != nil {
+	listenAddr := *addr
+	log.Info("bot starting", zap.String("addr", listenAddr))
+	if err := r.Run(listenAddr); err != nil {
 		log.Fatal("server exited", zap.Error(err))
 	}
 }

@@ -290,6 +290,7 @@ func main() {
 			Price  float64 `json:"price"`
 			Qty    float64 `json:"qty"`
 			UserID int64   `json:"user_id"`
+			Market string  `json:"market"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			response.Error(c, 400, 400, "bad request")
@@ -308,6 +309,7 @@ func main() {
 			Side:   side,
 			Price:  req.Price,
 			Qty:    req.Qty,
+			Market: req.Market,
 			Time:   time.Now().UnixNano(),
 		}
 		if !e.Submit(req.Symbol, o) {
