@@ -202,6 +202,19 @@ func (s *Service) Run(ctx context.Context) {
 	}
 }
 
+// Tick 手动触发一次指定策略的轮询下单（供管理/调试/跨服务 e2e 强制驱动；生产由 Run 后台循环调用）。
+// 仅对 active 策略生效。
+func (s *Service) Tick(ctx context.Context, id int64) error {
+	st, err := s.store.GetStrategy(id)
+	if err != nil {
+		return err
+	}
+	if st.Status != StrategyActive {
+		return ErrInvalidParam
+	}
+	return s.tick(st)
+}
+
 // tick 执行单个策略的一轮：依类型产生下单信号，代用户下单。
 // F1 幂等：client_oid = bot:strategyID:round，下游 spot/futures 后端去重；
 // F4 授权：代下单用策略绑定的用户 token，下游校验 token->userID，杜绝越权；
