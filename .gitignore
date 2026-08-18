@@ -23,5 +23,6 @@ internal/otc/uploads/
 /notification
 /risk
 /settlement
+/staking
 /user
 /hsm-signing-service

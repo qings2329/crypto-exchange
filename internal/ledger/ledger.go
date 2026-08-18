@@ -66,6 +66,18 @@ const (
 	// 经本账户 Debit 支出，本金仍经 SysWealth。账户余额恒等于「Σ已计收益 - Σ已兑付收益」，
 	// 即 用户应计收益负债。与 SysWealth 拆分记账，赎回时 SysWealth 不再静默透支（见 wealth F3-1，#24）。
 	SysWealthYieldPayable int64 = -9
+	// SysStaking 链上质押中央托管账户：用户委托质押时本金转入此账户（余额为正），
+	// 解质押释放时从此账户支出；账户余额恒等于「在质本金 - 用户应计奖励负债」，
+	// 即 余额 = Σ质押本金 - Σ已计奖励。系统账户允许透支，复式记账自动守恒（见 staking F3，#19）。
+	SysStaking int64 = -10
+	// SysStakingReward 质押应计奖励负债账户：链上奖励归集时同时 Debit SysStaking、
+	// Credit 本账户（余额为正，表示平台对用户累计欠付的质押奖励负债）；解质押/领取时
+	// 奖励部分经本账户 Debit 支出，本金仍经 SysStaking。与 SysStaking 拆分记账，
+	// 避免解质押时 SysStaking 静默透支（模式同 wealth F3-1，#24 / staking #19）。
+	SysStakingReward int64 = -11
+	// SysCopyTradeFee 跟单平台分成收入账户：复制成交后从粉丝收益中扣取的平台费 Credit 本账户
+	// （余额为正，表示平台累计收取的跟单分成）；交易员抽成经用户可用↔交易员账户结算。
+	SysCopyTradeFee int64 = -12
 )
 
 // 快照 schema 版本。v2 起金额以 AssetAmount（定点整数）序列化；v0/v1（无 version 字段）
