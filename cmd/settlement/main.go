@@ -45,6 +45,8 @@ func main() {
 	feeModel.Register(settlement.ChainETH, "ETH", 0.001, 0)
 	feeModel.Register(settlement.ChainBTC, "BTC", 0.0005, 0)
 	feeModel.Register(settlement.ChainTRON, "USDT", 1, 0)
+	feeModel.Register(settlement.ChainSOL, "SOL", 0.001, 0)  // 原生 SOL（9 位小数）
+	feeModel.Register(settlement.ChainSOL, "USDC", 0.1, 0)   // SPL USDC（6 位小数）
 
 	// 交易清算：持久化存储（有 DSN 走 MySQL ce_settlement_trades，否则内存）+
 	// 清算处理器（消费 Kafka 成交流入账）。

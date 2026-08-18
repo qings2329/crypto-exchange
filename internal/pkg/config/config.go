@@ -177,6 +177,12 @@ func Load(path string) (*Config, error) {
 		}
 		c.Settlement.ChainRPC.Endpoints["TRON"] = v
 	}
+	if v := os.Getenv("CHAIN_RPC_ENDPOINT_SOL"); v != "" {
+		if c.Settlement.ChainRPC.Endpoints == nil {
+			c.Settlement.ChainRPC.Endpoints = map[string]string{}
+		}
+		c.Settlement.ChainRPC.Endpoints["SOL"] = v
+	}
 	if v := os.Getenv("CHAIN_RPC_REQUIRED_CONFIRMATIONS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Settlement.ChainRPC.Required = n

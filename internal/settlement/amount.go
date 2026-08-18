@@ -210,6 +210,12 @@ func AssetDecimals(chain Chain, asset string) int {
 		return 18
 	case ChainTRON:
 		return 6
+	case ChainSOL:
+		// 原生 SOL 为 9 位小数；SPL 代币（如 USDC）统一 6 位小数，其余资产按 6 处理。
+		if asset == "SOL" {
+			return 9
+		}
+		return 6
 	default:
 		return 8
 	}
@@ -226,6 +232,8 @@ func AssetDecimalsByName(asset string) int {
 		return 18
 	case "USDT", "USDC", "TRX", "TRON", "TRC20":
 		return 6
+	case "SOL":
+		return 9
 	default:
 		return 8
 	}
@@ -238,7 +246,7 @@ func AssetDecimalsByName(asset string) int {
 // 注意：本函数与 AssetDecimalsByName 的 case 必须保持同步——新增受支持资产时两处都要改。
 func KnownAsset(asset string) bool {
 	switch asset {
-	case "BTC", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20":
+	case "BTC", "ETH", "USDT", "USDC", "TRX", "TRON", "TRC20", "SOL":
 		return true
 	default:
 		return false
