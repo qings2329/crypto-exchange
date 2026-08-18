@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -181,6 +182,34 @@ func TestRunLoopDrivesActive(t *testing.T) {
 		t.Errorf("Run should have driven multiple ticks, got %d", len(mock.calls))
 	}
 }
+
+// F5：行情非法（NaN/Inf/0/负）时本轮下单应被拒绝，不触发任何订单。
+func TestTickF5InvalidPrice(t *testing.T) {
+	for _, p := range []float64{math.NaN(), math.Inf(1), 0, -1} {
+		store := NewMemStore()
+		mock := &mockExec{}
+		svc := NewService(store, &badPrice{p: p}, mock, Config{}, nil)
+		st := validStrategy(1)
+		if err := svc.CreateStrategy(st); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if err := svc.StartStrategy(1, st.ID); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		got, _ := svc.store.GetStrategy(st.ID)
+		if err := svc.tick(got); err == nil {
+			t.Errorf("price %v: expected error, got nil", p)
+		}
+		if len(mock.calls) != 0 {
+			t.Errorf("price %v: no order should be placed, calls=%d", p, len(mock.calls))
+		}
+	}
+}
+
+// badPrice 返回指定（可能非法的）行情价，用于 F5 校验。
+type badPrice struct{ p float64 }
+
+func (b *badPrice) Price(_, _ string) (float64, error) { return b.p, nil }
 
 func itoa(i int64) string {
 	if i == 0 {
