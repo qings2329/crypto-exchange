@@ -162,6 +162,9 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 充值提币记录（实时聚合 futures 链上事件）
 		admin.GET("/deposits", s.listDeposits)
 		admin.GET("/withdrawals", s.listWithdrawals)
+
+		// 用户充值地址（按 userID 在各充值链确定性派生，无持久化）
+		admin.GET("/deposit-addresses", s.listUserDepositAddresses)
 		admin.POST("/withdrawals/:id/approve", middleware.RequirePerm(PermWithdrawApproval), s.approveWithdrawal)
 		admin.POST("/withdrawals/:id/reject", middleware.RequirePerm(PermWithdrawApproval), s.rejectWithdrawal)
 
