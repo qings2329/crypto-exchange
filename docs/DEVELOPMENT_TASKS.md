@@ -305,7 +305,7 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 
 **已知缺口（后续跟进）**：
 - 强平路径 `MatchNow` 消耗订单簿流动性，但该变更**不写入 WAL**（强平属特殊路径、且 `MatchNow` 刻意不回调 `onTrade`）；严格恢复需把强平成交也 journal。当前由强平扫描在恢复后重新触发兜底，可接受于原型。
-- spot/futures 仍各自持有内存订单簿；真正「全交易所多实例」应把匹配收敛为单一 `cmd/matching` 服务（单写者可水平容灾），spot/futures 改为其 HTTP 客户端。本轮未做（属更大的服务网格重构）。
+- ~~spot/futures 仍各自持有内存订单簿；真正「全交易所多实例」应把匹配收敛为单一 `cmd/matching` 服务（单写者可水平容灾），spot/futures 改为其 HTTP 客户端。本轮未做（属更大的服务网格重构）~~ **已完成（见 §18 / §18.1，2026-08-14 起落地）**：`internal/spot/server.go:75` 与 `internal/futuresapi/server.go:157` 已改为 `cmd/matching` 的 HTTP+WS 客户端（`client.New(cfg.Matching.URL)`），不再持有订单簿；单一写者 + leader 选举 + 崩溃恢复见 §17。多实例不再分裂簿，三进程端到端验证已证明 spot/futures 写入同一订单簿。
 
 ### 17.1 验证
 - `internal/matching/persist/mem_test.go`：`TestMemNextOrderIDMonotonic`（序号单调）、`TestMemWALReplayAndPrune`（WAL 回放+快照+剪枝）、`TestMemLeaderMutualExclusion`（双节点互斥：A 持锁时 B 不可获、A 释放后 B 可获）、`TestMemLeaderExpiryTakeover`（租约过期 B 可接管）、`TestOrderEventJSONRoundTrip`（JSON 往返，MySQLStore 依赖）。

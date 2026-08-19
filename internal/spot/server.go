@@ -52,14 +52,15 @@ type matcherClient interface {
 type Server struct {
 	log    *zap.Logger
 	client matcherClient
+	cfg    *config.Config
 	hub    *ws.Hub
 
 	ledgerSvc *ledger.Ledger // 现货自有复式记账账本（与合约服务各自独立实例，见计划说明）
 
-	freezeMu    sync.Mutex
-	openOrders  map[int64]*freezeRec // orderID -> 预冻结记录，供成交递减与撤单释放
-	clientOIDMap map[string]int64    // "uid:client_oid" -> orderID（下单幂等，避免重试双冻）
-	settledRefs map[string]bool      // 成交去重键 -> 已结算（避免重放双付）
+	freezeMu     sync.Mutex
+	openOrders   map[int64]*freezeRec // orderID -> 预冻结记录，供成交递减与撤单释放
+	clientOIDMap map[string]int64     // "uid:client_oid" -> orderID（下单幂等，避免重试双冻）
+	settledRefs  map[string]bool      // 成交去重键 -> 已结算（避免重放双付）
 
 	store Store // 订单持久化：重启后据此恢复 clientOIDMap（防重启+重试双冻）。nil 表示不持久化。
 
@@ -73,6 +74,7 @@ func NewServer(ledgerSvc *ledger.Ledger, cfg *config.Config, log *zap.Logger) *S
 	s := &Server{
 		log:          log,
 		client:       client.New(cfg.Matching.URL),
+		cfg:          cfg,
 		hub:          ws.NewHub(),
 		ledgerSvc:    ledgerSvc,
 		openOrders:   make(map[int64]*freezeRec),
@@ -138,7 +140,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 		Qty       float64 `json:"qty"`
 		IsMargin  bool    `json:"is_margin"`          // 杠杆现货单（借币后下单）
 		Leverage  float64 `json:"leverage,omitempty"` // 杠杆倍数（is_margin 时有效）
-		ClientOID string  `json:"client_oid"`          // 下单幂等键（F1）
+		ClientOID string  `json:"client_oid"`         // 下单幂等键（F1）
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, 400, 400, "bad request")
@@ -166,11 +168,15 @@ func (s *Server) handleOrder(c *gin.Context) {
 		return
 	}
 
+	// 边界定点化：请求中的价格/数量按交易对配置的 scale 对齐为 Fixed（消除浮点精度漂移）。
+	price := matching.FixedFromFloat(req.Price, s.cfg.PriceScale(req.Symbol))
+	qty := matching.FixedFromFloat(req.Qty, s.cfg.QtyScale(req.Symbol))
+
 	o := &matching.Order{
 		UserID: uid, // F4：身份来自 token。
 		Side:   side,
-		Price:  req.Price,
-		Qty:    req.Qty,
+		Price:  price,
+		Qty:    qty,
 		Time:   time.Now().UnixNano(),
 		Market: "spot",
 		// 杠杆现货单标记为 IsMargin，倍数透传；用于订单管理按杠杆过滤。
@@ -191,7 +197,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 		}
 	}
 	// 预冻结（临界区内执行，与提交/登记原子，避免成交事件早到漏结算与双冻）。
-	rec, err := s.reserveOnOpen(uid, side, req.Price, req.Qty, req.Symbol)
+	rec, err := s.reserveOnOpen(uid, side, price, qty, req.Symbol)
 	if err != nil {
 		s.freezeMu.Unlock()
 		response.Error(c, 400, 400, "insufficient balance: "+err.Error())
@@ -223,8 +229,9 @@ func (s *Server) handleOrder(c *gin.Context) {
 }
 
 // reserveOnOpen 下单前预冻结资金，返回（尚未绑定 orderID 的）预冻结记录。
-// 冻结额以 settlement.AssetAmount 计算并跟踪（F2）。price>0 已由调用方校验。
-func (s *Server) reserveOnOpen(userID int64, side matching.Side, price, qty float64, symbol string) (*freezeRec, error) {
+// 冻结额以 settlement.AssetAmount 计算并跟踪（F2）。price/qty 为已按交易对 scale 对齐的
+// 定点（Fixed），相乘/缩放全程整数运算，不再经 float64 漂移。price>0 已由调用方校验。
+func (s *Server) reserveOnOpen(userID int64, side matching.Side, price, qty matching.Fixed, symbol string) (*freezeRec, error) {
 	base, quote, ok := splitSymbol(symbol)
 	if !ok {
 		return nil, fmt.Errorf("unsupported symbol %s", symbol)
@@ -235,10 +242,13 @@ func (s *Server) reserveOnOpen(userID int64, side matching.Side, price, qty floa
 	switch {
 	case side == matching.Buy:
 		asset = quote
-		amt = settlement.AssetAmountFromFloat(price*qty, settlement.AssetDecimalsByName(asset))
+		// cost = price × qty（定点乘法，scale = PriceScale+QtyScale），再无损转为计价资产最小单位。
+		dec := settlement.AssetDecimalsByName(asset)
+		amt = settlement.NewAssetAmount(price.Mul(qty).ToBaseUnits(dec), dec)
 	case side == matching.Sell:
 		asset = base
-		amt = settlement.AssetAmountFromFloat(qty, settlement.AssetDecimalsByName(asset))
+		dec := settlement.AssetDecimalsByName(asset)
+		amt = settlement.NewAssetAmount(qty.ToBaseUnits(dec), dec)
 	}
 	if !amt.IsZero() {
 		if err := s.ledgerSvc.Freeze(userID, asset, amt); err != nil {
@@ -326,10 +336,11 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 		return fmt.Errorf("unsupported symbol %s", symbol)
 	}
 	// F5 纵深：ledger.Transfer 允许 0 转账，必须拦截零/负额，避免"付 0 计价收基础资产"白嫖。
-	if t.Price <= 0 || t.Qty <= 0 {
+	if !t.Price.IsPositive() || !t.Qty.IsPositive() {
 		return fmt.Errorf("invalid trade: price/qty must be positive")
 	}
-	cost := t.Price * t.Qty
+	// cost 为定点乘法（scale = PriceScale+QtyScale），再无损转为计价资产最小单位，全程无浮点。
+	cost := t.Price.Mul(t.Qty)
 
 	// 确定买卖方用户（TakerSide 决定哪一侧是买方）。
 	var buyer, seller int64
@@ -353,12 +364,14 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 	sellRec := s.lookupFreezeLocked(t.TakerOID, t.MakerOID, matching.Sell)
 
 	// 计价腿：买方支付 quote（先解冻后转账）。
-	quoteAmt := settlement.AssetAmountFromFloat(cost, settlement.AssetDecimalsByName(quote))
+	quoteDec := settlement.AssetDecimalsByName(quote)
+	quoteAmt := settlement.NewAssetAmount(cost.ToBaseUnits(quoteDec), quoteDec)
 	if buyRec != nil && quoteAmt.Cmp(buyRec.frozenQuote) > 0 {
 		quoteAmt = buyRec.frozenQuote // F2 钳位到真实剩余，消除累计漂移/残留。
 	}
 	// 基础腿：卖方支付 base（先解冻后转账）。
-	baseAmt := settlement.AssetAmountFromFloat(t.Qty, settlement.AssetDecimalsByName(base))
+	baseDec := settlement.AssetDecimalsByName(base)
+	baseAmt := settlement.NewAssetAmount(t.Qty.ToBaseUnits(baseDec), baseDec)
 	if sellRec != nil && baseAmt.Cmp(sellRec.frozenBase) > 0 {
 		baseAmt = sellRec.frozenBase
 	}

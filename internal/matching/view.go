@@ -19,13 +19,13 @@ type OrderView struct {
 	ID          int64       `json:"id"`
 	UserID      int64       `json:"user_id"`
 	Symbol      string      `json:"symbol"`
-	Market      string      `json:"market"` // spot | futures
-	IsMargin    bool        `json:"is_margin"`        // 是否杠杆单（现货杠杆/合约均为 true）
+	Market      string      `json:"market"`             // spot | futures
+	IsMargin    bool        `json:"is_margin"`          // 是否杠杆单（现货杠杆/合约均为 true）
 	Leverage    float64     `json:"leverage,omitempty"` // 杠杆倍数（无杠杆为 0）
-	Side        string      `json:"side"`   // buy | sell
-	Price       float64     `json:"price"`  // 0 表示市价单
-	Qty         float64     `json:"qty"`
-	Filled      float64     `json:"filled"`
+	Side        string      `json:"side"`               // buy | sell
+	Price       Fixed       `json:"price"`              // 零值表示市价单
+	Qty         Fixed       `json:"qty"`
+	Filled      Fixed       `json:"filled"`
 	Status      OrderStatus `json:"status"`
 	TimeInForce string      `json:"time_in_force,omitempty"`
 	CreatedAt   int64       `json:"created_at"`
@@ -34,13 +34,13 @@ type OrderView struct {
 
 // TradeView 一笔成交的只读视图（买卖双边用户均可见，对应其各自历史）。
 type TradeView struct {
-	ID        int64   `json:"id"`                     // 全局成交序号
+	ID        int64   `json:"id"` // 全局成交序号
 	Symbol    string  `json:"symbol"`
-	Market    string  `json:"market"`                // spot | futures
-	IsMargin  bool    `json:"is_margin"`             // 是否杠杆成交（来自吃单订单的杠杆标记）
-	Leverage  float64 `json:"leverage,omitempty"`    // 杠杆倍数（无杠杆为 0）
-	Price     float64 `json:"price"`
-	Qty       float64 `json:"qty"`
+	Market    string  `json:"market"`             // spot | futures
+	IsMargin  bool    `json:"is_margin"`          // 是否杠杆成交（来自吃单订单的杠杆标记）
+	Leverage  float64 `json:"leverage,omitempty"` // 杠杆倍数（无杠杆为 0）
+	Price     Fixed   `json:"price"`
+	Qty       Fixed   `json:"qty"`
 	TakerID   int64   `json:"taker_id"`
 	MakerID   int64   `json:"maker_id"`
 	TakerSide string  `json:"taker_side"` // buy | sell

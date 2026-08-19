@@ -128,8 +128,8 @@ func (s *Server) startWSSource() {
 				}
 				s.applyTrade(mq.TradeEvent{
 					Symbol:    ev.Symbol,
-					Price:     ev.Trade.Price,
-					Qty:       ev.Trade.Qty,
+					Price:     ev.Trade.Price.Float(), // 定点→float64：mq 边界保持兼容
+					Qty:       ev.Trade.Qty.Float(),
 					TakerID:   ev.Trade.TakerID,
 					MakerID:   ev.Trade.MakerID,
 					TakerSide: takerSide,
@@ -192,15 +192,16 @@ func (s *Server) applyDepth(ev mq.DepthEvent) {
 	s.hub.Broadcast(ev.Symbol, gin.H{"type": "depth", "symbol": ev.Symbol, "data": ev})
 }
 
-// toDepthLevels 把撮合引擎的订单簿层级聚合为深度行（每档 volume = 各订单 Qty 之和）。
+// toDepthLevels 把撮合引擎的订单簿层级聚合为深度行（每档 volume = 各订单 Qty 之和，
+// 定点求和后统一转 float64：mq 边界保持兼容）。
 func toDepthLevels(levels []matching.Level) []mq.DepthLevel {
 	out := make([]mq.DepthLevel, 0, len(levels))
 	for _, l := range levels {
-		var v float64
+		var v matching.Fixed
 		for _, o := range l.Orders {
-			v += o.Qty
+			v = v.Add(o.Qty)
 		}
-		out = append(out, mq.DepthLevel{Price: l.Price, Volume: v})
+		out = append(out, mq.DepthLevel{Price: l.Price.Float(), Volume: v.Float()})
 	}
 	return out
 }

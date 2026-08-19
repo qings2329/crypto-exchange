@@ -58,6 +58,9 @@ matching:
     - ETH_USDT
     - BTC_USDT_PERP
     - ETH_USDT_PERP
+  # 定点化精度：价格/数量的默认小数位（可被 scales 按 symbol 覆盖）。
+  default_price_scale: 2
+  default_qty_scale: 8
 
 services:
   user: "http://127.0.0.1:8081"

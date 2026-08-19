@@ -5,16 +5,16 @@ import "testing"
 // 以下 helper 仅构造订单，不触碰 TimeInForce / StopPrice / StopLimit。
 func buy(o *Order, qty, price float64, uid int64) *Order {
 	o.Side = Buy
-	o.Qty = qty
-	o.Price = price
+	o.Qty = fxQty(qty)
+	o.Price = fxPrice(price)
 	o.UserID = uid
 	return o
 }
 
 func sell(o *Order, qty, price float64, uid int64) *Order {
 	o.Side = Sell
-	o.Qty = qty
-	o.Price = price
+	o.Qty = fxQty(qty)
+	o.Price = fxPrice(price)
 	o.UserID = uid
 	return o
 }
@@ -25,11 +25,11 @@ func TestMatchRestIOC(t *testing.T) {
 	ob.Match(sell(&Order{ID: 1, UserID: 1}, 5, 100, 1)) // 挂卖 @100 x5
 
 	tr := ob.Match(buy(&Order{ID: 2, UserID: 2, TimeInForce: TIFIOC}, 10, 0, 2))
-	var filled float64
+	var filled Fixed
 	for _, x := range tr {
-		filled += x.Qty
+		filled = filled.Add(x.Qty)
 	}
-	if filled != 5 {
+	if filled.Cmp(fxQty(5)) != 0 {
 		t.Fatalf("IOC 应仅成交对手盘 5，got %v", filled)
 	}
 	if _, asks := ob.Depth(); len(asks) != 0 {
@@ -53,11 +53,11 @@ func TestMatchRestFOK(t *testing.T) {
 
 	// 流动性充足：全成
 	tr = ob.Match(buy(&Order{ID: 3, UserID: 3, TimeInForce: TIFFOK}, 5, 100, 3))
-	var filled float64
+	var filled Fixed
 	for _, x := range tr {
-		filled += x.Qty
+		filled = filled.Add(x.Qty)
 	}
-	if filled != 5 {
+	if filled.Cmp(fxQty(5)) != 0 {
 		t.Fatalf("FOK 充足应全成，got %v", filled)
 	}
 }
@@ -67,7 +67,7 @@ func TestStopOrderBuyTriggers(t *testing.T) {
 	ob := NewOrderBook("TEST")
 	ob.Match(sell(&Order{ID: 1, UserID: 1}, 10, 110, 1)) // 挂卖 @110 x10
 
-	stop := &Order{ID: 999, UserID: 2, Side: Buy, Qty: 3, StopPrice: 105}
+	stop := &Order{ID: 999, UserID: 2, Side: Buy, Qty: fxQty(3), StopPrice: fxPrice(105)}
 	tr := ob.Match(stop) // 尚无成交价，应挂起不成交
 	if len(tr) != 0 {
 		t.Fatalf("止损未触发前不应成交，got %v", tr)
@@ -97,13 +97,13 @@ func TestStopLimitActivatesAsLimit(t *testing.T) {
 	ob := NewOrderBook("TEST")
 	ob.Match(sell(&Order{ID: 1, UserID: 1}, 10, 110, 1)) // 挂卖 @110 x10
 
-	stop := &Order{ID: 7, UserID: 2, Side: Buy, Qty: 3, StopPrice: 105, StopLimit: 108}
+	stop := &Order{ID: 7, UserID: 2, Side: Buy, Qty: fxQty(3), StopPrice: fxPrice(105), StopLimit: fxPrice(108)}
 	ob.Match(stop) // 挂起
 	// 市价买 @110 x2 触发 last=110，止损激活为限价买 @108（<110 无法成交 → 挂买盘）
 	ob.Match(buy(&Order{ID: 2, UserID: 2}, 2, 110, 2))
 
 	bids, _ := ob.Depth()
-	if len(bids) != 1 || bids[0].Price != 108 {
+	if len(bids) != 1 || bids[0].Price.Cmp(fxPrice(108)) != 0 {
 		t.Fatalf("止损激活后限价单应挂买盘@108，bids=%v", bids)
 	}
 	if len(ob.stops) != 0 {
@@ -117,16 +117,16 @@ func TestCanFullyFill(t *testing.T) {
 	ob.Match(sell(&Order{ID: 1}, 5, 100, 1))
 	ob.Match(sell(&Order{ID: 2}, 5, 101, 1))
 
-	if !ob.canFullyFill(&Order{Side: Buy, Qty: 10, Price: 0}) {
+	if !ob.canFullyFill(&Order{Side: Buy, Qty: fxQty(10), Price: Fixed{}}) {
 		t.Fatal("市价买 x10 应可全成")
 	}
-	if ob.canFullyFill(&Order{Side: Buy, Qty: 10, Price: 100}) {
+	if ob.canFullyFill(&Order{Side: Buy, Qty: fxQty(10), Price: fxPrice(100)}) {
 		t.Fatal("限价买@100 x10 仅 5 可成")
 	}
-	if ob.canFullyFill(&Order{Side: Buy, Qty: 6, Price: 100}) {
+	if ob.canFullyFill(&Order{Side: Buy, Qty: fxQty(6), Price: fxPrice(100)}) {
 		t.Fatal("限价买@100 x6 仅 5 可成")
 	}
-	if !ob.canFullyFill(&Order{Side: Buy, Qty: 5, Price: 100}) {
+	if !ob.canFullyFill(&Order{Side: Buy, Qty: fxQty(5), Price: fxPrice(100)}) {
 		t.Fatal("限价买@100 x5 应可全成")
 	}
 }

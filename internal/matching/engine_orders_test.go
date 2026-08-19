@@ -12,17 +12,17 @@ func TestEngineOrderRegistry(t *testing.T) {
 
 	// 用户1的现货限价买（挂单，未成交）。
 	if _, _ = e.MatchNow("BTC_USDT", &Order{
-		ID: 1, UserID: 1, Side: Buy, Price: 100, Qty: 1, Time: 1, Market: "spot",
+		ID: 1, UserID: 1, Side: Buy, Price: fxPrice(100), Qty: fxQty(1), Time: 1, Market: "spot",
 	}, true); false {
 	}
 	// 用户2的合约市价卖，吃掉上方挂单，双方完全成交（合约=杠杆单）。
 	if _, _ = e.MatchNow("BTC_USDT", &Order{
-		ID: 2, UserID: 2, Side: Sell, Price: 0, Qty: 1, Time: 2, Market: "futures", IsMargin: true, Leverage: 10,
+		ID: 2, UserID: 2, Side: Sell, Price: Fixed{}, Qty: fxQty(1), Time: 2, Market: "futures", IsMargin: true, Leverage: 10,
 	}, false); false {
 	}
 	// 用户3的现货杠杆买（借币后下的现货杠杆单）。
 	if _, _ = e.MatchNow("BTC_USDT", &Order{
-		ID: 3, UserID: 3, Side: Buy, Price: 50, Qty: 1, Time: 3, Market: "spot", IsMargin: true, Leverage: 3,
+		ID: 3, UserID: 3, Side: Buy, Price: fxPrice(50), Qty: fxQty(1), Time: 3, Market: "spot", IsMargin: true, Leverage: 3,
 	}, true); false {
 	}
 
@@ -117,7 +117,7 @@ func TestEngineOrderRegistry(t *testing.T) {
 
 	// 撤销：新挂一笔后撤单，状态应变为 canceled。
 	if _, _ = e.MatchNow("BTC_USDT", &Order{
-		ID: 4, UserID: 4, Side: Buy, Price: 50, Qty: 1, Time: 4, Market: "spot",
+		ID: 4, UserID: 4, Side: Buy, Price: fxPrice(50), Qty: fxQty(1), Time: 4, Market: "spot",
 	}, true); false {
 	}
 	if !e.Cancel("BTC_USDT", 4) {

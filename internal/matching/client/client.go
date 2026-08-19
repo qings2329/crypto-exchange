@@ -92,11 +92,11 @@ func (c *Client) MatchNow(symbol string, o *matching.Order, rest bool) ([]matchi
 		side = "sell"
 	}
 	var resp struct {
-		Symbol       string           `json:"symbol"`
-		Trades       []matching.Trade `json:"trades"`
-		Filled       float64          `json:"filled"`
-		FullyFilled  bool             `json:"fully_filled"`
-		Error        string           `json:"error"`
+		Symbol      string           `json:"symbol"`
+		Trades      []matching.Trade `json:"trades"`
+		Filled      matching.Fixed   `json:"filled"`
+		FullyFilled bool             `json:"fully_filled"`
+		Error       string           `json:"error"`
 	}
 	if err := c.postJSON("/match-now", map[string]interface{}{
 		"symbol":  symbol,
@@ -219,8 +219,8 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn,
 			return err
 		}
 		var envelope struct {
-			Type   string `json:"type"`
-			Symbol string `json:"symbol"`
+			Type   string          `json:"type"`
+			Symbol string          `json:"symbol"`
 			Data   json.RawMessage `json:"data"`
 		}
 		if err := json.Unmarshal(data, &envelope); err != nil {

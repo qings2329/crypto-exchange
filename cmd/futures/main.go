@@ -83,17 +83,17 @@ func main() {
 	if dsn != "" {
 		if db, derr := sql.Open("mysql", dsn); derr == nil {
 			if perr := db.Ping(); perr == nil {
-			if ms, merr := risk.NewMySQLStore(db); merr == nil {
-				riskSvc = risk.New(ms)
-				log.Info("risk store: mysql")
-				// 账本操作级幂等指纹持久化（#26）：与风控共享同一 *sql.DB，
-				// 重启后同 ref 的重复转账/冻结可被检测并跳过，防双付。
-				if ierr := ledgerSvc.SetIdempotencyDB(db, "futures"); ierr != nil {
-					log.Warn("ledger idempotency db init failed", zap.Error(ierr))
+				if ms, merr := risk.NewMySQLStore(db); merr == nil {
+					riskSvc = risk.New(ms)
+					log.Info("risk store: mysql")
+					// 账本操作级幂等指纹持久化（#26）：与风控共享同一 *sql.DB，
+					// 重启后同 ref 的重复转账/冻结可被检测并跳过，防双付。
+					if ierr := ledgerSvc.SetIdempotencyDB(db, "futures"); ierr != nil {
+						log.Warn("ledger idempotency db init failed", zap.Error(ierr))
+					} else {
+						log.Info("ledger idempotency: mysql")
+					}
 				} else {
-					log.Info("ledger idempotency: mysql")
-				}
-			} else {
 					log.Warn("risk mysql migrate failed, fallback to mem", zap.Error(merr))
 					_ = db.Close()
 				}
@@ -112,7 +112,7 @@ func main() {
 
 	// 装配合约交易服务（引擎/预言机/网关/资金费循环/账本风控），不含业务逻辑。
 	// matchingURL 指向 cmd/matching 服务，撮合收敛为单一权威（见 DEVELOPMENT_TASKS §18）。
-	server := futuresapi.NewServer(ledgerSvc, log, dsn, cfg.Matching.URL, cfg.Oracle, cfg.Settlement.ChainRPC, riskSvc, cfg.Services["user"])
+	server := futuresapi.NewServer(ledgerSvc, log, cfg, dsn, cfg.Matching.URL, cfg.Oracle, cfg.Settlement.ChainRPC, riskSvc, cfg.Services["user"])
 	defer server.Close()
 
 	// 进程退出前持久化账本状态到 MySQL（正常返回或 Ctrl+C/kill 触发），保证资金安全态不丢失。
