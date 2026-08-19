@@ -53,11 +53,11 @@ type depthRow struct {
 func aggregate(levels []matching.Level) []depthRow {
 	out := make([]depthRow, 0, len(levels))
 	for _, l := range levels {
-		var v float64
+		var v matching.Fixed
 		for _, o := range l.Orders {
-			v += o.Qty
+			v = v.Add(o.Qty)
 		}
-		out = append(out, depthRow{Price: l.Price, Volume: v})
+		out = append(out, depthRow{Price: l.Price.Float(), Volume: v.Float()})
 	}
 	return out
 }

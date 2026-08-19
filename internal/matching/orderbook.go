@@ -25,15 +25,15 @@ type Order struct {
 	ID     int64
 	UserID int64
 	Side   Side
-	Price  float64 // 市价单 Price=0
-	Qty    float64
-	Filled float64
+	Price  Fixed // 市价单 Price 为零值（IsZero）
+	Qty    Fixed
+	Filled Fixed
 	Time   int64 // 时间戳，用于时间优先
 
 	// 高级订单属性（原型支持，默认零值表示普通限价/GTC）。
-	TimeInForce string  // GTC/IOC/FOK，空按 GTC 处理
-	StopPrice   float64 // >0 表示止盈止损单：成交价穿越该触发价后才激活为普通单
-	StopLimit   float64 // 仅 stop-limit 用：激活后作为限价单的挂单价；0 表示激活为市价单
+	TimeInForce string // GTC/IOC/FOK，空按 GTC 处理
+	StopPrice   Fixed  // 非零表示止盈止损单：成交价穿越该触发价后才激活为普通单
+	StopLimit   Fixed  // 仅 stop-limit 用：激活后作为限价单的挂单价；零值表示激活为市价单
 
 	// Market 标记订单来源市场（"spot" | "futures"），由上游在下单时写入，
 	// 用于订单管理模块按交易类型区分同一撮合引擎内的订单（现货/合约共用同一登记簿）。
@@ -41,25 +41,25 @@ type Order struct {
 	// IsMargin 标记该单是否为杠杆单（现货杠杆单与合约单均为 true，普通现货单为 false），
 	// 用于订单管理模块按"是否杠杆"过滤。Leverage 为杠杆倍数（无杠杆时 0）。
 	IsMargin bool
-	Leverage float64
+	Leverage float64 // 杠杆倍数（无杠杆为 0），本次保持 float64（倍数语义，非资金精度关键）
 }
 
 // IsFilled 是否完全成交。
-func (o *Order) IsFilled() bool { return o.Filled >= o.Qty }
+func (o *Order) IsFilled() bool { return o.Filled.Cmp(o.Qty) >= 0 }
 
 // Remaining 剩余未成交量。
-func (o *Order) Remaining() float64 { return o.Qty - o.Filled }
+func (o *Order) Remaining() Fixed { return o.Qty.Sub(o.Filled) }
 
 // Level 某一价格档的订单队列。
 type Level struct {
-	Price  float64
+	Price  Fixed
 	Orders []*Order
 }
 
 // Trade 成交回报。
 type Trade struct {
-	Price     float64
-	Qty       float64
+	Price     Fixed
+	Qty       Fixed
 	TakerID   int64 // 吃单用户 ID（资金记账溯源）
 	MakerID   int64 // 挂单用户 ID
 	TakerSide Side
@@ -78,41 +78,43 @@ type BookState struct {
 
 // OrderBook 单个交易对的内存订单簿。
 // 注意：骨架用 map + 每次排序实现价格优先，生产环境应替换为红黑树/跳表以保证 O(log n)。
+// 价位以 Fixed（定点小数，值类型可比较）为 map 键；同交易对内价格小数位（PriceScale）一致，
+// 保证相同价格映射到同一档（见 cmd/matching 按 symbol 注册精度）。
 type OrderBook struct {
 	symbol string
 	mu     sync.RWMutex
-	bids   map[float64]*Level // 买盘
-	asks   map[float64]*Level // 卖盘
-	stops  []*Order           // 未触发的止盈止损单：最近成交价穿越触发价后激活为普通单
-	last   float64            // 最近成交价，止盈止损触发判定的参考价
+	bids   map[Fixed]*Level // 买盘
+	asks   map[Fixed]*Level // 卖盘
+	stops  []*Order         // 未触发的止盈止损单：最近成交价穿越触发价后激活为普通单
+	last   Fixed            // 最近成交价，止盈止损触发判定的参考价
 }
 
 // NewOrderBook 创建订单簿。
 func NewOrderBook(symbol string) *OrderBook {
 	return &OrderBook{
 		symbol: symbol,
-		bids:   make(map[float64]*Level),
-		asks:   make(map[float64]*Level),
+		bids:   make(map[Fixed]*Level),
+		asks:   make(map[Fixed]*Level),
 	}
 }
 
 // sortedBidPrices 买盘价格降序。
-func (ob *OrderBook) sortedBidPrices() []float64 {
-	prices := make([]float64, 0, len(ob.bids))
+func (ob *OrderBook) sortedBidPrices() []Fixed {
+	prices := make([]Fixed, 0, len(ob.bids))
 	for p := range ob.bids {
 		prices = append(prices, p)
 	}
-	sort.Slice(prices, func(i, j int) bool { return prices[i] > prices[j] })
+	sort.Slice(prices, func(i, j int) bool { return prices[i].Cmp(prices[j]) > 0 })
 	return prices
 }
 
 // sortedAskPrices 卖盘价格升序。
-func (ob *OrderBook) sortedAskPrices() []float64 {
-	prices := make([]float64, 0, len(ob.asks))
+func (ob *OrderBook) sortedAskPrices() []Fixed {
+	prices := make([]Fixed, 0, len(ob.asks))
 	for p := range ob.asks {
 		prices = append(prices, p)
 	}
-	sort.Slice(prices, func(i, j int) bool { return prices[i] < prices[j] })
+	sort.Slice(prices, func(i, j int) bool { return prices[i].Cmp(prices[j]) < 0 })
 	return prices
 }
 
@@ -124,8 +126,8 @@ func (ob *OrderBook) Match(in *Order) []Trade {
 
 // MatchRest 撮合一笔新订单，返回成交列表。
 // rest=true（默认 Match 行为）：未成交部分挂单到订单簿（限价单正常挂单）。
-// rest=false：市价单（Price=0）未成交部分直接丢弃、不挂单——用于强平场景，
-// 避免空流动性时残留 price=0 挂单污染订单簿（剩余由保险基金兜底成交）。
+// rest=false：市价单（Price 零值）未成交部分直接丢弃、不挂单——用于强平场景，
+// 避免空流动性时残留零价挂单污染订单簿（剩余由保险基金兜底成交）。
 //
 // 时间约束力（仅对 taker 生效）：
 //   - IOC：忽略 rest，尽量撮合、剩余直接撤销。
@@ -135,7 +137,7 @@ func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 	defer ob.mu.Unlock()
 
 	// 止盈止损单：成交价穿越触发价前不入簿，挂起到 stops 等待激活。
-	if in.StopPrice > 0 {
+	if !in.StopPrice.IsZero() {
 		if !ob.stopTriggered(in) {
 			ob.stops = append(ob.stops, in)
 			return nil
@@ -163,9 +165,9 @@ func (ob *OrderBook) MatchRest(in *Order, rest bool) []Trade {
 }
 
 // canFullyFill 调用方必须已持 ob.mu。估算对手盘可用流动性是否足以完全成交 in。
-// 市价单（Price=0）统计全部对手盘；限价单仅统计可成交档位（满足价格优先）。
+// 市价单（Price 零值）统计全部对手盘；限价单仅统计可成交档位（满足价格优先）。
 func (ob *OrderBook) canFullyFill(in *Order) bool {
-	var available float64
+	var available Fixed
 	opposite := ob.asks
 	bestPrices := ob.sortedAskPrices()
 	if in.Side == Sell {
@@ -173,45 +175,45 @@ func (ob *OrderBook) canFullyFill(in *Order) bool {
 		bestPrices = ob.sortedBidPrices()
 	}
 	for _, p := range bestPrices {
-		if in.Price > 0 {
+		if !in.Price.IsZero() {
 			// 限价单：仅统计可成交档位。
-			if in.Side == Buy && p > in.Price {
+			if in.Side == Buy && p.Cmp(in.Price) > 0 {
 				break
 			}
-			if in.Side == Sell && p < in.Price {
+			if in.Side == Sell && p.Cmp(in.Price) < 0 {
 				break
 			}
 		}
 		level := opposite[p]
 		for _, o := range level.Orders {
-			available += o.Remaining()
+			available = available.Add(o.Remaining())
 		}
 	}
-	return available >= in.Qty
+	return available.Cmp(in.Qty) >= 0
 }
 
 // stopTriggered 调用方必须已持 ob.mu。依据最近成交价判定止盈止损单是否触发。
-//   - 买止损（StopPrice>0，无成交价前不触发）：last >= StopPrice 时触发（价格上涨触及）。
+//   - 买止损（StopPrice 非零，无成交价前不触发）：last >= StopPrice 时触发（价格上涨触及）。
 //   - 卖止损：last <= StopPrice 时触发（价格下跌触及）。
 func (ob *OrderBook) stopTriggered(in *Order) bool {
-	if ob.last == 0 {
+	if ob.last.IsZero() {
 		return false // 尚无成交价可参考
 	}
 	if in.Side == Buy {
-		return ob.last >= in.StopPrice
+		return ob.last.Cmp(in.StopPrice) >= 0
 	}
-	return ob.last <= in.StopPrice
+	return ob.last.Cmp(in.StopPrice) <= 0
 }
 
 // activateStop 返回激活形态的订单副本（不修改入参，保留原 ID 以便记账对账）：
-// StopLimit>0 激活为限价单（挂单价=StopLimit），否则激活为市价单（Price=0）。
+// StopLimit 非零激活为限价单（挂单价=StopLimit），否则激活为市价单（Price 零值）。
 func (ob *OrderBook) activateStop(in *Order) *Order {
 	act := *in
-	act.StopPrice = 0
-	if in.StopLimit > 0 {
+	act.StopPrice = Fixed{}
+	if !in.StopLimit.IsZero() {
 		act.Price = in.StopLimit
 	} else {
-		act.Price = 0
+		act.Price = Fixed{}
 	}
 	return &act
 }
@@ -256,11 +258,11 @@ func (ob *OrderBook) matchCore(in *Order, rest bool) []Trade {
 		if in.IsFilled() {
 			break
 		}
-		if in.Price > 0 {
-			if in.Side == Buy && p > in.Price {
+		if !in.Price.IsZero() {
+			if in.Side == Buy && p.Cmp(in.Price) > 0 {
 				break
 			}
-			if in.Side == Sell && p < in.Price {
+			if in.Side == Sell && p.Cmp(in.Price) < 0 {
 				break
 			}
 		}
@@ -268,14 +270,14 @@ func (ob *OrderBook) matchCore(in *Order, rest bool) []Trade {
 		for len(level.Orders) > 0 && !in.IsFilled() {
 			maker := level.Orders[0]
 			qty := in.Remaining()
-			if maker.Remaining() < qty {
+			if maker.Remaining().Cmp(qty) < 0 {
 				qty = maker.Remaining()
 			}
-			maker.Filled += qty
-			in.Filled += qty
+			maker.Filled = maker.Filled.Add(qty)
+			in.Filled = in.Filled.Add(qty)
 			trades = append(trades, Trade{
 				Price:     p,
-				Qty:      qty,
+				Qty:       qty,
 				TakerID:   in.UserID,
 				MakerID:   maker.UserID,
 				TakerSide: in.Side,
@@ -291,7 +293,7 @@ func (ob *OrderBook) matchCore(in *Order, rest bool) []Trade {
 		}
 	}
 
-	if !in.IsFilled() && rest && in.Price > 0 {
+	if !in.IsFilled() && rest && !in.Price.IsZero() {
 		book := own
 		level, ok := book[in.Price]
 		if !ok {
@@ -305,10 +307,10 @@ func (ob *OrderBook) matchCore(in *Order, rest bool) []Trade {
 
 // SetLast 更新最近成交价（如行情/标记价喂价），并激活穿越触发价的止盈止损单。
 // 返回被激活订单的成交流；引擎可据此回调 onTrade 对外发布。
-func (ob *OrderBook) SetLast(price float64) []Trade {
+func (ob *OrderBook) SetLast(price Fixed) []Trade {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
-	if price > 0 {
+	if !price.IsZero() {
 		ob.last = price
 	}
 	var trades []Trade
@@ -339,7 +341,7 @@ func (ob *OrderBook) Depth() (bids, asks []Level) {
 func (ob *OrderBook) Snapshot() BookState {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
-	clone := func(m map[float64]*Level) []Level {
+	clone := func(m map[Fixed]*Level) []Level {
 		out := make([]Level, 0, len(m))
 		for _, lvl := range m {
 			c := Level{Price: lvl.Price, Orders: make([]*Order, len(lvl.Orders))}
@@ -356,8 +358,8 @@ func (ob *OrderBook) Restore(s BookState) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	ob.symbol = s.Symbol
-	ob.bids = make(map[float64]*Level, len(s.Bids))
-	ob.asks = make(map[float64]*Level, len(s.Asks))
+	ob.bids = make(map[Fixed]*Level, len(s.Bids))
+	ob.asks = make(map[Fixed]*Level, len(s.Asks))
 	for _, lvl := range s.Bids {
 		ords := make([]*Order, len(lvl.Orders))
 		copy(ords, lvl.Orders)
@@ -374,7 +376,7 @@ func (ob *OrderBook) Restore(s BookState) {
 func (ob *OrderBook) Cancel(orderID int64) bool {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
-	sides := []map[float64]*Level{ob.bids, ob.asks}
+	sides := []map[Fixed]*Level{ob.bids, ob.asks}
 	for _, book := range sides {
 		for p, lvl := range book {
 			for i, o := range lvl.Orders {

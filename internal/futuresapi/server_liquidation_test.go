@@ -6,16 +6,29 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/futures"
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/matching"
+	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"go.uber.org/zap"
 )
+
+// testCfg 返回带默认精度配置的 Config（与 configs/config.yaml 默认一致），供测试构造 Server。
+func testCfg() *config.Config {
+	cfg := &config.Config{}
+	cfg.Matching.DefaultPriceScale = 2
+	cfg.Matching.DefaultQtyScale = 8
+	return cfg
+}
+
+// fxPrice/fxQty 构造测试用的定点价格/数量（按默认 scale 对齐，与生产边界一致）。
+func fxPrice(f float64) matching.Fixed { return matching.FixedFromFloat(f, 2) }
+func fxQty(f float64) matching.Fixed   { return matching.FixedFromFloat(f, 8) }
 
 // 演示：生产路径的 liquidationCloser——强平单作为市价单送入撮合引擎，
 // 订单簿无流动性时由保险基金（SysLiquidationLoss）兜底成交，保证强平必定完成。
 func TestLiquidationCloserBackstop(t *testing.T) {
 	e := matching.NewEngine(nil, nil)
 	e.Register("BTC_USDT_PERP")
-	s := &Server{matcher: e}
+	s := &Server{matcher: e, cfg: testCfg()}
 
 	// 场景1：订单簿无流动性 -> 兜底在标记价 45000 全额成交。
 	fill := s.liquidationCloser("BTC_USDT_PERP", 1001, futures.Long, 1, 45000)
@@ -29,7 +42,7 @@ func TestLiquidationCloserBackstop(t *testing.T) {
 	// 场景2：订单簿有真实流动性 -> 在订单簿价成交（不被兜底价覆盖）。
 	// 平多=卖，故播种一笔限价买@44000 作为对手流动性。
 	if _, _ = e.MatchNow("BTC_USDT_PERP", &matching.Order{
-		ID: 2, UserID: 2, Side: matching.Buy, Price: 44000, Qty: 1, Time: 1,
+		ID: 2, UserID: 2, Side: matching.Buy, Price: fxPrice(44000), Qty: fxQty(1), Time: 1,
 	}, true); true {
 	}
 	fill2 := s.liquidationCloser("BTC_USDT_PERP", 1001, futures.Long, 1, 45000)
@@ -43,7 +56,7 @@ func TestLiquidationCloserBackstop(t *testing.T) {
 	// 场景3：部分流动性 -> 部分按订单簿价、剩余按兜底标记价，加权均价介于二者之间。
 	// 再播种一笔限价买@43000（仅 0.5 张），平多卖单先吃 43000 的 0.5，剩余 0.5 兜底@45000。
 	if _, _ = e.MatchNow("BTC_USDT_PERP", &matching.Order{
-		ID: 3, UserID: 3, Side: matching.Buy, Price: 43000, Qty: 0.5, Time: 2,
+		ID: 3, UserID: 3, Side: matching.Buy, Price: fxPrice(43000), Qty: fxQty(0.5), Time: 2,
 	}, true); true {
 	}
 	fill3 := s.liquidationCloser("BTC_USDT_PERP", 1001, futures.Long, 1, 45000)

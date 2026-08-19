@@ -128,8 +128,8 @@ func main() {
 			}
 			if err := pub.PublishTrade(context.Background(), mq.TradeEvent{
 				Symbol:    symbol,
-				Price:     t.Price,
-				Qty:       t.Qty,
+				Price:     t.Price.Float(),
+				Qty:       t.Qty.Float(),
 				TakerID:   t.TakerID,
 				MakerID:   t.MakerID,
 				TakerSide: takerSide,
@@ -144,9 +144,9 @@ func main() {
 				return
 			}
 			hub.Broadcast(symbol, gin.H{
-				"type":  "depth",
+				"type":   "depth",
 				"symbol": symbol,
-				"data":  gin.H{"bids": bids, "asks": asks},
+				"data":   gin.H{"bids": bids, "asks": asks},
 			})
 			// 标记该交易对深度待发布（由节流 goroutine 聚合后发往 Kafka）。
 			depthMu.Lock()
@@ -285,18 +285,18 @@ func main() {
 			return
 		}
 		var req struct {
-			Symbol string  `json:"symbol"`
-			Side   string  `json:"side"`
-			Price  float64 `json:"price"`
-			Qty    float64 `json:"qty"`
-			UserID int64   `json:"user_id"`
-			Market string  `json:"market"`
+			Symbol string         `json:"symbol"`
+			Side   string         `json:"side"`
+			Price  matching.Fixed `json:"price"`
+			Qty    matching.Fixed `json:"qty"`
+			UserID int64          `json:"user_id"`
+			Market string         `json:"market"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			response.Error(c, 400, 400, "bad request")
 			return
 		}
-		if req.Qty <= 0 {
+		if !req.Qty.IsPositive() {
 			response.Error(c, 400, 400, "qty must be positive")
 			return
 		}
@@ -307,8 +307,8 @@ func main() {
 		o := &matching.Order{
 			UserID: req.UserID,
 			Side:   side,
-			Price:  req.Price,
-			Qty:    req.Qty,
+			Price:  req.Price.AlignScale(cfg.PriceScale(req.Symbol)),
+			Qty:    req.Qty.AlignScale(cfg.QtyScale(req.Symbol)),
 			Market: req.Market,
 			Time:   time.Now().UnixNano(),
 		}
@@ -345,18 +345,18 @@ func main() {
 			return
 		}
 		var req struct {
-			Symbol string  `json:"symbol"`
-			Side   string  `json:"side"`
-			Price  float64 `json:"price"`
-			Qty    float64 `json:"qty"`
-			UserID int64   `json:"user_id"`
-			Rest   bool    `json:"rest"`
+			Symbol string         `json:"symbol"`
+			Side   string         `json:"side"`
+			Price  matching.Fixed `json:"price"`
+			Qty    matching.Fixed `json:"qty"`
+			UserID int64          `json:"user_id"`
+			Rest   bool           `json:"rest"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			response.Error(c, 400, 400, "bad request")
 			return
 		}
-		if req.Qty <= 0 {
+		if !req.Qty.IsPositive() {
 			response.Error(c, 400, 400, "qty must be positive")
 			return
 		}
@@ -367,8 +367,8 @@ func main() {
 		o := &matching.Order{
 			UserID: req.UserID,
 			Side:   side,
-			Price:  req.Price,
-			Qty:    req.Qty,
+			Price:  req.Price.AlignScale(cfg.PriceScale(req.Symbol)),
+			Qty:    req.Qty.AlignScale(cfg.QtyScale(req.Symbol)),
 			Time:   time.Now().UnixNano(),
 		}
 		trades, fully := e.MatchNow(req.Symbol, o, req.Rest)
@@ -497,20 +497,20 @@ func aggregateDepth(levels []matching.Level, n int, isBid bool) []mq.DepthLevel 
 	copy(ls, levels)
 	sort.Slice(ls, func(i, j int) bool {
 		if isBid {
-			return ls[i].Price > ls[j].Price
+			return ls[i].Price.Cmp(ls[j].Price) > 0
 		}
-		return ls[i].Price < ls[j].Price
+		return ls[i].Price.Cmp(ls[j].Price) < 0
 	})
 	if len(ls) > n {
 		ls = ls[:n]
 	}
 	out := make([]mq.DepthLevel, 0, len(ls))
 	for _, l := range ls {
-		var v float64
+		var v matching.Fixed
 		for _, o := range l.Orders {
-			v += o.Qty
+			v = v.Add(o.Qty)
 		}
-		out = append(out, mq.DepthLevel{Price: l.Price, Volume: v})
+		out = append(out, mq.DepthLevel{Price: l.Price.Float(), Volume: v.Float()})
 	}
 	return out
 }

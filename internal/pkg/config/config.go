@@ -12,6 +12,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// SymbolScale 是单个交易对的价格/数量小数位（定点化精度）。
+type SymbolScale struct {
+	PriceScale int `yaml:"price_scale"`
+	QtyScale   int `yaml:"qty_scale"`
+}
+
 // Config 是全局配置结构，对应 configs/config.yaml。
 type Config struct {
 	Server struct {
@@ -71,6 +77,11 @@ type Config struct {
 		// Symbols 是 cmd/matching 预注册并提供服务的交易对集合；为空时取默认超集
 		// （现货 BTC_USDT/ETH_USDT + 合约永续 BTC_USDT_PERP/ETH_USDT_PERP）。
 		Symbols []string `yaml:"symbols"`
+		// DefaultPriceScale/DefaultQtyScale 是价格/数量的默认小数位（定点化精度）；<=0 用硬兜底。
+		DefaultPriceScale int `yaml:"default_price_scale"`
+		DefaultQtyScale   int `yaml:"default_qty_scale"`
+		// Scales 是可选的交易对精度覆盖（key 为 symbol，如 BTC_USDT）；缺省用上面默认。
+		Scales map[string]SymbolScale `yaml:"scales"`
 	} `yaml:"matching"`
 
 	Services map[string]string `yaml:"services"`
@@ -271,4 +282,26 @@ func (c *Config) ListenServer(srv *http.Server) error {
 		return srv.ListenAndServeTLS(c.Server.TLS.CertFile, c.Server.TLS.KeyFile)
 	}
 	return srv.ListenAndServe()
+}
+
+// PriceScale 返回交易对的价格小数位（定点化精度）；未配置时用硬兜底 2。
+func (c *Config) PriceScale(symbol string) int {
+	if s, ok := c.Matching.Scales[symbol]; ok && s.PriceScale > 0 {
+		return s.PriceScale
+	}
+	if c.Matching.DefaultPriceScale > 0 {
+		return c.Matching.DefaultPriceScale
+	}
+	return 2
+}
+
+// QtyScale 返回交易对的数量小数位（定点化精度）；未配置时用硬兜底 8。
+func (c *Config) QtyScale(symbol string) int {
+	if s, ok := c.Matching.Scales[symbol]; ok && s.QtyScale > 0 {
+		return s.QtyScale
+	}
+	if c.Matching.DefaultQtyScale > 0 {
+		return c.Matching.DefaultQtyScale
+	}
+	return 8
 }

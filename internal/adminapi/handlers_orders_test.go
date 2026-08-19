@@ -89,11 +89,11 @@ func TestAdminOrderManagement(t *testing.T) {
 
 	// 预置：用户1现货挂单（普通，成交），用户2合约吃单（杠杆单，成交）。
 	if _, _ = eng.MatchNow("BTC_USDT", &matching.Order{
-		ID: 1, UserID: 1, Side: matching.Buy, Price: 100, Qty: 1, Time: 1, Market: "spot",
+		ID: 1, UserID: 1, Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1, Market: "spot",
 	}, true); false {
 	}
 	if _, _ = eng.MatchNow("BTC_USDT", &matching.Order{
-		ID: 2, UserID: 2, Side: matching.Sell, Price: 0, Qty: 1, Time: 2, Market: "futures", IsMargin: true, Leverage: 10,
+		ID: 2, UserID: 2, Side: matching.Sell, Price: matching.Fixed{}, Qty: matching.FixedFromFloat(1, 8), Time: 2, Market: "futures", IsMargin: true, Leverage: 10,
 	}, false); false {
 	}
 

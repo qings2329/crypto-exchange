@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"math"
 	"sort"
 	"sync"
 	"time"
@@ -17,6 +16,7 @@ import (
 //   - 全局唯一订单号（多实例不冲突）；
 //   - WAL：订单在写入内存簿前先落盘，崩溃可重放；
 //   - 周期快照 + leader 选举，支持多实例单写者部署与故障接管。
+//
 // 未接入 Store 时行为与原来完全一致（内存、本地自增 ID）。
 type Engine struct {
 	mu      sync.RWMutex
@@ -25,10 +25,10 @@ type Engine struct {
 	onBook  func(symbol string) // 每笔订单处理后回调，用于推送深度变化
 
 	// 以下字段仅在 UseStore 后被使用。
-	store           Store
-	nodeID          string
+	store            Store
+	nodeID           string
 	snapshotInterval time.Duration
-	recovered       bool
+	recovered        bool
 
 	// 订单/成交登记（订单管理模块）：内存态。重启后 open 订单由 Recover 重建，
 	// 历史 filled/canceled 与成交流水丢失（原型限制，见 DEVELOPMENT_TASKS）。
@@ -51,9 +51,9 @@ type orderMeta struct {
 	IsMargin    bool
 	Leverage    float64
 	Side        Side
-	Price       float64
-	Qty         float64
-	FilledQty   float64
+	Price       Fixed
+	Qty         Fixed
+	FilledQty   Fixed
 	TimeInForce string
 	Status      OrderStatus
 	CreatedAt   int64
@@ -67,8 +67,8 @@ type tradeRecord struct {
 	Market    string
 	IsMargin  bool
 	Leverage  float64
-	Price     float64
-	Qty       float64
+	Price     Fixed
+	Qty       Fixed
 	TakerID   int64
 	MakerID   int64
 	TakerSide Side
@@ -85,10 +85,10 @@ type bookActor struct {
 // NewEngine 创建撮合引擎。
 func NewEngine(onTrade func(symbol string, t Trade), onBook func(symbol string)) *Engine {
 	return &Engine{
-		books:     make(map[string]*bookActor),
-		onTrade:   onTrade,
-		onBook:    onBook,
-		orders:    make(map[int64]*orderMeta),
+		books:      make(map[string]*bookActor),
+		onTrade:    onTrade,
+		onBook:     onBook,
+		orders:     make(map[int64]*orderMeta),
 		userOrders: make(map[int64][]int64),
 		userTrades: make(map[int64][]int64),
 	}
@@ -227,16 +227,16 @@ func validOrder(o *Order) bool {
 	if o == nil {
 		return false
 	}
-	if math.IsNaN(o.Qty) || math.IsInf(o.Qty, 0) || o.Qty <= 0 {
+	if !o.Qty.IsPositive() {
 		return false
 	}
-	if math.IsNaN(o.Price) || math.IsInf(o.Price, 0) || o.Price < 0 {
+	if !o.Price.IsZero() && !o.Price.IsPositive() {
 		return false
 	}
-	if math.IsNaN(o.StopPrice) || math.IsInf(o.StopPrice, 0) || o.StopPrice < 0 {
+	if !o.StopPrice.IsZero() && !o.StopPrice.IsPositive() {
 		return false
 	}
-	if math.IsNaN(o.StopLimit) || math.IsInf(o.StopLimit, 0) || o.StopLimit < 0 {
+	if !o.StopLimit.IsZero() && !o.StopLimit.IsPositive() {
 		return false
 	}
 	return true
@@ -279,15 +279,15 @@ func (e *Engine) MatchNow(symbol string, o *Order, rest bool) ([]Trade, bool) {
 // 返回被激活订单的成交流，便于调用方经 onTrade 对外发布（无交易对返回 nil）。
 // 注意：成交驱动的最后价由 MatchRest 内部自动更新；本方法用于"无成交但价格已穿越"的
 // 触发场景（如指数/标记价触发的止损）。
-func (e *Engine) SetMarkPrice(symbol string, price float64) []Trade {
+func (e *Engine) SetMarkPrice(symbol string, price Fixed) []Trade {
 	e.mu.RLock()
 	ba, ok := e.books[symbol]
 	e.mu.RUnlock()
 	if !ok {
 		return nil
 	}
-	// F5：拒绝非有限或非正标记价，避免 NaN 污染最近成交价并导致止盈止损单误触发。
-	if math.IsNaN(price) || math.IsInf(price, 0) || price <= 0 {
+	// F5：拒绝非正标记价，避免 NaN 污染最近成交价并导致止盈止损单误触发。
+	if !price.IsPositive() {
 		return nil
 	}
 	return ba.book.SetLast(price)
@@ -347,8 +347,8 @@ func (e *Engine) applyTrades(symbol string, taker *Order, trades []Trade) {
 		e.userTrades[t.TakerID] = append(e.userTrades[t.TakerID], rec.Seq)
 		e.userTrades[t.MakerID] = append(e.userTrades[t.MakerID], rec.Seq)
 		if m, ok := e.orders[t.MakerOID]; ok {
-			m.FilledQty += t.Qty
-			if m.FilledQty >= m.Qty {
+			m.FilledQty = m.FilledQty.Add(t.Qty)
+			if m.FilledQty.Cmp(m.Qty) >= 0 {
 				m.Status = OrderFilled
 			}
 			m.UpdatedAt = now
@@ -360,7 +360,7 @@ func (e *Engine) applyTrades(symbol string, taker *Order, trades []Trade) {
 		case taker.IsFilled():
 			tm.Status = OrderFilled
 		case e.bookHasOrder(symbol, taker.ID):
-			if tm.FilledQty > 0 {
+			if tm.FilledQty.IsPositive() {
 				tm.Status = OrderPartial
 			} else {
 				tm.Status = OrderOpen

@@ -33,7 +33,7 @@ func TestMemWALReplayAndPrune(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		if err := s.Append(ctx, matching.OrderEvent{
 			Symbol: "BTC_USDT", Type: matching.EventSubmit,
-			Order: &matching.Order{ID: int64(i), Side: matching.Buy, Price: 100, Qty: 1},
+			Order: &matching.Order{ID: int64(i), Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8)},
 			Ts:    time.Now().UnixNano(),
 		}); err != nil {
 			t.Fatal(err)
@@ -142,8 +142,8 @@ func TestMemLeaderExpiryTakeover(t *testing.T) {
 func TestOrderEventJSONRoundTrip(t *testing.T) {
 	ev := matching.OrderEvent{
 		Seq: 7, Symbol: "ETH_USDT", Type: matching.EventSubmit,
-		Order: &matching.Order{ID: 7, UserID: 3, Side: matching.Sell, Price: 250, Qty: 2},
-		Ts:   123456,
+		Order: &matching.Order{ID: 7, UserID: 3, Side: matching.Sell, Price: matching.FixedFromFloat(250, 2), Qty: matching.FixedFromFloat(2, 8)},
+		Ts:    123456,
 	}
 	b, err := json.Marshal(ev)
 	if err != nil {
@@ -153,7 +153,7 @@ func TestOrderEventJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.Seq != 7 || got.Symbol != "ETH_USDT" || got.Order == nil || got.Order.Qty != 2 {
+	if got.Seq != 7 || got.Symbol != "ETH_USDT" || got.Order == nil || got.Order.Qty.Float() != 2 {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/matching"
+	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"go.uber.org/zap"
 )
@@ -17,14 +18,22 @@ func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
 
 // newTestServer 构造一个不依赖实时撮合服务的现货 Server，仅用于结算单元测试。
 func newTestServer() *Server {
+	cfg := &config.Config{}
+	cfg.Matching.DefaultPriceScale = 2 // 与 configs/config.yaml 默认一致
+	cfg.Matching.DefaultQtyScale = 8
 	return &Server{
 		log:          zap.NewNop(),
+		cfg:          cfg,
 		ledgerSvc:    ledger.New(),
 		openOrders:   make(map[int64]*freezeRec),
 		clientOIDMap: make(map[string]int64),
 		settledRefs:  make(map[string]bool),
 	}
 }
+
+// fxPrice/fxQty 构造测试用的定点价格/数量（按默认 scale 对齐，与生产边界一致）。
+func fxPrice(f float64) matching.Fixed { return matching.FixedFromFloat(f, 2) }
+func fxQty(f float64) matching.Fixed   { return matching.FixedFromFloat(f, 8) }
 
 // seed 通过链上充值（复式记账：Debit 负债账户 + Credit 用户）注入余额，保证账本全局平衡，
 // 使 IsBalanced 断言有效。
@@ -38,7 +47,7 @@ func TestReserveOnOpenBuyLimit(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
 
-	rec, err := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	rec, err := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
 	if err != nil {
 		t.Fatalf("reserve failed: %v", err)
 	}
@@ -59,7 +68,7 @@ func TestReserveOnOpenInsufficient(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 50, 0) // 仅 50 USDT
 
-	if _, err := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT"); err == nil {
+	if _, err := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT"); err == nil {
 		t.Fatalf("expect insufficient error")
 	}
 	avail, frozen, _ := s.ledgerSvc.Balance(1, "USDT")
@@ -75,14 +84,14 @@ func TestSettleFillLimitBuySell(t *testing.T) {
 	seed(s, 2, 0, 10)     // 卖方：只有 BTC
 
 	// 预冻结：买方冻结 100 USDT，卖方冻结 1 BTC。
-	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
-	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[101] = buyRec
 	s.openOrders[202] = sellRec
 
 	trade := matching.Trade{
-		Price:     100,
-		Qty:       1,
+		Price:     fxPrice(100),
+		Qty:       fxQty(1),
 		TakerSide: matching.Buy,
 		TakerID:   1,
 		MakerID:   2,
@@ -126,7 +135,7 @@ func TestCancelReleasesFrozen(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
 
-	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 2, "BTC_USDT") // 冻结 200 USDT
+	rec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(2), "BTC_USDT") // 冻结 200 USDT
 	s.openOrders[777] = rec
 	if _, f, _ := s.ledgerSvc.Balance(1, "USDT"); !eqAmt(f, 200, "USDT") {
 		t.Fatalf("expect frozen=200 before cancel, got %v", f)
@@ -155,12 +164,12 @@ func TestPartialFillThenCancel(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
 
-	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 2, "BTC_USDT") // 冻结 200 USDT
+	rec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(2), "BTC_USDT") // 冻结 200 USDT
 	s.openOrders[888] = rec
 
 	// 半成交 1 BTC @100：买方付 100 USDT 给卖方（此处卖方任意，重点在看买方账本）。
 	trade := matching.Trade{
-		Price:     100, Qty: 1, TakerSide: matching.Buy,
+		Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy,
 		TakerID: 1, MakerID: 99, TakerOID: 888, MakerOID: 999,
 	}
 	if err := s.settleFill("BTC_USDT", trade); err != nil {
@@ -193,13 +202,13 @@ func TestSettleFillReplayIdempotent(t *testing.T) {
 	seed(s, 1, 100000, 0)
 	seed(s, 2, 0, 10)
 
-	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
-	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[101] = buyRec
 	s.openOrders[202] = sellRec
 
 	trade := matching.Trade{
-		Price: 100, Qty: 1, TakerSide: matching.Buy,
+		Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy,
 		TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202,
 	}
 	if err := s.settleFill("BTC_USDT", trade); err != nil {
@@ -232,13 +241,13 @@ func TestSettleFillClampToFrozen(t *testing.T) {
 	seed(s, 2, 0, 10)
 
 	// 卖方预冻结 5 BTC（多于本次成交的 1 BTC）。
-	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
-	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 5, "BTC_USDT")
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, fxPrice(100), fxQty(5), "BTC_USDT")
 	s.openOrders[101] = buyRec
 	s.openOrders[202] = sellRec
 
 	trade := matching.Trade{
-		Price: 100, Qty: 1, TakerSide: matching.Buy,
+		Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy,
 		TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202,
 	}
 	if err := s.settleFill("BTC_USDT", trade); err != nil {

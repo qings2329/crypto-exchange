@@ -37,11 +37,11 @@ func newFakeREST(t *testing.T) (*httptest.Server, *matching.Engine) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/order", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Symbol string  `json:"symbol"`
-			Side   string  `json:"side"`
-			Price  float64 `json:"price"`
-			Qty    float64 `json:"qty"`
-			UserID int64   `json:"user_id"`
+			Symbol string         `json:"symbol"`
+			Side   string         `json:"side"`
+			Price  matching.Fixed `json:"price"`
+			Qty    matching.Fixed `json:"qty"`
+			UserID int64          `json:"user_id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		side := matching.Buy
@@ -70,12 +70,12 @@ func newFakeREST(t *testing.T) (*httptest.Server, *matching.Engine) {
 	})
 	mux.HandleFunc("/match-now", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Symbol string  `json:"symbol"`
-			Side   string  `json:"side"`
-			Price  float64 `json:"price"`
-			Qty    float64 `json:"qty"`
-			UserID int64   `json:"user_id"`
-			Rest   bool    `json:"rest"`
+			Symbol string         `json:"symbol"`
+			Side   string         `json:"side"`
+			Price  matching.Fixed `json:"price"`
+			Qty    matching.Fixed `json:"qty"`
+			UserID int64          `json:"user_id"`
+			Rest   bool           `json:"rest"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		side := matching.Buy
@@ -138,7 +138,7 @@ func TestClientSubmitAndDepth(t *testing.T) {
 	srv, _ := newFakeREST(t)
 	c := client.New(srv.URL)
 
-	o := &matching.Order{Side: matching.Buy, Price: 100, Qty: 1, Time: time.Now().UnixNano()}
+	o := &matching.Order{Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: time.Now().UnixNano()}
 	if !c.Submit("BTC_USDT", o) {
 		t.Fatal("submit should succeed")
 	}
@@ -156,8 +156,8 @@ func TestClientSubmitAndDepth(t *testing.T) {
 	if len(bids) == 0 {
 		t.Fatal("expected at least one bid level after submit")
 	}
-	if bids[0].Price != 100 {
-		t.Fatalf("bid price should be 100, got %.2f", bids[0].Price)
+	if bids[0].Price.Float() != 100 {
+		t.Fatalf("bid price should be 100, got %s", bids[0].Price)
 	}
 }
 
@@ -167,11 +167,11 @@ func TestClientMatchNow(t *testing.T) {
 
 	// 播种一笔限价买@90 作为对手流动性。
 	if _, _ = e.MatchNow("BTC_USDT", &matching.Order{
-		ID: 1, Side: matching.Buy, Price: 90, Qty: 1, Time: 1,
+		ID: 1, Side: matching.Buy, Price: matching.FixedFromFloat(90, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1,
 	}, true); false {
 	}
 
-	o := &matching.Order{Side: matching.Sell, Price: 0, Qty: 1, Time: 2}
+	o := &matching.Order{Side: matching.Sell, Price: matching.Fixed{}, Qty: matching.FixedFromFloat(1, 8), Time: 2}
 	trades, fully := c.MatchNow("BTC_USDT", o, false)
 	if !fully {
 		t.Fatal("market sell should fully fill against resting buy")
@@ -179,8 +179,8 @@ func TestClientMatchNow(t *testing.T) {
 	if len(trades) == 0 {
 		t.Fatal("expected at least one trade")
 	}
-	if trades[0].Price != 90 {
-		t.Fatalf("trade price should be 90 (resting liquidity), got %.2f", trades[0].Price)
+	if trades[0].Price.Float() != 90 {
+		t.Fatalf("trade price should be 90 (resting liquidity), got %s", trades[0].Price)
 	}
 }
 
@@ -188,7 +188,7 @@ func TestClientCancel(t *testing.T) {
 	srv, _ := newFakeREST(t)
 	c := client.New(srv.URL)
 
-	o := &matching.Order{Side: matching.Buy, Price: 100, Qty: 1, Time: time.Now().UnixNano()}
+	o := &matching.Order{Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: time.Now().UnixNano()}
 	if !c.Submit("BTC_USDT", o) {
 		t.Fatal("submit failed")
 	}
@@ -211,12 +211,12 @@ func TestClientWatch(t *testing.T) {
 		}
 		_ = conn.WriteJSON(map[string]interface{}{
 			"type": "trade", "symbol": "BTC_USDT",
-			"data": matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy},
+			"data": matching.Trade{Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), TakerSide: matching.Buy},
 		})
 		_ = conn.WriteJSON(map[string]interface{}{
 			"type": "depth", "symbol": "BTC_USDT",
 			"data": map[string]interface{}{
-				"bids": []matching.Level{{Price: 100}},
+				"bids": []matching.Level{{Price: matching.FixedFromFloat(100, 2)}},
 				"asks": []matching.Level{},
 			},
 		})
@@ -239,7 +239,7 @@ func TestClientWatch(t *testing.T) {
 
 	select {
 	case ev := <-tradeCh:
-		if ev.Symbol != "BTC_USDT" || ev.Trade.Price != 100 {
+		if ev.Symbol != "BTC_USDT" || ev.Trade.Price.Float() != 100 {
 			t.Fatalf("unexpected trade event: %+v", ev)
 		}
 	case <-time.After(1 * time.Second):
@@ -248,7 +248,7 @@ func TestClientWatch(t *testing.T) {
 
 	select {
 	case ev := <-depthCh:
-		if ev.Symbol != "BTC_USDT" || len(ev.Bids) != 1 || ev.Bids[0].Price != 100 {
+		if ev.Symbol != "BTC_USDT" || len(ev.Bids) != 1 || ev.Bids[0].Price.Float() != 100 {
 			t.Fatalf("unexpected depth event: %+v", ev)
 		}
 	case <-time.After(1 * time.Second):
@@ -264,11 +264,11 @@ func TestClientListOrdersAndTrades(t *testing.T) {
 
 	// 播种：用户1的现货限价买（挂单）与用户2的合约市价卖（吃单成交）。
 	if _, _ = e.MatchNow("BTC_USDT", &matching.Order{
-		ID: 1, UserID: 1, Side: matching.Buy, Price: 100, Qty: 1, Time: 1, Market: "spot",
+		ID: 1, UserID: 1, Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1, Market: "spot",
 	}, true); false {
 	}
 	if _, _ = e.MatchNow("BTC_USDT", &matching.Order{
-		ID: 2, UserID: 2, Side: matching.Sell, Price: 0, Qty: 1, Time: 2, Market: "futures",
+		ID: 2, UserID: 2, Side: matching.Sell, Price: matching.Fixed{}, Qty: matching.FixedFromFloat(1, 8), Time: 2, Market: "futures",
 	}, false); false {
 	}
 

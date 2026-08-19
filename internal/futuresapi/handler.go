@@ -76,11 +76,15 @@ func (s *Server) handleOrder(c *gin.Context) {
 	if ps == futures.Short {
 		side = matching.Sell
 	}
+	// 边界定点化：价格/数量按交易对配置的 scale 对齐为 Fixed（消除浮点精度漂移）。
+	// 注意 margin 由定点乘积导出，与送入撮合的订单价量一致，避免冻结额与成交价对不上。
+	price := matching.FixedFromFloat(req.Price, s.cfg.PriceScale(req.Symbol))
+	qty := matching.FixedFromFloat(req.Qty, s.cfg.QtyScale(req.Symbol))
 	o := &matching.Order{
 		UserID: req.UserID,
 		Side:   side,
-		Price:  req.Price,
-		Qty:    req.Qty,
+		Price:  price,
+		Qty:    qty,
 		Time:   time.Now().UnixNano(),
 		Market: "futures",
 		// 合约单本质为杠杆单：标记 IsMargin 并透传杠杆倍数，供订单管理按杠杆过滤。
@@ -99,7 +103,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 			}
 			margin := req.Margin
 			if margin <= 0 {
-				margin = req.Price * req.Qty / lev
+				margin = price.Mul(qty).Float() / lev
 			}
 			mode := futures.Isolated
 			if req.MarginMode == "cross" {

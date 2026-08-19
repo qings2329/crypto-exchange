@@ -167,12 +167,12 @@ func TestSettleFillNoDoublePay_Replay(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
 	seed(s, 2, 0, 10)
-	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
-	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[101] = buyRec
 	s.openOrders[202] = sellRec
 
-	trade := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
+	trade := matching.Trade{Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
 	ref := tradeRef("BTC_USDT", trade)
 
 	if err := s.settleFill("BTC_USDT", trade); err != nil {
@@ -201,12 +201,12 @@ func TestSettleFillConcurrentReplay(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
 	seed(s, 2, 0, 10)
-	buyRec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
-	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	buyRec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[101] = buyRec
 	s.openOrders[202] = sellRec
 
-	trade := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
+	trade := matching.Trade{Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
 	ref := tradeRef("BTC_USDT", trade)
 
 	var wg sync.WaitGroup
@@ -295,7 +295,7 @@ func TestHandleCancelOwnOrderSuccess(t *testing.T) {
 	s := newTestServer()
 	s.client = fm
 	seed(s, 1, 100000, 0)
-	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT") // 冻结 100 USDT
+	rec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT") // 冻结 100 USDT
 	s.openOrders[555] = rec
 	r := setupRouter(s)
 
@@ -425,7 +425,7 @@ func TestHandleCancelForbiddenForOtherUser(t *testing.T) {
 	seed(s, 1, 100000, 0)
 	seed(s, 2, 100000, 0)
 	// 预冻结属于 uid=2 的订单 555。
-	rec, _ := s.reserveOnOpen(2, matching.Buy, 100, 1, "BTC_USDT")
+	rec, _ := s.reserveOnOpen(2, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[555] = rec
 	r := setupRouter(s)
 
@@ -479,7 +479,7 @@ func TestHandleOrderRejectsZeroPrice(t *testing.T) {
 func TestSettleFillZeroPriceNoFreeLunch(t *testing.T) {
 	s := newTestServer()
 	seed(s, 2, 0, 10) // 卖方有 BTC
-	trade := matching.Trade{Price: 0, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
+	trade := matching.Trade{Price: fxPrice(0), Qty: fxQty(1), TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 101, MakerOID: 202}
 	if err := s.settleFill("BTC_USDT", trade); err == nil {
 		t.Fatal("expect error for zero-price trade")
 	}
@@ -496,11 +496,11 @@ func TestPartialFillClampNoResidual(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
 	seed(s, 2, 0, 10)
-	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 2, "BTC_USDT") // 冻结 200 USDT
+	rec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(2), "BTC_USDT") // 冻结 200 USDT
 	s.openOrders[888] = rec
 
-	t1 := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 999}
-	t2 := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 998}
+	t1 := matching.Trade{Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 999}
+	t2 := matching.Trade{Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 998}
 	if err := s.settleFill("BTC_USDT", t1); err != nil {
 		t.Fatalf("t1 settle: %v", err)
 	}
@@ -525,7 +525,7 @@ func TestPartialFillClampNoResidual(t *testing.T) {
 func TestReconcileAdminEndpoint(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
-	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	rec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[777] = rec
 	r := setupRouter(s)
 
@@ -557,12 +557,12 @@ func TestCancelVsInFlightFill(t *testing.T) {
 	s := newTestServer()
 	seed(s, 1, 100000, 0)
 	seed(s, 2, 0, 10)
-	rec, _ := s.reserveOnOpen(1, matching.Buy, 100, 1, "BTC_USDT")
+	rec, _ := s.reserveOnOpen(1, matching.Buy, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[888] = rec
-	sellRec, _ := s.reserveOnOpen(2, matching.Sell, 100, 1, "BTC_USDT")
+	sellRec, _ := s.reserveOnOpen(2, matching.Sell, fxPrice(100), fxQty(1), "BTC_USDT")
 	s.openOrders[202] = sellRec
 
-	trade := matching.Trade{Price: 100, Qty: 1, TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 202}
+	trade := matching.Trade{Price: fxPrice(100), Qty: fxQty(1), TakerSide: matching.Buy, TakerID: 1, MakerID: 2, TakerOID: 888, MakerOID: 202}
 	ref := tradeRef("BTC_USDT", trade)
 
 	var wg sync.WaitGroup
@@ -598,8 +598,8 @@ func TestHandleOrdersReturnsOwnOnly(t *testing.T) {
 	s.client = fm
 	fm.orders = map[int64]matching.OrderView{
 		1: {ID: 1, UserID: 1, Symbol: "BTC_USDT", Market: "spot"},
-		2: {ID: 2, UserID: 2, Symbol: "BTC_USDT", Market: "spot"},     // 他人
-		3: {ID: 3, UserID: 1, Symbol: "BTC_USDT", Market: "futures"},  // 非 spot
+		2: {ID: 2, UserID: 2, Symbol: "BTC_USDT", Market: "spot"},    // 他人
+		3: {ID: 3, UserID: 1, Symbol: "BTC_USDT", Market: "futures"}, // 非 spot
 		4: {ID: 4, UserID: 1, Symbol: "BTC_USDT", Market: "spot", IsMargin: true},
 	}
 	r := setupRouter(s)
@@ -781,8 +781,8 @@ func TestHandleTradesReturnsOwn(t *testing.T) {
 	s.client = fm
 	fm.trades = []matching.TradeView{
 		{ID: 1, Symbol: "BTC_USDT", Market: "spot", TakerID: 1},
-		{ID: 2, Symbol: "BTC_USDT", Market: "spot", TakerID: 2},          // 他人
-		{ID: 3, Symbol: "BTC_USDT", Market: "futures", TakerID: 1},       // 非 spot
+		{ID: 2, Symbol: "BTC_USDT", Market: "spot", TakerID: 2},    // 他人
+		{ID: 3, Symbol: "BTC_USDT", Market: "futures", TakerID: 1}, // 非 spot
 	}
 	r := setupRouter(s)
 	w := httptest.NewRecorder()
@@ -807,8 +807,8 @@ func TestHandleDepthSuccess(t *testing.T) {
 	fm := &fakeMatcher{}
 	s := newTestServer()
 	s.client = fm
-	fm.depthBids = []matching.Level{{Price: 100, Orders: []*matching.Order{{Qty: 1}}}}
-	fm.depthAsks = []matching.Level{{Price: 200, Orders: []*matching.Order{{Qty: 2}}}}
+	fm.depthBids = []matching.Level{{Price: fxPrice(100), Orders: []*matching.Order{{Qty: fxQty(1)}}}}
+	fm.depthAsks = []matching.Level{{Price: fxPrice(200), Orders: []*matching.Order{{Qty: fxQty(2)}}}}
 	r := setupRouter(s) // /depth 为公开端点（豁免鉴权）
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("GET", "/api/v1/spot/depth?symbol=BTC_USDT", nil)

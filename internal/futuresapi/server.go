@@ -28,6 +28,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
+	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/risk"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/ws"
@@ -41,6 +42,7 @@ type ginH = map[string]interface{}
 type Server struct {
 	log       *zap.Logger
 	ledgerSvc *ledger.Ledger
+	cfg       *config.Config
 	dsn       string
 
 	hub           *ws.Hub
@@ -75,11 +77,12 @@ type Server struct {
 //
 // 调用方约定：在调用前必须已经完成账本快照恢复或种子充值（本函数会配置账本风控参数并启动巡检，
 // 但不负责账本初始状态的载入）。onTrade 由 WS 推送在成交后调用，此时 s.liquidator 已赋值。
-func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL string, oracleConf oracle.OracleConf, chainRPC settlement.ChainRPCConfig, riskSvc *risk.Service, userSvcURL string) *Server {
+func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, dsn, matchingURL string, oracleConf oracle.OracleConf, chainRPC settlement.ChainRPCConfig, riskSvc *risk.Service, userSvcURL string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		log:       log,
 		ledgerSvc: ledgerSvc,
+		cfg:       cfg,
 		dsn:       dsn,
 		hub:       ws.NewHub(),
 		symbols:   []string{"BTC_USDT_PERP", "ETH_USDT_PERP"},
@@ -235,8 +238,8 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, dsn, matchingURL strin
 	s.feeModel.Register(settlement.ChainETH, "ETH", 0.001, 0)
 	s.feeModel.Register(settlement.ChainBTC, "BTC", 0.0005, 0)
 	s.feeModel.Register(settlement.ChainTRON, "USDT", 1, 0)
-	s.feeModel.Register(settlement.ChainLTC, "LTC", 0.001, 0)   // 原生 LTC（8 位小数，对标 BTC 尘额）
-	s.feeModel.Register(settlement.ChainDOGE, "DOGE", 1.0, 0)   // 原生 DOGE（8 位小数）
+	s.feeModel.Register(settlement.ChainLTC, "LTC", 0.001, 0) // 原生 LTC（8 位小数，对标 BTC 尘额）
+	s.feeModel.Register(settlement.ChainDOGE, "DOGE", 1.0, 0) // 原生 DOGE（8 位小数）
 
 	// 链上充提网关及其事件监听。充值/提现网关均按配置在「真实 RPC」与「模拟」间切换
 	// （T-03 链上 RPC 半边脚手架，fail-degraded：未配置回退模拟）。
@@ -269,13 +272,13 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 			case ev := <-ch:
-			if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash); err != nil {
-				s.log.Error("on-chain credit failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
-			}
-			s.log.Info("on-chain deposit credited",
-				zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-				zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
+				if err := s.ledgerSvc.ReceiveOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash); err != nil {
+					s.log.Error("on-chain credit failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				s.log.Info("on-chain deposit credited",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
 				s.hub.Broadcast("SYS", ginH{"type": "chain_deposit", "data": ev})
 			case <-s.ctx.Done():
 				return
@@ -293,21 +296,21 @@ func (s *Server) startChainWatchers() {
 		for {
 			select {
 			case ev := <-rch:
-			badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash)
-			if err != nil {
-				s.log.Error("on-chain rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
-			}
-			if badDebt.Sign() > 0 {
-				s.log.Error("on-chain deposit reverted with BAD DEBT (user already spent funds)",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("bad_debt", badDebt.HumanFloat()),
-					zap.String("tx", ev.TxHash))
-			} else {
-				s.log.Warn("on-chain deposit reverted (orphan block)",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
-			}
+				badDebt, err := s.ledgerSvc.ReverseOnChain(ev.UserID, ev.Asset, ev.Amount, ev.TxHash)
+				if err != nil {
+					s.log.Error("on-chain rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				if badDebt.Sign() > 0 {
+					s.log.Error("on-chain deposit reverted with BAD DEBT (user already spent funds)",
+						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+						zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("bad_debt", badDebt.HumanFloat()),
+						zap.String("tx", ev.TxHash))
+				} else {
+					s.log.Warn("on-chain deposit reverted (orphan block)",
+						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+						zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
+				}
 				s.hub.Broadcast("SYS", ginH{"type": "chain_rollback", "data": ev, "bad_debt": badDebt})
 			case <-s.ctx.Done():
 				return
@@ -324,18 +327,18 @@ func (s *Server) startChainWatchers() {
 		}
 		for {
 			select {
-		case ev := <-wch:
-			total := ev.Amount.Add(ev.Fee)
-			switch ev.Status {
-			case settlement.WithdrawCredited:
-				if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
-					s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
-					continue
-				}
-				s.log.Info("on-chain withdraw settled",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
-					zap.String("tx", ev.TxHash))
+			case ev := <-wch:
+				total := ev.Amount.Add(ev.Fee)
+				switch ev.Status {
+				case settlement.WithdrawCredited:
+					if err := s.ledgerSvc.SettleWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
+						s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
+						continue
+					}
+					s.log.Info("on-chain withdraw settled",
+						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+						zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
+						zap.String("tx", ev.TxHash))
 					s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
 				case settlement.WithdrawFailed:
 					if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
@@ -361,20 +364,20 @@ func (s *Server) startChainWatchers() {
 		}
 		for {
 			select {
-		case ev := <-wrh:
-			total := ev.Amount.Add(ev.Fee)
-			if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
-				s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
-			}
-			if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
-				s.log.Error("withdraw rollback unfreeze failed", zap.String("tx", ev.TxHash), zap.Error(err))
-				continue
-			}
-			s.log.Warn("on-chain withdraw reverted (orphan block), funds returned",
-				zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-				zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
-				zap.String("tx", ev.TxHash))
+			case ev := <-wrh:
+				total := ev.Amount.Add(ev.Fee)
+				if err := s.ledgerSvc.ReverseWithdraw(ev.UserID, ev.Asset, ev.Amount, ev.Fee, ev.TxHash); err != nil {
+					s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
+					s.log.Error("withdraw rollback unfreeze failed", zap.String("tx", ev.TxHash), zap.Error(err))
+					continue
+				}
+				s.log.Warn("on-chain withdraw reverted (orphan block), funds returned",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
+					zap.String("tx", ev.TxHash))
 				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw_rollback", "data": ev})
 			case <-s.ctx.Done():
 				return
@@ -390,7 +393,7 @@ func (s *Server) onTrade(symbol string, t matching.Trade) {
 		mc.SetIndex(idx)
 		s.funding.UpdateIndexPrice(symbol, idx)
 	}
-	mc.UpdateContractPrice(t.Price)
+	mc.UpdateContractPrice(t.Price.Float()) // 标记价引擎为浮点接口（内部 roundSatoshi 量化），边界转换
 	mark := mc.MarkPrice()
 
 	if liqEvents := s.liquidator.UpdateMarkPrice(symbol, mark); len(liqEvents) > 0 {
@@ -464,40 +467,44 @@ func (s *Server) liquidationCloser(symbol string, userID int64, side futures.Pos
 	if side == futures.Short {
 		ms = matching.Buy
 	}
+	// 边界定点化：qty/mark 来自强平引擎（float），此处按交易对配置的 scale 对齐为 Fixed，
+	// 与送入撮合的订单一致；成交汇总（filled/notional）全程定点整数运算，消除累计漂移。
+	qtyF := matching.FixedFromFloat(qty, s.cfg.QtyScale(symbol))
+	markF := matching.FixedFromFloat(mark, s.cfg.PriceScale(symbol))
 	o := &matching.Order{
 		UserID: userID, // taker 标识为被强平用户（其持仓正被平仓）
 		Side:   ms,
-		Price:  0, // 市价单
-		Qty:    qty,
+		Price:  matching.Fixed{}, // 市价单
+		Qty:    qtyF,
 		Time:   time.Now().UnixNano(),
 		Market: "futures",
 	}
 	trades, fully := s.matcher.MatchNow(symbol, o, false)
-	var filled, notional float64
+	var filled, notional matching.Fixed
 	for _, t := range trades {
-		filled += t.Qty
-		notional += t.Price * t.Qty
+		filled = filled.Add(t.Qty)
+		notional = notional.Add(t.Price.Mul(t.Qty))
 	}
 	if !fully {
-		rem := qty - filled
-		if rem > 1e-9 {
+		rem := qtyF.Sub(filled)
+		if rem.IsPositive() {
 			// 保险基金兜底成交：maker 为 SysLiquidationLoss（破产价/标记价），保证强平必定完成。
 			trades = append(trades, matching.Trade{
-				Price:     mark,
+				Price:     markF,
 				Qty:       rem,
 				TakerID:   userID,
 				MakerID:   ledger.SysLiquidationLoss,
 				TakerSide: ms,
 			})
-			filled = qty
-			notional += mark * rem
+			filled = qtyF
+			notional = notional.Add(markF.Mul(rem))
 		}
 	}
 	avg := mark
-	if filled > 1e-9 {
-		avg = notional / filled
+	if filled.IsPositive() {
+		avg = notional.Div(filled).Float()
 	}
-	return futures.LiquidationFill{Filled: filled, AvgPrice: avg, Trades: len(trades)}
+	return futures.LiquidationFill{Filled: filled.Float(), AvgPrice: avg, Trades: len(trades)}
 }
 
 // liqScanInterval 独立强平扫描周期。

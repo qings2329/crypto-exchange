@@ -37,7 +37,7 @@ func TestSubmitWritesWAL(t *testing.T) {
 	e.UseStore(store, "n1", 0)
 	e.Register("BTC_USDT")
 
-	o := &matching.Order{Side: matching.Buy, Price: 100, Qty: 1, Time: 1}
+	o := &matching.Order{Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1}
 	if !e.Submit("BTC_USDT", o) {
 		t.Fatal("submit failed")
 	}
@@ -65,8 +65,8 @@ func TestEngineRecoverFromStore(t *testing.T) {
 	e1.Register("BTC_USDT")
 
 	// 两笔不互撮的挂单：买 100、卖 200。
-	buy := &matching.Order{Side: matching.Buy, Price: 100, Qty: 1, Time: 1}
-	sell := &matching.Order{Side: matching.Sell, Price: 200, Qty: 1, Time: 2}
+	buy := &matching.Order{Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1}
+	sell := &matching.Order{Side: matching.Sell, Price: matching.FixedFromFloat(200, 2), Qty: matching.FixedFromFloat(1, 8), Time: 2}
 	if !e1.Submit("BTC_USDT", buy) || !e1.Submit("BTC_USDT", sell) {
 		t.Fatal("submit failed")
 	}
@@ -90,10 +90,10 @@ func TestEngineRecoverFromStore(t *testing.T) {
 	if len(bids) != 1 || len(asks) != 1 {
 		t.Fatalf("recovered book mismatch: bids=%d asks=%d", len(bids), len(asks))
 	}
-	if !approx(bids[0].Price, 100, 1e-9) || !approx(bids[0].Orders[0].Qty, 1, 1e-9) {
+	if !approx(bids[0].Price.Float(), 100, 1e-9) || !approx(bids[0].Orders[0].Qty.Float(), 1, 1e-9) {
 		t.Fatalf("recovered bid wrong: %+v", bids[0])
 	}
-	if !approx(asks[0].Price, 200, 1e-9) || !approx(asks[0].Orders[0].Qty, 1, 1e-9) {
+	if !approx(asks[0].Price.Float(), 200, 1e-9) || !approx(asks[0].Orders[0].Qty.Float(), 1, 1e-9) {
 		t.Fatalf("recovered ask wrong: %+v", asks[0])
 	}
 
@@ -116,7 +116,7 @@ func TestEngineRecoverReflectsCancel(t *testing.T) {
 	e1.UseStore(store, "n1", 0)
 	e1.Register("BTC_USDT")
 
-	buy := &matching.Order{Side: matching.Buy, Price: 100, Qty: 1, Time: 1}
+	buy := &matching.Order{Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1}
 	if !e1.Submit("BTC_USDT", buy) {
 		t.Fatal("submit failed")
 	}
