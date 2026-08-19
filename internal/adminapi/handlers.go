@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/gin-gonic/gin"
 )
 
@@ -596,6 +597,45 @@ func (s *Server) listDeposits(c *gin.Context) {
 	// 避免误导运营资金决策；经 X-Degraded 响应头告知前端上游不可用。
 	c.Header("X-Degraded", "futures-unavailable")
 	s.ok(c, gin.H{"deposits": []Deposit{}, "total": 0})
+}
+
+// supportedDepositChains 是「用户充值地址」派生覆盖的链集合（与 settlement 支持的充值链一致）。
+// 充值地址由 settlement.GenerateAddress 按 userID 非硬化派生（HD 派生或降级 mock），无持久化表，
+// 因此直接遍历此固定集合即可；前端可用 chain 查询参数进一步过滤。
+var supportedDepositChains = []settlement.Chain{
+	settlement.ChainETH,
+	settlement.ChainTRON,
+	settlement.ChainBTC,
+	settlement.ChainSOL,
+	settlement.ChainLTC,
+	settlement.ChainDOGE,
+}
+
+// listUserDepositAddresses 查询某用户的充值地址：对用户 ID 在各条充值链上确定性派生地址。
+// 地址由 settlement.GenerateAddress 实时派生（HD 派生或降级 mock），无持久化存储需求。
+// user_id 缺省/非法时返回空列表（查询页初始态友好），不报错。
+func (s *Server) listUserDepositAddresses(c *gin.Context) {
+	limit, offset := parsePage(c)
+	userID, _ := strconv.ParseInt(c.Query("user_id"), 10, 64)
+	chainFilter := strings.ToUpper(strings.TrimSpace(c.Query("chain")))
+
+	if userID <= 0 {
+		s.ok(c, pageEnvelope([]DepositAddress{}, limit, offset))
+		return
+	}
+
+	out := make([]DepositAddress, 0, len(supportedDepositChains))
+	for _, ch := range supportedDepositChains {
+		if chainFilter != "" && string(ch) != chainFilter {
+			continue
+		}
+		out = append(out, DepositAddress{
+			UserID:  userID,
+			Chain:   string(ch),
+			Address: settlement.GenerateAddress(userID, ch),
+		})
+	}
+	s.ok(c, pageEnvelope(out, limit, offset))
 }
 
 // futuresHolds 是 futures 提现冷静期 hold 队列的返回结构（含真实 hold_id，审核的真正锚点）。

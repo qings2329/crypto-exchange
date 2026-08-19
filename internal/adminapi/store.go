@@ -66,6 +66,13 @@ type Deposit struct {
 	Time   time.Time `json:"time"`
 }
 
+// DepositAddress 是用户充值地址视图（按 userID + chain 确定性派生，无持久化）。
+type DepositAddress struct {
+	UserID  int64  `json:"user_id"`
+	Chain   string `json:"chain"`
+	Address string `json:"address"`
+}
+
 // Withdrawal 是提币记录（需审核）。
 type Withdrawal struct {
 	ID      string    `json:"id"` // 真实 futures hold_id（字符串），审批路由直接以此为锚点
