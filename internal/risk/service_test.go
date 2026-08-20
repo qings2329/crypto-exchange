@@ -2,6 +2,7 @@ package risk
 
 import (
 	"testing"
+	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
@@ -157,5 +158,119 @@ func TestEventsRecordedOnReject(t *testing.T) {
 	}
 	if evs[0].Kind != KindWithdrawLimit {
 		t.Fatalf("want withdraw_limit event got %s", evs[0].Kind)
+	}
+}
+
+// ---------- CheckPosition ----------
+
+func TestPositionLimitPass(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindPositionLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(10, 8)})
+	res, err := svc.CheckPosition(1, "BTC", 5, 0)
+	if err != nil || !res.Allowed {
+		t.Fatalf("want allowed, got %+v err=%v", res, err)
+	}
+}
+
+func TestPositionLimitExceeded(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindPositionLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(10, 8)})
+	res, err := svc.CheckPosition(1, "BTC", 15, 0)
+	if err != nil || res.Allowed {
+		t.Fatalf("want rejected, got %+v err=%v", res, err)
+	}
+}
+
+func TestPositionBlacklisted(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddBlacklist("1", "user", "test")
+	svc.AddRule(&RiskRule{Kind: KindPositionLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(100, 8)})
+	res, err := svc.CheckPosition(1, "BTC", 1, 0)
+	if err != nil || res.Allowed {
+		t.Fatalf("blacklisted user should be rejected, got %+v", res)
+	}
+}
+
+func TestPositionNoRuleDefaultsAllow(t *testing.T) {
+	svc := newTestSvc()
+	res, err := svc.CheckPosition(1, "BTC", 99999, 0)
+	if err != nil || !res.Allowed {
+		t.Fatalf("no rule should allow, got %+v err=%v", res, err)
+	}
+}
+
+// ---------- CheckFrequency ----------
+
+func TestFrequencyLimitPass(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindFreqLimit, MaxCountPerDay: 5})
+	res, err := svc.CheckFrequency(1, "login", 24*time.Hour)
+	if err != nil || !res.Allowed {
+		t.Fatalf("want allowed, got %+v err=%v", res, err)
+	}
+}
+
+func TestFrequencyLimitExceeded(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindFreqLimit, MaxCountPerDay: 2})
+	// 前两次放行
+	svc.CheckFrequency(1, "withdraw", 24*time.Hour)
+	svc.CheckFrequency(1, "withdraw", 24*time.Hour)
+	// 第三次被拒
+	res, err := svc.CheckFrequency(1, "withdraw", 24*time.Hour)
+	if err != nil || res.Allowed {
+		t.Fatalf("want rejected, got %+v err=%v", res, err)
+	}
+}
+
+func TestFrequencyBlacklisted(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddBlacklist("1", "user", "test")
+	svc.AddRule(&RiskRule{Kind: KindFreqLimit, MaxCountPerDay: 100})
+	res, err := svc.CheckFrequency(1, "login", 24*time.Hour)
+	if err != nil || res.Allowed {
+		t.Fatalf("blacklisted user should be rejected, got %+v", res)
+	}
+}
+
+func TestFrequencyNoRuleDefaultsAllow(t *testing.T) {
+	svc := newTestSvc()
+	res, err := svc.CheckFrequency(1, "login", 24*time.Hour)
+	if err != nil || !res.Allowed {
+		t.Fatalf("no rule should allow, got %+v err=%v", res, err)
+	}
+}
+
+func TestFrequencyDifferentUsersIndependent(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindFreqLimit, MaxCountPerDay: 1})
+	svc.CheckFrequency(1, "withdraw", 24*time.Hour)
+	// user 1 已用完配额
+	res1, _ := svc.CheckFrequency(1, "withdraw", 24*time.Hour)
+	if res1.Allowed {
+		t.Fatal("user 1 should be rejected")
+	}
+	// user 2 仍可操作
+	res2, _ := svc.CheckFrequency(2, "withdraw", 24*time.Hour)
+	if !res2.Allowed {
+		t.Fatal("user 2 should be allowed")
+	}
+}
+
+func TestFrequencyEventsRecordedOnReject(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindFreqLimit, MaxCountPerDay: 1})
+	svc.CheckFrequency(1, "withdraw", 24*time.Hour)
+	svc.CheckFrequency(1, "withdraw", 24*time.Hour) // 被拒
+	evs, _ := svc.ListEvents(1, 0)
+	found := false
+	for _, e := range evs {
+		if e.Kind == KindFreqLimit {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected freq_limit event on reject")
 	}
 }

@@ -235,5 +235,15 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 			apikeys.POST("", middleware.RequirePerm(PermApiKeyManage), s.createApiKey)
 			apikeys.DELETE("/:id", middleware.RequirePerm(PermApiKeyManage), s.revokeApiKey)
 		}
+
+		// 借贷管理（代理 lending 服务 /admin/* 端点）
+		admin.GET("/lending/pools", s.handleAdminLendingPools)
+		admin.POST("/lending/pools", s.handleAdminLendingPoolsCreate)
+		admin.GET("/lending/lends", s.handleAdminLendingLends)
+		admin.GET("/lending/borrows", s.handleAdminLendingBorrows)
+
+		// 交易机器人管理（代理 bot 服务 /admin/* 端点）
+		admin.GET("/bot/strategies", s.handleAdminBotStrategies)
+		admin.POST("/bot/strategies/:id/tick", s.handleAdminBotTick)
 	}
 }

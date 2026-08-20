@@ -4,7 +4,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 )
 
-// Migrations 是机器人业务建表迁移。版本号落在 9800+ 空闲区间（9803/9804）。
+// Migrations 是机器人业务建表迁移。版本号落在 9800+ 空闲区间（9803–9805）。
 var Migrations = []migrate.Migration{
 	{
 		Version: 9803,
@@ -42,5 +42,10 @@ var Migrations = []migrate.Migration{
 			INDEX idx_strategy (strategy_id)
 		)`,
 		Down: `DROP TABLE IF EXISTS ce_bot_orders`,
+	},
+	{
+		Version: 9805,
+		Up: `ALTER TABLE ce_bot_strategies ADD COLUMN grid_state JSON DEFAULT NULL`,
+		Down: `ALTER TABLE ce_bot_strategies DROP COLUMN grid_state`,
 	},
 }

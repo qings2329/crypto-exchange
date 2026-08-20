@@ -3,6 +3,7 @@ package risk
 import (
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
@@ -128,6 +129,60 @@ func (s *Service) CheckOrder(userID int64, asset string, qty float64, kycLevel i
 	if amt.Cmp(limit) > 0 {
 		s.record(userID, KindOrderLimit, fmt.Sprintf("qty %s exceeds limit %s", amt.HumanString(), limit.HumanString()))
 		return CheckResult{Allowed: false, Reason: "exceeds order limit"}, nil
+	}
+	return CheckResult{Allowed: true}, nil
+}
+
+// CheckPosition 评估持仓限额风控：positionSize 为用户当前持仓数量（按 asset 计价），
+// 超过 position_limit 规则的 MaxAmountPerDay 时拒绝。
+func (s *Service) CheckPosition(userID int64, asset string, positionSize float64, kycLevel int) (CheckResult, error) {
+	uidStr := strconv.FormatInt(userID, 10)
+	if ok, _ := s.store.IsBlacklisted(uidStr); ok {
+		s.record(userID, KindPositionLimit, fmt.Sprintf("user %s in blacklist", uidStr))
+		return CheckResult{Allowed: false, Reason: "user blacklisted"}, nil
+	}
+	rule := s.matchRule(KindPositionLimit, asset, userID)
+	if rule == nil {
+		return CheckResult{Allowed: true}, nil
+	}
+	if kycLevel < rule.MinKYCLevel {
+		s.record(userID, KindPositionLimit, fmt.Sprintf("kyc level %d < required %d", kycLevel, rule.MinKYCLevel))
+		return CheckResult{Allowed: false, Reason: "kyc level too low"}, nil
+	}
+	if positionSize < 0 {
+		s.record(userID, KindPositionLimit, fmt.Sprintf("position size %.8f invalid (must be non-negative)", positionSize))
+		return CheckResult{Allowed: false, Reason: "position size must be non-negative"}, nil
+	}
+	dec := settlement.AssetDecimalsByName(asset)
+	pos := settlement.AssetAmountFromFloat(positionSize, dec)
+	limit := rule.MaxAmountPerDay.ToDecimals(dec)
+	if pos.Cmp(limit) > 0 {
+		s.record(userID, KindPositionLimit, fmt.Sprintf("position %s exceeds limit %s", pos.HumanString(), limit.HumanString()))
+		return CheckResult{Allowed: false, Reason: "exceeds position limit"}, nil
+	}
+	return CheckResult{Allowed: true}, nil
+}
+
+// CheckFrequency 评估操作频率风控：按 freq_limit 规则校验单日操作次数。
+// 每次调用会原子递增计数器（在 window 窗口内），超过 MaxCountPerDay 时拒绝。
+func (s *Service) CheckFrequency(userID int64, action string, window time.Duration) (CheckResult, error) {
+	uidStr := strconv.FormatInt(userID, 10)
+	if ok, _ := s.store.IsBlacklisted(uidStr); ok {
+		s.record(userID, KindFreqLimit, fmt.Sprintf("user %s in blacklist", uidStr))
+		return CheckResult{Allowed: false, Reason: "user blacklisted"}, nil
+	}
+	rule := s.matchRule(KindFreqLimit, "", userID)
+	if rule == nil {
+		return CheckResult{Allowed: true}, nil
+	}
+	key := fmt.Sprintf("%d:%s", userID, action)
+	count, err := s.store.IncFrequencyCount(key, window)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "frequency counter error"}, err
+	}
+	if rule.MaxCountPerDay > 0 && count > rule.MaxCountPerDay {
+		s.record(userID, KindFreqLimit, fmt.Sprintf("action %s count %d exceeds limit %d", action, count, rule.MaxCountPerDay))
+		return CheckResult{Allowed: false, Reason: "exceeds frequency limit"}, nil
 	}
 	return CheckResult{Allowed: true}, nil
 }

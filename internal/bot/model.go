@@ -54,6 +54,8 @@ type BotStrategy struct {
 	Type   StrategyType `json:"type"`
 	Params BotParams    `json:"params"`
 	Status StrategyStatus `json:"status"`
+	// GridState 是网格策略的运行时状态（仅 grid 类型使用）。
+	GridState *GridState `json:"grid_state,omitempty"`
 	// UserToken 是用户授权 bot 代其下单的凭证（不序列化到外部响应）。
 	UserToken string `json:"-"`
 	CreatedAt int64  `json:"created_at"`

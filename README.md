@@ -20,6 +20,7 @@ internal/
   matching/         撮合引擎（订单簿 + 引擎）
   futures/          合约交易：持仓/保证金模型 + 强平引擎 + 标记价格 + 资金费率
   ledger/           钱包总账（复式记账：可用/冻结、保证金冻结、资金费结算、强平没收）
+  lending/          P2P 借贷：资金池/存借订单/利息归集/抵押管理（端口 :8100）
   services/         各业务服务实现
 ```
 
@@ -109,7 +110,7 @@ server:
 
 ## 开发任务清单
 
-完整的待开发任务与优先级见 [docs/DEVELOPMENT_TASKS.md](docs/DEVELOPMENT_TASKS.md)（含 P0 安全/资金闭环、P1 合约完善、P2 业务线等 17 项）。
+完整的任务清单与完成状态见 [docs/DEVELOPMENT_TASKS.md](docs/DEVELOPMENT_TASKS.md)（P0 安全/资金闭环、P1 合约完善、P2 基础设施/业务线等 31 项，截至 2026-08-18 全部已完成）。
 
 ## API 文档
 
@@ -177,10 +178,4 @@ make run-futures
 # 10x多@50000 标记价跌至40000 -> 强平 -> 用户1 保证金没收, 保险基金 +5000
 ```
 
-已知留白：指数价应来自多交易所现货加权/预言机；全仓（cross）模式、部分强平（阶梯减仓）、ADL 落地；穿仓时中转池/保险基金差额吸收。
-
-## 待补充
-
-- 数据库 migration、Kafka topic 设计、proto 生成脚本。
-- 其余业务线服务（otc / options / margin / wealth / risk / settlement / notification）。
-- futures：全仓（cross）模式、部分强平（阶梯减仓）、ADL 落地、穿仓处理。
+指数价由 `internal/oracle` 多源中位数聚合（Binance/OKX/Coinbase），未配置时回退内置 StaticFeed 演示。全仓（cross）模式、部分强平（阶梯减仓）、ADL、穿仓社会化分摊均已在 `internal/futures` 实现（见 [docs/DEVELOPMENT_TASKS.md](docs/DEVELOPMENT_TASKS.md) §6-§9）。
