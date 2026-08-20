@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 跨服务端到端测试脚本：运行 bot / copytrade 与下游 spot 订单服务的跨服务 e2e。
+# 跨服务端到端测试脚本：运行 bot / copytrade / lending 与下游 spot 订单服务的跨服务 e2e，
+# 以及 adminapi → lending/bot 服务的管理后台代理链路验证。
 #
-# 该 e2e 在进程内以独立 httptest 服务拉起「下游 spot 订单服务」与 bot/copytrade 路由，
+# 该 e2e 在进程内以独立 httptest 服务拉起「下游 spot 订单服务」与 bot/copytrade/lending 路由，
 # 共享同一 TokenVerifier，走真实 HTTP 验证跨服务资金安全不变量（F1 幂等 / F4 授权 / 复制费结算）。
 # 不依赖 MySQL / Kafka，可在任意环境运行。
 #

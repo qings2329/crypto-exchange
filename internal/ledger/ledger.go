@@ -78,6 +78,12 @@ const (
 	// SysCopyTradeFee 跟单平台分成收入账户：复制成交后从粉丝收益中扣取的平台费 Credit 本账户
 	// （余额为正，表示平台累计收取的跟单分成）；交易员抽成经用户可用↔交易员账户结算。
 	SysCopyTradeFee int64 = -12
+	// SysLendingPool 借贷资金池中央托管账户：用户存款入池时从用户可用 Debit、Credit 本账户；
+	// 借款放出时从本账户 Debit、Credit 借款用户；还款时反向。余额恒等于「总存款 - 总借款」。
+	SysLendingPool int64 = -13
+	// SysLendingCollateral 借贷抵押品托管账户：借款人冻结抵押品时从用户可用 Debit、Credit 本账户；
+	// 还款释放时反向。余额恒等于「Σ活跃借款抵押品」。
+	SysLendingCollateral int64 = -14
 )
 
 // 快照 schema 版本。v2 起金额以 AssetAmount（定点整数）序列化；v0/v1（无 version 字段）

@@ -2,6 +2,7 @@ package risk
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -30,6 +31,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		g.GET("/blacklist/check", h.checkBlacklist)
 		g.POST("/check/withdraw", h.checkWithdraw)
 		g.POST("/check/order", h.checkOrder)
+		g.POST("/check/position", h.checkPosition)
+		g.POST("/check/frequency", h.checkFrequency)
 		g.GET("/events", h.listEvents)
 	}
 }
@@ -143,6 +146,42 @@ func (h *Handler) checkOrder(c *gin.Context) {
 		return
 	}
 	res, err := h.svc.CheckOrder(in.UserID, in.Asset, in.Qty, in.KYCLevel)
+	if err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	response.JSON(c, res)
+}
+
+func (h *Handler) checkPosition(c *gin.Context) {
+	var in struct {
+		UserID   int64   `json:"user_id"`
+		Asset    string  `json:"asset"`
+		Size     float64 `json:"size"`
+		KYCLevel int     `json:"kyc_level"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		response.Error(c, 400, 400, "invalid body")
+		return
+	}
+	res, err := h.svc.CheckPosition(in.UserID, in.Asset, in.Size, in.KYCLevel)
+	if err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	response.JSON(c, res)
+}
+
+func (h *Handler) checkFrequency(c *gin.Context) {
+	var in struct {
+		UserID int64  `json:"user_id"`
+		Action string `json:"action"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		response.Error(c, 400, 400, "invalid body")
+		return
+	}
+	res, err := h.svc.CheckFrequency(in.UserID, in.Action, 24*time.Hour)
 	if err != nil {
 		response.Error(c, 500, 500, err.Error())
 		return

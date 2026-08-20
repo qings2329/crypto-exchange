@@ -13,6 +13,7 @@
 #   3) 链上质押生息（staking）：用户委托质押一笔资产（本金锁定到 SysStaking，复式记账），
 #      管理员触发一次奖励归集（accrue），链上待领奖励计入平台对用户欠付的 SysStakingReward
 #      负债；并验证解质押→释放把本金（及累计奖励）原子归还用户账本（F3）。
+#   4) 借贷（lending）：用户存款→借款→管理员计息→还款→提款，全流程复式记账，验证资金闭环（F3）。
 #
 # 鉴权 token 由本脚本用「共享开发密钥」本地签发（与 TokenVerifier.HMAC-SHA256 完全一致），
 # 与线上各服务本地校验 token 的方式一致——因此无需 user 服务往返（user 不参与资金流）。
@@ -182,12 +183,13 @@ SPOT_PORT="$(free_port)"
 BOT_PORT="$(free_port)"
 COPY_PORT="$(free_port)"
 STAKE_PORT="$(free_port)"
+LEND_PORT="$(free_port)"
 CFG_TMP="$(mktemp /tmp/ce-int-config.XXXX.yaml)"
 make_config "$CONFIG" "$CFG_TMP" "$MATCH_PORT"
 
 # ---- build binaries ----
 echo "== building binaries (go) =="
-for svc in matching spot bot copytrade staking; do
+for svc in matching spot bot copytrade staking lending; do
   echo "  building $svc ..."
   if ! go build -o "$BIN/$svc" "./cmd/$svc"; then
     echo "  [FAIL] build $svc"; FAILED=1; exit 1
@@ -195,12 +197,13 @@ for svc in matching spot bot copytrade staking; do
 done
 
 # ---- launch services（内存模式 + 空闲端口）----
-echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT stake=$STAKE_PORT) =="
+echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT stake=$STAKE_PORT lend=$LEND_PORT) =="
 "$BIN/matching"  --config "$CFG_TMP" --mysql-dsn "" --addr ":$MATCH_PORT" >"$LOGDIR/matching.log"  2>&1 & PIDS+=($!)
 "$BIN/spot"      --config "$CFG_TMP" --mysql-dsn "" --addr ":$SPOT_PORT" >"$LOGDIR/spot.log"       2>&1 & PIDS+=($!)
 "$BIN/bot"       --config "$CFG_TMP" --mysql-dsn "" --addr ":$BOT_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/bot.log" 2>&1 & PIDS+=($!)
 "$BIN/copytrade" --config "$CFG_TMP" --mysql-dsn "" --addr ":$COPY_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/copytrade.log" 2>&1 & PIDS+=($!)
 "$BIN/staking"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$STAKE_PORT" >"$LOGDIR/staking.log"   2>&1 & PIDS+=($!)
+"$BIN/lending"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$LEND_PORT" >"$LOGDIR/lending.log"   2>&1 & PIDS+=($!)
 
 wait_for "http://127.0.0.1:$MATCH_PORT/health"                 "matching"  || FAILED=1
 wait_for_match_leader "http://127.0.0.1:$MATCH_PORT/health"     "matching"  || FAILED=1
@@ -208,12 +211,14 @@ wait_for "http://127.0.0.1:$SPOT_PORT/api/v1/spot/depth"       "spot"      || FA
 wait_for "http://127.0.0.1:$BOT_PORT/api/v1/bot/strategies"    "bot"       || FAILED=1
 wait_for "http://127.0.0.1:$COPY_PORT/api/v1/copytrade/leads"  "copytrade" || FAILED=1
 wait_for "http://127.0.0.1:$STAKE_PORT/api/v1/staking/products" "staking"  || FAILED=1
+wait_for "http://127.0.0.1:$LEND_PORT/api/v1/lending/pools"    "lending"   || FAILED=1
 [ "$FAILED" -ne 0 ] && { echo "services failed to start"; exit 1; }
 
 SPOT="http://127.0.0.1:$SPOT_PORT"
 BOT="http://127.0.0.1:$BOT_PORT"
 COPY="http://127.0.0.1:$COPY_PORT"
 STAKE="http://127.0.0.1:$STAKE_PORT"
+LEND="http://127.0.0.1:$LEND_PORT"
 
 # tokens: 共享开发密钥本地签发
 ADMIN_TOKEN="$(mint_token 999 admin)"
@@ -331,6 +336,57 @@ check "staking release -> 200 (本金+奖励原子归还)" "$([ "$RESP_CODE" = "
 do_call POST "$STAKE/api/v1/staking/release" "$STAKE_USER_TOKEN" \
   '{"delegation_id":'"$DELEG_ID"'}'
 check "staking release 终态幂等：重复释放被拒 (非 200)" "$([ "$RESP_CODE" != "200" ] && echo 1 || echo 0)"
+
+# ================= 流程 4：lending 存款 -> 借款 -> 利息归集 -> 还款 -> 提款 =================
+echo "== flow 4: lending 存借还提 (F2 利息 / F3 原子 / F4 鉴权) =="
+LEND_USER_TOKEN="$(mint_token 1 user)"
+
+# 4.1 列出资金池（启动时 seed 了一个 USDT 池）
+do_call GET "$LEND/api/v1/lending/pools" "$LEND_USER_TOKEN" ""
+check "lending list pools -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+LEND_POOL_ID="$(echo "$RESP_BODY" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); ps=d.get("data",{}).get("pools",[])
+    print(ps[0]["id"] if ps else "")
+except Exception:
+    print("")')"
+check "lending pool id parsed" "$([ -n "$LEND_POOL_ID" ] && echo 1 || echo 0)"
+
+# 4.2 用户存款 500 USDT 到资金池（复式记账：用户可用→SysLendingPool）
+do_call POST "$LEND/api/v1/lending/lend" "$LEND_USER_TOKEN" \
+  '{"pool_id":'"$LEND_POOL_ID"',"amount":500}'
+check "lending lend 500 USDT -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.3 借款 100 USDT，抵押 200 USDT（collateral_req=1.5，100*1.5=150 ≤ 200）
+do_call POST "$LEND/api/v1/lending/borrow" "$LEND_USER_TOKEN" \
+  '{"pool_id":'"$LEND_POOL_ID"',"amount":100,"collateral":200}'
+check "lending borrow 100 USDT -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.4 我的存款/借款列表
+do_call GET "$LEND/api/v1/lending/my/lends" "$LEND_USER_TOKEN" ""
+check "lending my lends -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+check "lending 我的存款列表含 active 记录" "$(echo "$RESP_BODY" | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin); ls=d.get("data",{}).get("lends",[])
+    print("1" if any(x.get("status")=="active" for x in ls) else "0")
+except Exception:
+    print("0")')"
+
+do_call GET "$LEND/api/v1/lending/my/borrows" "$LEND_USER_TOKEN" ""
+check "lending my borrows -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.5 管理员触发利息归集（accrue 一次，计息到 borrowers）
+do_call POST "$LEND/api/v1/lending/admin/accrue" "$ADMIN_TOKEN" ""
+check "lending admin accrue -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.6 还款（连本带利）
+do_call POST "$LEND/api/v1/lending/repay" "$LEND_USER_TOKEN" '{"pool_id":'"$LEND_POOL_ID"'}'
+check "lending repay -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.7 提取存款（复式记账：SysLendingPool→用户可用）
+do_call POST "$LEND/api/v1/lending/withdraw" "$LEND_USER_TOKEN" '{"pool_id":'"$LEND_POOL_ID"'}'
+check "lending withdraw -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 
 echo "========================================="
 if [ "$FAILED" -eq 0 ]; then
