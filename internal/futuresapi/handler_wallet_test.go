@@ -97,6 +97,7 @@ func callReject(s *Server, holdID string) *httptest.ResponseRecorder {
 func callWithdrawRequest(s *Server, userID int64, asset, chain string, amount, fee float64, address string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", userID) // 模拟已鉴权身份（F4 修复后 handler 从 token 取 uid，忽略请求体 user_id）
 	body, _ := json.Marshal(gin.H{
 		"user_id": userID, "asset": asset, "chain": chain,
 		"amount": amount, "fee": fee, "address": address,
@@ -288,5 +289,32 @@ func TestWithdrawApproveUnknown(t *testing.T) {
 	s := newWithdrawServer(t)
 	if w := callApprove(s, "nope"); w.Code != http.StatusNotFound {
 		t.Fatalf("approve unknown hold should be 404, got %d", w.Code)
+	}
+}
+
+// TestWithdrawRequestIgnoresBodyUserID 是 F4 安全回归：提现请求的身份强制取自 token，
+// 忽略请求体 user_id，杜绝普通用户通过伪造 user_id 冒充他人提现（资金盗窃路径）。
+func TestWithdrawRequestIgnoresBodyUserID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	s := newWithdrawServer(t)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("user_id", int64(1)) // 真实登录身份
+	body, _ := json.Marshal(gin.H{
+		"user_id": 999, "asset": "USDT", "chain": "Ethereum", // 伪造他人 user_id
+		"amount": 100, "fee": 0, "address": "0xabc",
+	})
+	c.Request, _ = http.NewRequest(http.MethodPost, "/x", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	s.handleWithdrawRequest(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d %s", w.Code, w.Body.String())
+	}
+	// hold 必须归属真实身份 uid=1，而非伪造的 999。
+	if holds := s.ledgerSvc.ListWithdrawHolds(1); len(holds) == 0 {
+		t.Fatalf("expected withdraw hold under token uid=1")
+	}
+	if holds := s.ledgerSvc.ListWithdrawHolds(999); len(holds) != 0 {
+		t.Fatalf("withdraw hold must NOT be created under forged user_id=999")
 	}
 }

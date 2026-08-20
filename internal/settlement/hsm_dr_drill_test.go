@@ -118,6 +118,8 @@ func TestDRHSMFailoverAndRecovery(t *testing.T) {
 
 	stage := func(name string) string {
 		rawSeen = ""
+		// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+		g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo)
 		ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo, false)
 		if err != nil {
 			t.Fatalf("[%s] SubmitWithdraw 不应报错: %v", name, err)
@@ -186,6 +188,8 @@ func TestDRPublicKeyMismatchDetected(t *testing.T) {
 			HSM:           HSMConfig{Kind: "remote-http", Endpoint: srvK2.URL + "/sign", PublicKey: pubK1},
 		},
 	})
+	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo)
 	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo, false)
 	if err != nil {
 		t.Fatalf("公钥错配应 fail-degraded 不报错: %v", err)
@@ -224,6 +228,8 @@ func TestDRKeyLossRekey(t *testing.T) {
 				HSM: HSMConfig{Kind: "remote-http", Endpoint: srv.URL + "/sign", PublicKey: pubK1},
 			},
 		})
+		// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+		g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo)
 		if _, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo, false); err != nil {
 			t.Fatalf("K1 签名: %v", err)
 		}
@@ -250,6 +256,8 @@ func TestDRKeyLossRekey(t *testing.T) {
 				HSM: HSMConfig{Kind: "remote-http", Endpoint: srv.URL + "/sign", PublicKey: pubK2},
 			},
 		})
+		// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+		g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo)
 		if _, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), drTo, false); err != nil {
 			t.Fatalf("K2 签名: %v", err)
 		}

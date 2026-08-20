@@ -56,6 +56,9 @@ type Server struct {
 	feeModel      *settlement.FeeModel
 	chainGateway  settlement.DepositGateway
 	chainWithdraw settlement.WithdrawGateway
+	// chainAuthorizer 是提现门控能力（M4）。网关实现 WithdrawAuthorizer 时持有之，用于在
+	// SubmitWithdraw 前登记已通过风控 + ledger 预冻 hold 的提现授权；nil（网关未实现）时跳过。
+	chainAuthorizer settlement.WithdrawAuthorizer
 
 	// 风控：提现强制路径在冻结资金前调用 riskSvc.CheckWithdraw 网关。
 	riskSvc    *risk.Service
@@ -181,7 +184,13 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	})
 	s.liquidator.SetADLCallback(func(ev futures.ADLEvent) {
 		ref := fmt.Sprintf("adl:%d:%s", ev.UserID, ev.Symbol)
-		amt := settlement.AssetAmountFromFloat(ev.ProfitCovered, settlement.AssetDecimalsByName("USDT"))
+		// M5/F5：引擎派生金额为 float，落账前拦截 NaN/Inf（避免静默归零记坏账），并对正常浮点
+		// 尾差四舍五入（AssetAmountFromFloatSafe）。非法值跳过本次结算，避免污染账本。
+		amt, err := settlement.AssetAmountFromFloatSafe(ev.ProfitCovered, settlement.AssetDecimalsByName("USDT"))
+		if err != nil {
+			log.Error("adl settle skipped: invalid float", zap.Int64("user", ev.UserID), zap.Error(err))
+			return
+		}
 		// F3 原子：ADL 扣减用户保证金 + 转入保险基金，整体经 Batch 执行，任一失败整组回滚
 		// （避免"用户已扣、保险未收"的账本失衡）。Debit/Credit 不按 ref 去重，ref 仅作流水标签。
 		ops := []ledger.Op{
@@ -198,7 +207,11 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	})
 	s.liquidator.SetDeficitPayer(func(deficit float64) {
 		ref := fmt.Sprintf("deficit:%d", time.Now().UnixNano())
-		amt := settlement.AssetAmountFromFloat(deficit, settlement.AssetDecimalsByName("USDT"))
+		amt, err := settlement.AssetAmountFromFloatSafe(deficit, settlement.AssetDecimalsByName("USDT"))
+		if err != nil {
+			log.Error("liquidation deficit settle skipped: invalid float", zap.Error(err))
+			return
+		}
 		// F3 原子：保险基金垫付穿仓亏损 → 记为清算损失，整体 Batch（消除原 _= 吞错导致的失衡）。
 		ops := []ledger.Op{
 			{Kind: ledger.OpDebit, User: ledger.SysInsurance, Asset: "USDT", Amount: amt, Biz: "liquidation_deficit", Ref: ref},
@@ -212,7 +225,11 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	s.liquidator.SetSocializeCallback(func(shares []futures.SocializedLossEvent) {
 		for _, sh := range shares {
 			ref := fmt.Sprintf("socialize:%d:%s", sh.UserID, sh.Symbol)
-			amt := settlement.AssetAmountFromFloat(sh.Share, settlement.AssetDecimalsByName("USDT"))
+			amt, err := settlement.AssetAmountFromFloatSafe(sh.Share, settlement.AssetDecimalsByName("USDT"))
+			if err != nil {
+				log.Error("socialize settle skipped: invalid float", zap.Int64("user", sh.UserID), zap.Error(err))
+				continue
+			}
 			// F3 原子：社会化分摊从用户扣减 → 转入保险基金，整体 Batch。
 			ops := []ledger.Op{
 				{Kind: ledger.OpDebit, User: sh.UserID, Asset: "USDT", Amount: amt, Biz: "socialized_loss", Ref: ref},
@@ -247,6 +264,10 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	s.chainGateway.Start()
 	s.chainGateway.StartScan(ctx)
 	s.chainWithdraw = settlement.NewWithdrawGateway(chainRPC)
+	// M4：若提现网关实现门控能力，则持有之，以便在广播前登记授权（完整网关侧鉴权门控）。
+	if auth, ok := s.chainWithdraw.(settlement.WithdrawAuthorizer); ok {
+		s.chainAuthorizer = auth
+	}
 	s.chainWithdraw.Start()
 	s.startChainWatchers()
 
@@ -409,21 +430,31 @@ func (s *Server) onTrade(symbol string, t matching.Trade) {
 // onLiquidation 是强平器的强平事件回调：处理部分强平释放保证金与整仓强平没收保证金入保险基金。
 func (s *Server) onLiquidation(ev futures.LiquidationEvent) {
 	ref := fmt.Sprintf("liq:%d:%s", ev.UserID, ev.Symbol)
+	// M5/F5：强平金额由引擎 float 派生，落账前拦截 NaN/Inf 并四舍五入尾差；非法值跳过整笔结算。
+	marginAmt, err := settlement.AssetAmountFromFloatSafe(ev.Margin, settlement.AssetDecimalsByName("USDT"))
+	if err != nil {
+		s.log.Error("liquidation settle skipped: invalid margin float", zap.Int64("user", ev.UserID), zap.Error(err))
+		return
+	}
+	realizedAmt, err := settlement.AssetAmountFromFloatSafe(ev.Realized, settlement.AssetDecimalsByName("USDT"))
+	if err != nil {
+		s.log.Error("liquidation settle skipped: invalid realized float", zap.Int64("user", ev.UserID), zap.Error(err))
+		return
+	}
 	if ev.Partial {
 		if ev.Mode == futures.Cross {
 			if ev.Realized >= 0 {
-				_ = s.ledgerSvc.Freeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(ev.Realized, settlement.AssetDecimalsByName("USDT")))
+				_ = s.ledgerSvc.Freeze(ev.UserID, "USDT", realizedAmt)
 			} else {
-				_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", settlement.AssetAmountFromFloat(-ev.Realized, settlement.AssetDecimalsByName("USDT")))
+				_ = s.ledgerSvc.Unfreeze(ev.UserID, "USDT", realizedAmt.Neg())
 			}
 		} else {
-			marginAmt := settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT"))
 			// F3 原子：释放冻结保证金 + 实现盈亏（贷记/借记用户），整体 Batch。
 			ops := []ledger.Op{{Kind: ledger.OpUnfreeze, User: ev.UserID, Asset: "USDT", Amount: marginAmt}}
 			if ev.Realized >= 0 {
-				ops = append(ops, ledger.Op{Kind: ledger.OpCredit, User: ev.UserID, Asset: "USDT", Amount: settlement.AssetAmountFromFloat(ev.Realized, settlement.AssetDecimalsByName("USDT")), Biz: "partial_liq", Ref: ref})
+				ops = append(ops, ledger.Op{Kind: ledger.OpCredit, User: ev.UserID, Asset: "USDT", Amount: realizedAmt, Biz: "partial_liq", Ref: ref})
 			} else {
-				ops = append(ops, ledger.Op{Kind: ledger.OpDebit, User: ev.UserID, Asset: "USDT", Amount: settlement.AssetAmountFromFloat(-ev.Realized, settlement.AssetDecimalsByName("USDT")), Biz: "partial_liq", Ref: ref})
+				ops = append(ops, ledger.Op{Kind: ledger.OpDebit, User: ev.UserID, Asset: "USDT", Amount: realizedAmt.Neg(), Biz: "partial_liq", Ref: ref})
 			}
 			if err := s.ledgerSvc.Batch(ops); err != nil {
 				s.log.Error("partial liquidation settle failed", zap.Int64("user", ev.UserID), zap.Error(err))
@@ -436,7 +467,6 @@ func (s *Server) onLiquidation(ev futures.LiquidationEvent) {
 		return
 	}
 
-	marginAmt := settlement.AssetAmountFromFloat(ev.Margin, settlement.AssetDecimalsByName("USDT"))
 	// F3 原子：释放冻结保证金 + 没收入保险基金，整体 Batch（任一失败整组回滚，避免"释放却未没收"的失衡）。
 	ops := []ledger.Op{
 		{Kind: ledger.OpUnfreeze, User: ev.UserID, Asset: "USDT", Amount: marginAmt},
@@ -583,7 +613,12 @@ func (s *Server) fundingLoop() {
 					switch {
 					case p.Payment < 0:
 						pay := -p.Payment
-						payAmt := settlement.AssetAmountFromFloat(pay, settlement.AssetDecimalsByName("USDT"))
+						// M5/F5：资金费由引擎 float 派生，落账前拦截 NaN/Inf 并四舍五入尾差；非法值跳过该笔。
+						payAmt, ferr := settlement.AssetAmountFromFloatSafe(pay, settlement.AssetDecimalsByName("USDT"))
+						if ferr != nil {
+							s.log.Error("funding debit skipped: invalid float", zap.Int64("user", p.UserID), zap.Error(ferr))
+							continue
+						}
 						// F3 原子：跨仓先解冻保证金，再转账给资金费池；整体 Batch，失败整组回滚。
 						ops := []ledger.Op{
 							{Kind: ledger.OpTransfer, From: p.UserID, To: ledger.SysFundingPool, Asset: "USDT", Amount: payAmt, Biz: "funding", Ref: ref},
@@ -599,7 +634,12 @@ func (s *Server) fundingLoop() {
 							s.liquidator.AdjustCrossBalance(sym, p.UserID, -pay)
 						}
 					case p.Payment > 0:
-						payAmt := settlement.AssetAmountFromFloat(p.Payment, settlement.AssetDecimalsByName("USDT"))
+						// M5/F5：资金费由引擎 float 派生，落账前拦截 NaN/Inf 并四舍五入尾差；非法值跳过该笔。
+						payAmt, ferr := settlement.AssetAmountFromFloatSafe(p.Payment, settlement.AssetDecimalsByName("USDT"))
+						if ferr != nil {
+							s.log.Error("funding credit skipped: invalid float", zap.Int64("user", p.UserID), zap.Error(ferr))
+							continue
+						}
 						// F3 原子：资金费池转账给用户，跨仓再冻结保证金；整体 Batch，失败整组回滚。
 						ops := []ledger.Op{
 							{Kind: ledger.OpTransfer, From: ledger.SysFundingPool, To: p.UserID, Asset: "USDT", Amount: payAmt, Biz: "funding", Ref: ref},

@@ -106,6 +106,10 @@ type UnsignedTx struct {
 	// 的 energy 费用上限（sun，0→不设）。非 TRON 链忽略这些字段。
 	ContractAddress string `yaml:"contract_address"`
 	FeeLimit        uint64 `yaml:"fee_limit"`
+	// Authorized 是 M4 网关侧鉴权门控的产物标记：仅当该笔提现已通过 RPCWithdrawGateway 的
+	// AuthorizeWithdraw 门控后，网关才会置 true。chainSigner.Sign 拒绝为未授权（Authorized=false）
+	// 的交易签名，作为离线签名器来源校验的纵深防御（即便有人绕过 SubmitWithdraw 直连签名器）。
+	Authorized bool `yaml:"-"`
 }
 
 // Signer 离线签名边界：在热钱包 / HSM / 安全 enclave 内对交易签名，返回已签名的 raw
@@ -658,6 +662,11 @@ type RPCWithdrawGateway struct {
 	*MockWithdrawGateway
 	client ChainRPCClient
 	signer Signer // 离线签名器（可选）；nil → 回退节点侧签名广播
+	// enforceAuth 控制是否强制提现门控（M4）。true 时 SubmitWithdraw 在触发离线签名器前
+	// 校验该笔已通过 AuthorizeWithdraw 门控，未授权则拒绝签名/广播（防御离线签名器被任意来源
+	// 驱动签名转移资金）。由 NewWithdrawGateway 在装配离线签名器（真实广播路径）时置 true；
+	// 未配置签名器（节点侧签名广播 fail-degraded，无离线签名器可被滥用）时保持 false。
+	enforceAuth bool
 	// erc20 是 ETH 链可提现 ERC20 资产注册表（asset -> 合约地址 + decimals），由配置注入；
 	// 提现时按 asset 命中则构造 transfer 合约调用。空表示未配置 ERC20 提现（仅原生资产）。
 	erc20 map[string]ERC20TokenInfo
@@ -666,6 +675,12 @@ type RPCWithdrawGateway struct {
 // SubmitWithdraw 优先走离线签名边界（有 Signer 时：签名→SendRaw 广播并取回真实 TxHash）；
 // 无 Signer 或签名/广播失败时回退节点侧签名广播（Broadcast）；RPC 仍不可达则回退模拟。
 func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, willFail bool) (*WithdrawEvent, error) {
+	// M4 网关侧鉴权门控：离线签名器只接受经 AuthorizeWithdraw 门控的提现。强制模式下若未
+	// 授权则拒绝签名/广播，杜绝任意代码路径构造 UnsignedTx 驱动离线签名器转移资金。
+	if g.enforceAuth && !g.isAuthorized(userID, asset, chain, amount, fee, address) {
+		return nil, fmt.Errorf("settlement: withdraw rejected: not authorized by gateway gate (call AuthorizeWithdraw first): user=%d asset=%s chain=%s to=%s",
+			userID, asset, chain, address)
+	}
 	// 构造待签名交易：ERC20（chain=ETH 且注册表命中）时 to 仍为最终用户地址，但携带合约地址
 	// 与按代币 decimals 缩放后的金额，由签名器编码为 transfer 合约调用。
 	var tx *UnsignedTx
@@ -679,6 +694,7 @@ func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Ch
 			Amount:         amount.ToDecimals(info.Decimals),
 			Asset:          asset,
 			ContractAddress: info.Contract,
+			Authorized:     true, // M4：已通过门控，允许离线签名器签名
 		}
 	} else {
 		// 高危自检：ETH 链上非原生资产却未命中 ERC20 注册表，将作为原生 ETH 广播，
@@ -687,7 +703,7 @@ func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Ch
 			log.Printf("[settlement] ERROR withdraw asset %s on ETH not in ERC20 registry; will broadcast as NATIVE ETH (possible fund misroute): user=%d to=%s amount=%s",
 				asset, userID, address, amount.HumanString())
 		}
-		tx = &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset}
+		tx = &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset, Authorized: true} // M4：已通过门控
 	}
 	if g.client != nil {
 		// 主路径：离线签名（HSM）→ 广播已签原始交易。
@@ -749,6 +765,11 @@ type chainSigner struct {
 }
 
 func (c *chainSigner) Sign(ctx context.Context, tx *UnsignedTx) (string, error) {
+	// M4 纵深防御：离线签名器只签署经网关门控（AuthorizeWithdraw）的提现。任何绕过
+	// RPCWithdrawGateway.SubmitWithdraw 直连签名器的路径都会因 Authorized=false 被拒。
+	if !tx.Authorized {
+		return "", fmt.Errorf("settlement: refusing to sign unauthorized withdraw tx (missing gateway auth gate)")
+	}
 	if tx.Chain == ChainSOL {
 		if c.sol == nil {
 			return "", fmt.Errorf("SOL 离线签名器未配置（需 SOLANA_HOTWALLET_KEY）")
@@ -813,6 +834,9 @@ func NewWithdrawGateway(conf ChainRPCConfig) WithdrawGateway {
 			client:              client,
 			signer:              signer,
 			erc20:               conf.ERC20Tokens,
+			// M4 网关侧鉴权门控：装配了离线签名器（真实广播路径）即强制门控。未配置签名器时
+			// 走节点侧签名广播（fail-degraded，无离线签名器可被滥用），门控保持关闭。
+			enforceAuth: signer != nil,
 		}
 	}
 	// 离线签名边界未启用（纯 mock 网关）时也尝试装配 HD 充值地址派生（配置驱动）。

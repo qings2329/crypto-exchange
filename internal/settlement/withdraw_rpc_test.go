@@ -409,6 +409,8 @@ func TestNewWithdrawGatewayETHUsesNodeNonceGas(t *testing.T) {
 	// 取签名者地址用于恢复校验（与网关内签名器同私钥）。
 	sig, _ := newRealSignerWithSource(HotWalletConfig{SignerKey: knownVectorPriv}, SignerSources{})
 	to := "0x3535353535353535353535353535353535353535"
+	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to)
 	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
@@ -484,6 +486,8 @@ func TestNewWithdrawGatewayETHERC20UsesOfflineSigner(t *testing.T) {
 	}
 	userAddr := "0x1111111111111111111111111111111111111111"
 	// 1.5 USDT 经网关内部 ToDecimals(6) → 1500000 最小单位。
+	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+	rg.AuthorizeWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), userAddr)
 	ev, err := rg.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), userAddr, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
@@ -550,6 +554,8 @@ func TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath(t *testing.T) {
 		t.Fatalf("enabled gateway should be *RPCWithdrawGateway, got %T", g)
 	}
 
+	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "BTC", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), deriveP2WPKHAddress(priv.PubKey()))
 	ev, err := g.SubmitWithdraw(1, "BTC", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), deriveP2WPKHAddress(priv.PubKey()), false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
@@ -605,6 +611,8 @@ func TestSubmitWithdrawLogsERC20RoutedAndBroadcast(t *testing.T) {
 	}).(*RPCWithdrawGateway)
 	buf, restore := captureLog(t)
 	defer restore()
+	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+	g.AuthorizeWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), "0x1111111111111111111111111111111111111111")
 	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), "0x1111111111111111111111111111111111111111", false); err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
 	}
@@ -742,5 +750,52 @@ func TestJSONRPCClientSendRawLTCAndDOGE(t *testing.T) {
 		if h != "ltcdogetxhash" {
 			t.Fatalf("%s SendRaw got %q", chain, h)
 		}
+	}
+}
+
+// TestRPCWithdrawGatewayRejectsUnauthorizedWithdraw 回归 M4 网关侧鉴权门控：配置离线签名器
+// （enforceAuth=true）时，未先经 AuthorizeWithdraw 门控的提现必须被拒绝签名/广播，杜绝任意
+// 代码路径构造 UnsignedTx 驱动离线签名器转移资金。
+func TestRPCWithdrawGatewayRejectsUnauthorizedWithdraw(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
+		signer:              &emptyRawSigner{},
+		enforceAuth:         true,
+	}
+	if _, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0xabc", false); err == nil {
+		t.Fatalf("expected unauthorized withdraw to be rejected by gateway gate")
+	} else if !strings.Contains(err.Error(), "not authorized") {
+		t.Fatalf("expected auth-gate error, got %v", err)
+	}
+}
+
+// TestRPCWithdrawGatewayAuthorizedWithdrawOK 回归 M4：先 AuthorizeWithdraw 登记的提现可通过门控正常广播。
+func TestRPCWithdrawGatewayAuthorizedWithdrawOK(t *testing.T) {
+	g := &RPCWithdrawGateway{
+		MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
+		signer:              &emptyRawSigner{},
+		enforceAuth:         true,
+	}
+	if _, err := g.AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0xabc"); err != nil {
+		t.Fatalf("AuthorizeWithdraw: %v", err)
+	}
+	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0xabc", false)
+	if err != nil {
+		t.Fatalf("authorized withdraw should pass gate: %v", err)
+	}
+	if ev == nil || ev.TxHash == "" {
+		t.Fatalf("expected a broadcasted withdraw event")
+	}
+}
+
+// TestChainSignerRejectsUnauthorizedTx 回归 M4 纵深防御：chainSigner 拒绝为未授权
+// （Authorized=false）的交易签名，即便有人绕过 RPCWithdrawGateway.SubmitWithdraw 直连签名器。
+func TestChainSignerRejectsUnauthorizedTx(t *testing.T) {
+	cs := &chainSigner{base: &emptyRawSigner{}}
+	if _, err := cs.Sign(context.Background(), &UnsignedTx{Chain: ChainETH, To: "0xabc", Amount: amt(ChainETH, 1)}); err == nil || !strings.Contains(err.Error(), "unauthorized") {
+		t.Fatalf("chainSigner should reject unauthorized tx, got %v", err)
+	}
+	if _, err := cs.Sign(context.Background(), &UnsignedTx{Chain: ChainETH, To: "0xabc", Amount: amt(ChainETH, 1), Authorized: true}); err != nil {
+		t.Fatalf("authorized tx should reach base signer: %v", err)
 	}
 }

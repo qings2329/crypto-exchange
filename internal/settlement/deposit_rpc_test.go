@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -98,14 +100,32 @@ func TestNewDepositGatewayEnabledUsesRPC(t *testing.T) {
 	}
 }
 
-// TestJSONRPCDepositScannerETH 用 httptest 模拟节点 eth_getLogs 响应，验证真实扫描器把
-// 命中观察地址的 Transfer 日志解析为 DepositEvent（value 0x0de0b6b3a7640000 = 1e18 wei = 1.0）。
+// TestJSONRPCDepositScannerETH 用 httptest 模拟节点 eth_blockNumber + eth_getBlockByNumber
+// 响应，验证原生 ETH 充值经区块扫描（to==观察地址、value>0）被正确解析为 DepositEvent
+// （value 0x0de0b6b3a7640000 = 1e18 wei = 1.0 ETH），且非该地址发出的交易被忽略（M2 修复后
+// 原生 ETH 不再用 eth_getLogs 过滤地址，而是走区块扫描）。
 func TestJSONRPCDepositScannerETH(t *testing.T) {
+	var bn int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Method string `json:"method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[` +
-			`{"transactionHash":"0xabc","data":"0x0de0b6b3a7640000","address":"0xWATCH"}` +
-			`]}`))
+		switch req.Method {
+		case "eth_blockNumber":
+			// 每次调用链头+1（首次对齐水位线后，第二次起出现新区块触发扫描）。17=0x11, 18=0x12...
+			n := atomic.AddInt64(&bn, 1)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"result":"0x%x"}`, 16+n)))
+		case "eth_getBlockByNumber":
+			// 区块内含有转入观察地址的充值，以及一笔该地址「发出」的交易（须被忽略）。
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"transactions":[` +
+				`{"hash":"0xeth1","to":"0xWATCH","value":"0x0de0b6b3a7640000"},` +
+				`{"hash":"0xeth2","to":"0xOTHER","value":"0x0de0b6b3a7640000"}` +
+				`]}}`))
+		default:
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[]}`))
+		}
 	}))
 	defer srv.Close()
 
@@ -120,19 +140,28 @@ func TestJSONRPCDepositScannerETH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
 	}
-	select {
-	case ev := <-ch:
-		if ev.UserID != 9 || ev.Asset != "ETH" || ev.Chain != ChainETH {
-			t.Fatalf("unexpected event identity: %+v", ev)
+	got := map[string]DepositEvent{}
+	timeout := time.After(3 * time.Second)
+	for len(got) < 1 {
+		select {
+		case ev := <-ch:
+			got[strings.ToLower(ev.TxHash)] = ev
+		case <-timeout:
+			t.Fatalf("no native ETH deposit event scanned from node; got=%v", got)
 		}
-		if !amtEq(ev.Amount, 1.0) {
-			t.Fatalf("expected amount 1.0 (1e18 wei), got %v", ev.Amount)
-		}
-		if !strings.EqualFold(ev.TxHash, "0xabc") {
-			t.Fatalf("unexpected tx hash: %q", ev.TxHash)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("no deposit event scanned from node")
+	}
+	if _, ok := got["0xeth2"]; ok {
+		t.Fatalf("transaction sent FROM watch address must be ignored: %+v", got)
+	}
+	ev, ok := got["0xeth1"]
+	if !ok {
+		t.Fatalf("native ETH deposit 0xeth1 not scanned; got=%v", got)
+	}
+	if ev.UserID != 9 || ev.Asset != "ETH" || ev.Chain != ChainETH {
+		t.Fatalf("unexpected event identity: %+v", ev)
+	}
+	if !amtEq(ev.Amount, 1.0) {
+		t.Fatalf("expected amount 1.0 (1e18 wei), got %v", ev.Amount)
 	}
 }
 
@@ -307,4 +336,42 @@ func TestJSONRPCDepositScannerTRON(t *testing.T) {
 		}
 	}
 	t.Fatalf("no matching TRC20 deposit event scanned")
+}
+
+// TestJSONRPCDepositScannerTRONIgnoresRemoteDecimals 验证 TRC20 充值不再信任远端
+// token_info.decimals（攻击者可伪造 decimals 放大/缩小金额，造成盗窃或漏账，F2/F5）。远端即便
+// 返回伪造 decimals=18，金额也不得按 18 缩放（否则 1000000 会变成 0.000000001），而应按本地
+// 配置/资产名推断的 6 → 1.0。
+func TestJSONRPCDepositScannerTRONIgnoresRemoteDecimals(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[` +
+			`{"transaction_id":"0xtronA","token_info":{"decimals":18},"value":"1000000","to":"TRwatch"}` +
+			`]}`))
+	}))
+	defer srv.Close()
+
+	sc := NewJSONRPCDepositScanner(
+		NewJSONRPCClient(map[string]string{"TRON": srv.URL}),
+		[]DepositWatch{{Chain: ChainTRON, Address: "TRwatch", UserID: 3, Asset: "USDT"}},
+		20*time.Millisecond,
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := sc.Scan(ctx)
+	if err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+	select {
+	case ev := <-ch:
+		if ev.TxHash != "0xtronA" {
+			t.Fatalf("unexpected tx: %q", ev.TxHash)
+		}
+		if !amtEq(ev.Amount, 1.0) {
+			// 远端 decimals=18 被忽略，应按 6 位小数 → 1000000/1e6 = 1.0。
+			t.Fatalf("remote decimals(18) must be ignored; expected 1.0 @6 decimals, got %v", ev.Amount)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no TRC20 deposit event scanned")
+	}
 }

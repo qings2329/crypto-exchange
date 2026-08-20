@@ -7,12 +7,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// depositNodeMock 充当「假链上节点」，覆盖扫描器依赖的三种端点：
-//   - POST eth_getLogs：返回一条 ERC20 Transfer 日志（data=1e18 wei=1.0）。
+// depositNodeMock 充当「假链上节点」，覆盖扫描器依赖的端点：
+//   - POST eth_blockNumber：链头高度，每次调用 +1（模拟新区块，触发水位线推进后扫描到充值）。
+//   - POST eth_getBlockByNumber：返回含一笔充值交易的区块（to=0xwatch 供 TestScanETH、to=0xw
+//     供集成/网关测试；value 0xDE0B6B3A7640000 = 1 ETH；同哈希两笔以适配不同观察地址）。
+//   - POST eth_getLogs：保留给 ERC20 直测（原生 ETH 不再使用）。
 //   - POST listsinceblock：返回一条 BTC receive 入账（0.5）。
 //   - GET /v1/accounts/<addr>/transactions/trc20：返回一条 TRC20 入账（to 回显 path 中的地址，
 //     使过滤器命中；可用 tronTo 覆写为其它地址以验证「非本地址忽略」）。
@@ -26,6 +30,7 @@ type depositNodeOpts struct {
 
 func depositNodeMock(t *testing.T, opts depositNodeOpts) *httptest.Server {
 	t.Helper()
+	var bn int64
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if opts.badJSON {
@@ -59,6 +64,16 @@ func depositNodeMock(t *testing.T, opts depositNodeOpts) *httptest.Server {
 		switch req.Method {
 		case "eth_getLogs":
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":[{"transactionHash":"0xethtx1","data":"0xDE0B6B3A7640000"}]}`))
+		case "eth_blockNumber":
+			// 每次调用链头+1：首次扫描对齐水位线后，再次扫描即出现新区块触发充值捕获。
+			n := atomic.AddInt64(&bn, 1)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"result":"0x%x"}`, 16+n)))
+		case "eth_getBlockByNumber":
+			// 区块含两笔同哈希交易：to=0xwatch（TestScanETH）、to=0xw（集成/网关测试）。
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"transactions":[` +
+				`{"hash":"0xethtx1","to":"0xwatch","value":"0xDE0B6B3A7640000"},` +
+				`{"hash":"0xethtx1","to":"0xw","value":"0xDE0B6B3A7640000"}` +
+				`]}}`))
 		case "listsinceblock":
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"transactions":[{"txid":"btctx1","address":"btcwatch","amount":0.5,"category":"receive","confirmations":3}]}}`))
 		default:
@@ -116,7 +131,15 @@ func TestScanETH(t *testing.T) {
 	node := depositNodeMock(t, depositNodeOpts{})
 	defer node.Close()
 	s := NewJSONRPCDepositScanner(newScanClient(t, node.URL), nil, 0)
-	evs, err := s.scanETH(context.Background(), DepositWatch{UserID: 7, Asset: "ETH", Chain: ChainETH, Address: "0xwatch"})
+	watch := DepositWatch{UserID: 7, Asset: "ETH", Chain: ChainETH, Address: "0xwatch"}
+	// 首次扫描仅对齐区块水位线（不回填历史），返回空、无错误。
+	if evs, err := s.scanETH(context.Background(), watch); err != nil {
+		t.Fatalf("scanETH(首次对齐): %v", err)
+	} else if len(evs) != 0 {
+		t.Fatalf("首次对齐扫描应返回 0 条入账，got %d", len(evs))
+	}
+	// 链头推进后出现新区块，再次扫描应捕获 to==观察地址 的充值（value 1e18 wei = 1.0 ETH）。
+	evs, err := s.scanETH(context.Background(), watch)
 	if err != nil {
 		t.Fatalf("scanETH: %v", err)
 	}
@@ -128,12 +151,12 @@ func TestScanETH(t *testing.T) {
 		t.Fatalf("ETH 入账字段不符: %+v", e)
 	}
 
-	// 节点返回非法 JSON → 解析错误。
+	// 节点返回非法 JSON（eth_blockNumber 解析失败）→ 报错。
 	bad := depositNodeMock(t, depositNodeOpts{badJSON: true})
 	defer bad.Close()
 	s2 := NewJSONRPCDepositScanner(newScanClient(t, bad.URL), nil, 0)
 	if _, err := s2.scanETH(context.Background(), DepositWatch{Chain: ChainETH}); err == nil {
-		t.Fatalf("eth_getLogs 返回非法 JSON 应报错")
+		t.Fatalf("eth_blockNumber 返回非法 JSON 应报错")
 	}
 }
 

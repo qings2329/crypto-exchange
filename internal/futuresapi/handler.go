@@ -46,10 +46,15 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 }
 
 // handleOrder 开/平仓：action=open 开仓，action=close 平仓（骨架仅支持整仓反向市价/限价）。
+// 身份强制取自 token（F4），忽略请求体 user_id，用户只能开/平自己的仓、冻结自己的保证金。
 func (s *Server) handleOrder(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
 	var req struct {
 		Symbol     string  `json:"symbol"`
-		UserID     int64   `json:"user_id"`
 		Action     string  `json:"action"` // open | close
 		PosSide    string  `json:"pos_side"`
 		MarginMode string  `json:"margin_mode"` // isolated（默认）| cross
@@ -63,7 +68,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 		return
 	}
 	// 坏账风控：有未冲抵坏账的用户禁止开立新仓（与限提出金对称），强制先补缴/回收。
-	if req.Action == "open" && s.ledgerSvc.IsOutflowRestricted(req.UserID, "USDT") {
+	if req.Action == "open" && s.ledgerSvc.IsOutflowRestricted(uid, "USDT") {
 		response.Error(c, 403, 403, "opening blocked: repay outstanding bad debt first")
 		return
 	}
@@ -81,7 +86,7 @@ func (s *Server) handleOrder(c *gin.Context) {
 	price := matching.FixedFromFloat(req.Price, s.cfg.PriceScale(req.Symbol))
 	qty := matching.FixedFromFloat(req.Qty, s.cfg.QtyScale(req.Symbol))
 	o := &matching.Order{
-		UserID: req.UserID,
+		UserID: uid,
 		Side:   side,
 		Price:  price,
 		Qty:    qty,
@@ -110,14 +115,14 @@ func (s *Server) handleOrder(c *gin.Context) {
 				mode = futures.Cross
 			}
 			// 资金闭环：开仓前从钱包冻结保证金；余额不足则拒绝开仓。
-			if err := s.ledgerSvc.Freeze(req.UserID, "USDT", settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName("USDT"))); err != nil {
+			if err := s.ledgerSvc.Freeze(uid, "USDT", settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName("USDT"))); err != nil {
 				response.Error(c, 400, 400, "insufficient margin: "+err.Error())
 				return
 			}
 			if mode == futures.Cross {
-				s.liquidator.OpenCross(req.Symbol, req.UserID, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
+				s.liquidator.OpenCross(req.Symbol, uid, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
 			} else {
-				book.Open(req.UserID, req.Symbol, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
+				book.Open(uid, req.Symbol, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
 			}
 		}
 	}

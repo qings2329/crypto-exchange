@@ -2,6 +2,7 @@ package futuresapi
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -15,18 +16,23 @@ import (
 )
 
 // registerWalletRoutes 注册钱包/风控/指标相关路由（由 RegisterRoutes 调用）。
+// 鉴权策略（F1/F4 复审修复）：全局已 Use AuthWithSkips（仅校验登录）。
+//   - 特权/管理操作（手动入账、重组、全局冻结/解冻、风控开关、社会化分摊治理、拒绝提现）
+//     一律加 middleware.AdminGuard()，普通用户禁止调用。
+//   - 用户本人资金操作（提现请求、提现地址增删确认、坏账补缴、下单）在 handler 内强制
+//     取 token uid（middleware.UserID(c)），忽略请求体 user_id，杜绝冒充他人资金。
 func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.GET("/api/v1/futures/wallet", s.handleWallet)
-	r.POST("/api/v1/futures/wallet/deposit", s.handleDeposit)
-	r.POST("/api/v1/futures/wallet/deposit/chain", s.handleDepositChain)
+	r.POST("/api/v1/futures/wallet/deposit", middleware.AdminGuard(), s.handleDeposit)
+	r.POST("/api/v1/futures/wallet/deposit/chain", middleware.AdminGuard(), s.handleDepositChain)
 	r.GET("/api/v1/futures/wallet/deposits", s.handleDeposits)
-	r.POST("/api/v1/futures/wallet/deposit/reorg", s.handleDepositReorg)
-	r.POST("/api/v1/futures/wallet/deposit/reorg/depth", s.handleDepositReorgDepth)
+	r.POST("/api/v1/futures/wallet/deposit/reorg", middleware.AdminGuard(), s.handleDepositReorg)
+	r.POST("/api/v1/futures/wallet/deposit/reorg/depth", middleware.AdminGuard(), s.handleDepositReorgDepth)
 	// 链上直接提现绕过冷静期（等同管理员放行），属特权操作，必须管理员角色（F4 修复）。
 	r.POST("/api/v1/futures/wallet/withdraw/chain", middleware.AdminGuard(), s.handleWithdrawChain)
 	r.GET("/api/v1/futures/wallet/withdraws", s.handleWithdraws)
-	r.POST("/api/v1/futures/wallet/withdraw/reorg", s.handleWithdrawReorg)
-	r.POST("/api/v1/futures/wallet/withdraw/reorg/depth", s.handleWithdrawReorgDepth)
+	r.POST("/api/v1/futures/wallet/withdraw/reorg", middleware.AdminGuard(), s.handleWithdrawReorg)
+	r.POST("/api/v1/futures/wallet/withdraw/reorg/depth", middleware.AdminGuard(), s.handleWithdrawReorgDepth)
 	r.POST("/api/v1/futures/wallet/withdraw/request", s.handleWithdrawRequest)
 	r.POST("/api/v1/futures/wallet/withdraw/finalize", s.handleWithdrawFinalize)
 	r.POST("/api/v1/futures/wallet/withdraw/cancel", s.handleWithdrawCancel)
@@ -34,10 +40,10 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	// reject 退回冻结；与用户端 finalize/cancel 并存，路径避开 withdraw 下的静态兄弟段以免路由冲突。
 	// approve 跳过冷静期属特权放行，必须管理员角色（F4 修复）。
 	r.POST("/api/v1/futures/wallet/withdraw/approve/:hold_id", middleware.AdminGuard(), s.handleWithdrawApprove)
-	r.POST("/api/v1/futures/wallet/withdraw/reject/:hold_id", s.handleWithdrawReject)
-	r.POST("/api/v1/futures/wallet/withdraw/emergency/freeze", s.handleEmergencyFreeze)
-	r.POST("/api/v1/futures/wallet/withdraw/emergency/resume", s.handleEmergencyResume)
-	r.POST("/api/v1/futures/wallet/risk/enable", s.handleRiskEnable)
+	r.POST("/api/v1/futures/wallet/withdraw/reject/:hold_id", middleware.AdminGuard(), s.handleWithdrawReject)
+	r.POST("/api/v1/futures/wallet/withdraw/emergency/freeze", middleware.AdminGuard(), s.handleEmergencyFreeze)
+	r.POST("/api/v1/futures/wallet/withdraw/emergency/resume", middleware.AdminGuard(), s.handleEmergencyResume)
+	r.POST("/api/v1/futures/wallet/risk/enable", middleware.AdminGuard(), s.handleRiskEnable)
 	r.GET("/api/v1/futures/wallet/risk/events", s.handleRiskEvents)
 	r.GET("/api/v1/futures/wallet/withdraw/holds", s.handleWithdrawHolds)
 	r.POST("/api/v1/futures/wallet/withdraw/address", s.handleWithdrawAddressAdd)
@@ -51,8 +57,8 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.GET("/api/v1/futures/wallet/fee", s.handleWalletFee)
 	r.GET("/api/v1/futures/wallet/baddebt", s.handleBadDebt)
 	r.POST("/api/v1/futures/wallet/baddebt/repay", s.handleBadDebtRepay)
-	r.POST("/api/v1/futures/wallet/baddebt/socialize/propose", s.handleSocializePropose)
-	r.POST("/api/v1/futures/wallet/baddebt/socialize/approve", s.handleSocializeApprove)
+	r.POST("/api/v1/futures/wallet/baddebt/socialize/propose", middleware.AdminGuard(), s.handleSocializePropose)
+	r.POST("/api/v1/futures/wallet/baddebt/socialize/approve", middleware.AdminGuard(), s.handleSocializeApprove)
 	r.GET("/api/v1/futures/wallet/reconcile", s.handleReconcile)
 	r.GET("/api/v1/futures/wallet/snapshot", s.handleSnapshot)
 	r.POST("/api/v1/futures/wallet/snapshot/save", s.handleSnapshotSave)
@@ -241,6 +247,8 @@ func (s *Server) handleWithdrawChain(c *gin.Context) {
 		response.Error(c, 500, 500, err.Error())
 		return
 	}
+	// M4 网关侧鉴权门控：广播前登记授权，使离线签名器仅接受经门控的提现（防任意来源驱动签名）。
+	s.authorizeWithdraw(req.UserID, asset, settlement.Chain(req.Chain), amt, feeAmt, req.Address)
 	ev, err := s.chainWithdraw.SubmitWithdraw(req.UserID, asset, settlement.Chain(req.Chain),
 		amt, feeAmt, req.Address, req.WillFail)
 	if err != nil {
@@ -330,16 +338,21 @@ func (s *Server) handleWithdrawReorgDepth(c *gin.Context) {
 }
 
 // handleWithdrawRequest 提现安全冷静期通道：受理即冻结资金并入队，待冷静期过后由 finalize 清算。
+// 身份强制取自 token（F4），忽略请求体 user_id，用户只能对自己发起提现。
 func (s *Server) handleWithdrawRequest(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
 	var req struct {
-		UserID  int64   `json:"user_id"`
 		Asset   string  `json:"asset"`
 		Chain   string  `json:"chain"`
 		Amount  float64 `json:"amount"`
 		Fee     float64 `json:"fee"`
 		Address string  `json:"address"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.Amount <= 0 || req.UserID == 0 {
+	if err := c.ShouldBindJSON(&req); err != nil || req.Amount <= 0 {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
@@ -357,7 +370,7 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 	}
 	// 冻结额由与链上广播同源的 AssetAmount 派生，确保账本冻结额 == 链上划出额，消除 float 漂移（F2）。
 	total := amt.Add(feeAmt)
-	avail, _, ok := s.ledgerSvc.Balance(req.UserID, asset)
+	avail, _, ok := s.ledgerSvc.Balance(uid, asset)
 	if !ok || avail.Cmp(total) < 0 {
 		response.Error(c, 400, 400, "insufficient available balance")
 		return
@@ -370,7 +383,7 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 			response.Error(c, 503, 503, "risk: cannot verify kyc")
 			return
 		}
-		res, rerr := s.riskSvc.CheckWithdraw(req.UserID, asset, req.Amount, kyc, req.Address)
+		res, rerr := s.riskSvc.CheckWithdraw(uid, asset, req.Amount, kyc, req.Address)
 		if rerr != nil {
 			response.Error(c, 500, 500, rerr.Error())
 			return
@@ -380,7 +393,7 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 			return
 		}
 	}
-	id, holdUntil, err := s.ledgerSvc.RequestWithdrawHold(req.UserID, asset, amt, feeAmt, req.Chain, req.Address)
+	id, holdUntil, err := s.ledgerSvc.RequestWithdrawHold(uid, asset, amt, feeAmt, req.Chain, req.Address)
 	if err != nil {
 		response.Error(c, 403, 403, err.Error())
 		return
@@ -394,6 +407,18 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 		"hold_until":   holdUntil.Unix(),
 		"hold_seconds": int(holdUntil.Sub(time.Now()).Seconds()),
 	})
+}
+
+// authorizeWithdraw 在链上广播前登记提现门控授权（M4）：网关据此放行离线签名器签名。
+// 网关未实现 WithdrawAuthorizer（如旧测试桩 / 模拟网关）时静默跳过，不阻断既有行为。
+func (s *Server) authorizeWithdraw(userID int64, asset string, chain settlement.Chain, amount, fee settlement.AssetAmount, address string) {
+	if s.chainAuthorizer == nil {
+		return
+	}
+	if _, err := s.chainAuthorizer.AuthorizeWithdraw(userID, asset, chain, amount, fee, address); err != nil {
+		log.Printf("[futuresapi] WARN withdraw authorize failed: user=%d asset=%s chain=%s to=%s err=%v",
+			userID, asset, chain, address, err)
+	}
 }
 
 // finalizeHold 清算一笔冷静期提现：先校验 hold 状态，再链上广播 + 账本划出。
@@ -424,6 +449,9 @@ func (s *Server) finalizeHold(id string, requireCooling bool) (*ledger.WithdrawH
 		txHash = claimedTx
 	} else {
 		var ev *settlement.WithdrawEvent
+		// M4 网关侧鉴权门控：广播前登记授权（要素与本次 SubmitWithdraw 完全一致），使离线签名器
+		// 仅接受经门控的提现。
+		s.authorizeWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain), e.Amount, e.Fee, e.Address)
 		ev, berr = s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain),
 			e.Amount, e.Fee, e.Address, false)
 		if berr != nil {
@@ -598,23 +626,27 @@ func (s *Server) handleWithdrawHolds(c *gin.Context) {
 	})
 }
 
-// handleWithdrawAddressAdd 预登记一条出金地址（默认未验证）。
+// handleWithdrawAddressAdd 预登记一条出金地址（默认未验证）。身份强制取自 token（F4）。
 func (s *Server) handleWithdrawAddressAdd(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
 	var req struct {
-		UserID  int64  `json:"user_id"`
 		Asset   string `json:"asset"`
 		Chain   string `json:"chain"`
 		Address string `json:"address"`
 		Label   string `json:"label"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.UserID <= 0 || req.Address == "" {
-		response.Error(c, 400, 400, "bad request: user_id and address required")
+	if err := c.ShouldBindJSON(&req); err != nil || req.Address == "" {
+		response.Error(c, 400, 400, "bad request: address required")
 		return
 	}
 	if req.Asset == "" {
 		req.Asset = "USDT"
 	}
-	addr, err := s.ledgerSvc.AddWithdrawAddress(req.UserID, req.Asset, req.Chain, req.Address, req.Label)
+	addr, err := s.ledgerSvc.AddWithdrawAddress(uid, req.Asset, req.Chain, req.Address, req.Label)
 	if err != nil {
 		response.Error(c, 409, 409, err.Error())
 		return
@@ -632,48 +664,56 @@ func (s *Server) handleWithdrawAddressAdd(c *gin.Context) {
 	})
 }
 
-// handleWithdrawAddressConfirm 验证一条预登记地址（模拟 2FA/邮件验证通过）。
+// handleWithdrawAddressConfirm 验证一条预登记地址（模拟 2FA/邮件验证通过）。身份强制取自 token（F4）。
 func (s *Server) handleWithdrawAddressConfirm(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
 	var req struct {
-		UserID  int64  `json:"user_id"`
 		Asset   string `json:"asset"`
 		Chain   string `json:"chain"`
 		Address string `json:"address"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.UserID <= 0 || req.Address == "" {
-		response.Error(c, 400, 400, "bad request: user_id and address required")
+	if err := c.ShouldBindJSON(&req); err != nil || req.Address == "" {
+		response.Error(c, 400, 400, "bad request: address required")
 		return
 	}
 	if req.Asset == "" {
 		req.Asset = "USDT"
 	}
-	if err := s.ledgerSvc.ConfirmWithdrawAddress(req.UserID, req.Asset, req.Chain, req.Address); err != nil {
+	if err := s.ledgerSvc.ConfirmWithdrawAddress(uid, req.Asset, req.Chain, req.Address); err != nil {
 		response.Error(c, 404, 404, err.Error())
 		return
 	}
-	response.JSON(c, gin.H{"status": "verified", "user_id": req.UserID, "asset": req.Asset, "chain": req.Chain, "address": req.Address})
+	response.JSON(c, gin.H{"status": "verified", "user_id": uid, "asset": req.Asset, "chain": req.Chain, "address": req.Address})
 }
 
-// handleWithdrawAddressDelete 撤销一条已登记地址。
+// handleWithdrawAddressDelete 撤销一条已登记地址。身份强制取自 token（F4）。
 func (s *Server) handleWithdrawAddressDelete(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
 	var req struct {
-		UserID  int64  `json:"user_id"`
 		Asset   string `json:"asset"`
 		Chain   string `json:"chain"`
 		Address string `json:"address"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.UserID <= 0 || req.Address == "" {
-		response.Error(c, 400, 400, "bad request: user_id and address required")
+	if err := c.ShouldBindJSON(&req); err != nil || req.Address == "" {
+		response.Error(c, 400, 400, "bad request: address required")
 		return
 	}
 	if req.Asset == "" {
 		req.Asset = "USDT"
 	}
-	if err := s.ledgerSvc.RemoveWithdrawAddress(req.UserID, req.Asset, req.Chain, req.Address); err != nil {
+	if err := s.ledgerSvc.RemoveWithdrawAddress(uid, req.Asset, req.Chain, req.Address); err != nil {
 		response.Error(c, 404, 404, err.Error())
 		return
 	}
-	response.JSON(c, gin.H{"status": "removed", "user_id": req.UserID, "asset": req.Asset, "chain": req.Chain, "address": req.Address})
+	response.JSON(c, gin.H{"status": "removed", "user_id": uid, "asset": req.Asset, "chain": req.Chain, "address": req.Address})
 }
 
 // handleWithdrawAddresses 查询提现地址白名单（可按 user_id 过滤）。
@@ -776,28 +816,32 @@ func (s *Server) handleBadDebt(c *gin.Context) {
 	})
 }
 
-// handleBadDebtRepay 坏账补缴：用户主动用可用余额冲抵交易所垫付的坏账。
+// handleBadDebtRepay 坏账补缴：用户主动用可用余额冲抵交易所垫付的坏账。身份强制取自 token（F4）。
 func (s *Server) handleBadDebtRepay(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, 401, 401, "unauthorized")
+		return
+	}
 	var req struct {
-		UserID int64   `json:"user_id"`
 		Asset  string  `json:"asset"`
 		Amount float64 `json:"amount"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.UserID <= 0 || req.Amount <= 0 {
+	if err := c.ShouldBindJSON(&req); err != nil || req.Amount <= 0 {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
 	if req.Asset == "" {
 		req.Asset = "USDT"
 	}
-	ref := fmt.Sprintf("repay:%d", req.UserID)
-	if err := s.ledgerSvc.RepayBadDebt(req.UserID, req.Asset, settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset)), ref); err != nil {
+	ref := fmt.Sprintf("repay:%d", uid)
+	if err := s.ledgerSvc.RepayBadDebt(uid, req.Asset, settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset)), ref); err != nil {
 		response.Error(c, 400, 400, err.Error())
 		return
 	}
 	response.JSON(c, gin.H{
 		"status":          "repaid",
-		"user_id":         req.UserID,
+		"user_id":         uid,
 		"asset":           req.Asset,
 		"repaid":          req.Amount,
 		"bad_debt_remain": s.ledgerSvc.BadDebtTotal(req.Asset),
