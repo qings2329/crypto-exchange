@@ -5,6 +5,7 @@ bin/
 vendor/
 .idea/
 .vscode/
+.DS_Store
 
 # 运行时上传产物目录（otc 付款凭证等）
 internal/otc/uploads/
