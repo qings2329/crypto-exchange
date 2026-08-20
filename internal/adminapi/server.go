@@ -245,5 +245,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 交易机器人管理（代理 bot 服务 /admin/* 端点）
 		admin.GET("/bot/strategies", s.handleAdminBotStrategies)
 		admin.POST("/bot/strategies/:id/tick", s.handleAdminBotTick)
+
+		// 邀请佣金管理（直查 ce_referral_commissions 表）
+		admin.GET("/referral/commissions", s.handleAdminReferralCommissions)
 	}
 }

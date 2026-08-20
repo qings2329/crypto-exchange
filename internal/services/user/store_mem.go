@@ -12,6 +12,7 @@ type memStore struct {
 	users     map[int64]*User
 	byEmail   map[string]int64
 	byPhone   map[string]int64
+	byRefCode map[string]int64 // referral_code -> user_id
 	seq       int64
 	codes     []*VerifyCode
 	codeSeq   int64
@@ -26,6 +27,7 @@ func NewMemStore() Store {
 		users:     make(map[int64]*User),
 		byEmail:   make(map[string]int64),
 		byPhone:   make(map[string]int64),
+		byRefCode: make(map[string]int64),
 		refreshes: make(map[string]*RefreshToken),
 		kycs:      make(map[int64]*KYCSubmission),
 		prefs:     make(map[int64]*UserPreferences),
@@ -46,6 +48,11 @@ func (s *memStore) CreateUser(u *User) error {
 			return ErrUserExists
 		}
 	}
+	if u.ReferralCode != "" {
+		if _, ok := s.byRefCode[u.ReferralCode]; ok {
+			return ErrUserExists
+		}
+	}
 	s.seq++
 	u.ID = s.seq
 	u.CreatedAt = now
@@ -57,6 +64,9 @@ func (s *memStore) CreateUser(u *User) error {
 	}
 	if u.Phone != "" {
 		s.byPhone[u.Phone] = u.ID
+	}
+	if u.ReferralCode != "" {
+		s.byRefCode[u.ReferralCode] = u.ID
 	}
 	return nil
 }
@@ -256,4 +266,26 @@ func (s *memStore) UpdatePreferences(p *UserPreferences) error {
 func cloneUser(u *User) *User {
 	cp := *u
 	return &cp
+}
+
+func (s *memStore) GetByReferralCode(code string) (*User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.byRefCode[code]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneUser(s.users[id]), nil
+}
+
+func (s *memStore) GetReferrals(userID int64) ([]*User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*User
+	for _, u := range s.users {
+		if u.ReferrerID == userID {
+			out = append(out, cloneUser(u))
+		}
+	}
+	return out, nil
 }

@@ -24,7 +24,7 @@ func TestRegisterLoginEmail(t *testing.T) {
 	email := "alice@example.com"
 
 	// 未发码直接注册应失败
-	if _, err := svc.Register(email, "secret123", "000000"); err == nil {
+	if _, err := svc.Register(email, "secret123", "000000", ""); err == nil {
 		t.Fatal("register without code should fail")
 	}
 
@@ -36,7 +36,7 @@ func TestRegisterLoginEmail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get code: %v", err)
 	}
-	id, err := svc.Register(email, "secret123", code)
+	id, err := svc.Register(email, "secret123", code, "")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestRegisterLoginEmail(t *testing.T) {
 	}
 
 	// 重复注册冲突
-	if _, err := svc.Register(email, "secret123", code); err != ErrUserExists {
+	if _, err := svc.Register(email, "secret123", code, ""); err != ErrUserExists {
 		t.Fatalf("expected ErrUserExists, got %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestRegisterPhone(t *testing.T) {
 		t.Fatalf("send code: %v", err)
 	}
 	code, _ := latestCode(svc, phone, PurposeRegister)
-	if _, err := svc.Register(phone, "secret123", code); err != nil {
+	if _, err := svc.Register(phone, "secret123", code, ""); err != nil {
 		t.Fatalf("register phone: %v", err)
 	}
 	if _, err := svc.Login(phone, "secret123", ""); err != nil {
@@ -101,7 +101,7 @@ func TestResetPassword(t *testing.T) {
 	email := "bob@example.com"
 	_ = svc.SendCode(email, PurposeRegister)
 	code, _ := latestCode(svc, email, PurposeRegister)
-	if _, err := svc.Register(email, "oldpass1", code); err != nil {
+	if _, err := svc.Register(email, "oldpass1", code, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	// 找回：发重置码
@@ -125,7 +125,7 @@ func TestTFAFlow(t *testing.T) {
 	email := "carol@example.com"
 	_ = svc.SendCode(email, PurposeRegister)
 	code, _ := latestCode(svc, email, PurposeRegister)
-	id, err := svc.Register(email, "secret123", code)
+	id, err := svc.Register(email, "secret123", code, "")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestKYCFlow(t *testing.T) {
 	email := "dave@example.com"
 	_ = svc.SendCode(email, PurposeRegister)
 	code, _ := latestCode(svc, email, PurposeRegister)
-	id, err := svc.Register(email, "secret123", code)
+	id, err := svc.Register(email, "secret123", code, "")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -216,7 +216,7 @@ func registerTestUser(t *testing.T, svc *Service, email, password string) int64 
 	if err != nil {
 		t.Fatalf("get code: %v", err)
 	}
-	if _, err := svc.Register(email, password, code); err != nil {
+	if _, err := svc.Register(email, password, code, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	u, err := svc.store.GetByEmail(email)

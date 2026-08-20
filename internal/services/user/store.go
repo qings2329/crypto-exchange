@@ -30,4 +30,8 @@ type Store interface {
 	// 个人偏好设置
 	GetPreferences(userID int64) (*UserPreferences, error)
 	UpdatePreferences(p *UserPreferences) error
+
+	// 邀请
+	GetByReferralCode(code string) (*User, error)
+	GetReferrals(userID int64) ([]*User, error)
 }

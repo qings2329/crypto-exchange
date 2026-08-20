@@ -154,7 +154,8 @@ func (s *Service) verifyCode(target, purpose, code string) (*VerifyCode, error) 
 // ---- 注册 ----
 
 // Register 用邮箱或手机注册。register 用途的验证码必传；通过后创建用户并标记该渠道已验证。
-func (s *Service) Register(target, password, code string) (int64, error) {
+// referralCode 为可选的邀请码，传入时关联邀请人。
+func (s *Service) Register(target, password, code, referralCode string) (int64, error) {
 	if len(password) < s.cfg.MinPwdLen {
 		return 0, fmt.Errorf("password too short (min %d)", s.cfg.MinPwdLen)
 	}
@@ -176,11 +177,48 @@ func (s *Service) Register(target, password, code string) (int64, error) {
 	} else {
 		return 0, ErrInvalidAccount
 	}
+	// 处理邀请码：查找邀请人并关联
+	if referralCode != "" {
+		referrer, err := s.store.GetByReferralCode(referralCode)
+		if err == nil && referrer.ID != 0 {
+			u.ReferrerID = referrer.ID
+		}
+	}
+	// 生成唯一邀请码（8 位大写字母+数字）
+	u.ReferralCode = s.generateReferralCode()
 	if err := s.store.CreateUser(u); err != nil {
 		return 0, err
 	}
 	_ = s.store.ConsumeCode(vc.ID)
 	return u.ID, nil
+}
+
+// generateReferralCode 生成 8 位大写字母+数字的唯一邀请码。
+func (s *Service) generateReferralCode() string {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	for i := 0; i < 100; i++ { // 最多重试 100 次
+		code := make([]byte, 8)
+		for j := range code {
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+			code[j] = charset[n.Int64()]
+		}
+		c := string(code)
+		if _, err := s.store.GetByReferralCode(c); err != nil {
+			return c // 唯一
+		}
+	}
+	// 极不可能：退回时间戳哈希
+	return fmt.Sprintf("%08X", time.Now().UnixNano()%0xFFFFFFFF)
+}
+
+// GetByReferralCode 按邀请码查询用户。
+func (s *Service) GetByReferralCode(code string) (*User, error) {
+	return s.store.GetByReferralCode(code)
+}
+
+// GetReferrals 获取用户邀请的所有下线。
+func (s *Service) GetReferrals(userID int64) ([]*User, error) {
+	return s.store.GetReferrals(userID)
 }
 
 // VerifyAccount 注册后补充验证（如邮箱验证）。
