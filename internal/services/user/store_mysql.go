@@ -28,6 +28,7 @@ const (
 	userMigVerProfile   = 9105
 	userMigVerPrefs     = 9106
 	userMigVerTz        = 9107
+	userMigVerReferral  = 9108
 )
 
 // UserMigrations 是用户模块的建表迁移，运行时由 main 调 migrate.New(db, UserMigrations).Up()。
@@ -134,6 +135,16 @@ ALTER TABLE ce_users DROP COLUMN nickname;`,
     ADD COLUMN timezone VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'IANA 时区；空字符串表示跟随系统';`,
 		Down: "ALTER TABLE ce_user_preferences DROP COLUMN timezone;",
 	},
+	{
+		Version: userMigVerReferral,
+		Name:    "alter_ce_users_referral",
+		Up: `ALTER TABLE ce_users ADD COLUMN referrer_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE ce_users ADD COLUMN referral_code VARCHAR(16) NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX uk_referral_code ON ce_users (referral_code);`,
+		Down: `ALTER TABLE ce_users DROP INDEX uk_referral_code;
+ALTER TABLE ce_users DROP COLUMN referral_code;
+ALTER TABLE ce_users DROP COLUMN referrer_id;`,
+	},
 }
 
 // mysqlStore 是 Store 的 MySQL 实现。
@@ -161,11 +172,11 @@ func NewMySQLStore(dsn string) (Store, error) {
 func (s *mysqlStore) CreateUser(u *User) error {
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO ce_users (email, phone, pass_hash, status, kyc_level, tfa_secret, tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO ce_users (email, phone, pass_hash, status, kyc_level, tfa_secret, tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nullIfEmpty(u.Email), nullIfEmpty(u.Phone), u.PassHash, int(u.Status), int(u.KYCLevel),
 		u.TFASecret, boolToInt(u.TFAEnabled), boolToInt(u.EmailVerified), boolToInt(u.PhoneVerified),
-		u.Nickname, u.Avatar, now, now)
+		u.Nickname, u.Avatar, u.ReferrerID, u.ReferralCode, now, now)
 	if err != nil {
 		if isDuplicate(err) {
 			return ErrUserExists
@@ -183,15 +194,15 @@ func (s *mysqlStore) CreateUser(u *User) error {
 }
 
 func (s *mysqlStore) GetByEmail(email string) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users WHERE email = ?`, email)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE email = ?`, email)
 }
 
 func (s *mysqlStore) GetByPhone(phone string) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users WHERE phone = ?`, phone)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE phone = ?`, phone)
 }
 
 func (s *mysqlStore) GetByID(id int64) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users WHERE id = ?`, id)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE id = ?`, id)
 }
 
 func (s *mysqlStore) scanUser(query string, args ...interface{}) (*User, error) {
@@ -201,11 +212,12 @@ func (s *mysqlStore) scanUser(query string, args ...interface{}) (*User, error) 
 
 func (s *mysqlStore) scanUserRow(row scanner) (*User, error) {
 	var u User
-	var email, phone, tfaSecret, nickname, avatar sql.NullString
+	var email, phone, tfaSecret, nickname, avatar, referralCode sql.NullString
 	var tfaEnabled, emailVerified, phoneVerified int
 	err := row.Scan(
 		&u.ID, &email, &phone, &u.PassHash, &u.Status, &u.KYCLevel,
-		&tfaSecret, &tfaEnabled, &emailVerified, &phoneVerified, &nickname, &avatar, &u.CreatedAt, &u.UpdatedAt)
+		&tfaSecret, &tfaEnabled, &emailVerified, &phoneVerified, &nickname, &avatar,
+		&u.ReferrerID, &referralCode, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -220,6 +232,7 @@ func (s *mysqlStore) scanUserRow(row scanner) (*User, error) {
 	u.PhoneVerified = phoneVerified == 1
 	u.Nickname = nickname.String
 	u.Avatar = avatar.String
+	u.ReferralCode = referralCode.String
 	return &u, nil
 }
 
@@ -251,7 +264,7 @@ func (s *mysqlStore) UpdateUser(u *User) error {
 
 func (s *mysqlStore) ListAll() ([]*User, error) {
 	rows, err := s.db.Query(
-		`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, created_at, updated_at FROM ce_users ORDER BY id`)
+		`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -439,4 +452,26 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func (s *mysqlStore) GetByReferralCode(code string) (*User, error) {
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE referral_code = ?`, code)
+}
+
+func (s *mysqlStore) GetReferrals(userID int64) ([]*User, error) {
+	rows, err := s.db.Query(
+		`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE referrer_id = ? ORDER BY id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*User{}
+	for rows.Next() {
+		u, err := s.scanUserFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }

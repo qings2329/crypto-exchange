@@ -91,6 +91,9 @@ type Config struct {
 		// TradeFeeRate 是交易所对 taker 收取的交易手续费率（如 0.001=0.1%）。
 		// <=0 时使用 internal/settlement.DefaultTradeFeeRate。
 		TradeFeeRate float64 `yaml:"trade_fee_rate"`
+		// ReferralCommissionRate 是邀请佣金比例（如 0.2=20%），被邀请人产生交易手续费时，
+		// 按此比例给邀请人发放佣金。<=0 时禁用邀请佣金。
+		ReferralCommissionRate float64 `yaml:"referral_commission_rate"`
 		// ChainRPC 是链上提现网关（T-03 链上 RPC 半边）配置：生产填真实节点 RPC，
 		// 网关据此广播提现并取回真实 TxHash；留空/未启用则回退离线模拟网关
 		// （MockWithdrawGateway），保证无外部节点也能运行（fail-degraded）。

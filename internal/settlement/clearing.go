@@ -65,6 +65,20 @@ type Clearer struct {
 	store   ClearingStore
 	feeRate float64
 	stats   ClearingStats
+
+	// 邀请佣金钩子：清算成功后若 taker 有邀请人，记录佣金到 referral 模块。
+	// 接口解耦，spot/settlement 可独立注入实现（nil 表示禁用佣金）。
+	referralHook ReferralRecorder
+}
+
+// ReferralRecorder 交易佣金记录接口（解耦 spot ↔ referral）。
+type ReferralRecorder interface {
+	// RecordTradeFee 被邀请人产生交易手续费时调用。referrerID 为邀请人 ID，
+	// takerID 为被邀请人 ID，asset 为计价资产，feeAmount 为手续费（最小单位），
+	// bizRef 为幂等键。实现方应按自身逻辑计算佣金并落库。
+	RecordTradeFee(referrerID, takerID int64, asset string, feeAmount int64, bizRef string) error
+	// GetReferrerByTaker 按用户 ID 查询其邀请人 ID（若无则返回 0, nil）。
+	GetReferrerByTaker(takerID int64) (referrerID int64, err error)
 }
 
 // NewClearer 构造清算处理器；feeRate<=0 时采用 DefaultTradeFeeRate。
@@ -82,8 +96,14 @@ func NewClearer(store ClearingStore, feeRate float64) *Clearer {
 // FeeRate 返回当前生效的手续费率。
 func (cl *Clearer) FeeRate() float64 { return cl.feeRate }
 
+// SetReferralHook 注入邀请佣金钩子（可选）。nil 表示禁用佣金。
+func (cl *Clearer) SetReferralHook(hook ReferralRecorder) {
+	cl.referralHook = hook
+}
+
 // Clear 处理一笔成交流：计算手续费、幂等入账、更新聚合统计。幂等由 store 层保证，
 // 重复消息不计入统计、不影响既有数据。
+// 若注册了 referralHook 且 taker 有邀请人，同时记录邀请佣金。
 func (cl *Clearer) Clear(ev mq.TradeEvent) error {
 	t := ClearedTrade{
 		ID:        TradeID(ev),
@@ -110,6 +130,27 @@ func (cl *Clearer) Clear(ev mq.TradeEvent) error {
 	cl.stats.TotalCommission += t.Fee
 	cl.stats.BySymbol[ev.Symbol] += t.Fee
 	cl.mu.Unlock()
+
+	// 邀请佣金：taker 有邀请人时按比例发放佣金（异步，失败仅日志不阻塞清算）。
+	if cl.referralHook != nil && ev.TakerID > 0 {
+		go func() {
+			referrerID, err := cl.referralHook.GetReferrerByTaker(ev.TakerID)
+			if err != nil || referrerID == 0 {
+				return // 无邀请人或查询失败，跳过
+			}
+			// 从计价资产（symbol 的 quote）提取资产名
+			quote := quoteAsset(ev.Symbol)
+			if quote == "" {
+				return
+			}
+			feeBaseUnits := int64(t.Fee * float64(AssetDecimalsMultiplier(quote)))
+			bizRef := TradeBizRef(ev)
+			if err := cl.referralHook.RecordTradeFee(referrerID, ev.TakerID, quote, feeBaseUnits, bizRef); err != nil {
+				// 日志级别 warn，不阻塞主清算流程
+				_ = err
+			}
+		}()
+	}
 	return nil
 }
 
@@ -142,7 +183,6 @@ func TradeID(ev mq.TradeEvent) int64 {
 		_, _ = h.Write([]byte(s))
 		_, _ = h.Write([]byte{0})
 	}
-	// 固定精度序列化浮点，避免字符串化差异导致幂等键漂移。
 	write(ev.Symbol)
 	write(strconv.FormatFloat(ev.Price, 'f', -1, 64))
 	write(strconv.FormatFloat(ev.Qty, 'f', -1, 64))
@@ -151,4 +191,35 @@ func TradeID(ev mq.TradeEvent) int64 {
 	write(ev.TakerSide)
 	write(strconv.FormatInt(ev.Ts, 10))
 	return int64(h.Sum64())
+}
+
+// quoteAsset 从交易对（如 BTC_USDT）提取计价资产（USDT）。
+func quoteAsset(symbol string) string {
+	for i := len(symbol) - 1; i >= 0; i-- {
+		if symbol[i] == '_' {
+			return symbol[i+1:]
+		}
+	}
+	return ""
+}
+
+// AssetDecimalsMultiplier 返回资产 1 最小单位的 int64 乘数。
+func AssetDecimalsMultiplier(asset string) int64 {
+	switch asset {
+	case "USDT", "USDC", "TRX", "TRON":
+		return 1_000_000
+	case "BTC", "LTC", "DOGE":
+		return 100_000_000
+	case "ETH":
+		return 1_000_000_000_000_000_000
+	case "SOL":
+		return 1_000_000_000
+	default:
+		return 100_000_000
+	}
+}
+
+// TradeBizRef 成交幂等业务引用键（用于佣金去重）。
+func TradeBizRef(ev mq.TradeEvent) string {
+	return "clear:" + strconv.FormatInt(TradeID(ev), 10)
 }

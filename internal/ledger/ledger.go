@@ -84,6 +84,10 @@ const (
 	// SysLendingCollateral 借贷抵押品托管账户：借款人冻结抵押品时从用户可用 Debit、Credit 本账户；
 	// 还款释放时反向。余额恒等于「Σ活跃借款抵押品」。
 	SysLendingCollateral int64 = -14
+	// SysReferralCommission 邀请佣金中转账户：被邀请人产生交易手续费时，
+	// 佣金从系统收入中划出到本账户，再转入邀请人可用余额。
+	// 余额恒等于「已产生但未结算的佣金」，结算完成后归 0。
+	SysReferralCommission int64 = -15
 )
 
 // 快照 schema 版本。v2 起金额以 AssetAmount（定点整数）序列化；v0/v1（无 version 字段）

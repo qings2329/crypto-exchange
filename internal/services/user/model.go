@@ -45,6 +45,8 @@ type User struct {
 	PhoneVerified bool
 	Nickname     string // 昵称（个人设置可编辑，可选）
 	Avatar       string // 头像 URL（个人设置可编辑，可选）
+	ReferrerID   int64  // 邀请人 ID（0 表示无邀请人）
+	ReferralCode string // 本人的邀请码（8 位大写字母+数字，注册时自动生成）
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }

@@ -87,6 +87,8 @@ services:
 # trade_fee_rate 为 taker 手续费率；<=0 用内置默认 0.1%。
 settlement:
   trade_fee_rate: 0.001
+  # 邀请佣金配置：邀请人获得被邀请人交易手续费的比例佣金。
+  referral_commission_rate: 0.2  # 20%（即 taker 手续费的 20% 归邀请人）
   # 链上充提网关（T-03 链上 RPC 半边脚手架）：enabled=true 且配置了 endpoints 时，
   # 提现广播走真实节点 RPC 并取回真实 TxHash，确认数仍由模拟状态机推进（脚手架）；
   # 充值则按 watch_addresses 轮询节点监听入账并喂入确认状态机。两者未配置/节点宕机
