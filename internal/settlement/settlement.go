@@ -268,6 +268,11 @@ func (g *MockChainGateway) SubmitDepositWithHash(userID int64, asset string, cha
 		txHash = GenerateTxHash(userID, asset, chain, amount, time.Now().UnixNano())
 	}
 	g.mu.Lock()
+	// F1 幂等：同一链上交易（txHash）已登记则直接返回既有事件，避免重扫/重入重复入账（双付）。
+	if existing, ok := g.pending[txHash]; ok {
+		g.mu.Unlock()
+		return existing, nil
+	}
 	ev := &DepositEvent{
 		TxHash:        txHash,
 		UserID:        userID,
@@ -525,6 +530,16 @@ type WithdrawGateway interface {
 	Stop()
 }
 
+// WithdrawAuthorizer 是提现门控能力接口（M4）：在 SubmitWithdraw 之前调用 AuthorizeWithdraw
+// 登记一笔已通过风控 + 预冻（ledger hold）门控的提现。仅 RPCWithdrawGateway（生产路径、离线
+// 签名器真实广播）强制校验授权；模拟网关（无真实签名器、无资金盗窃风险）不校验，仅记录以便
+// 上游无感调用。该接口与 WithdrawGateway 正交，避免修改 WithdrawGateway 契约（零侵入）。
+type WithdrawAuthorizer interface {
+	// AuthorizeWithdraw 登记一笔已通过门控（风控 + ledger 预冻 hold）的提现，返回授权令牌
+	// （提现要素指纹）。仅持有有效授权的提现才允许经 RPCWithdrawGateway 的离线签名器签名广播。
+	AuthorizeWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string) (string, error)
+}
+
 // MockWithdrawGateway 离线模拟链上提现网关。
 // 每经过一个"区块"（interval）：Pending->Broadcasting(确认=1)；Broadcasting 每区块
 // +1 确认，达 Required 置 Credited 推送成功；WillFail 事件在首区块直接转 Failed。
@@ -539,6 +554,9 @@ type MockWithdrawGateway struct {
 	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
 	stop         chan struct{}
 	started      bool
+	// authorized 记录经门控授权的提现指纹（M4）。RPCWithdrawGateway.SubmitWithdraw 在触发
+	// 离线签名器前校验；模拟网关自身不校验（无真实签名器，无资金盗窃风险）。
+	authorized map[string]struct{}
 	// confirmSource 提供真实链上确认数（可选）。非 nil 时 tick 在 Broadcasting 阶段用
 	// 节点确认数推进（替代模拟「每 tick +1」）；查询失败回退 +1（fail-degraded）。nil=纯模拟。
 	confirmSource ConfirmSource
@@ -556,8 +574,36 @@ func NewMockWithdrawGateway(required int, interval time.Duration) *MockWithdrawG
 		required: required,
 		interval: interval,
 		pending:  make(map[string]*WithdrawEvent),
+		authorized: make(map[string]struct{}),
 		stop:     make(chan struct{}),
 	}
+}
+
+// AuthorizeWithdraw 登记一笔已通过门控（风控 + ledger 预冻 hold）的提现，返回授权令牌
+// （提现要素指纹）。RPCWithdrawGateway.SubmitWithdraw 在触发离线签名器前校验该令牌是否存在，
+// 缺失则拒绝签名/广播（M4 网关侧鉴权门控）。模拟网关自身不校验，仅记录以便上游无感调用。
+func (g *MockWithdrawGateway) AuthorizeWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	key := withdrawAuthKey(userID, asset, chain, amount, fee, address)
+	g.authorized[key] = struct{}{}
+	return key, nil
+}
+
+// isAuthorized 校验一笔提现是否已通过 AuthorizeWithdraw 门控（M4）。仅做存在性判断，
+// 不消费（允许 hold 重试/幂等重放同一要素），授权记录随网关生命周期累积（规模 ≈ 提现笔数）。
+func (g *MockWithdrawGateway) isAuthorized(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	_, ok := g.authorized[withdrawAuthKey(userID, asset, chain, amount, fee, address)]
+	return ok
+}
+
+// withdrawAuthKey 由提现要素生成稳定指纹，作为门控授权的去标识化键（不泄露私钥/hold 上下文）。
+func withdrawAuthKey(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d|%s|%s|%s|%s|%s", userID, asset, chain, amount.Value.String(), fee.Value.String(), address)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Start 启动后台确认循环（按区块推进提现状态机）。
@@ -686,6 +732,11 @@ func (g *MockWithdrawGateway) SubmitWithdrawWithHash(userID int64, asset string,
 		txHash = GenerateTxHash(userID, "W_"+asset, chain, amount, time.Now().UnixNano())
 	}
 	g.mu.Lock()
+	// F1 幂等：同一链上广播（txHash）已登记则直接返回既有事件，避免重试/并发重复广播（双付）。
+	if existing, ok := g.pending[txHash]; ok {
+		g.mu.Unlock()
+		return existing, nil
+	}
 	ev := &WithdrawEvent{
 		TxHash:        txHash,
 		UserID:        userID,

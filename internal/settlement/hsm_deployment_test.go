@@ -201,6 +201,8 @@ func TestDeploymentGatewaySignsViaHSMService(t *testing.T) {
 	}
 
 	to := "0x3535353535353535353535353535353535353535"
+	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to)
 	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
@@ -241,6 +243,8 @@ func TestDeploymentGatewayFailDegradedWhenHSMDown(t *testing.T) {
 			HSM: HSMConfig{Kind: "remote-http", Endpoint: "http://127.0.0.1:1/sign", PublicKey: pubHex},
 		},
 	})
+	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0x3535353535353535353535353535353535353535")
 	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0x3535353535353535353535353535353535353535", false)
 	if err != nil {
 		t.Fatalf("fail-degraded 下 SubmitWithdraw 不应报错: %v", err)

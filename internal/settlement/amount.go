@@ -3,6 +3,7 @@ package settlement
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"strings"
 )
@@ -37,14 +38,38 @@ func AssetAmountFromInt64(human int64, decimals int) AssetAmount {
 
 // AssetAmountFromFloat 由人类单位浮点（边界/测试用）按 decimals 缩放为最小单位。
 // 仅用于 API/测试边界把 float 转精确整数；领域内部不应再产生 float 金额。
+//
+// 采用四舍五入到最近（half-up）而非向零截断：big.Float.Int 默认向零截断，会对如 1.005→
+// 1004999 这类值系统性少算 1 个最小单位（dust 级尾差，M5）。四舍五入消除该系统性偏差。
+// 注意：NaN/Inf 本函数仍静默归零（与旧行为一致）。需在引擎内 float 派生金额上做 NaN/Inf
+// 拦截时，请改用 AssetAmountFromFloatSafe（F5/M5）。
 func AssetAmountFromFloat(human float64, decimals int) AssetAmount {
 	f := new(big.Float).SetPrec(256).SetFloat64(human)
 	f.Mul(f, new(big.Float).SetPrec(256).SetInt(pow10(decimals)))
+	// 四舍五入到最近（half-up）：对非负值 +0.5 后向零截断；负值对称 -0.5。256bit 精度下
+	// +0.5 精确无误差。
+	half := new(big.Float).SetPrec(256).SetFloat64(0.5)
+	if f.Sign() >= 0 {
+		f.Add(f, half)
+	} else {
+		f.Sub(f, half)
+	}
 	v, _ := f.Int(nil)
 	if v == nil {
 		v = big.NewInt(0)
 	}
 	return AssetAmount{Value: v, Decimals: decimals}
+}
+
+// AssetAmountFromFloatSafe 同 AssetAmountFromFloat 的四舍五入，但显式拦截 NaN/Inf：
+// float64 经二进制表示本就存在尾差，NaN/Inf 更应禁止落账（F5/M5——NaN/Inf 静默归零会导致
+// 免费借入/无抵押空头/穿仓亏损被记 0）。用于引擎内由 float 派生的资金金额（强平/资金费/ADL/
+// 社会化分摊/复制费）落账前的最后一道校验；调用方须处理返回的错误（通常记为失败、跳过该笔清算）。
+func AssetAmountFromFloatSafe(human float64, decimals int) (AssetAmount, error) {
+	if math.IsNaN(human) || math.IsInf(human, 0) {
+		return AssetAmount{}, fmt.Errorf("AssetAmountFromFloatSafe: invalid float amount %v (NaN/Inf not allowed)", human)
+	}
+	return AssetAmountFromFloat(human, decimals), nil
 }
 
 // AssetAmountFromString 解析十进制字符串（人类单位，如 "1.5"）为最小单位整数。

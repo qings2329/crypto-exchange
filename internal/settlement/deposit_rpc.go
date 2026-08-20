@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,12 +20,19 @@ type DepositScanner interface {
 
 // JSONRPCDepositScanner 是 DepositScanner 的通用 JSON-RPC 实现：按 `watch` 列表轮询各链
 // 节点，把命中观察地址的入账解析为 DepositEvent 喂给网关确认状态机。复用 withdraw_rpc.go
-// 的 JSONRPCClient 收发协议；真实节点解码（ETH Transfer 日志 / BTC listsinceblock 等）在
-// scanChain 内按链实现。TRON(TRC20) 因需合约事件过滤，脚手架默认返回空（生产补全）。
+// 的 JSONRPCClient 收发协议；真实节点解码在 scanChain 内按链实现：ETH 原生转账走区块扫描
+// （eth_getBlockByNumber 全量交易，按 to==观察地址 捕获），ERC20/TRC20 走合约 Transfer 事件，
+// BTC/LTC/DOGE 走 listsinceblock。原生 ETH 不复用 eth_getLogs（其无日志，原实现永不入账）。
 type JSONRPCDepositScanner struct {
 	client  *JSONRPCClient
 	watches []DepositWatch
 	poll    time.Duration
+	// lastBlock 记录每个观察地址（"chain|address"）已扫描到的最高区块高度，避免每次全量回溯、
+	// 并防止进程重启后重复扫描历史区块造成双付。原生 ETH 充值走区块扫描（M2），必须有水位线。
+	lastBlock map[string]int64
+	// blockStarted 标记某观察地址是否已做过首次扫描（首次仅把水位线对齐到当前链头，
+	// 不回填历史充值，避免进程重启后重复入账）。
+	blockStarted map[string]bool
 }
 
 // NewJSONRPCDepositScanner 由各链 RPC 客户端 + 观察地址列表 + 轮询间隔构造扫描器。
@@ -32,7 +40,13 @@ func NewJSONRPCDepositScanner(client *JSONRPCClient, watches []DepositWatch, pol
 	if poll <= 0 {
 		poll = 2 * time.Second
 	}
-	return &JSONRPCDepositScanner{client: client, watches: watches, poll: poll}
+	return &JSONRPCDepositScanner{
+		client:       client,
+		watches:      watches,
+		poll:         poll,
+		lastBlock:    make(map[string]int64),
+		blockStarted: make(map[string]bool),
+	}
 }
 
 // Scan 启动轮询：立即扫一次，随后按 poll 间隔重复；命中观察地址的入账经 out 推送，按
@@ -97,46 +111,111 @@ func (s *JSONRPCDepositScanner) scanChain(ctx context.Context, w DepositWatch) (
 	}
 }
 
-// scanETH 用 eth_getLogs 拉取观察地址的入账。w.Token 为空时按原生 ETH 处理（脚手架：以
-// 观察地址为合约地址过滤日志）；w.Token 非空时按 ERC20 处理：以代币合约地址过滤、并用
-// Transfer 事件 topics 过滤 to==观察地址，解析 value（最小单位，按 decimals 缩放）为 amount。
+// scanETH 解析 ETH 链充值。w.Token 非空时按 ERC20（合约 Transfer 日志）处理；w.Token 为空时
+// 按原生 ETH 处理：原生 ETH 的 value 转账不产生任何日志，故改用区块扫描（eth_getBlockByNumber
+// 全量交易）按 to==观察地址 捕获充值。原实现以观察地址为合约地址过滤 eth_getLogs，会因原生转账
+// 无日志而永不入账、且误收该地址发出的合约事件（M2/F5），此处修正。
 func (s *JSONRPCDepositScanner) scanETH(ctx context.Context, w DepositWatch) ([]DepositEvent, error) {
 	if w.Token != "" {
 		return s.scanERC20(ctx, w)
 	}
-	res, err := s.client.rpc(ctx, ChainETH, "eth_getLogs", []interface{}{
-		map[string]interface{}{
-			"address":   w.Address,
-			"fromBlock": "0x0",
-			"toBlock":   "latest",
-		},
+	return s.scanNativeETH(ctx, w)
+}
+
+// scanNativeETH 扫描原生 ETH 充值：原生转账不产出日志，只能按区块遍历找出 to==观察地址 且
+// value>0 的交易。水位线 lastBlock 保证每次只扫新区块、不回填历史（防进程重启/重复扫描造成双付）。
+// decimals 固定 18（#6，无 float 精度损失）。单区块拉取失败时已处理区块的结果照常返回，水位线
+// 推进到已处理高度，失败区块下次重试（fail-degraded，不丢弃已确认的充值）。
+func (s *JSONRPCDepositScanner) scanNativeETH(ctx context.Context, w DepositWatch) ([]DepositEvent, error) {
+	latest, err := s.ethBlockNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+	key := string(ChainETH) + "|" + w.Address
+	if !s.blockStarted[key] {
+		// 首次扫描：仅把水位线对齐到当前链头，不回填历史，避免重启后重复入账。
+		s.blockStarted[key] = true
+		s.lastBlock[key] = latest
+		return nil, nil
+	}
+	from := s.lastBlock[key] + 1
+	if from > latest {
+		return nil, nil
+	}
+	// 限制单次扫描区块数，避免极端落后时大量 RPC 调用（脚手架保护）。
+	const maxBlocksPerScan = 500
+	if latest-from+1 > maxBlocksPerScan {
+		if from = latest - maxBlocksPerScan + 1; from < s.lastBlock[key]+1 {
+			from = s.lastBlock[key] + 1
+		}
+	}
+	out := make([]DepositEvent, 0)
+	processed := from - 1
+	for blk := from; blk <= latest; blk++ {
+		txs, err := s.ethBlockTxs(ctx, blk)
+		if err != nil {
+			// 该区块拉取失败：已处理区块的充值照常返回，水位线推进到已处理高度，下次重试失败区块。
+			break
+		}
+		processed = blk
+		for _, tx := range txs {
+			if tx.To == "" || !strings.EqualFold(tx.To, w.Address) {
+				continue // 仅捕获转入观察地址的充值，忽略该地址发出的交易
+			}
+			amount := weiToAmount(tx.Value)
+			if amount.Sign() <= 0 {
+				continue
+			}
+			out = append(out, DepositEvent{
+				TxHash:  strings.Trim(tx.Hash, `"`),
+				UserID:  w.UserID,
+				Asset:   w.Asset,
+				Amount:  amount,
+				Chain:   ChainETH,
+				Address: w.Address,
+			})
+		}
+	}
+	s.lastBlock[key] = processed
+	return out, nil
+}
+
+// ethBlockNumber 取当前 ETH 链头高度（decimal hex）。
+func (s *JSONRPCDepositScanner) ethBlockNumber(ctx context.Context) (int64, error) {
+	res, err := s.client.rpc(ctx, ChainETH, "eth_blockNumber", []interface{}{})
+	if err != nil {
+		return 0, err
+	}
+	h := strings.Trim(strings.TrimSpace(string(res)), `"`)
+	n, err := strconv.ParseInt(strings.TrimPrefix(h, "0x"), 16, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid eth_blockNumber result %q: %w", h, err)
+	}
+	return n, nil
+}
+
+// ethTx 是 eth_getBlockByNumber 全量交易模式下的单笔交易结构（仅取充值解析所需字段）。
+type ethTx struct {
+	Hash  string `json:"hash"`
+	To    string `json:"to"`
+	Value string `json:"value"`
+}
+
+// ethBlockTxs 取指定高度区块的全部交易（full txs 模式）。
+func (s *JSONRPCDepositScanner) ethBlockTxs(ctx context.Context, block int64) ([]ethTx, error) {
+	res, err := s.client.rpc(ctx, ChainETH, "eth_getBlockByNumber", []interface{}{
+		fmt.Sprintf("0x%x", block), true,
 	})
 	if err != nil {
 		return nil, err
 	}
-	var logs []struct {
-		TransactionHash string `json:"transactionHash"`
-		Data            string `json:"data"`
+	var blk struct {
+		Transactions []ethTx `json:"transactions"`
 	}
-	if err := json.Unmarshal(res, &logs); err != nil {
+	if err := json.Unmarshal(res, &blk); err != nil {
 		return nil, err
 	}
-	out := make([]DepositEvent, 0, len(logs))
-	for _, l := range logs {
-		amount := weiToAmount(l.Data)
-		if amount.Sign() <= 0 {
-			continue
-		}
-		out = append(out, DepositEvent{
-			TxHash:  strings.Trim(l.TransactionHash, `"`),
-			UserID:  w.UserID,
-			Asset:   w.Asset,
-			Amount:  amount,
-			Chain:   ChainETH,
-			Address: w.Address,
-		})
-	}
-	return out, nil
+	return blk.Transactions, nil
 }
 
 // erc20TransferTopic 是 ERC20 Transfer(address,address,uint256) 事件的签名哈希（topic0）。
@@ -292,9 +371,15 @@ func (s *JSONRPCDepositScanner) scanTRON(ctx context.Context, w DepositWatch) ([
 		if !strings.EqualFold(d.To, w.Address) {
 			continue // 仅保留入账（to==观察地址），转出/其他地址忽略
 		}
-		decimals := d.TokenInfo.Decimals
+		// 绝不信任远端 token_info.decimals：攻击者可控的节点响应可伪造 decimals 来放大/缩小金额，
+		// 造成盗窃或漏账（F2/F5）。decimals 优先取本地配置 w.Decimals，其次按资产名推断，再否则
+		// 回退 6（TRC20 通用；USDT-TRC20 即 6 位小数）。
+		decimals := w.Decimals
 		if decimals <= 0 {
-			decimals = 6 // USDT-TRC20 默认 6 位小数
+			decimals = AssetDecimalsByName(w.Asset)
+			if decimals <= 0 {
+				decimals = 6 // USDT-TRC20 默认 6 位小数（不再信任远端 token_info）
+			}
 		}
 		amount := tronAmountToFloat(d.Value, decimals)
 		if amount.Sign() <= 0 {

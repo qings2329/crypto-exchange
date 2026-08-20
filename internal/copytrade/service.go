@@ -17,19 +17,19 @@ import (
 
 // Config 是跟单服务配置。
 type Config struct {
-	CopyFeeRate  float64 // 平台复制费率（按粉丝复制名义额的占比，如 0.001=0.1%）
-	MinNotional  float64 // 粉丝复制名义额下限（计价币），低于则跳过，避免粉尘单
-	DefaultMarket string // 复制下单目标市场（默认 spot；v1 仅支持现货跟单）
+	CopyFeeRate   float64 // 平台复制费率（按粉丝复制名义额的占比，如 0.001=0.1%）
+	MinNotional   float64 // 粉丝复制名义额下限（计价币），低于则跳过，避免粉尘单
+	DefaultMarket string  // 复制下单目标市场（默认 spot；v1 仅支持现货跟单）
 }
 
 // Service 跟单服务：消费撮合成交事件，识别被跟单的 lead，按比例复制下单并结算平台复制费。
 type Service struct {
-	store    Store
-	ledger   *ledger.Ledger // copytrade 自身账本（仅用于平台复制费结算到 SysCopyTradeFee）
-	exec     OrderExecutor
-	cfg      Config
-	log      *zap.Logger
-	mu       sync.Mutex
+	store     Store
+	ledger    *ledger.Ledger // copytrade 自身账本（仅用于平台复制费结算到 SysCopyTradeFee）
+	exec      OrderExecutor
+	cfg       Config
+	log       *zap.Logger
+	mu        sync.Mutex
 	processed map[string]bool // eventID -> 已处理（F1 全局去重，跨粉丝/跨 lead）
 }
 
@@ -84,12 +84,12 @@ func (s *Service) RegisterFollow(uid, leadID int64, copyRatio, allocatedAmount f
 		return nil, ErrInvalidParam
 	}
 	f := &Follow{
-		LeadID:         leadID,
-		FollowerID:     uid,
-		CopyRatio:      copyRatio,
+		LeadID:          leadID,
+		FollowerID:      uid,
+		CopyRatio:       copyRatio,
 		AllocatedAmount: allocatedAmount,
-		FollowerToken:  followerToken,
-		Status:         FollowActive,
+		FollowerToken:   followerToken,
+		Status:          FollowActive,
 	}
 	if err := s.store.CreateFollow(f); err != nil {
 		return nil, err
@@ -137,7 +137,9 @@ func (s *Service) ListActiveLeads() ([]*LeadTrader, error) { return s.store.List
 func (s *Service) MyFollows(uid int64) ([]*Follow, error) { return s.store.ListFollowsByFollower(uid) }
 
 // MyCopies 列出某粉丝的复制成交。
-func (s *Service) MyCopies(uid int64) ([]*CopyRecord, error) { return s.store.ListCopiesByFollower(uid) }
+func (s *Service) MyCopies(uid int64) ([]*CopyRecord, error) {
+	return s.store.ListCopiesByFollower(uid)
+}
 
 // OnTrade 是成交事件入口：识别被跟单的 lead 并复制其成交给各粉丝。
 // F1 幂等：同 eventID 全局只复制一次（processed map + 库唯一键双保险）；
@@ -234,21 +236,29 @@ func (s *Service) replicate(ctx context.Context, ev mq.TradeEvent, f *Follow, le
 	// 参与资金路径带来的漂移；ref 按 (follow, event) 固定，ledger 去重保证重试不双收费。
 	if s.ledger != nil && followerNotional > 0 {
 		dec := settlement.AssetDecimalsByName(quote)
-		notionalAmt := settlement.AssetAmountFromFloat(followerNotional, dec)
-		ratePPM := int64(math.Round(s.cfg.CopyFeeRate * 1e8))
-		feeVal := new(big.Int).Mul(notionalAmt.Value, big.NewInt(ratePPM))
-		feeVal.Div(feeVal, big.NewInt(1e8))
-		amt := settlement.AssetAmount{Value: feeVal, Decimals: dec}
-		rec.FeeAmount = amt
-		if amt.Sign() > 0 {
-			ref := fmt.Sprintf("copytrade:%d:%s", f.ID, eid)
-			if terr := s.ledger.Transfer(f.FollowerID, ledger.SysCopyTradeFee, quote, amt, "copytrade_fee", ref); terr != nil {
-				// 粉丝在 copytrade 账本余额不足：仅记录告警，不阻断已下的市价单。
-				if s.log != nil {
-					s.log.Warn("copytrade: fee transfer failed (insufficient copytrade balance?)",
-						zap.Int64("follower", f.FollowerID), zap.Error(terr))
+		// M5/F5：名义额由成交事件 float 派生，落账前拦截 NaN/Inf 并四舍五入尾差；非法值跳过收费。
+		notionalAmt, ferr := settlement.AssetAmountFromFloatSafe(followerNotional, dec)
+		if ferr != nil {
+			if s.log != nil {
+				s.log.Warn("copytrade: skip fee (invalid notional float)", zap.Float64("notional", followerNotional))
+			}
+			rec.FeeAmount = settlement.AssetAmount{}
+		} else {
+			ratePPM := int64(math.Round(s.cfg.CopyFeeRate * 1e8))
+			feeVal := new(big.Int).Mul(notionalAmt.Value, big.NewInt(ratePPM))
+			feeVal.Div(feeVal, big.NewInt(1e8))
+			amt := settlement.AssetAmount{Value: feeVal, Decimals: dec}
+			rec.FeeAmount = amt
+			if amt.Sign() > 0 {
+				ref := fmt.Sprintf("copytrade:%d:%s", f.ID, eid)
+				if terr := s.ledger.Transfer(f.FollowerID, ledger.SysCopyTradeFee, quote, amt, "copytrade_fee", ref); terr != nil {
+					// 粉丝在 copytrade 账本余额不足：仅记录告警，不阻断已下的市价单。
+					if s.log != nil {
+						s.log.Warn("copytrade: fee transfer failed (insufficient copytrade balance?)",
+							zap.Int64("follower", f.FollowerID), zap.Error(terr))
+					}
+					rec.FeeAmount = settlement.AssetAmount{}
 				}
-				rec.FeeAmount = settlement.AssetAmount{}
 			}
 		}
 	}
