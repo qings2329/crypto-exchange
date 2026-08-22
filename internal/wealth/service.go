@@ -183,18 +183,21 @@ func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Tim
 	return delta
 }
 
-// Accrue 对全部持有中持仓执行一次应计收益（通常在后台循环调用）。返回本轮回填的总收益（人类单位）。
+// Accrue 对全部持有中持仓执行一次应计收益（通常在后台循环调用）。返回本轮回填的总收益（定点金额）。
 //
 // s.mu 串行化：与 Redeem 互斥，避免后台计息与赎回并发导致 AccruedYield 重复累加、赎回时超额兑付。
-func (s *Service) Accrue(now time.Time) (float64, error) {
+//
+// 总收益以 AssetAmount 累加以消除 per-持仓 HumanFloat() 浮点求和的尾差累积（M5 收尾）；响应经
+// MarshalJSON 序列化为十进制字符串，与该服务持仓响应（AccruedYield 等）风格一致。
+func (s *Service) Accrue(now time.Time) (settlement.AssetAmount, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	all, err := s.store.ListAllHoldings()
 	if err != nil {
-		return 0, err
+		return settlement.AssetAmount{}, err
 	}
-	total := 0.0
+	var total settlement.AssetAmount
 	for _, h := range all {
 		if h.Status != HoldingActive {
 			continue
@@ -204,7 +207,7 @@ func (s *Service) Accrue(now time.Time) (float64, error) {
 			continue
 		}
 		if d := s.accrueHolding(h, p, now); d.Sign() > 0 {
-			total += d.HumanFloat()
+			total = total.Add(d)
 			_ = s.store.UpdateHolding(h)
 		}
 	}
