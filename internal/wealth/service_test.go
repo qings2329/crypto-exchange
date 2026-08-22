@@ -133,8 +133,8 @@ func TestAccrueUpdatesYield(t *testing.T) {
 		t.Fatalf("accrue: %v", err)
 	}
 	// 100 小时 × 1%/h = 10 收益，加上之前 0。
-	if total < 9.9 || total > 10.1 {
-		t.Fatalf("accrued wrong: %.4f want ~10", total)
+	if total.HumanFloat() < 9.9 || total.HumanFloat() > 10.1 {
+		t.Fatalf("accrued wrong: %.4f want ~10", total.HumanFloat())
 	}
 	got, _ := svc.store.GetHolding(h.ID)
 	if got.AccruedYield.HumanFloat() < 9.9 || got.AccruedYield.HumanFloat() > 10.1 {
