@@ -268,6 +268,11 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	if auth, ok := s.chainWithdraw.(settlement.WithdrawAuthorizer); ok {
 		s.chainAuthorizer = auth
 	}
+	// M4：若网关为真实 RPC 网关（实现 SetWithdrawHoldResolver），注入 ledger hold 解析器，
+	// 使离线签名器在广播前真正校验 hold 存在/状态/要素一致（绑定真实提现记录，纵深防御）。
+	if rgw, ok := s.chainWithdraw.(*settlement.RPCWithdrawGateway); ok {
+		rgw.SetWithdrawHoldResolver(ledgerHoldResolver{ledgerSvc})
+	}
 	s.chainWithdraw.Start()
 	s.startChainWatchers()
 
@@ -716,4 +721,28 @@ func (s *Server) Close() {
 		s.chainWithdraw.Stop()
 	}
 	s.ledgerSvc.StopReconciler()
+}
+
+// ledgerHoldResolver 将 ledger.WithdrawHold 适配为 settlement.WithdrawHoldResolver（M4 来源校验）：
+// 提现广播前据此真正查询 ledger 提现冻结记录，校验 hold 存在/状态/要素一致，使离线签名器绑定
+// 真实提现记录而非接受自证布尔。返回的去耦视图不含私钥/余额等敏感上下文。
+type ledgerHoldResolver struct {
+	l *ledger.Ledger
+}
+
+func (r ledgerHoldResolver) ResolveWithdrawHold(ctx context.Context, id string) (settlement.WithdrawHoldView, bool) {
+	e, ok := r.l.WithdrawHold(id)
+	if !ok {
+		return settlement.WithdrawHoldView{}, false
+	}
+	return settlement.WithdrawHoldView{
+		UserID:    e.UserID,
+		Asset:     e.Asset,
+		Chain:     settlement.Chain(e.Chain),
+		Amount:    e.Amount,
+		Fee:       e.Fee,
+		Address:   e.Address,
+		Finalized: e.Finalized,
+		Cancelled: e.Cancelled,
+	}, true
 }

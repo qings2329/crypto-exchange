@@ -35,6 +35,8 @@ func (m *FeeModel) Register(chain Chain, asset string, base, rate float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.schedule[feeKey(chain, asset)] = ChainFee{
+		// 保留裸 FromFloat：base 取自可信配置（Register 由装配时调用，非用户请求），NaN/Inf 不可达；
+		// rate 经 *big.Rat.SetFloat64 解析，异常值在此场景下等同费率 0，已由上层配置保证有效。
 		Base: AssetAmountFromFloat(base, AssetDecimals(chain, asset)),
 		Rate: new(big.Rat).SetFloat64(rate),
 	}

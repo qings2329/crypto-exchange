@@ -2502,6 +2502,9 @@ type ledgerSnapshotV1 struct {
 // migrateV1ToV2 将旧 float64 快照迁移为定点化 LedgerSnapshot：每个金额按资产标准 decimals
 // 用 AssetAmountFromFloat 缩放（丢失的浮点残差在最小单位内截断，可接受）。
 func migrateV1ToV2(v1 ledgerSnapshotV1) LedgerSnapshot {
+	// 保留裸 FromFloat：本函数将本系统自行序列化的 V1 快照（float 字段）重水化为 V2 定点结构，
+	// 数据为内部受信任来源（非用户请求/外部行情），NaN/Inf 不可达；此处仅做单位量化，故不引入
+	// Safe 校验（M5 保留项）。
 	decOf := func(asset string) int { return settlement.AssetDecimalsByName(asset) }
 	snap := LedgerSnapshot{
 		SchemaVersion:        ledgerSnapshotSchemaVersion,

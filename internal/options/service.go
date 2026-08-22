@@ -24,10 +24,10 @@ func finitePositive(x, max float64) bool {
 
 // Config 是期权业务参数。
 type Config struct {
-	QuoteAsset    string        // 计价资产（默认 USDT）
-	RiskFreeRate  float64       // 无风险利率（年化，定价用）
-	Volatility    float64       // 波动率（年化，定价用）
-	MarginRatio   float64       // 卖方保证金率（按名义价值）
+	QuoteAsset     string        // 计价资产（默认 USDT）
+	RiskFreeRate   float64       // 无风险利率（年化，定价用）
+	Volatility     float64       // 波动率（年化，定价用）
+	MarginRatio    float64       // 卖方保证金率（按名义价值）
 	SettleInterval time.Duration // 后台到期结算轮询间隔
 }
 
@@ -174,11 +174,17 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	}
 	quote := c.QuoteAsset
 	dec := settlement.AssetDecimalsByName(quote)
-	premiumTotal := c.Premium * quantity
-	if math.IsNaN(premiumTotal) || math.IsInf(premiumTotal, 0) {
+	// M5：c.Premium 为合约报价（创建时落库，受信任）；此处仍经 Safe 落账，杜绝库内异常值导致权利金记 0。
+	premiumPos, err := settlement.AssetAmountFromFloatSafe(c.Premium, dec)
+	if err != nil {
 		return nil, ErrInvalidQuantity
 	}
-	premiumAmt := settlement.AssetAmountFromFloat(premiumTotal, dec)
+	premiumTotal := c.Premium * quantity
+	// M5：权利金总量 = 合约报价 × 用户请求数量，须拦截 NaN/Inf（quantity 为用户输入）。
+	premiumAmt, err := settlement.AssetAmountFromFloatSafe(premiumTotal, dec)
+	if err != nil {
+		return nil, ErrInvalidQuantity
+	}
 
 	if side == SideLong {
 		avail, _, _ := s.ledger.Balance(userID, quote)
@@ -189,7 +195,7 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 		p := &OptionPosition{
 			UserID: userID, ContractID: contractID, Side: SideLong, Quantity: quantity,
 			QuoteAsset: quote,
-			Premium:    settlement.AssetAmountFromFloat(c.Premium, dec),
+			Premium:    premiumPos,
 			Margin:     settlement.AssetAmount{Decimals: dec},
 			Status:     StatusOpen,
 		}
@@ -206,10 +212,11 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 
 	// short：冻结保证金并收取权利金（来自系统对手方）。
 	margin := c.Strike * c.size() * quantity * s.cfg.MarginRatio
-	if math.IsNaN(margin) || math.IsInf(margin, 0) {
+	// M5：保证金 = 行权价×规模×用户数量×保证金率，须拦截 NaN/Inf（quantity 为用户输入）。
+	marginAmt, err := settlement.AssetAmountFromFloatSafe(margin, dec)
+	if err != nil {
 		return nil, ErrInvalidQuantity
 	}
-	marginAmt := settlement.AssetAmountFromFloat(margin, dec)
 	avail, _, _ := s.ledger.Balance(userID, quote)
 	if avail.Cmp(marginAmt) < 0 {
 		return nil, ErrInsufficientBalance
@@ -241,10 +248,11 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 //
 // 偿付能力护栏（F3-4）：CCP 采用中性模型，理论上"收的权利金 ≈ 付的内在价值"，但在极端行情下
 // 内在价值可能超过 CCP 现有余额。为避免 CCP 被击穿为负（资不抵债），本方法：
-//  1) 若 CCP 现有余额足以覆盖，直接全额支付；
-//  2) 否则 CCP 付尽现有余额，缺口依次由保险基金（SysInsurance）、穿仓损失账户
+//  1. 若 CCP 现有余额足以覆盖，直接全额支付；
+//  2. 否则 CCP 付尽现有余额，缺口依次由保险基金（SysInsurance）、穿仓损失账户
 //     （SysLiquidationLoss，平台承担、后续社会化分摊）垫付，保证用户足额收到、
 //     且 CCP 余额不为负（下限护栏为 0）。
+//
 // 全部步骤经账本 Batch 原子执行（任一子步失败整体回滚），并使用同一 ref 保证可重试幂等。
 func (s *Service) payoffFromCCP(userID int64, asset string, amount settlement.AssetAmount, ref string) error {
 	if amount.Sign() <= 0 {
@@ -323,6 +331,8 @@ func (s *Service) Exercise(userID, positionID int64) error {
 		return ErrNoPriceFeed
 	}
 	dec := settlement.AssetDecimalsByName(c.QuoteAsset)
+	// 保留裸 FromFloat：spot 已在上方经 NaN/Inf/≤0 守卫（无价格/负价不结算），c.IntrinsicValue 与
+	// p.Quantity 均为有限值，NaN/Inf 不可达；此处仅做行权收益量化（F3 中性 CCP 已定点化）。
 	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot)*p.Quantity, dec)
 	// 中性 CCP：long 开仓时已付权利金给 SysOptions（short 收权利金亦经 SysOptions），
 	// 行权时由 SysOptions 支付全部内在价值，不再扣减权利金。原 .Sub(PremiumTotal()) 属
@@ -376,6 +386,8 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 	}
 	quote := c.QuoteAsset
 	dec := settlement.AssetDecimalsByName(quote)
+	// 保留裸 FromFloat：spot 已在上游经 NaN/Inf 守卫（无价格/负价不结算），c.IntrinsicValue 与
+	// p.Quantity 均为有限值，NaN/Inf 不可达；此处仅做过期内在价值量化（F3 中性 CCP 已定点化）。
 	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot)*p.Quantity, dec)
 
 	// 先落终态。

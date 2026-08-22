@@ -17,9 +17,9 @@ import (
 
 // Config 是 OTC 业务参数。
 type Config struct {
-	Asset              string        // 默认加密资产（演示用 BTC）
-	ReconcileInterval  time.Duration // 后台对账轮询间隔
-	UploadDir          string        // 付款凭证文件落盘目录（默认 uploads/otc）
+	Asset             string        // 默认加密资产（演示用 BTC）
+	ReconcileInterval time.Duration // 后台对账轮询间隔
+	UploadDir         string        // 付款凭证文件落盘目录（默认 uploads/otc）
 }
 
 // PriceFunc 取资产参考价（当前 OTC 核心流程不强制依赖行情，预留扩展）。返回 (price, ok)。
@@ -116,8 +116,15 @@ func (s *Service) TakeOrder(adID, takerID int64, fiatAmount float64, paymentMeth
 	if cryptoAmount.Sign() <= 0 {
 		return nil, ErrInvalidAmount
 	}
-	minA := settlement.AssetAmountFromFloat(ad.MinAmount, dec)
-	maxA := settlement.AssetAmountFromFloat(ad.MaxAmount, dec)
+	// M5：ad.MinAmount/MaxAmount 为用户建广告时提交并经落库的金额，须拦截 NaN/Inf，避免区间记 0 致任意成交。
+	minA, err := settlement.AssetAmountFromFloatSafe(ad.MinAmount, dec)
+	if err != nil {
+		return nil, err
+	}
+	maxA, err := settlement.AssetAmountFromFloatSafe(ad.MaxAmount, dec)
+	if err != nil {
+		return nil, err
+	}
 	if cryptoAmount.Cmp(minA) < 0 || cryptoAmount.Cmp(maxA) > 0 {
 		return nil, ErrAmountOutOfRange
 	}

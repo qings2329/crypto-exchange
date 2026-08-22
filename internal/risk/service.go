@@ -95,7 +95,11 @@ func (s *Service) CheckWithdraw(userID int64, asset string, amount float64, kycL
 		return CheckResult{Allowed: false, Reason: "amount must be positive"}, nil
 	}
 	dec := settlement.AssetDecimalsByName(asset)
-	amt := settlement.AssetAmountFromFloat(amount, dec)
+	// M5：amount 来自请求，NaN/Inf 会静默记 0 绕过提现限额，须拦截。
+	amt, err := settlement.AssetAmountFromFloatSafe(amount, dec)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "invalid amount"}, nil
+	}
 	limit := rule.MaxAmountPerDay.ToDecimals(dec)
 	if amt.Cmp(limit) > 0 {
 		s.record(userID, KindWithdrawLimit, fmt.Sprintf("amount %s exceeds limit %s", amt.HumanString(), limit.HumanString()))
@@ -124,7 +128,11 @@ func (s *Service) CheckOrder(userID int64, asset string, qty float64, kycLevel i
 		return CheckResult{Allowed: false, Reason: "qty must be positive"}, nil
 	}
 	dec := settlement.AssetDecimalsByName(asset)
-	amt := settlement.AssetAmountFromFloat(qty, dec)
+	// M5：qty 来自请求，NaN/Inf 会静默记 0 绕过下单限额，须拦截。
+	amt, err := settlement.AssetAmountFromFloatSafe(qty, dec)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "invalid qty"}, nil
+	}
 	limit := rule.MaxAmountPerDay.ToDecimals(dec)
 	if amt.Cmp(limit) > 0 {
 		s.record(userID, KindOrderLimit, fmt.Sprintf("qty %s exceeds limit %s", amt.HumanString(), limit.HumanString()))
@@ -154,7 +162,11 @@ func (s *Service) CheckPosition(userID int64, asset string, positionSize float64
 		return CheckResult{Allowed: false, Reason: "position size must be non-negative"}, nil
 	}
 	dec := settlement.AssetDecimalsByName(asset)
-	pos := settlement.AssetAmountFromFloat(positionSize, dec)
+	// M5：positionSize 来自请求/行情，NaN/Inf 会静默记 0 绕过持仓限额，须拦截。
+	pos, err := settlement.AssetAmountFromFloatSafe(positionSize, dec)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "invalid position size"}, nil
+	}
 	limit := rule.MaxAmountPerDay.ToDecimals(dec)
 	if pos.Cmp(limit) > 0 {
 		s.record(userID, KindPositionLimit, fmt.Sprintf("position %s exceeds limit %s", pos.HumanString(), limit.HumanString()))

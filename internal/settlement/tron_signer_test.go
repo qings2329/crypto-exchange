@@ -278,7 +278,7 @@ func TestNewWithdrawGatewayTRONUsesOfflineSigner(t *testing.T) {
 
 	recipient := deriveTronAddress(parseSignerKeyOrDie(tronTestPrivRecipient).PubKey())
 	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
-	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "TRX", ChainTRON, amt(ChainTRON, 2.0), amt(ChainTRON, 0.001), recipient)
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "TRX", ChainTRON, amt(ChainTRON, 2.0), amt(ChainTRON, 0.001), recipient, "")
 	ev, err := g.SubmitWithdraw(1, "TRX", ChainTRON, amt(ChainTRON, 2.0), amt(ChainTRON, 0.001), recipient, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
