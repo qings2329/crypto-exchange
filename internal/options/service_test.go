@@ -430,3 +430,45 @@ func TestExerciseCCPSolvencyGuard(t *testing.T) {
 		t.Fatalf("insurance after exercise %v want 2000 (backstop 18000)", insAfter)
 	}
 }
+
+// TestExerciseCCPPartialInsuranceBackstop F3-4：CCP 余额 + 保险基金均不足以覆盖全额 payoff 时，
+// 三者按「CCP 付尽现有 → 保险基金补 → 剩余记穿仓损失」分摊；用户始终足额收到、CCP 不为负。
+// 锁定三路组合分摊逻辑（前两个测试分别只覆盖「保险全兜底」「纯穿仓损失」单一路径）。
+func TestExerciseCCPPartialInsuranceBackstop(t *testing.T) {
+	svc, l := newTestService()
+	// 保险基金仅 5000，不足以单独覆盖缺口。
+	ins := settlement.AssetAmountFromFloat(5000, settlement.AssetDecimalsByName("USDT"))
+	if err := l.CreditAvailable(ledger.SysInsurance, "USDT", ins, "seed_ins", ""); err != nil {
+		t.Fatalf("seed insurance: %v", err)
+	}
+	const uid = int64(1)
+	c := mustContract(svc, 1000, time.Now().Add(time.Hour))
+	p, err := svc.OpenPosition(uid, c.ID, SideLong, 2)
+	if err != nil {
+		t.Fatalf("open long: %v", err)
+	}
+	// 开仓付权利金 2*1000=2000 入 CCP；CCP 余额=2000。
+	if ccp, _, _ := l.Balance(ledger.SysOptions, "USDT"); !eqAmt(ccp, 2000, "USDT") {
+		t.Fatalf("CCP before exercise %v want 2000", ccp)
+	}
+	// 行权 payoff=20000（数量2，ITV=20000）。
+	if err := svc.Exercise(uid, p.ID); err != nil {
+		t.Fatalf("exercise: %v", err)
+	}
+	// 用户足额收到 20000：账户 = 100000 - 2000 + 20000 = 118000。
+	if avail, _, _ := l.Balance(uid, "USDT"); !eqAmt(avail, 118000, "USDT") {
+		t.Fatalf("user after exercise %v want 118000 (full payoff)", avail)
+	}
+	// CCP 付尽现有 2000 → 0（不为负）。
+	if ccp, _, _ := l.Balance(ledger.SysOptions, "USDT"); ccp.Sign() != 0 {
+		t.Fatalf("CCP after exercise %v want 0", ccp)
+	}
+	// 保险 5000 全用于补缺口 → 0。
+	if insAfter, _, _ := l.Balance(ledger.SysInsurance, "USDT"); !eqAmt(insAfter, 0, "USDT") {
+		t.Fatalf("insurance after exercise %v want 0", insAfter)
+	}
+	// 剩余缺口 20000-2000-5000=13000 由穿仓损失账户承担。
+	if loss, _, _ := l.Balance(ledger.SysLiquidationLoss, "USDT"); !eqAmt(loss, -13000, "USDT") {
+		t.Fatalf("deficit after exercise %v want -13000", loss)
+	}
+}
