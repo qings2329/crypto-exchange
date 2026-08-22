@@ -352,15 +352,20 @@ except Exception:
     print("")')"
 check "lending pool id parsed" "$([ -n "$LEND_POOL_ID" ] && echo 1 || echo 0)"
 
-# 4.2 用户存款 500 USDT 到资金池（复式记账：用户可用→SysLendingPool）
+# 4.2 用户存款 500 USDT 到资金池（复式记账：用户可用→SysLendingPool）。
+# 注意：handler 的 amount/borrow_amount/collateral 均为「人类可读金额字符串」，非数字。
 do_call POST "$LEND/api/v1/lending/lend" "$LEND_USER_TOKEN" \
-  '{"pool_id":'"$LEND_POOL_ID"',"amount":500}'
+  '{"pool_id":'"$LEND_POOL_ID"',"amount":"500"}'
 check "lending lend 500 USDT -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+LEND_ORDER_ID="$(extract_id "$RESP_BODY")"
+check "lending order id parsed" "$([ -n "$LEND_ORDER_ID" ] && echo 1 || echo 0)"
 
 # 4.3 借款 100 USDT，抵押 200 USDT（collateral_req=1.5，100*1.5=150 ≤ 200）
 do_call POST "$LEND/api/v1/lending/borrow" "$LEND_USER_TOKEN" \
-  '{"pool_id":'"$LEND_POOL_ID"',"amount":100,"collateral":200}'
+  '{"pool_id":'"$LEND_POOL_ID"',"borrow_amount":"100","collateral":"200"}'
 check "lending borrow 100 USDT -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+BORROW_ORDER_ID="$(extract_id "$RESP_BODY")"
+check "lending borrow order id parsed" "$([ -n "$BORROW_ORDER_ID" ] && echo 1 || echo 0)"
 
 # 4.4 我的存款/借款列表
 do_call GET "$LEND/api/v1/lending/my/lends" "$LEND_USER_TOKEN" ""
@@ -380,12 +385,12 @@ check "lending my borrows -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 
 do_call POST "$LEND/api/v1/lending/admin/accrue" "$ADMIN_TOKEN" ""
 check "lending admin accrue -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 
-# 4.6 还款（连本带利）
-do_call POST "$LEND/api/v1/lending/repay" "$LEND_USER_TOKEN" '{"pool_id":'"$LEND_POOL_ID"'}'
+# 4.6 还款（连本带利）：repay 按「借款订单 id」走路径参数。
+do_call POST "$LEND/api/v1/lending/repay/$BORROW_ORDER_ID" "$LEND_USER_TOKEN" '{}'
 check "lending repay -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 
-# 4.7 提取存款（复式记账：SysLendingPool→用户可用）
-do_call POST "$LEND/api/v1/lending/withdraw" "$LEND_USER_TOKEN" '{"pool_id":'"$LEND_POOL_ID"'}'
+# 4.7 提取存款（复式记账：SysLendingPool→用户可用）：withdraw 按「存款订单 id」走路径参数。
+do_call POST "$LEND/api/v1/lending/withdraw/$LEND_ORDER_ID" "$LEND_USER_TOKEN" '{}'
 check "lending withdraw -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 
 echo "========================================="

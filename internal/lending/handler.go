@@ -2,6 +2,7 @@ package lending
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -28,6 +29,7 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 		api.POST("/admin/pools", middleware.AdminGuard(), s.handleAdminCreatePool)
 		api.GET("/admin/lends", middleware.AdminGuard(), s.handleAdminListLends)
 		api.GET("/admin/borrows", middleware.AdminGuard(), s.handleAdminListBorrows)
+		api.POST("/admin/accrue", middleware.AdminGuard(), s.handleAdminAccrue)
 	}
 }
 
@@ -291,4 +293,14 @@ func (s *Service) handleAdminListBorrows(c *gin.Context) {
 		})
 	}
 	response.JSON(c, gin.H{"borrows": out})
+}
+
+// handleAdminAccrue 管理员手动触发一次利息归集：对全部活跃借款订单按各自池利率计息，
+// 并写入利息记录（与后台 RunLoop 定时归集同源，供运维在异常/测试时即时触发）。
+func (s *Service) handleAdminAccrue(c *gin.Context) {
+	if err := s.Accrue(time.Now()); err != nil {
+		response.Error(c, 500, 5000, err.Error())
+		return
+	}
+	response.JSON(c, gin.H{"status": "ok"})
 }
