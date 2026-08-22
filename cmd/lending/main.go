@@ -72,11 +72,12 @@ func main() {
 	}
 
 	svcCfg := lending.Config{
-		AccrueInterval:   60 * time.Second,
-		MinBorrowAmount:  10,
-		MinLendAmount:    10,
-		BaseInterestRate: 0.05,
-		MaxInterestRate:  1.0,
+		AccrueInterval:    60 * time.Second,
+		ReconcileInterval: 60 * time.Second,
+		MinBorrowAmount:   10,
+		MinLendAmount:     10,
+		BaseInterestRate:  0.05,
+		MaxInterestRate:   1.0,
 	}
 	svc := lending.NewService(store, ledgerSvc, svcCfg, log)
 

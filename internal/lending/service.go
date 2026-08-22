@@ -14,11 +14,12 @@ import (
 
 // Config 借贷服务配置。
 type Config struct {
-	AccrueInterval   time.Duration // 利息归集周期
-	MinBorrowAmount  float64       // 最小借款额
-	MinLendAmount    float64       // 最小存款额
-	BaseInterestRate float64       // 基础年化利率（如 0.05 = 5%）
-	MaxInterestRate  float64       // 最大年化利率（如 1.0 = 100%）
+	AccrueInterval    time.Duration // 利息归集周期
+	ReconcileInterval time.Duration // 后台业务对账巡检周期（0 表示不巡检）
+	MinBorrowAmount   float64       // 最小借款额
+	MinLendAmount     float64       // 最小存款额
+	BaseInterestRate  float64       // 基础年化利率（如 0.05 = 5%）
+	MaxInterestRate   float64       // 最大年化利率（如 1.0 = 100%）
 }
 
 // Service 借贷业务服务。
@@ -142,18 +143,30 @@ func (s *Service) Borrow(userID, poolID int64, borrowAmt, collateralAmt settleme
 		return nil, err
 	}
 
-	// 2) 冻结抵押品：用户可用 -> SysLendingCollateral
-	ref := fmt.Sprintf("borrow_collateral:%d", order.ID)
-	if err := s.ledger.Transfer(userID, ledger.SysLendingCollateral, p.Asset, collateralAmt, "borrow_collateral", ref); err != nil {
-		_ = s.store.UpdateBorrowOrder(&BorrowOrder{ID: order.ID, Status: "cancelled"})
-		return nil, err
+	// 2) 冻结抵押品 + 放款：两条转账整体经 ledger.Batch 原子执行（F3 原子）。
+	//    任一步失败整组回滚，消除「抵押扣了但放款失败」及回退失败导致抵押悬空的部分入账窗口
+	//    （早期版本用两条顺序 Transfer + 手工 revert，revert 失败则抵押永久卡在 SysLendingCollateral）。
+	ops := []ledger.Op{
+		{
+			Kind:   ledger.OpTransfer,
+			From:   userID,
+			To:     ledger.SysLendingCollateral,
+			Asset:  p.Asset,
+			Amount: collateralAmt,
+			Biz:    "borrow_collateral",
+			Ref:    fmt.Sprintf("borrow_collateral:%d", order.ID),
+		},
+		{
+			Kind:   ledger.OpTransfer,
+			From:   ledger.SysLendingPool,
+			To:     userID,
+			Asset:  p.Asset,
+			Amount: borrowAmt,
+			Biz:    "borrow_loan",
+			Ref:    fmt.Sprintf("borrow_loan:%d", order.ID),
+		},
 	}
-
-	// 3) 放款：SysLendingPool -> 用户可用
-	refLoan := fmt.Sprintf("borrow_loan:%d", order.ID)
-	if err := s.ledger.Transfer(ledger.SysLendingPool, userID, p.Asset, borrowAmt, "borrow_loan", refLoan); err != nil {
-		// 回退抵押品
-		_ = s.ledger.Transfer(ledger.SysLendingCollateral, userID, p.Asset, collateralAmt, "borrow_collateral_revert", ref)
+	if err := s.ledger.Batch(ops); err != nil {
 		_ = s.store.UpdateBorrowOrder(&BorrowOrder{ID: order.ID, Status: "cancelled"})
 		return nil, err
 	}
@@ -188,15 +201,30 @@ func (s *Service) Repay(userID, borrowOrderID int64) (*BorrowOrder, error) {
 	// 还款额 = 本金 + 累计利息
 	totalRepay := o.Amount.Add(o.InterestAcc)
 
-	// 1) 收回本息：用户可用 -> SysLendingPool
-	refRepay := fmt.Sprintf("borrow_repay:%d", o.ID)
-	if err := s.ledger.Transfer(userID, ledger.SysLendingPool, p.Asset, totalRepay, "borrow_repay", refRepay); err != nil {
-		return nil, err
+	// 1) 收回本息 + 释放抵押品：两条转账整体经 ledger.Batch 原子执行（F3 原子）。
+	//    原实现无回退——若释放抵押失败，用户已还款却拿不回抵押（钱货两失）；Batch 保证全有或全无，
+	//    失败则账本零变化、订单保持 active 可安全重试。
+	ops := []ledger.Op{
+		{
+			Kind:   ledger.OpTransfer,
+			From:   userID,
+			To:     ledger.SysLendingPool,
+			Asset:  p.Asset,
+			Amount: totalRepay,
+			Biz:    "borrow_repay",
+			Ref:    fmt.Sprintf("borrow_repay:%d", o.ID),
+		},
+		{
+			Kind:   ledger.OpTransfer,
+			From:   ledger.SysLendingCollateral,
+			To:     userID,
+			Asset:  p.Asset,
+			Amount: o.Collateral,
+			Biz:    "borrow_collateral_release",
+			Ref:    fmt.Sprintf("borrow_release:%d", o.ID),
+		},
 	}
-
-	// 2) 释放抵押品：SysLendingCollateral -> 用户可用
-	refRelease := fmt.Sprintf("borrow_release:%d", o.ID)
-	if err := s.ledger.Transfer(ledger.SysLendingCollateral, userID, p.Asset, o.Collateral, "borrow_collateral_release", refRelease); err != nil {
+	if err := s.ledger.Batch(ops); err != nil {
 		return nil, err
 	}
 
@@ -323,20 +351,75 @@ func (s *Service) PoolInfo(poolID int64) (map[string]interface{}, error) {
 	}, nil
 }
 
-// RunLoop 后台利息归集循环。
+// RunLoop 后台循环（ticker 驱动），ctx 取消即退出。
+// 同时驱动：① 利息归集（AccrueInterval）；② 业务对账巡检（ReconcileInterval）。
+// 两路周期相互独立，任一未配置（<=0）则不触发该路；两者均未配置则直接退出。
 func (s *Service) RunLoop(ctx context.Context) {
-	if s.cfg.AccrueInterval <= 0 {
+	accrueOK := s.cfg.AccrueInterval > 0
+	reconOK := s.cfg.ReconcileInterval > 0
+	if !accrueOK && !reconOK {
 		return
 	}
-	ticker := time.NewTicker(s.cfg.AccrueInterval)
-	defer ticker.Stop()
+	var accrueTicker *time.Ticker
+	if accrueOK {
+		accrueTicker = time.NewTicker(s.cfg.AccrueInterval)
+		defer accrueTicker.Stop()
+	}
+	var reconTicker *time.Ticker
+	if reconOK {
+		reconTicker = time.NewTicker(s.cfg.ReconcileInterval)
+		defer reconTicker.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-accrueTicker.C:
 			if err := s.Accrue(time.Now()); err != nil && s.log != nil {
 				s.log.Warn("lending accrue failed", zap.Error(err))
+			}
+		case <-reconTicker.C:
+			s.reconcileAndAlert()
+		}
+	}
+}
+
+// Reconcile 业务对账（F3）：逐资产校验「活跃借款抵押之和 == SysLendingCollateral 余额」，
+// 返回各资产偏差（0 表示平衡）。偏差非 0 意味着抵押托管与账本账户不一致，应触发告警排查。
+// 与全局账本复式平衡探针互补：全局探针只保证借贷和为 0，本方法进一步保证业务抵押逐笔对平。
+func (s *Service) Reconcile() map[string]settlement.AssetAmount {
+	dev := make(map[string]settlement.AssetAmount)
+	borrows, err := s.store.ListActiveBorrowOrders()
+	if err != nil {
+		return dev
+	}
+	want := make(map[string]settlement.AssetAmount)
+	for _, o := range borrows {
+		if o.Status != "active" {
+			continue
+		}
+		p, perr := s.store.GetPool(o.PoolID)
+		if perr != nil {
+			continue
+		}
+		want[p.Asset] = want[p.Asset].Add(o.Collateral)
+	}
+	for asset, w := range want {
+		av, fr, _ := s.ledger.Balance(ledger.SysLendingCollateral, asset)
+		got := av.Add(fr)
+		dev[asset] = dev[asset].Add(got.Sub(w))
+	}
+	return dev
+}
+
+// reconcileAndAlert 执行业务对账，对存在非零偏差的资产告警（F3 纵深）。
+func (s *Service) reconcileAndAlert() {
+	for asset, dev := range s.Reconcile() {
+		if !dev.IsZero() {
+			if s.log != nil {
+				s.log.Warn("lending reconciliation deviation",
+					zap.String("asset", asset),
+					zap.String("deviation", dev.HumanString()))
 			}
 		}
 	}
