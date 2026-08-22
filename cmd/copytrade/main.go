@@ -76,7 +76,10 @@ func main() {
 
 	// 代粉丝下单执行器：默认调 spot 的 /order，复用下游 F1(client_oid)/F4(token) 资金安全。
 	exec := copytrade.NewHTTPExecutor(*spotURL, *futuresURL)
-	svc := copytrade.NewService(store, ledgerSvc, exec, copytrade.Config{MinNotional: 1}, log)
+	svc := copytrade.NewService(store, ledgerSvc, exec, copytrade.Config{
+		MinNotional:      1,
+		ReconcileInterval: 60 * time.Second,
+	}, log)
 
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
 	r := gin.New()
@@ -108,10 +111,14 @@ func main() {
 	}()
 	log.Info("copytrade replicator subscribed", zap.String("topic", tradeTopic))
 
+	ctx, cancel := context.WithCancel(context.Background())
+	go svc.RunLoop(ctx)
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
+		cancel()
 		_ = subscriber.Close()
 		os.Exit(0)
 	}()

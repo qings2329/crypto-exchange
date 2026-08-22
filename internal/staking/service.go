@@ -29,7 +29,8 @@ type ChainBackend interface {
 
 // Config 是质押服务配置。
 type Config struct {
-	AccrueInterval time.Duration // 后台奖励归集周期
+	AccrueInterval    time.Duration // 后台奖励归集周期
+	ReconcileInterval time.Duration // 后台业务对账巡检周期（0 表示不巡检）
 }
 
 // Service 质押业务服务。
@@ -268,20 +269,47 @@ func (s *Service) Reconcile() map[string]settlement.AssetAmount {
 	return dev
 }
 
-// RunLoop 后台奖励归集循环（ticker 驱动），ctx 取消即退出。
+// RunLoop 后台循环（ticker 驱动），ctx 取消即退出。
+// 同时驱动：① 奖励归集（AccrueInterval）；② 业务对账巡检（ReconcileInterval）。
+// 两路周期相互独立，任一未配置（<=0）则不触发该路；两者均未配置则直接退出。
 func (s *Service) RunLoop(ctx context.Context) {
-	if s.cfg.AccrueInterval <= 0 {
+	accrueOK := s.cfg.AccrueInterval > 0
+	reconOK := s.cfg.ReconcileInterval > 0
+	if !accrueOK && !reconOK {
 		return
 	}
-	ticker := time.NewTicker(s.cfg.AccrueInterval)
-	defer ticker.Stop()
+	var accrueTicker *time.Ticker
+	if accrueOK {
+		accrueTicker = time.NewTicker(s.cfg.AccrueInterval)
+		defer accrueTicker.Stop()
+	}
+	var reconTicker *time.Ticker
+	if reconOK {
+		reconTicker = time.NewTicker(s.cfg.ReconcileInterval)
+		defer reconTicker.Stop()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-accrueTicker.C:
 			if _, err := s.Accrue(time.Now()); err != nil && s.log != nil {
 				s.log.Warn("stake accrue failed", zap.Error(err))
+			}
+		case <-reconTicker.C:
+			s.reconcileAndAlert()
+		}
+	}
+}
+
+// reconcileAndAlert 执行业务对账，对存在非零偏差的资产告警（F3 纵深）。
+func (s *Service) reconcileAndAlert() {
+	for asset, dev := range s.Reconcile() {
+		if !dev.IsZero() {
+			if s.log != nil {
+				s.log.Warn("staking reconciliation deviation",
+					zap.String("asset", asset),
+					zap.String("deviation", dev.HumanString()))
 			}
 		}
 	}
