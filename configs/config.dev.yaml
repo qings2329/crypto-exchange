@@ -1,0 +1,314 @@
+server:
+  port: 8080
+  mode: debug # debug | release
+  rate_limit_per_sec: 100        # 单实例每 IP 限流（req/s）
+  allowed_origins:              # 跨域白名单；为空则拒绝一切跨域
+    - "http://localhost:5173"    # ce-frontend 用户前端（dev）
+    - "http://localhost:5174"    # web-admin 管理后台前端（dev）
+  max_body_bytes: 1048576        # 请求体上限（1 MiB）
+  # 受信任的反向代理/负载均衡 IP 或 CIDR。配置后 gin 的 c.ClientIP() 从
+  # X-Forwarded-For 取真实客户端 IP，使审计 IP、全局限流、admin 登录 IP 限流正确归因。
+  # 留空（默认）则不信任任何代理，直接使用直连对端 IP（RemoteAddr）——适合服务直连公网、
+  # 或前面没有反向代理的场景。若服务位于网关/LB/CDN 之后，必须在此填入其地址，否则
+  # 所有请求会被误判为同一个上游 IP（限流/审计失真、甚至误伤）。
+  trusted_proxies: []            # 例：["10.0.0.0/8", "192.168.1.10"]
+  tls:
+    cert_file: ""                # 同时配置 cert/key 才启用 HTTPS
+    key_file: ""
+
+mysql:
+  # 远端 MySQL（sqlpub 托管）。注意：go-sql-driver 原生格式为 user:pass@tcp(host:port)/db?params，
+  # 不是 mysql:// 前缀。
+  # 库名必须用 wallet：该账号授权为 GRANT ALL ON wallet.*，crypto_exchange 库不存在且无建库权限。
+  # 驱动固定 v1.7.1：v1.10 与 sqlpub 代理(8.0.41-sqlpub-mysql-proxy)的 caching_sha2 明文认证不兼容
+  # （收到 AuthMoreData 后未做 RSA 公钥交换即误判成功 → unexpected EOF）；v1.7.1 默认即可完成 RSA 交换。
+  # 不要加 get_server_public_key 参数：v1.7.1 不识别该 DSN 参数（会当成会话变量 → 1193 错误）。
+  dsn: ""
+  max_open: 100
+  max_idle: 10
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+kafka:
+  brokers:
+    - "127.0.0.1:9092"
+  order_topic: "exchange.orders"
+  trade_topic: "exchange.trades"
+  depth_topic: "market.depth"
+  # 协议协商版本（sarama 与 broker 对齐用）。空则用内置默认 V3_6_0_0；
+  # 实际 Kafka 为更新/更旧版本时改为对应值（如 "3.8.0"），sarama 会向下协商。
+  version: "3.6.0"
+
+auth:
+  # Bearer Token 共享密钥（HMAC-SHA256）。生产务必从密钥管理注入并定期轮换，勿提交真实密钥。
+  # 也可通过环境变量 AUTH_SECRET 覆盖（优先级高于此处）。
+  secret: "dev-only-change-me"
+
+matching:
+  # 撮合引擎服务（cmd/matching）专用配置。
+  url: "http://127.0.0.1:8085"  # spot/futures 调用的匹配权威基址；空则匹配不可用
+  snapshot_interval_sec: 5     # 订单簿周期快照间隔（秒）
+  leader_ttl_sec: 10           # leader 租约时长（秒）；follower 在租约过期后竞争接管
+  # 预注册并对外提供服务的交易对；为空时取默认超集（现货+合约永续）。
+  symbols:
+    - BTC_USDT
+    - ETH_USDT
+    - BTC_USDT_PERP
+    - ETH_USDT_PERP
+  # 定点化精度：价格/数量的默认小数位（可被 scales 按 symbol 覆盖）。
+  default_price_scale: 2
+  default_qty_scale: 8
+
+services:
+  user: "http://127.0.0.1:8081"
+  spot: "http://127.0.0.1:8082"
+  market: "http://127.0.0.1:8083"
+  futures: "http://127.0.0.1:8084"
+  # matching 是撮合权威（单写者）；网关仅暴露其只读/行情端点，写端点（/order、
+  # /cancel、/match-now）不在此反代，订单提交仍经 spot/futures 以保留资金预冻结与
+  # 账本结算（资金安全，详见 DEVELOPMENT_TASKS.md §18 / §18.1）。另见 matching.url。
+  matching: "http://127.0.0.1:8085"
+  margin: "http://127.0.0.1:8087"
+  notification: "http://127.0.0.1:8088"
+  risk: "http://127.0.0.1:8089"
+  options: "http://127.0.0.1:8090"
+  otc: "http://127.0.0.1:8091"
+  wealth: "http://127.0.0.1:8092"
+  staking: "http://127.0.0.1:8097"
+  bot: "http://127.0.0.1:8098"
+  copytrade: "http://127.0.0.1:8099"
+  settlement: "http://127.0.0.1:8086"
+  lending: "http://127.0.0.1:8100"
+
+# 清算/结算服务（cmd/settlement）：交易手续费清算配置。
+# trade_fee_rate 为 taker 手续费率；<=0 用内置默认 0.1%。
+settlement:
+  trade_fee_rate: 0.001
+  # 邀请佣金配置：邀请人获得被邀请人交易手续费的比例佣金。
+  referral_commission_rate: 0.2  # 20%（即 taker 手续费的 20% 归邀请人）
+  # 链上充提网关（T-03 链上 RPC 半边脚手架）：enabled=true 且配置了 endpoints 时，
+  # 提现广播走真实节点 RPC 并取回真实 TxHash，确认数仍由模拟状态机推进（脚手架）；
+  # 充值则按 watch_addresses 轮询节点监听入账并喂入确认状态机。两者未配置/节点宕机
+  # 均自动回退离线模拟（Mock*Gateway，fail-degraded）。
+  chain_rpc:
+    # 生产部署：置 true 并填入真实节点 URL（见下 endpoints）。enabled=true 但 endpoints 为空、
+    # 或节点宕机时，自动回退离线模拟网关（fail-degraded），不会因配置缺失而崩溃。
+    # 真实节点 URL（常含 API key）与签名私钥属敏感信息，建议经环境变量注入，不写进本文件：
+    #   CHAIN_RPC_ENABLED=true
+    #   CHAIN_RPC_ENDPOINT_ETH=https://eth-mainnet.g.alchemy.com/v2/<KEY>
+    #   CHAIN_RPC_ENDPOINT_BTC=http://<rpcuser>:<rpcpass>@127.0.0.1:8332
+    #   CHAIN_RPC_ENDPOINT_TRON=https://api.trongrid.io
+    # 设置了环境变量则覆盖此处的值（与 AUTH_SECRET 同一模式）。
+    enabled: true
+    endpoints:
+      # ETH：自建 geth `http://127.0.0.1:8545`；或 Infura/Alchemy/TronGrid 等托管节点
+      # （key 嵌在 URL 路径里，如 https://eth-mainnet.g.alchemy.com/v2/<KEY>）。
+      ETH: ""
+      # BTC：bitcoind RPC（默认 8332），Basic Auth 由 URL 的 user:pass 自动注入，
+      # 形如 http://<rpcuser>:<rpcpass>@127.0.0.1:8332；或通过环境变量注入避免暴露口令。
+      BTC: ""
+      # TRON：java-tron 全节点 HTTP（默认 8090）`http://127.0.0.1:8090`，或 TronGrid
+      # 公网 `https://api.trongrid.io`（免费额度无需 key，高频需 API key header）。
+      TRON: ""
+      # LTC：litecoind RPC（默认 9332），`http://<rpcuser>:<rpcpass>@127.0.0.1:9332`。
+      LTC: ""
+      # DOGE：dogecoind RPC（默认 22555），`http://<rpcuser>:<rpcpass>@127.0.0.1:22555`。
+      # 注：DOGE 无原生 segwit，充值/提现地址仅 base58 P2PKH（D…），离线签名走 P2PKH 路径。
+      DOGE: ""
+    required_confirmations: 2
+    poll_interval_sec: 2
+    # watch_addresses：充值监听的「地址→用户」映射（生产由热钱包/地址派生服务生成）。
+    # 仅 enabled=true 且配了 endpoints 时生效；空则启用了也无充值可扫（等价于模拟）。
+    watch_addresses:
+      - chain: ETH
+        address: "0x0000000000000000000000000000000000000000"
+        user_id: 1
+        asset: ETH
+      # ERC20 代币监控（chain=ETH 且 token 非空 → 按代币合约地址 + Transfer 事件 topics 过滤
+      # to==address 扫描充值）。以下为主网真实合约地址示例，生产请替换为「用户绑定充值地址」
+      # （由 HD 派生服务生成）与对应代币合约；decimals 必须与链上代币一致，否则金额缩放错误。
+      - chain: ETH
+        address: "0x0000000000000000000000000000000000000001"
+        user_id: 1
+        asset: USDT
+        token: "0xdAC17F958D2ee523a2206206994597C13D831ec7" # USDT-ERC20 主网合约
+        decimals: 6
+      - chain: ETH
+        address: "0x0000000000000000000000000000000000000002"
+        user_id: 1
+        asset: USDC
+        token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" # USDC-ERC20 主网合约
+        decimals: 6
+      - chain: BTC
+        address: "bc1examplewatchaddress"
+        user_id: 1
+        asset: BTC
+      - chain: TRON
+        address: "TRexamplewatchaddress"
+        user_id: 1
+        asset: USDT
+        token: "TR7NHqjiehqjqTD9QgQsrQUDsV7qxXWm1f" # TRC20 合约地址（USDT-TRC20 主网）；空则默认此值
+      - chain: LTC
+        address: "ltc1examplewatchaddress"
+        user_id: 1
+        asset: LTC
+      - chain: DOGE
+        address: "Dexamplewatchaddress"
+        user_id: 1
+        asset: DOGE
+    # erc20_tokens：ETH 链可提现 ERC20 资产注册表（asset -> 合约地址 + decimals）。提现时按
+    # asset 命中则构造 transfer 合约调用（to=合约、value=0、data=transfer 编码）；未命中按原生
+    # 资产处理。decimals 须与链上代币一致（如 USDT/USDC-ERC20=6），否则 transfer 金额缩放错误。
+    # 合约地址为主网示例，生产请替换为对应代币部署地址。
+    erc20_tokens:
+      USDT: {contract: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6}
+      USDC: {contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals: 6}
+
+    # hot_wallet：离线签名边界（T-03 热钱包/离线签名）。enabled=true 且 signer_type 配了
+    # 时，提现走「离线签名→SendRaw 广播原始交易」（私钥不出域）。生产接 HSM/KMS 时，Sign 内部
+    # 改为调用安全模块的签名 API（同一 Signer 接口），私钥永不离开安全域；当前仓库内的
+    # "hsm"/"kms" 为软件等价实现（真实 secp256k1 签名，仅用于离线跑通链路）。"stub" 仍保留作
+    # 纯边界演示（标记化 raw hex，非真实密码学）。未启用/私钥缺失 → 回退节点侧签名广播（fail-degraded）。
+    # 私钥与签名后端 keyID 经环境变量注入：HOT_WALLET_SIGNER_KEY、HOT_WALLET_SIGNER_BACKEND。
+    hot_wallet:
+      enabled: true
+      signer_type: "hsm"
+      # signer_backend：软件("software"，默认) 或 external("external")。external 时优先从
+      # RegisterExternalSigner 取真实 HSM/KMS 后端；注册表未命中则按下方 hsm 段（环境变量注入）
+      # 自动构造并注册真实后端，无需手写 RegisterExternalSigner。生产接 HSM/KMS 时设 "external"
+      # 并配 HSM_* 环境变量。
+      signer_backend: "software"
+      # signer_key：软件签名器本地演示用的私钥（32 字节 hex，可选 0x 前缀）。生产应由 HSM/KMS
+      # 注入、不落配置；此处留空即关闭真实签名（回退节点侧广播）。切勿在真实环境提交私钥，
+      # 生产改用环境变量 HOT_WALLET_SIGNER_KEY 注入。
+      signer_key: ""
+      # ETH 真实签名的兜底默认值（UnsignedTx 未显式填时采用）；生产主网建议填对应 chainID
+      # 走 EIP-155，gas_price_wei 按节点建议值填（不能为 0，否则签名失败回退广播）。
+      eth_chain_id: 1
+      eth_gas_price_wei: 0
+      eth_gas_limit: 21000
+      # hsm：生产 HSM/KMS 后端连接配置。signer_backend="external" 且全局注册表未命中时，
+      # 按此自动构造并注册真实签名后端（无需部署方手写 RegisterExternalSigner）。敏感字段
+      # （endpoint 可能含访问凭据、public_key）经环境变量注入，不写进本文件；此处仅列字段说明，
+      # 真实取值见 .env.example（HSM_KIND/HSM_ENDPOINT/HSM_API_KEY/HSM_PUBLIC_KEY）。
+      #   kind: "remote-http" —— 内部签名服务「对 32 字节摘要做 ECDSA」的 HTTPS 端点（私钥永不离开安全模块）。
+      #         （aws-kms / pkcs11 等其它 kind 需自行实现 KeySigner 后用 RegisterExternalSigner 注入。）
+      #   public_key：安全模块导出的 secp256k1 公钥（hex，压缩/非压缩均可），用于派生地址、推导 ETH recovery id、校验签名。
+      hsm:
+        kind: ""          # 例：remote-http（环境变量 HSM_KIND 注入）
+        endpoint: ""      # 例：https://hsm.internal/sign（HSM_ENDPOINT 注入，可含鉴权凭据）
+        api_key: ""       # 可选：作为 Bearer Token 注入 Authorization 头（HSM_API_KEY 注入）
+        public_key: ""    # 设备导出的 secp256k1 公钥 hex（HSM_PUBLIC_KEY 注入）
+      # deposit：给用户生成充值地址的 HD 派生配置（进程只持公钥，私钥留 HSM）。
+      # xpub 是「账户/外部链级」扩展公钥（BIP44: m/44'/coin'/0'/0），由 HSM 内 xprv 经硬化层级
+      # 派生后导出；进程用它按 userID 做非硬化子派生，得到每用户独立的真实 ETH/BTC/TRON 地址。
+      # xpub 属敏感信息，经环境变量 DEPOSIT_XPUB 注入，不写进本文件（见 .env.example）。
+      # 未配置（enabled=false 或 xpub 为空）→ GenerateAddress 回退确定性 mock 占位地址（fail-degraded）。
+      deposit:
+        enabled: false
+        xpub: ""          # 账户/外部链级 xpub（base58，DEPOSIT_XPUB 注入）；空=未配置
+        btc_address_type: "p2wpkh"  # BTC 地址类型："p2wpkh"(bech32 bc1…) 或 "p2pkh"(base58 1…)
+
+# 行情 K 线持久化（T-16）：已收盘 K 线写入 InfluxDB（measurement "kline"），
+# 行情服务在内存环形缓冲（klineCap=500）之外可回取更长历史。
+# url 为空 → 行情服务仅用内存，不连接 InfluxDB（fail-degraded）。
+# 启用时填入 docker-compose 中 influxdb:2.7（:8086）的实例信息，例如：
+#   influxdb:
+#     url: "http://127.0.0.1:8086"
+#     token: "<有读写权限的 API token>"
+#     org: "coldlar"
+#     bucket: "market"
+influxdb:
+  url: ""
+  token: ""
+  org: ""
+  bucket: ""
+
+# 成交检索（T-16）：每笔成交索引入 Elasticsearch（index "trades"），行情服务可检索历史成交
+# （按 symbol / 买卖方向 / 时间窗）。url 为空 → 行情服务仅用内存，不连接 ES（fail-degraded）。
+# 启用时填入 docker-compose 中 elasticsearch:8.13.0（:9200）的实例地址，例如：
+#   es:
+#     url: "http://127.0.0.1:9200"
+#     index: "trades"
+es:
+  url: ""
+  index: ""
+
+# 指数价预言机（internal/oracle）：真实多交易所 REST 喂价。
+# 留空（删除 feeds 或整个 oracle 段）时各服务回退到内置 StaticFeed 演示（futures 默认演示）。
+# 字段：name 源标识；type http/static；url 需含 %s 占位；symbol 交易所交易对（覆盖内部 symbol）；
+#       parse binance/okx/coinbase；price static 固定价；timeout_sec 请求超时（秒，0 用默认 2s）。
+oracle:
+  poll_interval_sec: 3
+  tolerance: 0.02          # 离群剔除容差（相对中位偏离），与 oracle.DefaultOutlierTolerance 一致
+  min_feeds: 2             # 最小健康源数
+  feeds:
+    BTC_USDT:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: BTCUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: BTC-USDT
+        parse: okx
+      - name: coinbase
+        type: http
+        url: "https://api.coinbase.com/v2/prices/%s/spot"
+        symbol: BTC-USDT
+        parse: coinbase
+    ETH_USDT:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: ETHUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: ETH-USDT
+        parse: okx
+      - name: coinbase
+        type: http
+        url: "https://api.coinbase.com/v2/prices/%s/spot"
+        symbol: ETH-USDT
+        parse: coinbase
+    BTC_USDT_PERP:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: BTCUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: BTC-USDT
+        parse: okx
+    ETH_USDT_PERP:
+      - name: binance
+        type: http
+        url: "https://api.binance.com/api/v3/ticker/price?symbol=%s"
+        symbol: ETHUSDT
+        parse: binance
+      - name: okx
+        type: http
+        url: "https://www.okx.com/api/v5/market/ticker?instId=%s"
+        symbol: ETH-USDT
+        parse: okx
+
+# 管理后台后端（cmd/admin）：仅 role=admin 的 token 可访问其 /api/admin/* 接口。
+admin:
+  addr: ":8095"                  # 监听地址（避开 services 段已占用的 8090）
+  username: "admin"             # 管理后台登录用户名
+  # password_hash 是登录口令的 bcrypt 哈希；比对走 bcrypt.CompareHashAndPassword，
+  # 不再使用明文口令。可通过环境变量 ADMIN_PASSWORD_HASH 覆盖（优先级高于此处）。
+  # 下面为口令 "admin123" 的 bcrypt 哈希（仅开发演示用，生产请替换）。
+  password_hash: "$2a$10$1whA6AwKmcb/6mLrQe0mPOBYY04TcCXmXHlNP2FdRyh/4HaCYJ7nG"
+  token_ttl_sec: 3600           # 签发的 admin token 有效期（秒）
+  allowed_origins:
+    - "http://localhost:5174"    # 管理后台前端来源
