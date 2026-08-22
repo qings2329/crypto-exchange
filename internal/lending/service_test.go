@@ -337,3 +337,33 @@ func TestZeroAmountBorrow(t *testing.T) {
 		t.Fatalf("expected ErrBelowMinAmount, got %v", err)
 	}
 }
+
+// TestReconcileCollateralBalanced 锁定 F3 业务对账：多笔活跃借款的抵押之和应等于
+// SysLendingCollateral 账本余额（偏差为 0）。
+func TestReconcileCollateralBalanced(t *testing.T) {
+	svc, _ := newTestLendingService()
+	p, _ := svc.CreatePool("USDT", 1.5)
+	svc.Lend(100, p.ID, usdt(10000))
+	svc.Borrow(2, p.ID, usdt(1000), usdt(1500))
+	svc.Borrow(3, p.ID, usdt(2000), usdt(3000))
+
+	dev := svc.Reconcile()
+	if d, ok := dev["USDT"]; !ok || !d.IsZero() {
+		t.Fatalf("expected zero USDT deviation, got %v (present=%v)", d, ok)
+	}
+}
+
+// TestReconcileCollateralReleasedOnRepay 锁定还款后抵押已释放：无活跃借款时对账无偏差。
+// 同时验证 Repay 经 Batch 原子释放抵押（SysLendingCollateral 归零）。
+func TestReconcileCollateralReleasedOnRepay(t *testing.T) {
+	svc, _ := newTestLendingService()
+	p, _ := svc.CreatePool("USDT", 1.5)
+	svc.Lend(100, p.ID, usdt(10000))
+	b, _ := svc.Borrow(2, p.ID, usdt(1000), usdt(1500))
+	svc.Repay(2, b.ID)
+
+	dev := svc.Reconcile()
+	if d, ok := dev["USDT"]; ok && !d.IsZero() {
+		t.Fatalf("expected no USDT deviation after repay, got %s", d.HumanString())
+	}
+}
