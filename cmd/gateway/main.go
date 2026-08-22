@@ -59,6 +59,11 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		"/api/v1/user/verify",
 		"/api/v1/user/forgot",
 		"/api/v1/user/reset",
+		// refresh/logout 走刷新令牌（body 中的 refresh_token）而非 Bearer access token；
+		// 后端 user 服务将其列入公开组，故网关亦豁免，否则已登出（无 access token）的
+		// 用户无法经网关刷新或登出，造成与后端策略不一致的 401（非漏洞，仅为策略对齐）。
+		"/api/v1/user/refresh",
+		"/api/v1/user/logout",
 		"/api/v1/spot/depth",
 		"/api/v1/spot/ws",
 		"/api/v1/market/ticker",
