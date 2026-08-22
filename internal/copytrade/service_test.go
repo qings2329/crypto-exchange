@@ -3,11 +3,16 @@ package copytrade
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // mockExec 记录代粉丝下单调用，并校验 F1(client_oid)/F4(token) 绑定。
@@ -216,5 +221,55 @@ func TestCopyTradeReconcile(t *testing.T) {
 	dev := svc.Reconcile()
 	if v, ok := dev["USDT"]; ok && v.Sign() != 0 {
 		t.Fatalf("reconcile deviation USDT = %s, want 0", v.HumanString())
+	}
+}
+
+// TestCopyTradeReconcileDeviationAlert 锁定新增的 reconcileAndAlert 告警路径：当已入账复制费
+// 之和与 SysCopyTradeFee 账本余额出现非零偏差时，应通过 logger 告警（F3 纵深）。
+func TestCopyTradeReconcileDeviationAlert(t *testing.T) {
+	svc, _, _, lg := newTestService()
+	if _, err := svc.CreateLead(1, "alice", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.RegisterFollow(2, 1, 1, 0, "tok-follower-2"); err != nil {
+		t.Fatal(err)
+	}
+	ev := mq.TradeEvent{Symbol: "BTC_USDT", Price: 10000, Qty: 2, TakerID: 1, MakerID: 99, TakerSide: "buy", Ts: 1700000000000}
+	svc.OnTrade(context.Background(), ev)
+
+	// 制造偏差：从 SysCopyTradeFee 转走 5 USDT，使账本余额 < 业务记录费用。
+	drift := settlement.AssetAmountFromFloat(5, settlement.AssetDecimalsByName("USDT"))
+	if err := lg.Transfer(ledger.SysCopyTradeFee, 999, "USDT", drift, "drift", "drift"); err != nil {
+		t.Fatal(err)
+	}
+
+	core, logs := observer.New(zapcore.WarnLevel)
+	svc.log = zap.New(core)
+	svc.reconcileAndAlert()
+
+	found := false
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, "copytrade reconciliation deviation") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected 'copytrade reconciliation deviation' alert on non-zero deviation")
+	}
+}
+
+// TestCopyTradeRunLoopExitsOnCancel 锁定 RunLoop 生命周期：设 ReconcileInterval 走 ticker 路径，
+// ctx 取消后应干净退出。
+func TestCopyTradeRunLoopExitsOnCancel(t *testing.T) {
+	svc, _, _, _ := newTestService()
+	svc.cfg.ReconcileInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { svc.RunLoop(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunLoop did not exit after ctx cancel")
 	}
 }
