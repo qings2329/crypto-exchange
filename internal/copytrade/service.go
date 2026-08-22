@@ -17,9 +17,10 @@ import (
 
 // Config 是跟单服务配置。
 type Config struct {
-	CopyFeeRate   float64 // 平台复制费率（按粉丝复制名义额的占比，如 0.001=0.1%）
-	MinNotional   float64 // 粉丝复制名义额下限（计价币），低于则跳过，避免粉尘单
-	DefaultMarket string  // 复制下单目标市场（默认 spot；v1 仅支持现货跟单）
+	CopyFeeRate      float64       // 平台复制费率（按粉丝复制名义额的占比，如 0.001=0.1%）
+	MinNotional      float64       // 粉丝复制名义额下限（计价币），低于则跳过，避免粉尘单
+	DefaultMarket    string        // 复制下单目标市场（默认 spot；v1 仅支持现货跟单）
+	ReconcileInterval time.Duration // 后台业务对账巡检周期（0 表示不巡检）
 }
 
 // Service 跟单服务：消费撮合成交事件，识别被跟单的 lead，按比例复制下单并结算平台复制费。
@@ -306,6 +307,37 @@ func (s *Service) Reconcile() map[string]settlement.AssetAmount {
 		dev[asset] = dev[asset].Add(got.Sub(w))
 	}
 	return dev
+}
+
+// RunLoop 后台对账巡检循环（ticker 驱动），ctx 取消即退出。周期性执行 Reconcile，
+// 对存在非零偏差的资产告警（F3 纵深），与全局账本复式平衡探针互补。
+func (s *Service) RunLoop(ctx context.Context) {
+	if s.cfg.ReconcileInterval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(s.cfg.ReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.reconcileAndAlert()
+		}
+	}
+}
+
+// reconcileAndAlert 执行业务对账，对存在非零偏差的资产告警（F3 纵深）。
+func (s *Service) reconcileAndAlert() {
+	for asset, dev := range s.Reconcile() {
+		if !dev.IsZero() {
+			if s.log != nil {
+				s.log.Warn("copytrade reconciliation deviation",
+					zap.String("asset", asset),
+					zap.String("deviation", dev.HumanString()))
+			}
+		}
+	}
 }
 
 // eventID 由成交字段生成稳定指纹，用于 F1 全局去重。
