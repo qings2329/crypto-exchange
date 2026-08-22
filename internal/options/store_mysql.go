@@ -28,8 +28,8 @@ func (s *mysqlStore) CreateContract(c *OptionContract) error {
 		INSERT INTO ce_option_contracts
 			(underlying, quote_asset, strike, expiry, type, style, contract_size, premium, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.Underlying, c.QuoteAsset, c.Strike, c.Expiry, string(c.Type), string(c.Style),
-		c.ContractSize, c.Premium, c.CreatedAt, c.UpdatedAt)
+		c.Underlying, c.QuoteAsset, c.Strike.HumanString(), c.Expiry, string(c.Type), string(c.Style),
+		c.ContractSize.HumanString(), c.Premium.HumanString(), c.CreatedAt, c.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -146,14 +146,18 @@ func (s *mysqlStore) DeletePosition(id int64) error {
 func scanContract(row *sql.Row) (*OptionContract, error) {
 	var c OptionContract
 	var typ, style string
-	err := row.Scan(&c.ID, &c.Underlying, &c.QuoteAsset, &c.Strike, &c.Expiry,
-		&typ, &style, &c.ContractSize, &c.Premium, &c.CreatedAt, &c.UpdatedAt)
+	var strikeStr, sizeStr, premiumStr string
+	err := row.Scan(&c.ID, &c.Underlying, &c.QuoteAsset, &strikeStr, &c.Expiry,
+		&typ, &style, &sizeStr, &premiumStr, &c.CreatedAt, &c.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrContractNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	c.Strike = parseOptionAmount(strikeStr, c.QuoteAsset)
+	c.ContractSize = parseOptionAmount(sizeStr, c.QuoteAsset)
+	c.Premium = parseOptionAmount(premiumStr, c.QuoteAsset)
 	c.Type = OptionType(typ)
 	c.Style = ExerciseStyle(style)
 	return &c, nil
@@ -164,10 +168,14 @@ func scanContracts(rows *sql.Rows) ([]*OptionContract, error) {
 	for rows.Next() {
 		var c OptionContract
 		var typ, style string
-		if err := rows.Scan(&c.ID, &c.Underlying, &c.QuoteAsset, &c.Strike, &c.Expiry,
-			&typ, &style, &c.ContractSize, &c.Premium, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		var strikeStr, sizeStr, premiumStr string
+		if err := rows.Scan(&c.ID, &c.Underlying, &c.QuoteAsset, &strikeStr, &c.Expiry,
+			&typ, &style, &sizeStr, &premiumStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
+		c.Strike = parseOptionAmount(strikeStr, c.QuoteAsset)
+		c.ContractSize = parseOptionAmount(sizeStr, c.QuoteAsset)
+		c.Premium = parseOptionAmount(premiumStr, c.QuoteAsset)
 		c.Type = OptionType(typ)
 		c.Style = ExerciseStyle(style)
 		out = append(out, &c)

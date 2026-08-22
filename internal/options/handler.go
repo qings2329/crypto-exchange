@@ -56,15 +56,21 @@ func (s *Service) handleCreateContract(c *gin.Context) {
 		response.Error(c, 400, 4001, "unsupported underlying/quote_asset")
 		return
 	}
+	// 计价资产默认值与定点小数位解析（HTTP 输入为 float，落库统一为定点 AssetAmount）。
+	quote := req.QuoteAsset
+	if quote == "" {
+		quote = "USDT"
+	}
+	dec := settlement.AssetDecimalsByName(quote)
 	contract := &OptionContract{
 		Underlying:   req.Underlying,
-		QuoteAsset:   req.QuoteAsset,
-		Strike:       req.Strike,
+		QuoteAsset:   quote,
+		Strike:       settlement.AssetAmountFromFloat(req.Strike, dec),
 		Expiry:       req.Expiry,
 		Type:         OptionType(req.Type),
 		Style:        ExerciseStyle(req.Style),
-		ContractSize: req.ContractSize,
-		Premium:      req.Premium,
+		ContractSize: settlement.AssetAmountFromFloat(req.ContractSize, dec),
+		Premium:      settlement.AssetAmountFromFloat(req.Premium, dec),
 	}
 	if err := s.CreateContract(contract); err != nil {
 		response.Error(c, 400, 4002, err.Error())

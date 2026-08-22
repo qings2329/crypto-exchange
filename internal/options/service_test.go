@@ -13,6 +13,11 @@ func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
 	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
 }
 
+// aa 按资产小数位把人类单位字面量构造为定点 AssetAmount（测试构造合约字段用）。
+func aa(asset string, human float64) settlement.AssetAmount {
+	return settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))
+}
+
 func newTestService() (*Service, *ledger.Ledger) {
 	store := NewMemStore()
 	l := ledger.New()
@@ -37,9 +42,9 @@ func newTestService() (*Service, *ledger.Ledger) {
 
 func mustContract(s *Service, premium float64, expiry time.Time) *OptionContract {
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "USDT", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "USDT", Strike: aa("USDT", 40000),
 		Expiry: expiry, Type: TypeCall, Style: StyleAmerican,
-		ContractSize: 1, Premium: premium,
+		ContractSize: aa("USDT", 1), Premium: aa("USDT", premium),
 	}
 	if err := s.CreateContract(c); err != nil {
 		panic(err)
@@ -290,9 +295,9 @@ func TestQuoteRejectsMissingPrice(t *testing.T) {
 	svc, _ := newTestService()
 	// ETH 不在 priceFn 中（无行情），premium 显式给定以通过创建。
 	c := &OptionContract{
-		Underlying: "ETH", QuoteAsset: "USDT", Strike: 100,
+		Underlying: "ETH", QuoteAsset: "USDT", Strike: aa("USDT", 100),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall,
-		Style: StyleAmerican, ContractSize: 1, Premium: 100,
+		Style: StyleAmerican, ContractSize: aa("USDT", 1), Premium: aa("USDT", 100),
 	}
 	if err := svc.CreateContract(c); err != nil {
 		t.Fatalf("create: %v", err)
@@ -335,9 +340,9 @@ func TestBlackScholes(t *testing.T) {
 func TestCreateContractRejectsUnsupportedAsset(t *testing.T) {
 	svc, _ := newTestService()
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "XYZ", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "XYZ", Strike: aa("USDT", 40000),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
-		ContractSize: 1, Premium: 100,
+		ContractSize: aa("USDT", 1), Premium: aa("USDT", 100),
 	}
 	if err := svc.CreateContract(c); err != ErrUnsupportedAsset {
 		t.Fatalf("expected ErrUnsupportedAsset, got %v", err)
@@ -348,9 +353,9 @@ func TestCreateContractRejectsUnsupportedAsset(t *testing.T) {
 func TestCreateContractRejectsBadContractSize(t *testing.T) {
 	svc, _ := newTestService()
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "USDT", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "USDT", Strike: aa("USDT", 40000),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
-		ContractSize: -1, Premium: 100,
+		ContractSize: aa("USDT", -1), Premium: aa("USDT", 100),
 	}
 	if err := svc.CreateContract(c); err == nil {
 		t.Fatal("expected error for negative contract_size")
@@ -377,9 +382,9 @@ func TestExerciseRejectsBadSpot(t *testing.T) {
 func TestOpenPositionRejectsUnsupportedAsset(t *testing.T) {
 	svc, _ := newTestService()
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "XYZ", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "XYZ", Strike: aa("USDT", 40000),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
-		ContractSize: 1, Premium: 100,
+		ContractSize: aa("USDT", 1), Premium: aa("USDT", 100),
 	}
 	if err := svc.store.CreateContract(c); err != nil {
 		t.Fatalf("seed contract: %v", err)
