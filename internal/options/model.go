@@ -121,5 +121,7 @@ type OptionPosition struct {
 // PremiumTotal 返回该持仓支付/收取的权利金总额（quote 计，定点）。
 func (p *OptionPosition) PremiumTotal() settlement.AssetAmount {
 	dec := settlement.AssetDecimalsByName(p.QuoteAsset)
+	// 保留裸 FromFloat：p.Premium 与 p.Quantity 均为账本内部定点值，不接受用户输入，NaN/Inf 不可达；
+	// 此处仅做权利金总额量化（持仓已 F2 定点化）。
 	return settlement.AssetAmountFromFloat(p.Premium.HumanFloat()*p.Quantity, dec)
 }

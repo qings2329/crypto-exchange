@@ -536,8 +536,30 @@ type WithdrawGateway interface {
 // 上游无感调用。该接口与 WithdrawGateway 正交，避免修改 WithdrawGateway 契约（零侵入）。
 type WithdrawAuthorizer interface {
 	// AuthorizeWithdraw 登记一笔已通过门控（风控 + ledger 预冻 hold）的提现，返回授权令牌
-	// （提现要素指纹）。仅持有有效授权的提现才允许经 RPCWithdrawGateway 的离线签名器签名广播。
-	AuthorizeWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string) (string, error)
+	// （提现要素指纹）。holdID 为对应的 ledger 提现冻结记录 ID，RPCWithdrawGateway 在签名前
+	// 据此真正查 ledger.WithdrawHold 校验 hold 存在/状态/要素一致（纵深防御：签名器绑定真实
+	// 提现记录，而非接受自证布尔）。仅持有有效授权 + 对应真实 hold 的提现才允许经离线签名器广播。
+	AuthorizeWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, holdID string) (string, error)
+}
+
+// WithdrawHoldView 是 ledger 提现冻结记录的去耦视图（M4 来源校验用）。settlement 不依赖
+// ledger 具体类型（避免循环依赖），由上层（futuresapi）将 *ledger.WithdrawHoldEntry 适配为此结构。
+type WithdrawHoldView struct {
+	UserID    int64
+	Asset     string
+	Chain     Chain
+	Amount    AssetAmount
+	Fee       AssetAmount
+	Address   string
+	Finalized bool
+	Cancelled bool
+}
+
+// WithdrawHoldResolver 提供提现 hold 的只读查询能力（M4）：RPCWithdrawGateway 在签名前据此
+// 校验 hold 真实存在且要素与本次提现一致。由上层注入 ledger 适配实现；nil 时网关退化为仅做
+// 授权存在性校验（兼容无 ledger 注入的纯模拟/单元测试场景）。
+type WithdrawHoldResolver interface {
+	ResolveWithdrawHold(ctx context.Context, id string) (WithdrawHoldView, bool)
 }
 
 // MockWithdrawGateway 离线模拟链上提现网关。
@@ -554,9 +576,10 @@ type MockWithdrawGateway struct {
 	height       int // 当前模拟区块高度，每 tick 推进；深度重组据此回退
 	stop         chan struct{}
 	started      bool
-	// authorized 记录经门控授权的提现指纹（M4）。RPCWithdrawGateway.SubmitWithdraw 在触发
-	// 离线签名器前校验；模拟网关自身不校验（无真实签名器，无资金盗窃风险）。
-	authorized map[string]struct{}
+	// authorized 记录经门控授权的提现指纹（M4）。值绑定对应 ledger holdID，RPCWithdrawGateway
+	// 在触发离线签名器前据此真正查 ledger.WithdrawHold 校验 hold 存在/状态/要素一致；
+	// 模拟网关自身不校验（无真实签名器，无资金盗窃风险）。
+	authorized map[string]string
 	// confirmSource 提供真实链上确认数（可选）。非 nil 时 tick 在 Broadcasting 阶段用
 	// 节点确认数推进（替代模拟「每 tick +1」）；查询失败回退 +1（fail-degraded）。nil=纯模拟。
 	confirmSource ConfirmSource
@@ -574,19 +597,20 @@ func NewMockWithdrawGateway(required int, interval time.Duration) *MockWithdrawG
 		required: required,
 		interval: interval,
 		pending:  make(map[string]*WithdrawEvent),
-		authorized: make(map[string]struct{}),
+		authorized: make(map[string]string),
 		stop:     make(chan struct{}),
 	}
 }
 
 // AuthorizeWithdraw 登记一笔已通过门控（风控 + ledger 预冻 hold）的提现，返回授权令牌
-// （提现要素指纹）。RPCWithdrawGateway.SubmitWithdraw 在触发离线签名器前校验该令牌是否存在，
-// 缺失则拒绝签名/广播（M4 网关侧鉴权门控）。模拟网关自身不校验，仅记录以便上游无感调用。
-func (g *MockWithdrawGateway) AuthorizeWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string) (string, error) {
+// （提现要素指纹）。holdID 为对应 ledger 提现冻结记录 ID，RPCWithdrawGateway.SubmitWithdraw
+// 在触发离线签名器前据此真正查 ledger.WithdrawHold 校验 hold 存在/状态/要素一致（M4 来源校验）。
+// 模拟网关自身不校验，仅记录（含 holdID）以便上游无感调用。
+func (g *MockWithdrawGateway) AuthorizeWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, holdID string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	key := withdrawAuthKey(userID, asset, chain, amount, fee, address)
-	g.authorized[key] = struct{}{}
+	g.authorized[key] = holdID
 	return key, nil
 }
 
@@ -597,6 +621,14 @@ func (g *MockWithdrawGateway) isAuthorized(userID int64, asset string, chain Cha
 	defer g.mu.RUnlock()
 	_, ok := g.authorized[withdrawAuthKey(userID, asset, chain, amount, fee, address)]
 	return ok
+}
+
+// lookupHoldID 取回某笔授权提现绑定的 ledger holdID（M4）。授权不存在时返回空串，
+// 由调用方（RPCWithdrawGateway.SubmitWithdraw）据此判定未授权或（注入 resolver 时）查真实 hold。
+func (g *MockWithdrawGateway) lookupHoldID(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string) string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.authorized[withdrawAuthKey(userID, asset, chain, amount, fee, address)]
 }
 
 // withdrawAuthKey 由提现要素生成稳定指纹，作为门控授权的去标识化键（不泄露私钥/hold 上下文）。

@@ -269,6 +269,8 @@ func (s *Service) Accrue(now time.Time) error {
 		if interest < 1 {
 			continue // 忽略微小利息
 		}
+		// 保留裸 FromFloat：interest 由本金(big.Int)×可信利率×流逝时间派生，均为有限值，不接受用户输入，
+		// NaN/Inf 不可达；此处仅做利息量化（P2P 借贷利息已定点化）。
 		interestAmt := settlement.AssetAmountFromFloat(interest, 8)
 		o.InterestAcc = o.InterestAcc.Add(interestAmt)
 		_ = s.store.UpdateBorrowOrder(o)

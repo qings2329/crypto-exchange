@@ -306,7 +306,11 @@ func (s *JSONRPCDepositScanner) scanUTXO(ctx context.Context, w DepositWatch) ([
 	}
 	out := make([]DepositEvent, 0)
 	for _, t := range body.Transactions {
-		amt := AssetAmountFromFloat(t.Amount, 8) // 节点返回 BTC(float)→satoshi 最小单位
+		// M5：节点返回的 BTC 金额为外部不可信 float，须拦截 NaN/Inf，避免异常金额落账（跳过该笔）。
+		amt, err := AssetAmountFromFloatSafe(t.Amount, 8) // 节点返回 BTC(float)→satoshi 最小单位
+		if err != nil {
+			continue
+		}
 		if t.Category != "receive" || t.Address != w.Address || amt.Sign() <= 0 {
 			continue
 		}

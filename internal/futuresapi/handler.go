@@ -115,7 +115,13 @@ func (s *Server) handleOrder(c *gin.Context) {
 				mode = futures.Cross
 			}
 			// 资金闭环：开仓前从钱包冻结保证金；余额不足则拒绝开仓。
-			if err := s.ledgerSvc.Freeze(uid, "USDT", settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName("USDT"))); err != nil {
+			// M5：margin 来自用户请求（或价格派生），须经 Safe 拦截 NaN/Inf，避免冻结 0 金额造成无抵押开仓。
+			marginAmt, err := settlement.AssetAmountFromFloatSafe(margin, settlement.AssetDecimalsByName("USDT"))
+			if err != nil {
+				response.Error(c, 400, 400, "invalid margin: "+err.Error())
+				return
+			}
+			if err := s.ledgerSvc.Freeze(uid, "USDT", marginAmt); err != nil {
 				response.Error(c, 400, 400, "insufficient margin: "+err.Error())
 				return
 			}

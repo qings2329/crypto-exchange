@@ -106,6 +106,11 @@ type UnsignedTx struct {
 	// 的 energy 费用上限（sun，0→不设）。非 TRON 链忽略这些字段。
 	ContractAddress string `yaml:"contract_address"`
 	FeeLimit        uint64 `yaml:"fee_limit"`
+	// HoldID 是 M4 来源校验绑定的 ledger 提现冻结记录 ID：由 RPCWithdrawGateway 在授权通过、
+	// hold 校验通过后写入，使离线签名器（及审计日志）能追溯到真实提现记录。配合 Authorized
+	// 形成纵深防御——即便绕过 SubmitWithdraw 直连签名器，无对应真实 hold 的交易也无法被签
+	// （持有有效 holdID 是经风控 + ledger 预冻的产物）。
+	HoldID string `yaml:"-"`
 	// Authorized 是 M4 网关侧鉴权门控的产物标记：仅当该笔提现已通过 RPCWithdrawGateway 的
 	// AuthorizeWithdraw 门控后，网关才会置 true。chainSigner.Sign 拒绝为未授权（Authorized=false）
 	// 的交易签名，作为离线签名器来源校验的纵深防御（即便有人绕过 SubmitWithdraw 直连签名器）。
@@ -670,16 +675,51 @@ type RPCWithdrawGateway struct {
 	// erc20 是 ETH 链可提现 ERC20 资产注册表（asset -> 合约地址 + decimals），由配置注入；
 	// 提现时按 asset 命中则构造 transfer 合约调用。空表示未配置 ERC20 提现（仅原生资产）。
 	erc20 map[string]ERC20TokenInfo
+	// holdResolver 是 M4 来源校验的真实 hold 查询源（可选）。非 nil 时 SubmitWithdraw 在触发
+	// 离线签名器前据此查 ledger.WithdrawHold，校验 hold 存在/状态/要素一致；nil 时退化为仅做
+	// 授权存在性校验（兼容无 ledger 注入的纯模拟/单测场景）。由 SetWithdrawHoldResolver 注入。
+	holdResolver WithdrawHoldResolver
+}
+
+// SetWithdrawHoldResolver 注入 M4 来源校验用的真实 hold 查询源（ledger 适配）。仅在装配了
+// 离线签名器（真实广播路径）的生产网关上调用；未注入时 SubmitWithdraw 退化为授权存在性校验。
+func (g *RPCWithdrawGateway) SetWithdrawHoldResolver(r WithdrawHoldResolver) {
+	g.holdResolver = r
 }
 
 // SubmitWithdraw 优先走离线签名边界（有 Signer 时：签名→SendRaw 广播并取回真实 TxHash）；
 // 无 Signer 或签名/广播失败时回退节点侧签名广播（Broadcast）；RPC 仍不可达则回退模拟。
 func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Chain, amount, fee AssetAmount, address string, willFail bool) (*WithdrawEvent, error) {
-	// M4 网关侧鉴权门控：离线签名器只接受经 AuthorizeWithdraw 门控的提现。强制模式下若未
-	// 授权则拒绝签名/广播，杜绝任意代码路径构造 UnsignedTx 驱动离线签名器转移资金。
-	if g.enforceAuth && !g.isAuthorized(userID, asset, chain, amount, fee, address) {
-		return nil, fmt.Errorf("settlement: withdraw rejected: not authorized by gateway gate (call AuthorizeWithdraw first): user=%d asset=%s chain=%s to=%s",
-			userID, asset, chain, address)
+	// M4 网关侧鉴权门控 + 真实 hold 来源校验：离线签名器只接受经 AuthorizeWithdraw 门控、
+	// 且绑定真实 ledger 提现冻结记录（hold 存在/状态/要素一致）的提现。强制模式下若未授权
+	// 或 hold 校验失败则拒绝签名/广播，杜绝任意代码路径构造 UnsignedTx 驱动离线签名器转移资金。
+	var holdID string
+	if g.enforceAuth {
+		if g.holdResolver == nil {
+			// 未注入真实 ledger（纯模拟/单测场景）：退化为仅做授权存在性校验，保持向后兼容。
+			if !g.isAuthorized(userID, asset, chain, amount, fee, address) {
+				return nil, fmt.Errorf("settlement: withdraw rejected: not authorized by gateway gate (call AuthorizeWithdraw first): user=%d asset=%s chain=%s to=%s",
+					userID, asset, chain, address)
+			}
+		} else {
+			// 已注入真实 ledger：要求提现绑定有效 hold 并逐字段校验，杜绝自证布尔绕过（M4）。
+			holdID = g.lookupHoldID(userID, asset, chain, amount, fee, address)
+			if holdID == "" {
+				return nil, fmt.Errorf("settlement: withdraw rejected: not authorized by gateway gate (call AuthorizeWithdraw first): user=%d asset=%s chain=%s to=%s",
+					userID, asset, chain, address)
+			}
+			hv, ok := g.holdResolver.ResolveWithdrawHold(context.Background(), holdID)
+			if !ok {
+				return nil, fmt.Errorf("settlement: withdraw rejected: bound hold %s not found", holdID)
+			}
+			if hv.Finalized || hv.Cancelled {
+				return nil, fmt.Errorf("settlement: withdraw rejected: bound hold %s already finalized/cancelled", holdID)
+			}
+			if hv.UserID != userID || hv.Asset != asset || hv.Chain != chain ||
+				hv.Amount.Cmp(amount) != 0 || hv.Fee.Cmp(fee) != 0 || hv.Address != address {
+				return nil, fmt.Errorf("settlement: withdraw rejected: bound hold %s field mismatch (user/asset/chain/amount/fee/address)", holdID)
+			}
+		}
 	}
 	// 构造待签名交易：ERC20（chain=ETH 且注册表命中）时 to 仍为最终用户地址，但携带合约地址
 	// 与按代币 decimals 缩放后的金额，由签名器编码为 transfer 合约调用。
@@ -694,7 +734,8 @@ func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Ch
 			Amount:         amount.ToDecimals(info.Decimals),
 			Asset:          asset,
 			ContractAddress: info.Contract,
-			Authorized:     true, // M4：已通过门控，允许离线签名器签名
+			HoldID:         holdID, // M4：绑定真实 ledger hold，供签名器/审计追溯
+			Authorized:     true,   // M4：已通过门控，允许离线签名器签名
 		}
 	} else {
 		// 高危自检：ETH 链上非原生资产却未命中 ERC20 注册表，将作为原生 ETH 广播，
@@ -703,7 +744,7 @@ func (g *RPCWithdrawGateway) SubmitWithdraw(userID int64, asset string, chain Ch
 			log.Printf("[settlement] ERROR withdraw asset %s on ETH not in ERC20 registry; will broadcast as NATIVE ETH (possible fund misroute): user=%d to=%s amount=%s",
 				asset, userID, address, amount.HumanString())
 		}
-		tx = &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset, Authorized: true} // M4：已通过门控
+		tx = &UnsignedTx{Chain: chain, To: address, Amount: amount, Asset: asset, HoldID: holdID, Authorized: true} // M4：已通过门控 + 绑定真实 hold
 	}
 	if g.client != nil {
 		// 主路径：离线签名（HSM）→ 广播已签原始交易。

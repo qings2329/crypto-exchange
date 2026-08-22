@@ -116,9 +116,18 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 		return nil, ErrProductNotOpen
 	}
 	dec := settlement.AssetDecimalsByName(p.Asset)
-	amt := settlement.AssetAmountFromFloat(amount, dec)
+	// M5：amount 已经济 finitePositive 守卫，此处仍经 Safe 落账（防御性）；p.MinAmount 为落库产品额，
+	// 须拦截 NaN/Inf，避免起购额记 0 致任意申购通过。
+	amt, err := settlement.AssetAmountFromFloatSafe(amount, dec)
+	if err != nil {
+		return nil, err
+	}
+	minAmt, err := settlement.AssetAmountFromFloatSafe(p.MinAmount, dec)
+	if err != nil {
+		return nil, err
+	}
 	// 起购额判断在定点空间做，去掉 float 的 1e-9 容差。
-	if amt.Cmp(settlement.AssetAmountFromFloat(p.MinAmount, dec)) < 0 {
+	if amt.Cmp(minAmt) < 0 {
 		return nil, ErrBelowMinAmount
 	}
 	// 校验用户可用余额。

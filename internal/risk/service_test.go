@@ -1,6 +1,7 @@
 package risk
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -35,6 +36,30 @@ func TestWithdrawLowKYC(t *testing.T) {
 	res, _ := svc.CheckWithdraw(1, "BTC", 500, 1, "")
 	if res.Allowed || res.Reason != "kyc level too low" {
 		t.Fatalf("want rejected(kyc), got %+v", res)
+	}
+}
+
+// TestWithdrawLimitRejectsNonFinite 回归 M5：NaN/Inf 金额经 CheckWithdraw 必须被拒绝（不能静默记 0 绕过限额）。
+func TestWithdrawLimitRejectsNonFinite(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindWithdrawLimit, Asset: "BTC", MaxAmountPerDay: settlement.AssetAmountFromFloat(1000, settlement.AssetDecimalsByName("BTC")), MinKYCLevel: 1})
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		res, _ := svc.CheckWithdraw(1, "BTC", bad, 1, "")
+		if res.Allowed {
+			t.Fatalf("non-finite amount %v should be rejected, got allowed", bad)
+		}
+	}
+}
+
+// TestOrderLimitRejectsNonFinite 回归 M5：下单风控同样须拦截 NaN/Inf 数量。
+func TestOrderLimitRejectsNonFinite(t *testing.T) {
+	svc := newTestSvc()
+	svc.AddRule(&RiskRule{Kind: KindOrderLimit, Asset: "ETH", MaxAmountPerDay: settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("ETH")), MinKYCLevel: 1})
+	for _, bad := range []float64{math.NaN(), math.Inf(1)} {
+		res, _ := svc.CheckOrder(1, "ETH", bad, 1)
+		if res.Allowed {
+			t.Fatalf("non-finite qty %v should be rejected, got allowed", bad)
+		}
 	}
 }
 
