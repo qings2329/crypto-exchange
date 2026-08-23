@@ -79,6 +79,9 @@ type Position struct {
 	Mode       MarginMode // 该持仓所属保证金模式
 	OpenTime   int64
 	LiqPriceVal float64 // 展示用强平价（由开仓/快照时计算填充）
+	// TP/SL 止盈止损（可选，由 /futures/tpsl 设置；nil 表示未设置）。
+	TP *float64 `json:"TP,omitempty"`
+	SL *float64 `json:"SL,omitempty"`
 }
 
 // Notional 持仓名义价值（以报价货币计）。

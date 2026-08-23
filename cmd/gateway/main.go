@@ -71,6 +71,9 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		"/api/v1/market/depth",
 		"/api/v1/market/trades",
 		"/api/v1/market/klines",
+		// 前端（crypto-exchange-web）兼容端点：单数 /kline 及其 WS 子路径 /kline/ws。
+		// 遵循 AuthWithSkips 的「精确或 pre+"/" 前缀」匹配，故仅列 /api/v1/market/kline 即可同时豁免两者。
+		"/api/v1/market/kline",
 		// 管理后台（cmd/admin）用独立 admin token 鉴权，不走普通用户鉴权域；
 		// 整段豁免后由 admin 后端自行校验 admin token（零信任：后端二次校验）。
 		// 这样 web-admin 可经网关统一入口访问 /api/admin/*（含新增的 /api/admin/apikeys）。

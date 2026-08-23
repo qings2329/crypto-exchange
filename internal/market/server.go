@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math/rand"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -27,6 +28,11 @@ type Server struct {
 	hub         *ws.Hub
 	demoSymbols []string
 	indexer     es.TradeIndexer // 可选：成交检索引擎（ES）；nil 时仅用内存
+
+	// 前端（crypto-exchange-web）兼容层：按 symbol+interval 过滤并推送币安风格 K 线的订阅表。
+	// 仅在有兼容 WS 连接时非空；热路径 applyTrade 在无订阅时快速跳过，不影响既有 Hub 广播。
+	klineSubsMu sync.RWMutex
+	klineSubs   []*klineSub
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -164,6 +170,8 @@ func (s *Server) applyTrade(ev mq.TradeEvent) {
 			s.hub.Broadcast(ev.Symbol, gin.H{"type": "kline", "symbol": ev.Symbol, "data": c})
 		}
 	}
+	// 前端兼容（crypto-exchange-web）：按 symbol+interval 过滤后，推送币安风格 K 线。
+	s.dispatchKlineCompat(ev.Symbol)
 	// 成交检索（T-16）：异步把成交索引入 ES（best-effort，失败仅记录不阻断行情）。
 	if s.indexer != nil {
 		doc := es.TradeDoc{
@@ -233,6 +241,10 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 	r.GET("/api/v1/market/trades", s.handleTrades)
 	r.GET("/api/v1/market/trades/search", s.handleTradeSearch)
 	r.GET("/api/v1/market/klines", s.handleKlines)
+	// 前端（crypto-exchange-web）兼容端点：单数 /kline 返回币安风格数组，
+	// /kline/ws 提供按 symbol+interval 过滤的原始推送，使既有前端无需改动即可对接生产。
+	r.GET("/api/v1/market/kline", s.handleKlineCompat)
+	r.GET("/api/v1/market/kline/ws", s.handleKlineWSCompat)
 }
 
 // handleWS 升级为行情 WebSocket，按 symbol 订阅实时推送（trade/depth/ticker）。

@@ -18,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -65,6 +66,19 @@ type Server struct {
 	userSvcURL string
 	kycFetcher func(c *gin.Context) (int, error) // 可注入，便于测试；默认从 user 服务取 kyc_level
 
+	// 交易白名单（地址簿）：用户维护的可信提现/转账地址。
+	addrBookMu sync.Mutex
+	addrBook   map[int64][]AddrBookEntry
+	addrSeq    int64
+
+	// 内部划转：资金账户(可用) ⇄ 合约保证金(冻结)。与账本可用余额分离计账。
+	marginMu   sync.Mutex
+	marginAcct map[int64]map[string]float64 // uid -> asset -> 保证金余额
+
+	// 持仓止盈止损（TP/SL）：按 (uid|symbol|side) 持久化。
+	tpslMu sync.Mutex
+	tpsl   map[int64]map[string]TPState
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -96,6 +110,10 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 		riskSvc:    riskSvc,
 		userSvcURL: userSvcURL,
 		kycFetcher: newKYCFetcher(userSvcURL),
+
+		addrBook:   make(map[int64][]AddrBookEntry),
+		marginAcct: make(map[int64]map[string]float64),
+		tpsl:       make(map[int64]map[string]TPState),
 	}
 
 	// 账本资金安全防线（演示值，生产按资产风险配置）。
