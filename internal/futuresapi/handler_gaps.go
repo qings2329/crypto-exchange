@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
@@ -281,6 +282,12 @@ func (s *Server) handleSetTPSL(c *gin.Context) {
 	}
 	s.tpsl[uid][key] = TPState{TP: b.TP, SL: b.SL}
 	s.tpslMu.Unlock()
+	// 写穿持久化：内存 + 库同步，重启后可恢复。
+	if s.tpslStore != nil {
+		if err := s.tpslStore.Upsert(uid, key, b.TP, b.SL); err != nil {
+			s.log.Warn("tpsl persist failed (written to memory only)", zap.Error(err))
+		}
+	}
 	response.JSON(c, gin.H{"symbol": b.Symbol, "pos_side": b.PosSide, "tp": b.TP, "sl": b.SL})
 }
 

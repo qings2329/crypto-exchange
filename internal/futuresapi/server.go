@@ -13,6 +13,7 @@ package futuresapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -76,8 +77,10 @@ type Server struct {
 	marginAcct map[int64]map[string]float64 // uid -> asset -> 保证金余额
 
 	// 持仓止盈止损（TP/SL）：按 (uid|symbol|side) 持久化。
-	tpslMu sync.Mutex
-	tpsl   map[int64]map[string]TPState
+	// tpsl     内存热缓存；tpslStore 写穿持久化层（MySQL 或 mem 降级），重启恢复。
+	tpslMu    sync.Mutex
+	tpsl      map[int64]map[string]TPState
+	tpslStore TPSLStore
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -131,6 +134,37 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
 	})
 	ledgerSvc.StartReconciler(15 * time.Second)
+
+	// TP-SL 持久化：MySQL 可用时落库；不可用时退化为纯内存（重启丢失）。
+	if dsn != "" {
+		if db, derr := sql.Open("mysql", dsn); derr == nil {
+			if perr := db.Ping(); perr == nil {
+				if store, sErr := NewMySQLTPSLStore(db); sErr == nil {
+					s.tpslStore = store
+					log.Info("tpsl store: mysql")
+				} else {
+					log.Warn("tpsl mysql migrate failed, fallback to mem", zap.Error(sErr))
+					_ = db.Close()
+				}
+			} else {
+				log.Warn("tpsl mysql ping failed, fallback to mem", zap.Error(perr))
+				_ = db.Close()
+			}
+		} else {
+			log.Warn("tpsl sql.Open failed, fallback to mem", zap.Error(derr))
+		}
+	}
+	if s.tpslStore == nil {
+		s.tpslStore = NewMemTPSLStore()
+		log.Info("tpsl store: in-memory")
+	}
+	// 启动时从持久层全量加载到内存热缓存。
+	if loaded, lErr := s.tpslStore.LoadAll(); lErr == nil {
+		s.tpsl = loaded
+		log.Info("tpsl loaded from store", zap.Int("entries", tpslCount(s.tpsl)))
+	} else {
+		log.Warn("tpsl load failed, starting empty", zap.Error(lErr))
+	}
 
 	// 指数价预言机：优先使用配置中的真实 REST 喂价（oracle.NewFromConfig）；
 	// 未配置喂价源时回退到内置 StaticFeed 演示（模拟多交易所价差）。
@@ -763,4 +797,12 @@ func (r ledgerHoldResolver) ResolveWithdrawHold(ctx context.Context, id string) 
 		Finalized: e.Finalized,
 		Cancelled: e.Cancelled,
 	}, true
+}
+
+func tpslCount(m map[int64]map[string]TPState) int {
+	c := 0
+	for _, km := range m {
+		c += len(km)
+	}
+	return c
 }

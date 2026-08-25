@@ -876,3 +876,40 @@ login-history / anti-phishing 全缺**。公告（announcement）经复核两侧
 
 > 验证：`go test ./...` 35 包全绿；前端 client.ts 切换至 /deposit/self 后 tsc/vitest 全绿，
 > mock 网关新增同名别名路由保持开发流一致。
+
+---
+
+## 36. TP-SL 持久化（重启不丢失用户止盈止损设置）
+
+### 问题
+
+TP-SL（止盈/止损）订单在 `Server.tpsl` 内存 map 中存储，进程重启后全部丢失。
+用户设置的止盈止损在交易所重启后静默消失，存在重大风控缺口。
+
+### 改动
+
+1. **`internal/futuresapi/tpsl_store.go`**（新增文件）：
+   - `TPSLStore` interface：`Upsert(uid int64, key string, tp, sl *float64) error`、
+     `LoadAll() (map[int64]map[string]TPState, error)`、`Delete(uid int64, key string) error`；
+   - `MemTPSLStore`：内存实现（map + sync.RWMutex），单元测试覆盖往返语义；
+   - `MySQLTPSLStore`：MySQL 持久化实现，迁移 **9951** 创建表 `ce_futures_tpsl`
+     （user_id, key, tp, sl, created_at, updated_at）；UPSERT ON DUPLICATE KEY UPDATE；
+   - `key` 格式：`{symbol}:{pos_side}`（如 `BTC_USDT_PERP:long`）。
+
+2. **`internal/futuresapi/server.go`**：
+   - Server struct 新增 `tpslStore TPSLStore` 字段；
+   - `NewServer` 中：若提供 `*sql.DB` 则创建 `MySQLTPSLStore`，否则 `MemTPSLStore`；
+   - 启动时 `LoadAll()` 从 store 加载到内存 map，日志记录恢复条目数。
+
+3. **`internal/futuresapi/handler_gaps.go`** — `handleSetTPSL`：
+   - 更新内存 map 后调用 `s.tpslStore.Upsert(...)` 写穿持久化；
+   - 写穿失败仅 warn 日志，不阻塞用户操作（内存优先保可用性）。
+
+### 测试
+
+- `internal/futuresapi/tpsl_store_test.go`：
+  - `TestTPSLStoreRoundtrip`：Upsert → LoadAll 一致性 → 覆盖写 → Delete 清除；
+  - `TestTPSLWriteThroughViaServer`：通过 handler 设置 TP-SL → 验证 store 落库 →
+    新 Server 实例共用同一 store（模拟重启）→ decorateWithTPSL 恢复验证。
+
+> 验证：`go test ./...` 35 包全绿。
