@@ -52,3 +52,16 @@ type PublishInput struct {
 	Title  string `json:"title"`
 	Body   string `json:"body"`
 }
+
+// LevelOf 把内部通知类型映射为前端展示等级（info | warning | critical）。
+// 前端 UserNotification.level 取值见 crypto-exchange-web/src/api/client.ts。
+func LevelOf(t string) string {
+	switch t {
+	case TypeRiskAlert:
+		return "critical"
+	case TypeKYCRejected:
+		return "warning"
+	default:
+		return "info"
+	}
+}

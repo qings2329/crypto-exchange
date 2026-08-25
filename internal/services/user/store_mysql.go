@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -29,6 +30,10 @@ const (
 	userMigVerPrefs     = 9106
 	userMigVerTz        = 9107
 	userMigVerReferral  = 9108
+	userMigVerApiKeys   = 9109
+	userMigVerLogins    = 9110
+	userMigVerSessions  = 9111
+	userMigVerAntiPhish = 9112
 )
 
 // UserMigrations 是用户模块的建表迁移，运行时由 main 调 migrate.New(db, UserMigrations).Up()。
@@ -144,6 +149,68 @@ CREATE UNIQUE INDEX uk_referral_code ON ce_users (referral_code);`,
 		Down: `ALTER TABLE ce_users DROP INDEX uk_referral_code;
 ALTER TABLE ce_users DROP COLUMN referral_code;
 ALTER TABLE ce_users DROP COLUMN referrer_id;`,
+	},
+	{
+		Version: userMigVerApiKeys,
+		Name:    "create_ce_user_api_keys",
+		Up: `CREATE TABLE IF NOT EXISTS ce_user_api_keys (
+    id           BIGINT       NOT NULL AUTO_INCREMENT,
+    user_id      BIGINT       NOT NULL,
+    label        VARCHAR(64)  NOT NULL,
+    key_public   VARCHAR(96)  NOT NULL COMMENT '可安全展示的公钥 cxk_<prefix>_<secret>',
+    secret_hash  CHAR(64)     NOT NULL COMMENT 'sha256(secret)',
+    permissions  VARCHAR(255) NOT NULL DEFAULT '' COMMENT '逗号分隔：read,trade,withdraw',
+    ip_whitelist VARCHAR(512) NOT NULL DEFAULT '' COMMENT '逗号分隔；空表示不限制',
+    status       VARCHAR(16)  NOT NULL DEFAULT 'active',
+    created_at   DATETIME(3)  NOT NULL,
+    last_used_at DATETIME(3)  NULL,
+    PRIMARY KEY (id),
+    KEY idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		Down: "DROP TABLE IF EXISTS ce_user_api_keys;",
+	},
+	{
+		Version: userMigVerLogins,
+		Name:    "create_ce_user_login_history",
+		Up: `CREATE TABLE IF NOT EXISTS ce_user_login_history (
+    id         BIGINT       NOT NULL AUTO_INCREMENT,
+    user_id    BIGINT       NOT NULL,
+    ip         VARCHAR(64)  NOT NULL DEFAULT '',
+    ua         VARCHAR(255) NOT NULL DEFAULT '',
+    location   VARCHAR(64)  NOT NULL DEFAULT '',
+    success    TINYINT      NOT NULL DEFAULT 1,
+    created_at DATETIME(3)  NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_user (user_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		Down: "DROP TABLE IF EXISTS ce_user_login_history;",
+	},
+	{
+		Version: userMigVerSessions,
+		Name:    "create_ce_user_sessions",
+		Up: `CREATE TABLE IF NOT EXISTS ce_user_sessions (
+    id             VARCHAR(64)  NOT NULL,
+    user_id        BIGINT       NOT NULL,
+    ip             VARCHAR(64)  NOT NULL DEFAULT '',
+    ua             VARCHAR(255) NOT NULL DEFAULT '',
+    location       VARCHAR(64)  NOT NULL DEFAULT '',
+    created_at     DATETIME(3)  NOT NULL,
+    last_active_at DATETIME(3)  NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		Down: "DROP TABLE IF EXISTS ce_user_sessions;",
+	},
+	{
+		Version: userMigVerAntiPhish,
+		Name:    "create_ce_user_anti_phishing",
+		Up: `CREATE TABLE IF NOT EXISTS ce_user_anti_phishing (
+    user_id    BIGINT      NOT NULL,
+    code       VARCHAR(32) NOT NULL DEFAULT '',
+    updated_at DATETIME(3) NOT NULL,
+    PRIMARY KEY (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+		Down: "DROP TABLE IF EXISTS ce_user_anti_phishing;",
 	},
 }
 
@@ -474,4 +541,213 @@ func (s *mysqlStore) GetReferrals(userID int64) ([]*User, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// ---- 安全中心：API Key ----
+
+func joinStrings(list []string) string {
+	return strings.Join(list, ",")
+}
+
+func splitStrings(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+const apiKeyCols = `id, user_id, label, key_public, secret_hash, permissions, ip_whitelist, status, created_at, last_used_at`
+
+func scanApiKey(row interface{ Scan(dest ...interface{}) error }) (*ApiKey, error) {
+	var k ApiKey
+	var perms, ips string
+	var lastUsed sql.NullTime
+	if err := row.Scan(&k.ID, &k.UserID, &k.Label, &k.KeyPublic, &k.SecretHash, &perms, &ips, &k.Status, &k.CreatedAt, &lastUsed); err != nil {
+		return nil, err
+	}
+	k.Permissions = splitStrings(perms)
+	k.IPWhitelist = splitStrings(ips)
+	if lastUsed.Valid {
+		t := lastUsed.Time
+		k.LastUsedAt = &t
+	}
+	return &k, nil
+}
+
+func (s *mysqlStore) CreateApiKey(k *ApiKey) error {
+	now := time.Now().UTC()
+	res, err := s.db.Exec(
+		`INSERT INTO ce_user_api_keys (user_id, label, key_public, secret_hash, permissions, ip_whitelist, status, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		k.UserID, k.Label, k.KeyPublic, k.SecretHash, joinStrings(k.Permissions), joinStrings(k.IPWhitelist), k.Status, now)
+	if err != nil {
+		return err
+	}
+	k.ID, _ = res.LastInsertId()
+	k.CreatedAt = now
+	return nil
+}
+
+func (s *mysqlStore) ListApiKeys(userID int64) ([]*ApiKey, error) {
+	rows, err := s.db.Query(
+		`SELECT `+apiKeyCols+` FROM ce_user_api_keys WHERE user_id = ? ORDER BY id DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*ApiKey{}
+	for rows.Next() {
+		k, err := scanApiKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (s *mysqlStore) UpdateApiKeyStatus(userID, id int64, status string) error {
+	res, err := s.db.Exec(
+		`UPDATE ce_user_api_keys SET status = ? WHERE id = ? AND user_id = ?`, status, id, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *mysqlStore) DeleteApiKey(userID, id int64) error {
+	res, err := s.db.Exec(
+		`DELETE FROM ce_user_api_keys WHERE id = ? AND user_id = ?`, id, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---- 安全中心：登录历史 ----
+
+func (s *mysqlStore) RecordLogin(e *LoginEntry) error {
+	res, err := s.db.Exec(
+		`INSERT INTO ce_user_login_history (user_id, ip, ua, location, success, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		e.UserID, e.IP, e.UA, e.Location, boolToInt(e.Success), e.CreatedAt)
+	if err != nil {
+		return err
+	}
+	e.ID, _ = res.LastInsertId()
+	return nil
+}
+
+func (s *mysqlStore) ListLoginHistory(userID int64, limit int) ([]*LoginEntry, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, ip, ua, location, success, created_at
+		 FROM ce_user_login_history WHERE user_id = ? ORDER BY id DESC LIMIT ?`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*LoginEntry{}
+	for rows.Next() {
+		var e LoginEntry
+		var ok int
+		if err := rows.Scan(&e.ID, &e.UserID, &e.IP, &e.UA, &e.Location, &ok, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		e.Success = ok == 1
+		out = append(out, &e)
+	}
+	return out, rows.Err()
+}
+
+// ---- 安全中心：会话 ----
+
+func (s *mysqlStore) CreateSession(sess *Session) error {
+	_, err := s.db.Exec(
+		`INSERT INTO ce_user_sessions (id, user_id, ip, ua, location, created_at, last_active_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		sess.ID, sess.UserID, sess.IP, sess.UA, sess.Location, sess.CreatedAt, sess.LastActiveAt)
+	return err
+}
+
+func (s *mysqlStore) ListSessions(userID int64) ([]*Session, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, ip, ua, location, created_at, last_active_at
+		 FROM ce_user_sessions WHERE user_id = ? ORDER BY created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []*Session{}
+	for rows.Next() {
+		var sess Session
+		if err := rows.Scan(&sess.ID, &sess.UserID, &sess.IP, &sess.UA, &sess.Location, &sess.CreatedAt, &sess.LastActiveAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &sess)
+	}
+	return out, rows.Err()
+}
+
+func (s *mysqlStore) TouchSession(userID int64, sessionID string, at time.Time) error {
+	_, err := s.db.Exec(
+		`UPDATE ce_user_sessions SET last_active_at = ? WHERE id = ? AND user_id = ?`, at, sessionID, userID)
+	return err
+}
+
+func (s *mysqlStore) DeleteSession(userID int64, sessionID string) error {
+	res, err := s.db.Exec(
+		`DELETE FROM ce_user_sessions WHERE id = ? AND user_id = ?`, sessionID, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *mysqlStore) DeleteOtherSessions(userID int64, keepID string) (int64, error) {
+	res, err := s.db.Exec(
+		`DELETE FROM ce_user_sessions WHERE user_id = ? AND id <> ?`, userID, keepID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// ---- 安全中心：防钓鱼码 ----
+
+func (s *mysqlStore) GetAntiPhishing(userID int64) (string, error) {
+	var code string
+	err := s.db.QueryRow(`SELECT code FROM ce_user_anti_phishing WHERE user_id = ?`, userID).Scan(&code)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return code, err
+}
+
+func (s *mysqlStore) SetAntiPhishing(userID int64, code string) error {
+	if code == "" {
+		_, err := s.db.Exec(`DELETE FROM ce_user_anti_phishing WHERE user_id = ?`, userID)
+		return err
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO ce_user_anti_phishing (user_id, code, updated_at) VALUES (?, ?, ?)
+		 ON DUPLICATE KEY UPDATE code = VALUES(code), updated_at = VALUES(updated_at)`,
+		userID, code, time.Now().UTC())
+	return err
 }

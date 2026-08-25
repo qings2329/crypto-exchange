@@ -95,6 +95,18 @@ func (s *mysqlStore) CountUnread(userID int64) (int64, error) {
 	return cnt, nil
 }
 
+func (s *mysqlStore) Delete(userID, id int64) error {
+	res, err := s.db.Exec(
+		`DELETE FROM ce_notifications WHERE id = ? AND user_id = ?`, id, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *mysqlStore) query(q string, args ...interface{}) ([]*Notification, error) {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {

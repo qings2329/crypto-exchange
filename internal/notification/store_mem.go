@@ -108,3 +108,14 @@ func (s *memStore) CountUnread(userID int64) (int64, error) {
 	}
 	return cnt, nil
 }
+
+func (s *memStore) Delete(userID, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.all[id]
+	if !ok || n.UserID != userID {
+		return ErrNotFound
+	}
+	delete(s.all, id)
+	return nil
+}

@@ -55,6 +55,9 @@ func (h *Handler) Register(r *gin.Engine) {
 	auth.GET("/referrals", h.getReferrals)
 	auth.GET("/referral-code", h.getReferralCode)
 
+	// 安全中心（API Key / 登录历史 / 会话 / 防钓鱼码）。
+	h.registerSecurityRoutes(auth)
+
 	// 管理后台聚合接口（仅管理员；cmd/admin 以 admin token 代理调用）。
 	// 此处再叠加 AdminGuard 作为纵深防御：即便上游网关漏配，普通用户也无法越权操作他人账户 / 审核 KYC。
 	// adminapi 转发的是 role=admin 的 selfToken，故不影响既有管理后台流程。
@@ -134,6 +137,15 @@ func (h *Handler) login(c *gin.Context) {
 		return
 	}
 	res, err := h.svc.Login(req.Target, req.Password, req.TFACode)
+	// 登录历史/会话登记：能归属到具体用户（含密码错误的既有账号）即记录。
+	if res != nil {
+		h.svc.RecordLoginWithMeta(req.Target, err, res.User.ID, c.ClientIP(), c.Request.UserAgent())
+	} else if uerr := err; uerr != nil {
+		// 失败场景下重新定位用户以归属历史（定位不到则跳过）。
+		if uid, ok := h.svc.LookupUserID(req.Target); ok {
+			h.svc.RecordLoginWithMeta(req.Target, uerr, uid, c.ClientIP(), c.Request.UserAgent())
+		}
+	}
 	if err != nil {
 		fail(c, err)
 		return

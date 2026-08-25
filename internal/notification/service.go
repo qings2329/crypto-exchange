@@ -55,3 +55,8 @@ func (s *Service) MarkRead(userID, id int64) error {
 func (s *Service) MarkAllRead(userID int64) (int64, error) {
 	return s.store.MarkAllRead(userID)
 }
+
+// Delete 删除某用户的一条通知。
+func (s *Service) Delete(userID, id int64) error {
+	return s.store.Delete(userID, id)
+}

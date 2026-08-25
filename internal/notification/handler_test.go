@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -647,4 +648,135 @@ func TestHandlerListContainsUserID(t *testing.T) {
 	if uid != float64(42) {
 		t.Fatalf("expect user_id=42, got %v", uid)
 	}
+}
+
+// --- 用户侧别名路由契约测试（对齐 crypto-exchange-web/src/api/client.ts）---
+
+// TestUserNotificationContract 契约：/api/v1/user/notifications* 五端点的响应形状
+// 与前端 UserNotification 投影（level/content/read）逐字段校验。
+func TestUserNotificationContract(t *testing.T) {
+	r := setupRouter()
+	tok := authHeader(7)
+
+	// 造两条通知（一 critical 一 info）。
+	pub := func(typ, title string) float64 {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/notification/publish",
+			strings.NewReader(`{"user_id":7,"type":"`+typ+`","title":"`+title+`","body":"内容`+title+`"}`))
+		req.Header.Set("Authorization", tok)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("publish %s: %d %s", typ, w.Code, w.Body.String())
+		}
+		return respData(t, w)["id"].(float64) // JSON 数字统一 float64
+	}
+	idCritical := pub(TypeRiskAlert, "风险提醒")
+	idInfo := pub(TypeSystem, "系统通知")
+
+	// 1) 列表形状：notifications 数组 + unread 计数 + 字段投影。
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/user/notifications", nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", w.Code, w.Body.String())
+	}
+	d := respData(t, w)
+	arr, ok := d["notifications"].([]interface{})
+	if !ok || len(arr) != 2 {
+		t.Fatalf("expect notifications[2], got %s", w.Body.String())
+	}
+	if u, _ := d["unread"].(float64); u != 2 {
+		t.Fatalf("expect unread=2, got %v", d["unread"])
+	}
+	first := arr[0].(map[string]interface{}) // 时间倒序，首条为 idInfo
+	if first["id"].(float64) != idInfo {
+		t.Fatalf("expect newest id=%v first, got %v", idInfo, first["id"])
+	}
+	for k, want := range map[string]interface{}{"level": "info", "title": "系统通知", "content": "内容系统通知", "read": false} {
+		if first[k] != want {
+			t.Fatalf("field %s: expect %v, got %v", k, want, first[k])
+		}
+	}
+
+	// 2) 未读数：{count}。
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/user/notifications/unread-count", nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if c := respData(t, w)["count"].(float64); c != 2 {
+		t.Fatalf("expect count=2, got %s", w.Body.String())
+	}
+
+	// 3) 单条已读（路径参数）：critical 的 level 投影 + read 翻转。
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/user/notifications/"+itoa64(idCritical)+"/read", nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || respData(t, w)["ok"] != true {
+		t.Fatalf("read: %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/user/notifications", nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	for _, item := range respData(t, w)["notifications"].([]interface{}) {
+		m := item.(map[string]interface{})
+		if m["id"].(float64) == idCritical && (m["level"] != "critical" || m["read"] != true) {
+			t.Fatalf("critical projection wrong: %v", m)
+		}
+	}
+
+	// 4) 越权读他人通知 → 404。
+	other := authHeader(8)
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/user/notifications/"+itoa64(idInfo)+"/read", nil)
+	req.Header.Set("Authorization", other)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross-user read should 404, got %d", w.Code)
+	}
+
+	// 5) 全部已读 → count 归零。
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodPost, "/api/v1/user/notifications/read-all", nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || respData(t, w)["ok"] != true {
+		t.Fatalf("read-all: %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/user/notifications/unread-count", nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if c := respData(t, w)["count"].(float64); c != 0 {
+		t.Fatalf("expect count=0 after read-all, got %s", w.Body.String())
+	}
+
+	// 6) DELETE 单条：删除后列表只剩一条；重复删除 404。
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodDelete, "/api/v1/user/notifications/"+itoa64(idCritical), nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || respData(t, w)["ok"] != true {
+		t.Fatalf("delete: %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodDelete, "/api/v1/user/notifications/"+itoa64(idCritical), nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("re-delete should 404, got %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/user/notifications", nil)
+	req.Header.Set("Authorization", tok)
+	r.ServeHTTP(w, req)
+	if arr, _ := respData(t, w)["notifications"].([]interface{}); len(arr) != 1 {
+		t.Fatalf("expect 1 notification left, got %s", w.Body.String())
+	}
+}
+
+func itoa64(v float64) string {
+	return strings.TrimSpace(strconv.FormatInt(int64(v), 10))
 }

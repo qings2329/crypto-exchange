@@ -14,4 +14,6 @@ type Store interface {
 	MarkAllRead(userID int64) (int64, error)
 	// CountUnread 返回某用户未读数量。
 	CountUnread(userID int64) (int64, error)
+	// Delete 删除某用户的一条通知；不属于该用户或不存在时返回 ErrNotFound。
+	Delete(userID, id int64) error
 }

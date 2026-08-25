@@ -811,3 +811,43 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 > 验证：`go build ./... && go vet ./...` 通过；`go test ./...` **35 包全绿**；
 > integration.sh ALL PASS（含新流程 5）。前端无需改动——mock/gateway.mjs 的 earn/
 > launchpad 路由族与本服务逐字段对齐，切真实后端即插即用。
+
+## 34. 用户侧缺口收口：通知契约对齐 + 安全中心四组端点（2026-08-25，已完成）
+
+闭合 §24 缺口清单中的用户域两项：**站内信前缀错配**与 **api-keys / sessions /
+login-history / anti-phishing 全缺**。公告（announcement）经复核两侧已逐字段对齐
+（用户端 GET /api/v1/announcement/list、管理端 CRUD、mock 与 vite 代理均已通），无需改动。
+
+### 改动
+
+1. **通知别名路由**（`internal/notification`，保留旧路由兼容 adminapi）：
+   - 新增 `/api/v1/user/notifications` 五端点：GET 列表（`{notifications,unread}`）、
+     GET unread-count（`{count}`）、POST `/:id/read`（路径参数版单条已读）、
+     POST read-all、**DELETE `/:id`（新增删除能力，Store 接口 + mem/mysql 三层补齐）**；
+   - 响应形状投影 userNotificationView：内部 `{type,body,status}` → 前端
+     `{level(info|warning|critical),content,read(bool)}`，LevelOf 映射：risk_alert→critical、
+     kyc_rejected→warning、其余→info；
+   - gin v1.10 验证静态段（read-all）与参数段（:id/read）可共存。
+2. **安全中心四组端点**（`internal/services/user`，security.go / security_handler.go）：
+   - **API Key**：POST 创建校验 label/permissions（⊂read|trade|withdraw）/ip_whitelist，
+     生成 `cxk_<prefix>_<secret>` 明文（secret 仅创建响应返回一次，存储只落 sha256(secret)
+     哈希）；GET `{api_keys,total}` 不泄露 secret；PUT 启停（仅 active|disabled）；DELETE 硬删；
+   - **登录历史**：Login 成功/失败均记录（失败按 target 反查归属用户；未知目标跳过），
+     IP→归属地演示映射（本地/内网/未知），entry id 以字符串序列化（前端 id:string 契约）；
+   - **会话**：登录成功建会话（随机 32 hex id）；current 不落库——读取时推导「最近活跃」
+     并触碰 last_active_at（调用方即当前会话）；不可注销当前会话（400）；注销全部返回 revoked 计数；
+   - **防钓鱼码**：GET 回显（未设置为空串）、POST 设置/空串清除、超长 400；
+3. **迁移 9109-9112**：ce_user_api_keys / ce_user_login_history / ce_user_sessions /
+   ce_user_anti_phishing（permissions/ip_whitelist 逗号分隔存储）。
+
+### 测试
+
+- `internal/notification/handler_test.go` +TestUserNotificationContract：五端点全链路
+  （列表形状/unread/count 键/critical 投影/越权 404/read-all 归零/DELETE 及重复删除 404）；
+- `internal/services/user/security_test.go` ×3：API Key 全生命周期（含三类 400 守卫、
+  secret 泄露检查、跨用户 404）；登录历史+会话（成功/失败双记录、字符串 id、current 推导、
+  当前会话 400、未知 404、revoked 计数）；防钓鱼码设置回显清除。
+
+> 验证：`go build ./... && go vet ./...` 通过；`go test ./...` 35 包全绿。
+> 已知边界：会话 current 为「最近活跃」启发式（真实部署建议把 session id 写入 access token
+> claim 精确绑定）；登录历史归属地为演示值（可接 GeoIP 替换 locFromIP）。
