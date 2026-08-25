@@ -1,10 +1,13 @@
 package futuresapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +27,8 @@ import (
 func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.GET("/api/v1/futures/wallet", s.handleWallet)
 	r.POST("/api/v1/futures/wallet/deposit", middleware.AdminGuard(), s.handleDeposit)
+	// 用户侧自助充值（演示语义）：uid 取 token；白名单/单笔上限/频控见 handleDepositSelf。
+	r.POST("/api/v1/futures/wallet/deposit/self", s.handleDepositSelf)
 	r.POST("/api/v1/futures/wallet/deposit/chain", middleware.AdminGuard(), s.handleDepositChain)
 	r.GET("/api/v1/futures/wallet/deposits", s.handleDeposits)
 	r.POST("/api/v1/futures/wallet/deposit/reorg", middleware.AdminGuard(), s.handleDepositReorg)
@@ -66,6 +71,92 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.POST("/api/v1/futures/wallet/sweep", s.handleSweep)
 	r.POST("/api/v1/futures/wallet/unsweep", s.handleUnsweep)
 	r.GET("/metrics", s.handleMetrics)
+}
+
+// selfDepositGuard 是用户侧自助充值的内存频控（uid -> 最近请求时间窗）。
+var (
+	selfDepositMu     sync.Mutex
+	selfDepositWindow = map[int64][]time.Time{}
+)
+
+const (
+	selfDepositMaxAmount = 10000.0            // 单笔上限（USDT 计）
+	selfDepositMaxPerMin = 6                  // 每分钟最多次数
+	selfDepositAssets    = "USDT,BTC,ETH"     // 资产白名单（对齐 mock 网关 WALLET_ASSETS）
+)
+
+// allowSelfDeposit 滑动窗口频控：每 uid 每分钟最多 selfDepositMaxPerMin 次。
+func allowSelfDeposit(uid int64) bool {
+	now := time.Now()
+	selfDepositMu.Lock()
+	defer selfDepositMu.Unlock()
+	recent := selfDepositWindow[uid][:0]
+	for _, ts := range selfDepositWindow[uid] {
+		if now.Sub(ts) < time.Minute {
+			recent = append(recent, ts)
+		}
+	}
+	if len(recent) >= selfDepositMaxPerMin {
+		selfDepositWindow[uid] = recent
+		return false
+	}
+	selfDepositWindow[uid] = append(recent, now)
+	return true
+}
+
+// handleDepositSelf 用户侧自助充值（模拟链上确认后即时入账的演示语义）。
+// 安全边界：归属用户一律取 token uid（防冒充）；资产白名单；单笔上限 + 分钟级频控，
+// 防止脚本无限刷入虚假资金。与管理端 faucet（POST /deposit，AdminGuard）并存。
+func (s *Server) handleDepositSelf(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok || uid <= 0 {
+		response.Error(c, http.StatusUnauthorized, 401, "unauthorized")
+		return
+	}
+	var req struct {
+		Asset   string          `json:"asset"`
+		Amount  json.Number     `json:"amount"`
+		Network string          `json:"network"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, 400, 400, "bad request")
+		return
+	}
+	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
+	if asset == "" {
+		asset = "USDT"
+	}
+	if !strings.Contains(","+selfDepositAssets+",", ","+asset+",") {
+		response.Error(c, 400, 400, "unsupported deposit asset")
+		return
+	}
+	amt, err := req.Amount.Float64()
+	if err != nil || amt <= 0 || amt > selfDepositMaxAmount {
+		response.Error(c, 400, 400, "invalid amount (0 < amount <= "+strconv.FormatFloat(selfDepositMaxAmount, 'f', -1, 64)+")")
+		return
+	}
+	if !allowSelfDeposit(uid) {
+		response.Error(c, 429, 429, "too many deposits, retry later")
+		return
+	}
+	depAmt, err := settlement.AssetAmountFromFloatSafe(amt, settlement.AssetDecimalsByName(asset))
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
+	// ref 唯一化：同额快速连充不被账本指纹去重吞掉。
+	ref := fmt.Sprintf("deposit:self:%d:%d", uid, time.Now().UnixNano())
+	if err := s.ledgerSvc.Deposit(uid, asset, depAmt, ref); err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	avail, frozen, _ := s.ledgerSvc.Balance(uid, asset)
+	response.JSON(c, gin.H{
+		"status":    "ok",
+		"asset":     asset,
+		"available": avail.HumanFloat(),
+		"frozen":    frozen.HumanFloat(),
+	})
 }
 
 // handleWallet 钱包余额查询（可用 / 冻结 + 保险基金 / 资金池）。

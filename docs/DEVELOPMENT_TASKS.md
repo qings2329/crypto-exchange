@@ -851,3 +851,28 @@ login-history / anti-phishing 全缺**。公告（announcement）经复核两侧
 > 验证：`go build ./... && go vet ./...` 通过；`go test ./...` 35 包全绿。
 > 已知边界：会话 current 为「最近活跃」启发式（真实部署建议把 session id 写入 access token
 > claim 精确绑定）；登录历史归属地为演示值（可接 GeoIP 替换 locFromIP）。
+
+## 35. 契约缺口收口 II：OTC 法币报价 + 用户侧自助充值（2026-08-25，已完成）
+
+1. **GET /api/v1/otc/prices**（`internal/otc`）：补齐前端虚构的后端缺口。
+   base_price = 参考价(USD) × fiat_rate；汇率表 USD=1/CNY=7.23/EUR=0.92 与 mock 网关
+   同口径（真实部署接汇率源）；USDT 无行情按 1 USD 稳定币基准，其余资产必须有
+   priceFn 报价否则 404；未知法币回退 rate=1。响应 {asset,fiat,base_price,fiat_rate,updated_at}。
+2. **POST /api/v1/futures/wallet/deposit/self**（`internal/futuresapi`）：
+   修复「充值被 AdminGuard 拒绝 + body 要求 user_id」与前端用户侧充值的双重错配：
+   - 归属 uid 一律取 token（防冒充，body user_id 忽略）；管理端 faucet（POST /deposit，
+     AdminGuard + body user_id 指定入账对象）保留并存；
+   - 资产白名单 USDT/BTC/ETH（对齐 mock WALLET_ASSETS）；单笔上限 10000、滑动窗频控
+     6 次/分钟（内存实现），防脚本刷入虚假资金；
+   - ledger ref 唯一化（deposit:self:uid:unixnano），同额快速连充不被指纹去重吞掉；
+   - 响应 {status,asset,available,frozen}（HumanFloat 数值口径对齐 mock）。
+
+### 测试
+
+- `internal/otc/handler_test.go` +TestOtcPrices：BTC/CNY 换算、缺省参数 USDT/CNY、
+  未知法币回退、无行情资产 404；
+- `internal/futuresapi/handler_wallet_f4_test.go` +TestDepositSelfUserFlow：正常入账
+  （10000+500）、白名单/上限/负数 400、body user_id 冒充无效、频控第 7 次 429。
+
+> 验证：`go test ./...` 35 包全绿；前端 client.ts 切换至 /deposit/self 后 tsc/vitest 全绿，
+> mock 网关新增同名别名路由保持开发流一致。

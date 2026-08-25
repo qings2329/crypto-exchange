@@ -1,6 +1,7 @@
 package futuresapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -124,5 +125,79 @@ func TestWalletFeeBadAmount(t *testing.T) {
 	// 合法 amount 应正常估算（200）。
 	if w := call("10"); w.Code != http.StatusOK {
 		t.Fatalf("fee with valid amount should be 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDepositSelfUserFlow 契约：用户侧自助充值——uid 取 token（防冒充）、白名单、
+// 上限/频控护栏，入账后返回可用/冻结余额。
+func TestDepositSelfUserFlow(t *testing.T) {
+	_, r, verifier := newF4Server(t)
+	userTok := verifier.Issue(1, time.Hour)
+
+	post := func(tok, body string) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/futures/wallet/deposit/self", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	// 正常充值 500 USDT → ok，可用余额 10000+500。
+	w := post(userTok, `{"asset":"USDT","amount":500}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("deposit self: %d %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Status    string  `json:"status"`
+			Asset     string  `json:"asset"`
+			Available float64 `json:"available"`
+			Frozen    float64 `json:"frozen"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Data.Status != "ok" || resp.Data.Asset != "USDT" || resp.Data.Available != 10500 {
+		t.Fatalf("unexpected resp: %+v", resp.Data)
+	}
+
+	// 非白名单资产 → 400。
+	if w = post(userTok, `{"asset":"DOGE","amount":1}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported asset should 400, got %d", w.Code)
+	}
+	// 超上限 → 400。
+	if w = post(userTok, `{"asset":"USDT","amount":10001}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("over-cap should 400, got %d", w.Code)
+	}
+	// 非法金额（负数）→ 400。
+	if w = post(userTok, `{"asset":"USDT","amount":-5}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("negative should 400, got %d", w.Code)
+	}
+
+	// 冒充防护：body 里塞 user_id 无效（uid 一律取 token）。
+	if w = post(userTok, `{"asset":"USDT","amount":10,"user_id":999}`); w.Code != http.StatusOK {
+		t.Fatalf("self deposit should ignore body user_id, got %d %s", w.Code, w.Body.String())
+	}
+	var bal struct {
+		Data struct {
+			Available float64 `json:"available"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &bal)
+	if bal.Data.Available != 10510 {
+		t.Fatalf("expect credited to token uid (10510), got %+v", bal.Data)
+	}
+
+	// 频控：连续第 7 次（本窗口内已用 3 次）后触发 429 —— 用新 uid 隔离窗口精确验证。
+	tok2 := verifier.Issue(2, time.Hour)
+	for i := 0; i < selfDepositMaxPerMin; i++ {
+		if w = post(tok2, `{"asset":"USDT","amount":1}`); w.Code != http.StatusOK {
+			t.Fatalf("burst #%d should pass, got %d %s", i, w.Code, w.Body.String())
+		}
+	}
+	if w = post(tok2, `{"asset":"USDT","amount":1}`); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("rate limit should 429, got %d", w.Code)
 	}
 }

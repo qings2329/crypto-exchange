@@ -2,6 +2,7 @@ package otc
 
 import (
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,6 +23,7 @@ func (s *Service) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifi
 	{
 		api.POST("/advertisements", s.handleCreateAd)
 		api.GET("/advertisements", s.handleListAds)
+		api.GET("/prices", s.handlePrices)
 		api.POST("/orders/take", s.handleTakeOrder)
 		api.POST("/orders/:id/pay", s.handleMarkPaid)
 		api.POST("/orders/:id/complete", s.handleConfirmComplete)
@@ -49,6 +51,16 @@ type createAdReq struct {
 	MinAmount      float64 `json:"min_amount"`
 	MaxAmount      float64 `json:"max_amount"`
 	PaymentMethods string  `json:"payment_methods"`
+}
+
+// handlePrices GET /api/v1/otc/prices?asset=&fiat= → 法币报价（前端 OtcPrice 契约）。
+func (s *Service) handlePrices(c *gin.Context) {
+	q, err := s.FiatQuote(c.Query("asset"), c.Query("fiat"))
+	if err != nil {
+		response.Error(c, http.StatusNotFound, 404, err.Error())
+		return
+	}
+	response.JSON(c, q)
 }
 
 func (s *Service) handleCreateAd(c *gin.Context) {
