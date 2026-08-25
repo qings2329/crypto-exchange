@@ -768,3 +768,46 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 > 验证：`go build ./...` 通过；`go test ./...` 34 包全绿。已知边界：停机窗口超过
 > RecentTrades 回看深度时更早漏结依赖 `/spot/admin/reconcile` 告警人工介入；NewServer 的
 > Watch 订阅先于恢复流程启动，极端竞态下早到成交走纯转账分支（幂等安全，仅登记滞后）。
+
+## 33. 业务线落地：理财中心 earn + 新币挖矿 launchpad（2026-08-25，已完成）
+
+对齐前端 `Earn.tsx`/`Launchpad.tsx` 契约（§24 缺口清单 A-2），新包 `internal/earn` 覆盖两条
+路由族：`/api/v1/earn/*`（活期/定期申购、计息、赎回）与 `/api/v1/launchpad/*`（项目列表、
+质押、领奖、解押）。复用 §28 wealth 的定点整数计息公式与两阶段出金模式。
+
+### 改动
+
+1. **理财中心**：
+   - 申购：agreed 风险揭示必勾选；min/max 限额；余额校验后本金 user→SysWealth
+     （ref `earn_sub:<id>`），两阶段「先落单后转账」失败回滚；
+   - 计息：`AccrueAll` 按 YIELD_SCALE 定点整数计息 SysWealth→SysWealthYieldPayable，
+     ref 携带 unix 时间戳（`earn_accrue:<sub>:<ts>`，规避账本指纹去重吞掉跨期利息——
+     wealth #47 的 ref 无时间戳属潜在隐患，此处已规避）；
+   - 赎回：定期未到期拒绝（Maturity 锁定）；先落终态再 Batch 双腿出金
+     （part=principal/yield），Batch 失败回滚终态；
+2. **Launchpool**：
+   - 项目：管理员创建（pools 校验：id 唯一、资产白名单 KnownAsset）、状态由 now 推导
+     upcoming/ongoing/ended；奖励预算由管理员 FundProject 预充 token→SysStakingReward
+     （funded_total 累计入库存，供对账）；
+   - 质押 user→SysStaking（ref `lp_stake:<pos>:<seq>`）；同一池重复质押合并仓位；
+   - 领奖 Harvest：**系统账户允许透支**，预算闸口必须在服务层显式做——池余额不足时
+     先持久化 Pending 再返回 ErrPoolExhausted（fail-safe 可追溯）；
+   - 解押 Unstake：partial 或全额（amount=0），seq 引用防指纹去重。
+3. **持久化**：迁移 9611-9614（ce_earn_products / ce_earn_subscriptions /
+   ce_launch_projects 含 funded_total / ce_launch_positions），金额列 VARCHAR(64)
+   HumanString 存储、读取 AssetAmountFromString 解析；MemStore + MySQLStore 同构。
+4. **装配**：`cmd/earn/main.go`（--addr :8093，种子产品 + 进行中 NEW 项目由 admin 预充
+   预算，RunLoop 60s 自动计息）。
+5. **集成脚本**：integration.sh 新增流程 5（产品列表/agreed 护栏/申购赎回/项目列表/
+   质押/harvest fail-safe/解押），earn 二进制纳入构建与探活。
+
+### 测试
+
+- `internal/earn/service_test.go` ×8：活期申赎闭环 / agreed+min/max 护栏 / 定期锁定与到期
+  赎回 / 定点计息入 YieldPayable / 质押领奖解押全流程（区间断言容忍 AddDate 半年天数）/
+  状态门控与预算 fail-safe / 重复质押不因幂等指纹被吞 / 部分解押与护栏；
+- `internal/earn/handler_test.go` ×2：admin 端点 F4 鉴权护栏（403 矩阵）/ 未勾选揭示 400。
+
+> 验证：`go build ./... && go vet ./...` 通过；`go test ./...` **35 包全绿**；
+> integration.sh ALL PASS（含新流程 5）。前端无需改动——mock/gateway.mjs 的 earn/
+> launchpad 路由族与本服务逐字段对齐，切真实后端即插即用。

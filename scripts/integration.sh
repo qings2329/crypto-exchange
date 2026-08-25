@@ -184,12 +184,13 @@ BOT_PORT="$(free_port)"
 COPY_PORT="$(free_port)"
 STAKE_PORT="$(free_port)"
 LEND_PORT="$(free_port)"
+EARN_PORT="$(free_port)"
 CFG_TMP="$(mktemp /tmp/ce-int-config.XXXX.yaml)"
 make_config "$CONFIG" "$CFG_TMP" "$MATCH_PORT"
 
 # ---- build binaries ----
 echo "== building binaries (go) =="
-for svc in matching spot bot copytrade staking lending; do
+for svc in matching spot bot copytrade staking lending earn; do
   echo "  building $svc ..."
   if ! go build -o "$BIN/$svc" "./cmd/$svc"; then
     echo "  [FAIL] build $svc"; FAILED=1; exit 1
@@ -204,6 +205,7 @@ echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_P
 "$BIN/copytrade" --config "$CFG_TMP" --mysql-dsn "" --addr ":$COPY_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/copytrade.log" 2>&1 & PIDS+=($!)
 "$BIN/staking"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$STAKE_PORT" >"$LOGDIR/staking.log"   2>&1 & PIDS+=($!)
 "$BIN/lending"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$LEND_PORT" >"$LOGDIR/lending.log"   2>&1 & PIDS+=($!)
+"$BIN/earn"      --config "$CFG_TMP" --mysql-dsn "" --addr ":$EARN_PORT" >"$LOGDIR/earn.log"      2>&1 & PIDS+=($!)
 
 wait_for "http://127.0.0.1:$MATCH_PORT/health"                 "matching"  || FAILED=1
 wait_for_match_leader "http://127.0.0.1:$MATCH_PORT/health"     "matching"  || FAILED=1
@@ -212,6 +214,7 @@ wait_for "http://127.0.0.1:$BOT_PORT/api/v1/bot/strategies"    "bot"       || FA
 wait_for "http://127.0.0.1:$COPY_PORT/api/v1/copytrade/leads"  "copytrade" || FAILED=1
 wait_for "http://127.0.0.1:$STAKE_PORT/api/v1/staking/products" "staking"  || FAILED=1
 wait_for "http://127.0.0.1:$LEND_PORT/api/v1/lending/pools"    "lending"   || FAILED=1
+wait_for "http://127.0.0.1:$EARN_PORT/api/v1/earn/products"    "earn"      || FAILED=1
 [ "$FAILED" -ne 0 ] && { echo "services failed to start"; exit 1; }
 
 SPOT="http://127.0.0.1:$SPOT_PORT"
@@ -219,6 +222,7 @@ BOT="http://127.0.0.1:$BOT_PORT"
 COPY="http://127.0.0.1:$COPY_PORT"
 STAKE="http://127.0.0.1:$STAKE_PORT"
 LEND="http://127.0.0.1:$LEND_PORT"
+EARN="http://127.0.0.1:$EARN_PORT"
 
 # tokens: 共享开发密钥本地签发
 ADMIN_TOKEN="$(mint_token 999 admin)"
@@ -392,6 +396,53 @@ check "lending repay -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 # 4.7 提取存款（复式记账：SysLendingPool→用户可用）：withdraw 按「存款订单 id」走路径参数。
 do_call POST "$LEND/api/v1/lending/withdraw/$LEND_ORDER_ID" "$LEND_USER_TOKEN" '{}'
 check "lending withdraw -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# ================= 流程 5：earn 理财申购计息赎回 + launchpool 质押领奖解押 =================
+echo "== flow 5: earn/launchpad (F2 定点 / F3 原子 / 预算 fail-safe) =="
+
+EARN_USER_TOKEN="$(mint_token 1 user)" # earn 内存账本预置 1-4 余额
+
+# 5.1 理财产品列表（服务启动时种子发行）
+do_call GET "$EARN/api/v1/earn/products" "$EARN_USER_TOKEN" ""
+check "earn list products -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 5.2 未勾选风险揭示必须被拒（agreed=false → 400）
+do_call POST "$EARN/api/v1/earn/subscribe" "$EARN_USER_TOKEN" '{"product_id":1,"amount":100,"agreed":false}'
+check "earn subscribe w/o agreement -> 400" "$([ "$RESP_CODE" = "400" ] && echo 1 || echo 0)"
+
+# 5.3 正常申购（agreed=true）
+do_call POST "$EARN/api/v1/earn/subscribe" "$EARN_USER_TOKEN" '{"product_id":1,"amount":100,"agreed":true}'
+check "earn subscribe -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+SUB_ID="$(extract_id "$RESP_BODY")"
+
+# 5.4 活期立即赎回（本金+≈0 收益回账）
+do_call POST "$EARN/api/v1/earn/subscriptions/$SUB_ID/redeem" "$EARN_USER_TOKEN" '{}'
+check "earn redeem flexible -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 5.5 Launchpool 项目列表（含推导状态 ongoing + 池）
+do_call GET "$EARN/api/v1/launchpad/projects" "$EARN_USER_TOKEN" ""
+check "launchpad list projects -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+LP_ID="$(echo "$RESP_BODY" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin).get("data",{}).get("projects",[]); print(d[0]["id"] if d else "")
+except Exception:
+    print("")')"
+
+# 5.6 质押进 USDT 池（服务启动已由 uid=1 预充 NEW 奖励预算）
+STAKE_BODY="$(printf '{"project_id":%s,"pool_id":"usdt","amount":500}' "$LP_ID")"
+do_call POST "$EARN/api/v1/launchpad/stake" "$EARN_USER_TOKEN" "$STAKE_BODY"
+check "launchpad stake -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+POS_ID="$(extract_id "$RESP_BODY")"
+
+# 5.7 无奖励可领时 harvest 被拒（40x）
+HV_BODY="$(printf '{"position_id":%s}' "$POS_ID")"
+do_call POST "$EARN/api/v1/launchpad/harvest" "$EARN_USER_TOKEN" "$HV_BODY"
+check "launchpad harvest empty -> 400" "$([ "$RESP_CODE" != "200" ] && echo 1 || echo 0)"
+
+# 5.8 全额解押
+UN_BODY="$(printf '{"position_id":%s,"amount":0}' "$POS_ID")"
+do_call POST "$EARN/api/v1/launchpad/unstake" "$EARN_USER_TOKEN" "$UN_BODY"
+check "launchpad unstake all -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 
 echo "========================================="
 if [ "$FAILED" -eq 0 ]; then
