@@ -731,3 +731,40 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - **修复真实 bug（跨服务 market 字段丢失）**：spot 下单经 `matching` HTTP `/order` 时，`matching` 客户端 `Submit` 与 `/order` handler 均未传输 `Market` 字段，导致撮合引擎存储的订单 `market=""`，spot `GET /orders` 按 `v.Market != "spot"` 过滤时把全部订单丢弃——用户查不到自己任何现货订单。已修复：客户端 `Submit` 增加 `"market": o.Market`，`/order` handler 读取并写入 `o.Market`。该 bug 由二进制集成脚本（真实链路）首次暴露，in-process e2e 因使用假下游未能覆盖。
 
 > 验证：`go build ./...`、`go vet`、`go test ./internal/matching/... ./internal/spot/... ./internal/bot/... ./internal/copytrade/... ./e2e/...` 全绿；`bash scripts/integration.sh` 全流程 ALL PASS。
+
+## 32. 现货资金安全闭环：账本快照持久化 + openOrders 对账重建 + 停机补账（2026-08-25，已完成）
+
+闭合 §19/审计指出的现货资金安全缺口：撮合引擎有独立快照/WAL（§17），重启后旧挂单仍在簿；
+而 spot 侧账本为进程内内存、openOrders 冻结登记不重建——僵尸单成交走「无冻结记录→纯转账」
+分支，从重置后的种子余额划转（账实脱钩）。
+
+### 改动
+
+1. **账本快照持久化**（`cmd/spot/main.go`，镜像 §18 futures 方案）：
+   - 启动时 `LoadSnapshotFromMySQL(dsn, "spot")` → `Restore`；库无快照/加载失败回退种子充值；
+   - defer + SIGINT/SIGTERM 双路 `SaveToMySQL(dsn, "spot")`，余额/冻结跨重启保留；
+   - `SetIdempotencyDB(db, "spot")` 接线（此前仅 futures 有），转账指纹跨进程防双付。
+2. **openOrders 对账重建**（`internal/spot/store.go` `RestoreOrders` 重写）：
+   - 新增三态查询 `matching.Client.OrderState`：known(200) / not-found(404) / unreachable(err)，
+     区分「订单已终结」与「撮合暂时不可达」；
+   - open/partial → 正常重建冻结登记与 clientOIDMap；
+   - 终态或撮合不认识 → 释放残留冻结 + 删除持久化记录 + 清理幂等键（杜绝僵尸冻结）；
+   - 撮合不可达 → **保守保留**冻结登记（不误释放，用户撤单可自愈，reconcile 可发现）。
+3. **停机补账**（`internal/spot/server.go` `CatchUpSettlement` + `Client.RecentTrades`）：
+   - 重启后拉取各交易对最近 1000 笔全市场公开成交按时间正序重放 `settleFill`，
+     弥补 WS 成交事件丢失导致的经济漏记（在簿已成交、资金未划转）；
+   - 防双付三重保障：settledRefs 内存去重 + 账本 ref 指纹持久化跳过 + Batch 原子性；
+   - **调用顺序约束（关键）**：必须先于 RestoreOrders——此刻 openOrders 尚空，settleFill
+     走纯转账分支、所有操作携带成交 ref 受指纹保护；若先恢复冻结登记再重放，旧成交的
+     Unfreeze 无 ref 不受指纹保护会二次解冻。幂等库不可用时跳过补账并告警。
+
+### 测试
+
+- `internal/spot/restore_test.go` ×6：open 单重建 / 终态单释放冻结（账平校验）/ 撮合不可达
+  保守保留 / 补账一次结清且重放不双付 / 合约成交不参与补账 / 恢复单后续成交正确递减；
+- fakeMatcher 扩展 `OrderState`（含 unreachable 开关）/ `RecentTrades`（symbol 过滤保真）；
+- 既有 `TestRestoreOrdersRebuildsClientOIDMap` 适配新对账语义。
+
+> 验证：`go build ./...` 通过；`go test ./...` 34 包全绿。已知边界：停机窗口超过
+> RecentTrades 回看深度时更早漏结依赖 `/spot/admin/reconcile` 告警人工介入；NewServer 的
+> Watch 订阅先于恢复流程启动，极端竞态下早到成交走纯转账分支（幂等安全，仅登记滞后）。
