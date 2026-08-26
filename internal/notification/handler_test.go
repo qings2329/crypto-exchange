@@ -780,3 +780,54 @@ func TestUserNotificationContract(t *testing.T) {
 func itoa64(v float64) string {
 	return strings.TrimSpace(strconv.FormatInt(int64(v), 10))
 }
+
+// TestLevelOfNewTypes LevelOf 映射验证（§37 业务事件→通知）。
+func TestLevelOfNewTypes(t *testing.T) {
+	tests := []struct{ typ, want string }{
+		{TypeLiquidation, "critical"},
+		{TypeMarginWarning, "warning"},
+		{TypeRiskAlert, "critical"},
+		{TypeKYCRejected, "warning"},
+		{TypeSystem, "info"},
+	}
+	for _, tt := range tests {
+		if got := LevelOf(tt.typ); got != tt.want {
+			t.Errorf("LevelOf(%s) = %s, want %s", tt.typ, got, tt.want)
+		}
+	}
+}
+
+// TestNewNotificationTypesPublished 新类型通知：强平(critical)与保证金预警(warning)（§37）。
+// 直接走 Service 层（与 HTTP 契约测试解耦），验证类型合法且 level 投影正确。
+func TestNewNotificationTypesPublished(t *testing.T) {
+	svc := New(NewMemStore())
+	for _, typ := range []string{TypeLiquidation, TypeMarginWarning} {
+		if _, err := svc.Publish(PublishInput{
+			UserID: 101,
+			Type:   typ,
+			Title:  "t",
+			Body:   "b",
+		}); err != nil {
+			t.Fatalf("publish %s: %v", typ, err)
+		}
+	}
+	ns, err := svc.List(101, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ns) != 2 {
+		t.Fatalf("expected 2 notifications, got %d", len(ns))
+	}
+	for _, n := range ns {
+		var want string
+		switch n.Type {
+		case TypeLiquidation:
+			want = "critical"
+		case TypeMarginWarning:
+			want = "warning"
+		}
+		if got := LevelOf(n.Type); got != want {
+			t.Fatalf("type %s level mismatch: got %s want %s", n.Type, got, want)
+		}
+	}
+}

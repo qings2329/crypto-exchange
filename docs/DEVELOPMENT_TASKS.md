@@ -913,3 +913,62 @@ TP-SL（止盈/止损）订单在 `Server.tpsl` 内存 map 中存储，进程重
     新 Server 实例共用同一 store（模拟重启）→ decorateWithTPSL 恢复验证。
 
 > 验证：`go test ./...` 35 包全绿。
+
+---
+
+## 37. 业务事件→通知：强平与保证金预警写入站内信（2026-08-26，已完成）
+
+闭合「合约强平/逼近爆仓仅留 WS 广播、不入用户通知中心」的缺口：用户强平时无站内信、
+无 app 推送入口，安全事件不可见。
+
+### 改动
+
+1. **通知类型扩展**（`internal/notification/model.go`）：
+   - 新增 `TypeLiquidation = "liquidation"`（强平）、`TypeMarginWarning = "margin_warning"`（保证金预警）；
+   - `LevelOf` 映射：liquidation→critical、margin_warning→warning（与 risk_alert 同级 critical、kyc_rejected 同级 warning 一致）；
+   - `validType` 同步放行两类型（未知类型仍降级为 system，不阻塞调用方）。
+2. **futuresapi 接入通知服务**（`internal/futuresapi/server.go`）：
+   - Server 新增 `notifSvc *notification.Service`（内存 store，重启清空已读状态，不影响内容）+ `marginWarned map` 去重；
+   - `NewServer` 内初始化（与风险/账本同进程，无需跨服务 RPC）；
+   - `broadcastLiquidations` 在 WS 广播的同时调用 `publishLiquidationNotice`，向被强平用户推送站内信（部分/全额强平分标题，body 含标的/方向/强平价/手续费/实现盈亏）；
+   - 新增 `emitMarginWarnings` + 常量 `MarginWarnRatio=1.2`：liqScanLoop 每轮扫描所有仓位，
+     逐仓按 `(margin+UPNL)/notional`、全仓按 `mark/liqPrice`（多）或 `liqPrice/mark`（空）推算保证金率，
+     低于阈值且未在 `marginWarned` 去重集合中时发送「保证金不足预警」站内信（每 user+symbol 仅一次，避免震荡期骚扰）。
+3. **copytrade 自动跟单（已具备，本次验证）**：`cmd/copytrade/main.go` 经 Kafka `exchange.trades` 订阅
+   驱动 `svc.OnTrade`；本次确认链路完整（已有 26+ handler_test 覆盖 API、service_test 覆盖复制逻辑）。
+
+### 测试
+
+- `internal/notification/handler_test.go`：+`TestLevelOfNewTypes`（映射）、+`TestNewNotificationTypesPublished`（两类型经 Publish 落库且 level 正确）；
+- `internal/futuresapi/notify_test.go`：+`TestLiquidationNoticePublished`（全额/部分强平标题与落库）、+`TestMarginWarningEmitted`（逼近爆仓触发预警、内存去重、重置后可恢复）。
+
+> 验证：`go test ./...` 35 包全绿；`go vet` 通过。
+
+---
+
+## 38. 推荐防刷：新用户冷却期 + 自邀请拒绝（2026-08-26，已完成）
+
+闭合「推荐佣金可被注册即刷量」的缺口：原实现仅结算层校验 `referrer==taker` 自交易，
+未限制被邀请人注册后立刻自买自卖刷佣金，也无冷却窗口。
+
+### 改动
+
+1. **冷却期**（`internal/referral/hook.go`）：
+   - `HookAdapter` 新增 `cooldownDays int` + `now func() time.Time`（可注入）；
+   - `NewHookAdapterWithCooldown(userStore, svc, rate, cooldownDays)` 构造器；
+   - `RecordTradeFee` 在结算层佣金落账前检查被邀请人 `CreatedAt`：若 `now-CreatedAt < cooldownDays*24h` 则跳过（不计佣金）；
+   - 默认 `DefaultCooldownDays = 7`，`NewHookAdapter` 包装沿用默认；`cmd/settlement/main.go` 调用不变。
+2. **自邀请拒绝**（`internal/referral/hook.go`）：保留 `referrer==taker` 直接报错（`fmt.Errorf("referrer cannot be taker")`），
+   与原有 settlement 层防自交易一致；注册层 `user.Service.Register` 已按 referral_code 查邀请人，
+   自引用在 DB 层天然不可能（自身 code 注册时方生成）。
+
+### 测试
+
+- `internal/referral/hook_test.go`：+`TestReferralCooldown`：
+  - 注册 1h 的 taker 在 7 天冷却期内不计佣金（0 条）；
+  - 注册 30 天的 taker 正常计入（1 条）；
+  - `cooldownDays=0` 关闭冷却后刚注册用户也计入（1 条）；
+  - 自邀请（referrer==taker）返回错误且 0 条佣金（原有规则保留）。
+  - 配套 `fakeUserStore`（实现 user.Store 全接口最小内存）、`fakeCommissionStore`。
+
+> 验证：`go test ./...` 35 包全绿；`go vet` 通过。

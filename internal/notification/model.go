@@ -13,6 +13,9 @@ const (
 	TypeDepositArrived = "deposit_arrived"
 	TypeWithdrawDone  = "withdraw_done"
 	TypeSystem        = "system"
+	// 合约业务事件（§37 业务事件→通知）。
+	TypeLiquidation   = "liquidation"   // 强平通知
+	TypeMarginWarning = "margin_warning" // 保证金预警（仓位接近强平价）
 )
 
 // 通知状态。
@@ -38,7 +41,8 @@ type Notification struct {
 // validType 校验通知类型是否已知（未知类型也允许写入，避免阻塞调用方）。
 func validType(t string) bool {
 	switch t {
-	case TypeKYCAproved, TypeKYCRejected, TypeRiskAlert, TypeDepositArrived, TypeWithdrawDone, TypeSystem:
+	case TypeKYCAproved, TypeKYCRejected, TypeRiskAlert, TypeDepositArrived, TypeWithdrawDone, TypeSystem,
+		TypeLiquidation, TypeMarginWarning:
 		return true
 	default:
 		return false
@@ -57,9 +61,9 @@ type PublishInput struct {
 // 前端 UserNotification.level 取值见 crypto-exchange-web/src/api/client.ts。
 func LevelOf(t string) string {
 	switch t {
-	case TypeRiskAlert:
+	case TypeRiskAlert, TypeLiquidation:
 		return "critical"
-	case TypeKYCRejected:
+	case TypeKYCRejected, TypeMarginWarning:
 		return "warning"
 	default:
 		return "info"

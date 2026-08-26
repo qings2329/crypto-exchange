@@ -177,7 +177,7 @@ func (s *Service) Register(target, password, code, referralCode string) (int64, 
 	} else {
 		return 0, ErrInvalidAccount
 	}
-	// 处理邀请码：查找邀请人并关联
+	// 处理邀请码：查找邀请人并关联（§38：自引用检查见 settlement 层 hook）。
 	if referralCode != "" {
 		referrer, err := s.store.GetByReferralCode(referralCode)
 		if err == nil && referrer.ID != 0 {

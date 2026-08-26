@@ -29,6 +29,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/risk"
@@ -81,6 +82,12 @@ type Server struct {
 	tpslMu    sync.Mutex
 	tpsl      map[int64]map[string]TPState
 	tpslStore TPSLStore
+
+	// 通知服务（§37 业务事件→通知）：强平/保证金预警等业务事件写入站内信。
+	// 内存存储，重启后已读状态丢失，不影响通知内容。
+	notifSvc        *notification.Service
+	marginWarned    map[string]bool // "uid:symbol" → 已预警（防止重复发送）
+	marginWarnedMu  sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -165,6 +172,10 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	} else {
 		log.Warn("tpsl load failed, starting empty", zap.Error(lErr))
 	}
+
+	// §37 业务事件→通知：初始化通知服务（内存存储，重启清空）。
+	s.notifSvc = notification.New(notification.NewMemStore())
+	s.marginWarned = make(map[string]bool)
 
 	// 指数价预言机：优先使用配置中的真实 REST 喂价（oracle.NewFromConfig）；
 	// 未配置喂价源时回退到内置 StaticFeed 演示（模拟多交易所价差）。
@@ -623,12 +634,71 @@ func (s *Server) liqScanLoop() {
 				if evs := s.liquidator.UpdateMarkPrice(sym, mark); len(evs) > 0 {
 					s.broadcastLiquidations(evs)
 				}
+				// §37 保证金预警：扫描所有仓位，标记价接近强平价时发送预警通知。
+				s.emitMarginWarnings(sym, mark)
 			}
 		}
 	}
 }
 
-// broadcastLiquidations 广播强平事件（onTrade 与 liqScanLoop 共用）：记录审计日志并推送 WS。
+// MarginWarnRatio 保证金预警阈值：保证金率低于此值时触发预警通知（如 1.2 = 保证金率 120%）。
+// 略高于 SafeMarginRatio(1.1)，为用户留出反应时间。
+const MarginWarnRatio = 1.2
+
+// emitMarginWarnings 扫描所有仓位，对保证金率低于预警阈值的仓位发送站内通知。
+// 每个 (user, symbol) 组合仅预警一次（内存去重），防止行情震荡期重复打扰。
+func (s *Server) emitMarginWarnings(symbol string, mark float64) {
+	if s.notifSvc == nil || mark <= 0 {
+		return
+	}
+	positions := s.liquidator.AllPositions(symbol)
+	for _, p := range positions {
+		if p.Size <= 0 {
+			continue
+		}
+		var marginRatio float64
+		if p.Mode == futures.Isolated {
+			// 逐仓：marginRatio = (margin + UPNL) / notional
+			upnl := p.UPNL(mark)
+			notional := p.Notional(mark)
+			if notional > 0 {
+				marginRatio = (p.Margin + upnl) / notional
+			}
+		} else {
+			// 全仓：用强平价近似推导保证金率
+			// mark 接近强平价 → 保证金率低
+			if p.LiqPriceVal > 0 && mark > 0 {
+				if p.Side == futures.Long {
+					marginRatio = mark / p.LiqPriceVal
+				} else {
+					marginRatio = p.LiqPriceVal / mark
+				}
+			}
+		}
+		if marginRatio <= 0 || marginRatio >= MarginWarnRatio {
+			continue
+		}
+		key := fmt.Sprintf("%d:%s", p.UserID, symbol)
+		s.marginWarnedMu.Lock()
+		if s.marginWarned[key] {
+			s.marginWarnedMu.Unlock()
+			continue
+		}
+		s.marginWarned[key] = true
+		s.marginWarnedMu.Unlock()
+
+		sideStr := sideName(p.Side)
+		s.notifSvc.Publish(notification.PublishInput{
+			UserID: p.UserID,
+			Type:   notification.TypeMarginWarning,
+			Title:  "保证金不足预警",
+			Body: fmt.Sprintf("您的 %s %s 仓位保证金率 %.1f%%，接近强平价 %.2f，请及时追加保证金",
+				symbol, sideStr, marginRatio*100, p.LiqPriceVal),
+		})
+	}
+}
+
+// broadcastLiquidations 广播强平事件（onTrade 与 liqScanLoop 共用）：记录审计日志、推送 WS 并发送站内通知。
 func (s *Server) broadcastLiquidations(evs []futures.LiquidationEvent) {
 	for _, ev := range evs {
 		s.log.Warn("liquidation",
@@ -638,7 +708,34 @@ func (s *Server) broadcastLiquidations(evs []futures.LiquidationEvent) {
 			zap.Float64("fee", ev.Fee),
 			zap.Bool("partial", ev.Partial))
 		s.hub.Broadcast(ev.Symbol, ginH{"type": "liquidation", "data": ev})
+		// §37 强平站内通知：写入用户通知中心。
+		s.publishLiquidationNotice(ev)
 	}
+}
+
+// publishLiquidationNotice 向被强平用户发送站内通知（§37 业务事件→通知）。
+// 部分强平与全额强平分别标题，body 含标的/方向/强平价/手续费等关键风控信息。
+func (s *Server) publishLiquidationNotice(ev futures.LiquidationEvent) {
+	if s.notifSvc == nil {
+		return
+	}
+	title := "合约仓位被强平"
+	body := fmt.Sprintf("您的 %s %s 仓位已被强制平仓", ev.Symbol, sideName(ev.Side))
+	if ev.Partial {
+		title = "合约仓位部分强平"
+		body = fmt.Sprintf("您的 %s %s 仓位已被部分强平（平仓 %.4f，剩余 %.4f）",
+			ev.Symbol, sideName(ev.Side), ev.Size, ev.RemainingSize)
+	}
+	body += fmt.Sprintf("。标记价 %.2f，强平手续费 %.4f USDT", ev.LiqPrice, ev.Fee)
+	if ev.Realized != 0 {
+		body += fmt.Sprintf("，实现盈亏 %.2f USDT", ev.Realized)
+	}
+	s.notifSvc.Publish(notification.PublishInput{
+		UserID: ev.UserID,
+		Type:   notification.TypeLiquidation,
+		Title:  title,
+		Body:   body,
+	})
 }
 
 // fundingLoop 周期性对所有持仓结算一次资金费用（标记价 + 溢价 EMA + 持仓，净额零和转账）。
