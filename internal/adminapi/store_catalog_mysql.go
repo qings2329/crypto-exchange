@@ -9,12 +9,14 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 )
 
-// 管理配置（Catalog）模块迁移版本号（错开其他模块；9101-9104 全局唯一）。
+// 管理配置（Catalog）模块迁移版本号。
+// 注意：必须错开 user 模块的 9101-9113（含其 DSN 默认共享同一 ce_schema_migrations 版本表），
+// 否则 user 先落版本会导致 catalog 建表迁移被跳过、回退内存存储。故使用 9301-9304。
 const (
-	catalogMigVerSymbols      = 9101
-	catalogMigVerChains       = 9102
-	catalogMigVerCoins        = 9103
-	catalogMigVerNotifications = 9104
+	catalogMigVerSymbols      = 9301
+	catalogMigVerChains       = 9302
+	catalogMigVerCoins        = 9303
+	catalogMigVerNotifications = 9304
 )
 
 // CatalogMigrations 是 Catalog 模块的建表迁移，运行时由 NewMySQLCatalogStore 应用。
