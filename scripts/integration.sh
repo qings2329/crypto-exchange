@@ -14,6 +14,13 @@
 #      管理员触发一次奖励归集（accrue），链上待领奖励计入平台对用户欠付的 SysStakingReward
 #      负债；并验证解质押→释放把本金（及累计奖励）原子归还用户账本（F3）。
 #   4) 借贷（lending）：用户存款→借款→管理员计息→还款→提款，全流程复式记账，验证资金闭环（F3）。
+#   5) 安全中心（user）：创建 API Key、登录历史、会话列表、防钓鱼码读写（新端点覆盖）。
+#   6) 通知中心（notification）：未读列表 / 未读数 / 全部已读（新端点覆盖，内存模式验证鉴权与接通）。
+#
+# 鉴权 token 由本脚本用「共享开发密钥」本地签发（与 TokenVerifier.HMAC-SHA256 完全一致），
+# 与线上各服务本地校验 token 的方式一致。user / notification 服务亦在本脚本中启动（内存模式），
+# 仅为覆盖安全中心与通知中心端点；其通知生产与消费为两个独立内存实例，故流程 6 仅验证端点接通与鉴权，
+# 跨服务通知往返由 e2e_test.go（共享 notification.Service 实例）强校验。
 #
 # 鉴权 token 由本脚本用「共享开发密钥」本地签发（与 TokenVerifier.HMAC-SHA256 完全一致），
 # 与线上各服务本地校验 token 的方式一致——因此无需 user 服务往返（user 不参与资金流）。
@@ -185,12 +192,14 @@ COPY_PORT="$(free_port)"
 STAKE_PORT="$(free_port)"
 LEND_PORT="$(free_port)"
 EARN_PORT="$(free_port)"
+USER_PORT="$(free_port)"
+NOTIF_PORT="$(free_port)"
 CFG_TMP="$(mktemp /tmp/ce-int-config.XXXX.yaml)"
 make_config "$CONFIG" "$CFG_TMP" "$MATCH_PORT"
 
 # ---- build binaries ----
 echo "== building binaries (go) =="
-for svc in matching spot bot copytrade staking lending earn; do
+for svc in matching spot bot copytrade staking lending earn user notification; do
   echo "  building $svc ..."
   if ! go build -o "$BIN/$svc" "./cmd/$svc"; then
     echo "  [FAIL] build $svc"; FAILED=1; exit 1
@@ -198,7 +207,7 @@ for svc in matching spot bot copytrade staking lending earn; do
 done
 
 # ---- launch services（内存模式 + 空闲端口）----
-echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT stake=$STAKE_PORT lend=$LEND_PORT) =="
+echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT stake=$STAKE_PORT lend=$LEND_PORT user=$USER_PORT notif=$NOTIF_PORT) =="
 "$BIN/matching"  --config "$CFG_TMP" --mysql-dsn "" --addr ":$MATCH_PORT" >"$LOGDIR/matching.log"  2>&1 & PIDS+=($!)
 "$BIN/spot"      --config "$CFG_TMP" --mysql-dsn "" --addr ":$SPOT_PORT" >"$LOGDIR/spot.log"       2>&1 & PIDS+=($!)
 "$BIN/bot"       --config "$CFG_TMP" --mysql-dsn "" --addr ":$BOT_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/bot.log" 2>&1 & PIDS+=($!)
@@ -206,6 +215,8 @@ echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_P
 "$BIN/staking"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$STAKE_PORT" >"$LOGDIR/staking.log"   2>&1 & PIDS+=($!)
 "$BIN/lending"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$LEND_PORT" >"$LOGDIR/lending.log"   2>&1 & PIDS+=($!)
 "$BIN/earn"      --config "$CFG_TMP" --mysql-dsn "" --addr ":$EARN_PORT" >"$LOGDIR/earn.log"      2>&1 & PIDS+=($!)
+"$BIN/user"       --config "$CFG_TMP" --addr ":$USER_PORT" >"$LOGDIR/user.log"        2>&1 & PIDS+=($!)
+"$BIN/notification" --config "$CFG_TMP" --addr ":$NOTIF_PORT" >"$LOGDIR/notification.log" 2>&1 & PIDS+=($!)
 
 wait_for "http://127.0.0.1:$MATCH_PORT/health"                 "matching"  || FAILED=1
 wait_for_match_leader "http://127.0.0.1:$MATCH_PORT/health"     "matching"  || FAILED=1
@@ -215,6 +226,8 @@ wait_for "http://127.0.0.1:$COPY_PORT/api/v1/copytrade/leads"  "copytrade" || FA
 wait_for "http://127.0.0.1:$STAKE_PORT/api/v1/staking/products" "staking"  || FAILED=1
 wait_for "http://127.0.0.1:$LEND_PORT/api/v1/lending/pools"    "lending"   || FAILED=1
 wait_for "http://127.0.0.1:$EARN_PORT/api/v1/earn/products"    "earn"      || FAILED=1
+wait_for "http://127.0.0.1:$USER_PORT/api/v1/user/login-history" "user"     || FAILED=1
+wait_for "http://127.0.0.1:$NOTIF_PORT/api/v1/user/notifications" "notification" || FAILED=1
 [ "$FAILED" -ne 0 ] && { echo "services failed to start"; exit 1; }
 
 SPOT="http://127.0.0.1:$SPOT_PORT"
@@ -223,6 +236,8 @@ COPY="http://127.0.0.1:$COPY_PORT"
 STAKE="http://127.0.0.1:$STAKE_PORT"
 LEND="http://127.0.0.1:$LEND_PORT"
 EARN="http://127.0.0.1:$EARN_PORT"
+USER="http://127.0.0.1:$USER_PORT"
+NOTIF="http://127.0.0.1:$NOTIF_PORT"
 
 # tokens: 共享开发密钥本地签发
 ADMIN_TOKEN="$(mint_token 999 admin)"
@@ -230,6 +245,7 @@ BOT_USER_TOKEN="$(mint_token 2 user)"   # spot 内存账本预置 1-4 余额
 LEAD_TOKEN="$(mint_token 3 user)"       # 创建 lead
 FOLLOWER_TOKEN="$(mint_token 4 user)"   # 承接复制单（spot 内存账本有余额）
 STAKE_USER_TOKEN="$(mint_token 1 user)" # staking 内存账本预置 1-4 余额（uid=1 有 10 ETH）
+USER_TOKEN="$(mint_token 1 user)"       # 安全中心 / 通知中心（user 与 notification 服务共用）
 
 # ================= 流程 1：bot → spot =================
 echo "== flow 1: bot -> spot (F4 身份边界) =="
@@ -443,6 +459,47 @@ check "launchpad harvest empty -> 400" "$([ "$RESP_CODE" != "200" ] && echo 1 ||
 UN_BODY="$(printf '{"position_id":%s,"amount":0}' "$POS_ID")"
 do_call POST "$EARN/api/v1/launchpad/unstake" "$EARN_USER_TOKEN" "$UN_BODY"
 check "launchpad unstake all -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# ================= 流程 6：安全中心 + 通知中心（新模块端点覆盖）=================
+echo "== flow 6: user security-center + notification center (新端点覆盖) =="
+
+# 6.1 安全中心：创建 API Key（用户服务内闭环）
+do_call POST "$USER/api/v1/user/api-keys" "$USER_TOKEN" '{"label":"it-key","permissions":["read","trade"]}'
+check "security: create api-key -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+APIKEY_ID="$(echo "$RESP_BODY" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print(d.get("data",{}).get("api_key",{}).get("id",""))
+except Exception:
+    print("")')"
+check "security: api-key id parsed" "$([ -n "$APIKEY_ID" ] && echo 1 || echo 0)"
+
+# 6.2 安全中心：登录历史（注册/创建 key 等会留下审计记录；至少能列出）
+do_call GET "$USER/api/v1/user/login-history" "$USER_TOKEN" ""
+check "security: login-history -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.3 安全中心：会话列表
+do_call GET "$USER/api/v1/user/sessions" "$USER_TOKEN" ""
+check "security: sessions -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.4 安全中心：防钓鱼码读取（初始应返回空或默认）
+do_call GET "$USER/api/v1/user/anti-phishing" "$USER_TOKEN" ""
+check "security: anti-phishing get -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.5 安全中心：设置防钓鱼码
+do_call POST "$USER/api/v1/user/anti-phishing" "$USER_TOKEN" '{"code":"CE-INTEG"}'
+check "security: anti-phishing set -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.6 通知中心：未读列表（内存模式初始为空，验证端点接通 + 鉴权）
+do_call GET "$NOTIF/api/v1/user/notifications" "$USER_TOKEN" ""
+check "notification: list -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.7 通知中心：未读数
+do_call GET "$NOTIF/api/v1/user/notifications/unread-count" "$USER_TOKEN" ""
+check "notification: unread-count -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.8 通知中心：全部已读（空操作不应报错）
+do_call POST "$NOTIF/api/v1/user/notifications/read-all" "$USER_TOKEN" ""
+check "notification: read-all -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 
 echo "========================================="
 if [ "$FAILED" -eq 0 ]; then

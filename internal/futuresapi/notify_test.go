@@ -6,6 +6,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/futures"
 	"github.com/coldlar/crypto-exchange/internal/notification"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // TestLiquidationNoticePublished 验证 §37 强平事件写入用户站内通知。
@@ -97,5 +98,66 @@ func TestMarginWarningEmitted(t *testing.T) {
 	ns3, _ := s.notifSvc.List(1, false, 10)
 	if len(ns3) != 2 {
 		t.Fatalf("expected 2 after dedupe reset, got %d", len(ns3))
+	}
+}
+
+// TestDepositNoticePublished 验证 §37 链上充值到账写入用户站内通知。
+func TestDepositNoticePublished(t *testing.T) {
+	s := newGapServer(t)
+	s.notifSvc = notification.New(notification.NewMemStore())
+
+	ev := settlement.DepositEvent{
+		UserID:  7,
+		Chain:   "ETH",
+		Asset:   "ETH",
+		Amount:  settlement.AssetAmountFromFloat(1.0, 18),
+		TxHash:  "0xdepositabc",
+		Address: "0xaddr",
+	}
+	s.publishDepositNotice(ev)
+
+	ns, err := s.notifSvc.List(7, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ns) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(ns))
+	}
+	if ns[0].Type != notification.TypeDepositArrived {
+		t.Fatalf("expected deposit_arrived type, got %s", ns[0].Type)
+	}
+	if ns[0].Title != "充值到账" {
+		t.Fatalf("unexpected title: %s", ns[0].Title)
+	}
+}
+
+// TestWithdrawNoticePublished 验证 §37 链上提现完成写入用户站内通知。
+func TestWithdrawNoticePublished(t *testing.T) {
+	s := newGapServer(t)
+	s.notifSvc = notification.New(notification.NewMemStore())
+
+	ev := settlement.WithdrawEvent{
+		UserID:  8,
+		Chain:   "ETH",
+		Asset:   "USDT",
+		Amount:  settlement.AssetAmountFromFloat(100.0, 6),
+		Fee:     settlement.AssetAmountFromFloat(1.0, 6),
+		TxHash:  "0xwithdrawxyz",
+		Status:  settlement.WithdrawCredited,
+	}
+	s.publishWithdrawNotice(ev)
+
+	ns, err := s.notifSvc.List(8, false, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ns) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(ns))
+	}
+	if ns[0].Type != notification.TypeWithdrawDone {
+		t.Fatalf("expected withdraw_done type, got %s", ns[0].Type)
+	}
+	if ns[0].Title != "提现已完成" {
+		t.Fatalf("unexpected title: %s", ns[0].Title)
 	}
 }

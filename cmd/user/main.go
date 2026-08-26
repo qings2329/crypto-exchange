@@ -1,12 +1,14 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/announcement"
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -15,6 +17,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
+	addr := flag.String("addr", ":8081", "listen address")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -37,7 +40,7 @@ func main() {
 	}
 
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
-	svc := user.NewService(store, verifier, user.NewLogNotifier(), user.Config{})
+	svc := user.NewService(store, verifier, user.NewLogNotifier(), newUserNotifSvc(cfg.MySQL.DSN, log), user.Config{})
 	h := user.NewHandler(svc, verifier)
 
 	// 公告模块：与用户模块共用同一数据库（同一份 ce_schema_migrations，版本号已错开）。
@@ -64,9 +67,26 @@ func main() {
 	h.Register(r)
 	aH.Register(r, verifier)
 
-	addr := ":8081"
-	log.Info("user service starting", zap.String("addr", addr))
-	if err := cfg.Listen(r, addr); err != nil {
+	log.Info("user service starting", zap.String("addr", *addr))
+	if err := cfg.Listen(r, *addr); err != nil {
 		log.Fatal("server exited", zap.Error(err))
 	}
+}
+
+// newUserNotifSvc 构造通知服务：优先 MySQL（持久化站内信），失败降级内存。
+func newUserNotifSvc(dsn string, log *zap.Logger) *notification.Service {
+	if dsn != "" {
+		db, err := sql.Open("mysql", dsn)
+		if err == nil {
+			store, merr := notification.NewMySQLStore(db)
+			if merr == nil {
+				return notification.New(store)
+			}
+			log.Warn("user: notification mysql migrate failed, fallback to in-memory", zap.Error(merr))
+			_ = db.Close()
+		} else {
+			log.Warn("user: notification mysql open failed, fallback to in-memory", zap.Error(err))
+		}
+	}
+	return notification.New(notification.NewMemStore())
 }

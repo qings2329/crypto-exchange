@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 )
 
@@ -51,18 +52,20 @@ func (c Config) withDefaults() Config {
 
 // Service 实现账户体系业务（注册/登录/验证码/找回/2FA/KYC）。
 type Service struct {
-	store    Store
-	verifier *middleware.TokenVerifier
-	notifier Notifier
-	cfg      Config
+	store     Store
+	verifier  *middleware.TokenVerifier
+	notifier  Notifier
+	notifSvc  *notification.Service // 业务事件→通知中心（强平/预警/审核结果等）
+	cfg       Config
 }
 
-// NewService 构造用户服务。
-func NewService(store Store, verifier *middleware.TokenVerifier, notifier Notifier, cfg Config) *Service {
+// NewService 构造用户服务。notifSvc 可为 nil（不推送站内信）。
+func NewService(store Store, verifier *middleware.TokenVerifier, notifier Notifier, notifSvc *notification.Service, cfg Config) *Service {
 	return &Service{
 		store:    store,
 		verifier: verifier,
 		notifier: notifier,
+		notifSvc: notifSvc,
 		cfg:      cfg.withDefaults(),
 	}
 }
@@ -491,7 +494,26 @@ func (s *Service) ReviewKYC(userID int64, approve bool, rejectReason, reviewer s
 	if err := s.store.UpdateKYC(sub); err != nil {
 		return err
 	}
-	return s.store.UpdateUser(u)
+	if err := s.store.UpdateUser(u); err != nil {
+		return err
+	}
+	// 业务事件：KYC 审核结果写入通知中心
+	typ, title, body := notification.TypeKYCAproved, "KYC 认证通过", "您的 KYC 认证已通过，账户等级已提升。"
+	if !approve {
+		typ, title = notification.TypeKYCRejected, "KYC 认证被驳回"
+		body = rejectReason
+	}
+	if s.notifSvc != nil {
+		if _, perr := s.notifSvc.Publish(notification.PublishInput{
+			UserID: userID,
+			Type:   typ,
+			Title:  title,
+			Body:   body,
+		}); perr != nil {
+			return fmt.Errorf("publish kyc notification: %w", perr)
+		}
+	}
+	return nil
 }
 
 // GetProfile 取回用户档案与 KYC 状态。

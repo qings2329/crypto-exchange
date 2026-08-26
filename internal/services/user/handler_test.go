@@ -20,7 +20,7 @@ func newTestHandler(t *testing.T) (*gin.Engine, *user.Service) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	store := user.NewMemStore()
-	svc := user.NewService(store, testVerifier, user.NewLogNotifier(), user.Config{})
+	svc := user.NewService(store, testVerifier, user.NewLogNotifier(), nil, user.Config{})
 	h := user.NewHandler(svc, testVerifier)
 	r := gin.New()
 	h.Register(r)

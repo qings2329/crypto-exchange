@@ -170,7 +170,7 @@ func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Tim
 	// 利息整数化（#47）：直接按定点整数运算，避免 Principal.HumanFloat() 的 float 精度丢失与每期尾差累积。
 	delta := h.YieldToAmount(now, p.AnnualRate, dec)
 	if delta.Sign() > 0 {
-		ref := fmt.Sprintf("wealth_accrue product=%d holding=%d", p.ID, h.ID)
+		ref := fmt.Sprintf("wealth_accrue product=%d holding=%d t=%d", p.ID, h.ID, now.Unix())
 		if err := s.ledger.Transfer(ledger.SysWealth, ledger.SysWealthYieldPayable, p.Asset, delta, "wealth_accrue", ref); err != nil {
 			if s.log != nil {
 				s.log.Error("wealth accrue: move yield failed", zap.Int64("user_id", h.UserID), zap.String("asset", p.Asset), zap.Error(err))

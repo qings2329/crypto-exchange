@@ -260,7 +260,7 @@ func TestWealthAccrueMovesYieldToPayable(t *testing.T) {
 
 // TestWealthAccrueIntegerExact #47：利息整数化——按定点整数运算，增量计息精确累加、无浮点尾差。
 func TestWealthAccrueIntegerExact(t *testing.T) {
-	svc, _ := newTestService()
+	svc, l := newTestService()
 	p := mustProduct(svc, TypeCurrent, 0.876, 0, 100) // 876% 年化 => 1% 每小时
 	store := svc.store
 	base := time.Now()
@@ -285,5 +285,14 @@ func TestWealthAccrueIntegerExact(t *testing.T) {
 	got, _ = store.GetHolding(h.ID)
 	if !eqAmt(got.AccruedYield, 20, "USDT") {
 		t.Fatalf("second accrual total %v want exactly 20", got.AccruedYield)
+	}
+	// 账本侧应付（SysWealthYieldPayable）应累计收到 20，证明两期计息均真实落账、
+	// 未被账本幂等指纹（ref 无时间戳）静默吞掉。
+	payable, _, ok := l.Balance(ledger.SysWealthYieldPayable, "USDT")
+	if !ok {
+		t.Fatalf("balance payable: not found")
+	}
+	if !eqAmt(payable, 20, "USDT") {
+		t.Fatalf("payable %v want exactly 20 (both accrual legs must post)", payable)
 	}
 }

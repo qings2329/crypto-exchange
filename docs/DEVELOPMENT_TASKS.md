@@ -1000,3 +1000,95 @@ TP-SL（止盈/止损）订单在 `Server.tpsl` 内存 map 中存储，进程重
   tick 用真实价算量，qty≈0.1 而非 MockPrice=100 时的 40，证明已脱离写死价）。
 
 > 验证：`go test ./...` 35 包全绿；`go vet` 通过。真实行情需在 configs 配置 `oracle.feeds` 段（与 futures 共享同一份声明式配置）。
+
+---
+
+## §40 通知生产端补全（KYC/充值/提现三类事件）
+
+### 背景
+
+通知中心（§34）已定义 `kyc_approved`/`kyc_rejected`/`deposit_arrived`/`withdraw_done` 四种类型，
+但此前**只有 futures 的强平/保证金预警**调用 `Publish`。业务闭环不完整——KYC 审核、链上充值到账、
+链上提现完成这三类站内信始终无人写入。本次补全 producer 侧。
+
+### 改动
+
+1. **KYC 审核结果**（`internal/services/user/service.go` `ReviewKYC`）：
+   - `Service` 新增 `notifSvc *notification.Service` 字段，`NewService` 增加该入参（允许 nil）；
+   - 审核通过/驳回后调用 `notifSvc.Publish`，类型 `kyc_approved`/`kyc_rejected`，驳回时 `Body` 带驳回原因；
+   - `cmd/user/main.go` 新增 `newUserNotifSvc(dsn, log)`：DSN 非空则 `notification.NewMySQLStore` 持久化，
+     否则降级内存；与 announcement 同级装配。
+2. **充值到账 / 提现完成**（`internal/futuresapi/server.go` `startChainWatchers`）：
+   - `ReceiveOnChain` 成功后调用 `publishDepositNotice`（类型 `deposit_arrived`）；
+   - `WithdrawCredited` settle 成功后调用 `publishWithdrawNotice`（类型 `withdraw_done`）；
+   - 通知服务由内存升级为 **MySQL 持久化**（DSN 非空时 `notification.NewMySQLStore`，与 TP-SL 存储同模式），
+     重启不丢站内信；不可用时退化内存。
+
+### 测试
+
+- `internal/services/user/service_test.go`：+`TestReviewKYCPublishesNotification`
+  （通过/驳回各生成对应类型，驳回 body 带原因）。
+- `internal/futuresapi/notify_test.go`：+`TestDepositNoticePublished`、+`TestWithdrawNoticePublished`
+  （抽离 `publishDepositNotice`/`publishWithdrawNotice` 便于单测）。
+
+> 验证：`go test ./internal/services/user/... ./internal/futuresapi/...` 全绿。
+> 注：settlement 侧仅记日志不推送，futures 是唯一生产消费链上事件的落账点，故 producer 集中在此。
+
+---
+
+## §41 e2e/集成脚本覆盖新模块（安全中心 + 通知中心）
+
+### 背景
+
+此前 `scripts/integration.sh`（5 条资金流）与 `e2e/e2e_test.go` 仅覆盖 bot/copytrade/lending 等旧线，
+安全中心（API Key/登录历史/会话/防钓鱼码）与通知中心（§34/§37）**完全没有端到端验证**。本次补齐。
+
+### 改动
+
+1. **`cmd/user/main.go`、`cmd/notification/main.go` 增加 `-addr` 启动参数**（原硬编码 `:8081`/`:8088`），
+   以便 `integration.sh` 在动态空闲端口拉起这两个服务。
+2. **`scripts/integration.sh`**：
+   - 构建/启动新增 `user`、`notification` 两个服务（内存模式，`make_config` 已置空 DSN 退内存）；
+   - 新增 **flow 6**：安全中心创建 API Key / 登录历史 / 会话列表 / 防钓鱼码读写，
+     以及通知中心未读列表 / 未读数 / 全部已读（验证端点接通 + Bearer 鉴权）。
+   - 注：内存模式下 user 的 notifSvc 与 notification 服务是**两个独立内存实例**，故 flow 6 仅验端点与鉴权；
+     真正的「生产→消费」跨服务往返由 `e2e_test.go` 共享实例强校验。
+3. **`e2e/e2e_test.go`** 新增：
+   - `TestSecurityCenterE2E`：进程内拉起 user 服务，走真实 HTTP 验证安全中心四组端点闭环
+     （含防钓鱼码设置后回读一致）；
+   - `TestNotificationCenterE2E`：user 服务与 notification 服务**共享同一 `notification.Service` 实例**，
+     直接 Publish 模拟强平事件 → 经 `/api/v1/user/notifications*` 读链路（列表/未读数/全部已读）全闭环。
+
+### 测试
+
+- `bash scripts/integration.sh` → `INTEGRATION: ALL PASS`（含 flow 6）。
+- `go test ./e2e/... -run 'TestSecurityCenterE2E|TestNotificationCenterE2E'` 全绿。
+
+---
+
+## §42 wealth 计息 ref 加时间戳（闭环已知隐患）
+
+### 背景
+
+`internal/wealth/service.go` 的 `accrueHolding` 在调用账本 `Transfer("wealth_accrue", ref)` 时，
+ref 为 `wealth_accrue product=<PID> holding=<HID>` —— **不含任何时间分量**。账本以
+`from|to|asset|amount|decimals|biz|ref` 计算幂等指纹，同一持仓两次**金额相同**的计息会产生相同指纹，
+第二笔被账本静默丢弃（`transferSeen` 命中直接 `return nil`）。earn 模块（§31）已用 `t=%d` 规避，
+wealth 此前未修，属潜在资金漏记隐患。
+
+### 改动
+
+- `internal/wealth/service.go:173`：`ref` 追加 `t=%d` 与 `now.Unix()`，即
+  `fmt.Sprintf("wealth_accrue product=%d holding=%d t=%d", p.ID, h.ID, now.Unix())`，
+  镜像 earn 的模式。`now` 已是 `accrueHolding` 入参，无需改签名，同时覆盖 `Accrue` 周期与 `Redeem` 前补计两条路径。
+
+### 测试
+
+- `internal/wealth/service_test.go`：`TestWealthAccrueIntegerExact` 原有「两次计息累计 20」的持仓层断言，
+  本次**新增账本层断言**——`l.Balance(SysWealthYieldPayable, "USDT") == 20`，
+  证明两期计息均真实落账（修复前该 ref 会让第二笔被幂等吞掉，payable 仅 10）。
+- `go test ./internal/wealth/...` 通过；`go test ./...` 全绿。
+
+> 前端方面：Bot 页（`pages/BotGrid.tsx`）与通知中心（`pages/Notifications.tsx`）此前已实现并接入
+> `App.tsx` 路由（`/bot`、`/notifications`），API 契约（`api.userNotifications*` /
+> `api.botStrategies*`）与后端一致，类型检查与单测均通过，无需改动。

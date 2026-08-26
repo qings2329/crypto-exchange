@@ -21,6 +21,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
+	addr := flag.String("addr", ":8088", "listen address")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -71,10 +72,9 @@ func main() {
 	r.Use(append(mws, middleware.Auth(verifier))...)
 	h.RegisterRoutes(r)
 
-	addr := ":8088"
-	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: r, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		logger.Info("notification service listening", zap.String("addr", addr))
+		logger.Info("notification service listening", zap.String("addr", *addr))
 		if err := cfg.ListenServer(srv); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("notification serve", zap.Error(err))
 		}

@@ -173,8 +173,29 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 		log.Warn("tpsl load failed, starting empty", zap.Error(lErr))
 	}
 
-	// §37 业务事件→通知：初始化通知服务（内存存储，重启清空）。
-	s.notifSvc = notification.New(notification.NewMemStore())
+	// §37 业务事件→通知：初始化通知服务（MySQL 持久化；不可用时退化为内存）。
+	if dsn != "" {
+		if ndb, nerr := sql.Open("mysql", dsn); nerr == nil {
+			if nping := ndb.Ping(); nping == nil {
+				if nstore, nsErr := notification.NewMySQLStore(ndb); nsErr == nil {
+					s.notifSvc = notification.New(nstore)
+					log.Info("notification store: mysql")
+				} else {
+					log.Warn("notification mysql migrate failed, fallback to mem", zap.Error(nsErr))
+					_ = ndb.Close()
+				}
+			} else {
+				log.Warn("notification mysql ping failed, fallback to mem", zap.Error(nping))
+				_ = ndb.Close()
+			}
+		} else {
+			log.Warn("notification sql.Open failed, fallback to mem", zap.Error(nerr))
+		}
+	}
+	if s.notifSvc == nil {
+		s.notifSvc = notification.New(notification.NewMemStore())
+		log.Info("notification store: in-memory")
+	}
 	s.marginWarned = make(map[string]bool)
 
 	// 指数价预言机：优先使用配置中的真实 REST 喂价（oracle.NewFromConfig）；
@@ -369,6 +390,7 @@ func (s *Server) startChainWatchers() {
 					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
 					zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
 				s.hub.Broadcast("SYS", ginH{"type": "chain_deposit", "data": ev})
+				s.publishDepositNotice(ev)
 			case <-s.ctx.Done():
 				return
 			}
@@ -424,11 +446,12 @@ func (s *Server) startChainWatchers() {
 						s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
 						continue
 					}
-					s.log.Info("on-chain withdraw settled",
-						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-						zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
-						zap.String("tx", ev.TxHash))
-					s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
+				s.log.Info("on-chain withdraw settled",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
+					zap.String("tx", ev.TxHash))
+				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
+				s.publishWithdrawNotice(ev)
 				case settlement.WithdrawFailed:
 					if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
 						s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
@@ -735,6 +758,32 @@ func (s *Server) publishLiquidationNotice(ev futures.LiquidationEvent) {
 		Type:   notification.TypeLiquidation,
 		Title:  title,
 		Body:   body,
+	})
+}
+
+// publishDepositNotice 充值到账通知。
+func (s *Server) publishDepositNotice(ev settlement.DepositEvent) {
+	if s.notifSvc == nil {
+		return
+	}
+	s.notifSvc.Publish(notification.PublishInput{
+		UserID: ev.UserID,
+		Type:   notification.TypeDepositArrived,
+		Title:  "充值到账",
+		Body:   fmt.Sprintf("您的 %s 充值 %.4f 已到账，交易哈希 %s", ev.Asset, ev.Amount.HumanFloat(), ev.TxHash),
+	})
+}
+
+// publishWithdrawNotice 提现完成通知。
+func (s *Server) publishWithdrawNotice(ev settlement.WithdrawEvent) {
+	if s.notifSvc == nil {
+		return
+	}
+	s.notifSvc.Publish(notification.PublishInput{
+		UserID: ev.UserID,
+		Type:   notification.TypeWithdrawDone,
+		Title:  "提现已完成",
+		Body:   fmt.Sprintf("您的 %s 提现 %.4f 已到账链上，交易哈希 %s", ev.Asset, ev.Amount.HumanFloat(), ev.TxHash),
 	})
 }
 

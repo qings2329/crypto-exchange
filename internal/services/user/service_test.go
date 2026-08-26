@@ -4,13 +4,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 )
 
 func newTestService() *Service {
 	store := NewMemStore()
 	verifier := middleware.NewTokenVerifier("test-secret")
-	svc := NewService(store, verifier, NewLogNotifier(), Config{
+	svc := NewService(store, verifier, NewLogNotifier(), nil, Config{
 		AccessTTL:  15 * time.Minute,
 		RefreshTTL: time.Hour,
 		CodeTTL:    time.Minute,
@@ -361,5 +362,57 @@ func TestPreferencesTimezone(t *testing.T) {
 	}
 	if got2.Timezone != "" {
 		t.Fatalf("expected empty timezone after clear, got %q", got2.Timezone)
+	}
+}
+
+// TestReviewKYCPublishesNotification 验证 ReviewKYC 通过/驳回均写入通知中心。
+func TestReviewKYCPublishesNotification(t *testing.T) {
+	notifSvc := notification.New(notification.NewMemStore())
+	store := NewMemStore()
+	verifier := middleware.NewTokenVerifier("test-secret")
+	svc := NewService(store, verifier, NewLogNotifier(), notifSvc, Config{})
+
+	uid := registerTestUser(t, svc, "kyc@example.com", "secret123")
+	if err := svc.SubmitKYC(uid, KYCRequest{RealName: "张三", IDNumber: "110"}); err != nil {
+		t.Fatalf("submit kyc: %v", err)
+	}
+
+	// 通过
+	if err := svc.ReviewKYC(uid, true, "", "reviewer-a"); err != nil {
+		t.Fatalf("review kyc approve: %v", err)
+	}
+	list, err := notifSvc.List(uid, false, 10)
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(list) != 1 || list[0].Type != notification.TypeKYCAproved {
+		t.Fatalf("expected 1 approved notification, got %+v", list)
+	}
+
+	// 再次提交并驳回
+	if err := svc.SubmitKYC(uid, KYCRequest{RealName: "张三", IDNumber: "110"}); err != nil {
+		t.Fatalf("submit kyc again: %v", err)
+	}
+	if err := svc.ReviewKYC(uid, false, "材料不清晰", "reviewer-b"); err != nil {
+		t.Fatalf("review kyc reject: %v", err)
+	}
+	list, err = notifSvc.List(uid, false, 10)
+	if err != nil {
+		t.Fatalf("list notifications again: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 notifications, got %d", len(list))
+	}
+	var rejected *notification.Notification
+	for _, n := range list {
+		if n.Type == notification.TypeKYCRejected {
+			rejected = n
+		}
+	}
+	if rejected == nil {
+		t.Fatalf("rejected notification missing: %+v", list)
+	}
+	if rejected.Body != "材料不清晰" {
+		t.Fatalf("expected reject reason in body, got %q", rejected.Body)
 	}
 }

@@ -32,9 +32,11 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/copytrade"
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/lending"
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
+	"github.com/coldlar/crypto-exchange/internal/services/user"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
@@ -567,4 +569,198 @@ func e2eAdminDo(t *testing.T, r *gin.Engine, method, path, token string, body in
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w.Code, w.Body.Bytes()
+}
+
+// TestSecurityCenterE2E 验证用户服务「安全中心」四组端点在进程内的完整闭环
+// （API Key 创建+列出、登录历史、会话列表、防钓鱼码读写）。与线上一致需 Bearer 鉴权。
+func TestSecurityCenterE2E(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	secret := "e2e-security-secret"
+	v := middleware.NewTokenVerifier(secret)
+
+	store := user.NewMemStore()
+	// notifSvc 共享实例：便于安全中心与通知中心在同一进程内闭环（KYC 审核结果会写入此处）。
+	notifSvc := notification.New(notification.NewMemStore())
+	svc := user.NewService(store, v, user.NewLogNotifier(), notifSvc, user.Config{})
+	h := user.NewHandler(svc, v)
+	r := gin.New()
+	h.Register(r)
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	token := v.Issue(1, time.Hour)
+
+	// 1) 创建 API Key
+	code, body := httpDo(t, http.MethodPost, srv.URL+"/api/v1/user/api-keys", token,
+		map[string]interface{}{"label": "e2e-key", "permissions": []string{"read", "trade"}})
+	if code != http.StatusOK {
+		t.Fatalf("create api-key: %d %s", code, body)
+	}
+	var created struct {
+		Data struct {
+			ApiKey struct {
+				ID int64 `json:"id"`
+			} `json:"api_key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatalf("parse api-key: %v", err)
+	}
+	if created.Data.ApiKey.ID == 0 {
+		t.Fatalf("api-key id missing: %s", body)
+	}
+
+	// 2) 列出 API Key（应含刚创建的）
+	code, body = httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/api-keys", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("list api-keys: %d %s", code, body)
+	}
+	var list struct {
+		Data struct {
+			ApiKeys []struct {
+				ID    int64    `json:"id"`
+				Label string    `json:"label"`
+				Key   string    `json:"key"`
+				Perms []string  `json:"permissions"`
+			} `json:"api_keys"`
+			Total int `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("parse api-key list: %v", err)
+	}
+	if list.Data.Total != 1 || list.Data.ApiKeys[0].Label != "e2e-key" {
+		t.Fatalf("api-key list unexpected: %s", body)
+	}
+
+	// 3) 登录历史（mem store 初始为空，验证端点接通）
+	code, body = httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/login-history", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("login-history: %d %s", code, body)
+	}
+
+	// 4) 会话列表（mem store 初始为空）
+	code, body = httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/sessions", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("sessions: %d %s", code, body)
+	}
+
+	// 5) 防钓鱼码：初始应为空
+	code, body = httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/anti-phishing", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("anti-phishing get: %d %s", code, body)
+	}
+	var ap struct {
+		Data struct {
+			Code string `json:"code"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &ap); err != nil {
+		t.Fatalf("parse anti-phishing: %v", err)
+	}
+	if ap.Data.Code != "" {
+		t.Fatalf("expected empty anti-phishing initially, got %q", ap.Data.Code)
+	}
+
+	// 6) 设置防钓鱼码后应回读一致
+	code, body = httpDo(t, http.MethodPost, srv.URL+"/api/v1/user/anti-phishing", token,
+		map[string]interface{}{"code": "CE-E2E"})
+	if code != http.StatusOK {
+		t.Fatalf("anti-phishing set: %d %s", code, body)
+	}
+	code, body = httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/anti-phishing", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("anti-phishing get2: %d %s", code, body)
+	}
+	if err := json.Unmarshal(body, &ap); err != nil {
+		t.Fatalf("parse anti-phishing2: %v", err)
+	}
+	if ap.Data.Code != "CE-E2E" {
+		t.Fatalf("expected anti-phishing CE-E2E, got %q", ap.Data.Code)
+	}
+}
+
+// TestNotificationCenterE2E 验证通知中心用户侧读链路：生产者（以同一 notifSvc 直接 Publish
+// 模拟强平/充值等业务事件）→ 经 /api/v1/user/notifications* 端点读取、未读数、全部已读 全闭环。
+// 与 integration.sh 不同，本测试共享同一 notification.Service 实例，可做真正的跨「生产→消费」往返。
+func TestNotificationCenterE2E(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	secret := "e2e-notif-secret"
+	v := middleware.NewTokenVerifier(secret)
+
+	notifSvc := notification.New(notification.NewMemStore())
+	nh := notification.NewHandler(notifSvc)
+	r := gin.New()
+	r.Use(middleware.Auth(v)) // 与 cmd/notification/main.go 一致：引擎级挂载鉴权
+	nh.RegisterRoutes(r)
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+
+	token := v.Issue(1, time.Hour)
+
+	// 生产者侧：模拟业务事件写入（强平通知）
+	if _, err := notifSvc.Publish(notification.PublishInput{
+		UserID: 1, Type: notification.TypeLiquidation,
+		Title: "合约仓位被强平", Body: "您的 BTC_USDT_PERP 多头已被强平",
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	// 1) 列出通知：应含 1 条
+	code, body := httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/notifications", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("list: %d %s", code, body)
+	}
+	var list struct {
+		Data struct {
+			Notifications []struct {
+				ID      int64  `json:"id"`
+				Title   string `json:"title"`
+				Content string `json:"content"`
+			} `json:"notifications"`
+			Unread int64 `json:"unread"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("parse list: %v", err)
+	}
+	if len(list.Data.Notifications) != 1 || list.Data.Notifications[0].Title != "合约仓位被强平" {
+		t.Fatalf("notification list unexpected: %s", body)
+	}
+	if list.Data.Unread != 1 {
+		t.Fatalf("expected unread 1, got %d", list.Data.Unread)
+	}
+
+	// 2) 未读数
+	code, body = httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/notifications/unread-count", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("unread-count: %d %s", code, body)
+	}
+	var uc struct {
+		Data struct {
+			Count int64 `json:"count"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &uc); err != nil {
+		t.Fatalf("parse unread-count: %v", err)
+	}
+	if uc.Data.Count != 1 {
+		t.Fatalf("expected count 1, got %d", uc.Data.Count)
+	}
+
+	// 3) 全部已读
+	code, body = httpDo(t, http.MethodPost, srv.URL+"/api/v1/user/notifications/read-all", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("read-all: %d %s", code, body)
+	}
+	code, body = httpDo(t, http.MethodGet, srv.URL+"/api/v1/user/notifications/unread-count", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("unread-count2: %d %s", code, body)
+	}
+	if err := json.Unmarshal(body, &uc); err != nil {
+		t.Fatalf("parse unread-count2: %v", err)
+	}
+	if uc.Data.Count != 0 {
+		t.Fatalf("expected count 0 after read-all, got %d", uc.Data.Count)
+	}
 }
