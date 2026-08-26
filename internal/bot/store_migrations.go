@@ -45,7 +45,7 @@ var Migrations = []migrate.Migration{
 	},
 	{
 		Version: 9805,
-		Up: `ALTER TABLE ce_bot_strategies ADD COLUMN grid_state JSON DEFAULT NULL`,
+		Up: `ALTER TABLE ce_bot_strategies ADD COLUMN IF NOT EXISTS grid_state JSON DEFAULT NULL`,
 		Down: `ALTER TABLE ce_bot_strategies DROP COLUMN grid_state`,
 	},
 }

@@ -91,6 +91,10 @@ func (r *Runner) withLock(ctx context.Context, fn func(ctx context.Context, conn
 	if got != 1 {
 		return fmt.Errorf("migrate: failed to acquire lock (got %d)", got)
 	}
+	// 命名锁与「连接」绑定：把 *sql.Conn 归还连接池并不会真正断开底层连接，
+	// 因此必须显式 RELEASE_LOCK，否则锁会泄漏在池中的连接上，导致后续（或并发）
+	// 迁移的 GET_LOCK 全部超时（got=0）。defer 顺序为 LIFO：先释放锁，再归还连接。
+	defer conn.ExecContext(ctx, "SELECT RELEASE_LOCK('ce_migrate')")
 	return fn(ctx, conn)
 }
 

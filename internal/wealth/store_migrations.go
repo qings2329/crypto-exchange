@@ -54,7 +54,7 @@ var WealthMigrations = []migrate.Migration{
 		Version: 9703,
 		Name:    "alter_ce_wealth_holdings_fixedpoint",
 		Up: `ALTER TABLE ce_wealth_holdings
-				ADD COLUMN asset VARCHAR(32) NOT NULL DEFAULT '' AFTER product_id,
+				ADD COLUMN IF NOT EXISTS asset VARCHAR(32) NOT NULL DEFAULT '' AFTER product_id,
 				MODIFY principal      VARCHAR(64) NOT NULL DEFAULT '0',
 				MODIFY accrued_yield  VARCHAR(64) NOT NULL DEFAULT '0'`,
 		Down: `ALTER TABLE ce_wealth_holdings

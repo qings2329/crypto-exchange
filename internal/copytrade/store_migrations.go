@@ -7,7 +7,7 @@ import (
 // Migrations 是跟单业务建表迁移。版本号落在 9800+ 空闲区间（9805/9806/9807）。
 var Migrations = []migrate.Migration{
 	{
-		Version: 9805,
+		Version: 9809,
 		Up: `CREATE TABLE IF NOT EXISTS ce_copytrade_leads (
 			id BIGINT PRIMARY KEY,
 			name VARCHAR(128) NOT NULL DEFAULT '',
@@ -61,8 +61,8 @@ var Migrations = []migrate.Migration{
 		// F2 定点化：复制费改为定点存储（值+小数位），消除 DOUBLE 浮点漂移。
 		Version: 9808,
 		Up: `ALTER TABLE ce_copytrade_copies
-			ADD COLUMN fee_value BIGINT NOT NULL DEFAULT 0,
-			ADD COLUMN fee_decimals INT NOT NULL DEFAULT 0`,
+			ADD COLUMN IF NOT EXISTS fee_value BIGINT NOT NULL DEFAULT 0,
+			ADD COLUMN IF NOT EXISTS fee_decimals INT NOT NULL DEFAULT 0`,
 		Down: `ALTER TABLE ce_copytrade_copies
 			DROP COLUMN fee_value,
 			DROP COLUMN fee_decimals`,

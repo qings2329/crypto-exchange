@@ -53,7 +53,7 @@ var OptionsMigrations = []migrate.Migration{
 		Version: 9503,
 		Name:    "alter_ce_option_positions_fixedpoint",
 		Up: `ALTER TABLE ce_option_positions
-				ADD COLUMN quote_asset VARCHAR(16) NOT NULL DEFAULT '' AFTER quantity,
+				ADD COLUMN IF NOT EXISTS quote_asset VARCHAR(16) NOT NULL DEFAULT '' AFTER quantity,
 				MODIFY premium VARCHAR(64) NOT NULL DEFAULT '0',
 				MODIFY margin  VARCHAR(64) NOT NULL DEFAULT '0'`,
 		Down: `ALTER TABLE ce_option_positions

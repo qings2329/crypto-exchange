@@ -8,7 +8,7 @@ import (
 // 与各业务线全局错开，避免 ce_schema_migrations 冲突。
 var Migrations = []migrate.Migration{
 	{
-		Version: 9801,
+		Version: 9800,
 		Up: `CREATE TABLE IF NOT EXISTS ce_staking_products (
 			id BIGINT PRIMARY KEY AUTO_INCREMENT,
 			name VARCHAR(128) NOT NULL,

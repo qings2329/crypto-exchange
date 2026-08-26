@@ -113,8 +113,8 @@ var UserMigrations = []migrate.Migration{
 	{
 		Version: userMigVerProfile,
 		Name:    "alter_ce_users_profile",
-		Up: `ALTER TABLE ce_users ADD COLUMN nickname VARCHAR(64) NOT NULL DEFAULT '';
-ALTER TABLE ce_users ADD COLUMN avatar VARCHAR(512) NOT NULL DEFAULT '';`,
+		Up: `ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS nickname VARCHAR(64) NOT NULL DEFAULT '';
+ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS avatar VARCHAR(512) NOT NULL DEFAULT '';`,
 		Down: `ALTER TABLE ce_users DROP COLUMN avatar;
 ALTER TABLE ce_users DROP COLUMN nickname;`,
 	},
@@ -143,8 +143,11 @@ ALTER TABLE ce_users DROP COLUMN nickname;`,
 	{
 		Version: userMigVerReferral,
 		Name:    "alter_ce_users_referral",
-		Up: `ALTER TABLE ce_users ADD COLUMN referrer_id BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE ce_users ADD COLUMN referral_code VARCHAR(16) NOT NULL DEFAULT '';
+		Up: `ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS referrer_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(16) NOT NULL DEFAULT '';
+-- 已有行 referral_code 默认为空串，直接建唯一索引会因 '' 重复而失败；
+-- 先为空值补齐「RC<id>」形式的唯一码（id 为主键，保证全局唯一），再建唯一索引。
+UPDATE ce_users SET referral_code = CONCAT('RC', id) WHERE referral_code = '' OR referral_code IS NULL;
 CREATE UNIQUE INDEX uk_referral_code ON ce_users (referral_code);`,
 		Down: `ALTER TABLE ce_users DROP INDEX uk_referral_code;
 ALTER TABLE ce_users DROP COLUMN referral_code;

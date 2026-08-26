@@ -1117,3 +1117,38 @@ wealth 此前未修，属潜在资金漏记隐患。
 > 至此通知中心所有「业务生产」类型（kyc_approved / kyc_rejected / risk_alert / deposit_arrived /
 > withdraw_done / liquidation / margin_warning）均已接入 producer；`system` 类型保留为管理端
 > `/api/v1/notification/publish` 手动广播（与公告模块各自独立通道，避免重复触达）。
+
+---
+
+## §44 真实 MySQL 集成测试 + 迁移缺陷修复
+
+### 背景
+
+既有单元测试大量使用内存存储，MySQL 路径仅在「能连上 DB 时」被覆盖，CI 中常被跳过。
+用户要求：集成测试**直连 configs/config.yaml 的 MySQL**（不用 Docker），验证各模块迁移与读写链路。
+
+### 新增
+
+- `internal/integration/mysql_test.go`：`TestMySQLStoresMigrate`（全模块 Up 迁移建表）、
+  `TestMySQLNotificationRoundTrip`、`TestMySQLAnnouncementRoundTrip`。
+  - DSN 来源：环境变量 `CE_MYSQL_TEST_DSN` 优先；否则尝试在「config.yaml 同一台 MySQL」上
+    自动建隔离测试库 `wallet_it`（需建库权限）；两者皆不可用时 `t.Skip`
+    （绝不在已漂移/有数据的线上库上直接迁移或读写）。
+  - 该测试在默认环境（无干净测试库）下**安全跳过**，仅在提供了干净 MySQL 时运行。
+
+### 修复（测试过程中暴露的真实缺陷）
+
+1. **`internal/pkg/migrate/migrate.go` 锁泄漏**：`withLock` 仅 `defer conn.Close()`，而 `*sql.Conn`
+   归还连接池不会真正断开底层连接，导致 `GET_LOCK('ce_migrate')` 泄漏在池内连接上，后续迁移
+   全部 `got=0` 超时。已补 `defer conn.ExecContext(ctx, "SELECT RELEASE_LOCK('ce_migrate')")`。
+2. **全局迁移版本号冲突（严重）**：`migrate` 包用单张 `ce_schema_migrations` 且版本全局唯一，
+   但多个模块复用同一版本号，导致后注册模块的迁移被**静默跳过**：
+   - `9301` notification ↔ referral → notification 改 `9320`
+   - `9401` announcement(const) ↔ risk → risk 改 `9411~9414`
+   - `9801` spot / staking / settlement(const) / adminapi(const) → settlement `9811`、adminapi `9812`（spot 保留 9801，staking 已改 9800）
+   - `9802` staking / apikeys(const) → apikeys `9813`
+   - `9805` bot / copytrade → copytrade `9809`
+3. **迁移非幂等**：`bot/copytrade/options/wealth/user` 的 `ALTER ADD COLUMN` 与
+   `referral` 的 `CREATE TABLE` 在全新库上因「列已存在于 CREATE TABLE」而报重复，
+   已全部补 `IF NOT EXISTS`；`user` 9108 先为空白 `referral_code` 补齐 `RC<id>` 再建唯一索引，
+   避免既有数据重复键。

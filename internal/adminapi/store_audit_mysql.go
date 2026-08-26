@@ -9,7 +9,7 @@ import (
 )
 
 // 审计日志迁移版本（错开账户 92xx、公告 94xx、理财 97xx 等）。
-const adminMigVerAudit = 9801
+const adminMigVerAudit = 9812
 
 // AuditMigrations 是审计日志表的建表迁移，由 NewMySQLAuditStore 应用。
 var AuditMigrations = []migrate.Migration{

@@ -6,7 +6,7 @@ import "github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 // 其它模块（ledger 9001、user 9101、margin 9201）冲突。
 var NotificationMigrations = []migrate.Migration{
 	{
-		Version: 9301,
+		Version: 9320,
 		Name:    "create_ce_notifications",
 		Up: `CREATE TABLE IF NOT EXISTS ce_notifications (
 			id          BIGINT        NOT NULL AUTO_INCREMENT,

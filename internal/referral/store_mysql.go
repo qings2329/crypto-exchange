@@ -35,7 +35,7 @@ func (s *mysqlStore) runMigrations() error {
 		{
 			Version: 9301,
 			Name:    "create_ce_referral_commissions",
-			Up: `CREATE TABLE ce_referral_commissions (
+			Up: `CREATE TABLE IF NOT EXISTS ce_referral_commissions (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     referrer_id BIGINT NOT NULL,
     taker_id BIGINT NOT NULL,
