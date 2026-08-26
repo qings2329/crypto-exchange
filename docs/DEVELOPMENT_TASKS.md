@@ -1092,3 +1092,28 @@ wealth 此前未修，属潜在资金漏记隐患。
 > 前端方面：Bot 页（`pages/BotGrid.tsx`）与通知中心（`pages/Notifications.tsx`）此前已实现并接入
 > `App.tsx` 路由（`/bot`、`/notifications`），API 契约（`api.userNotifications*` /
 > `api.botStrategies*`）与后端一致，类型检查与单测均通过，无需改动。
+
+---
+
+## §43 risk_alert 通知生产端（失败登录风险预警）
+
+### 背景
+
+通知类型 `risk_alert`（§34 定义）此前**无 producer**。安全中心虽记录登录历史与会话
+（`RecordLoginWithMeta`），但「异常登录」不会主动触达用户，通知中心永远收不到安全类消息。
+
+### 改动
+
+- `internal/services/user/security.go` `RecordLoginWithMeta`：当 `authErr != nil` 且能定位到既有账号
+  （`userID != 0`）时，经 `notifSvc` 发布 `risk_alert` 类型通知
+  （标题「账号登录异常提醒」，正文含时间/IP）。成功登录不触发，避免误报。
+- 复用既有的 `notifSvc` 字段（§40 引入），无需新增装配。
+
+### 测试
+
+- `internal/services/user/service_test.go`：+`TestRiskAlertOnFailedLogin`
+  （失败登录产生 1 条 risk_alert；随后成功登录不再新增）。
+
+> 至此通知中心所有「业务生产」类型（kyc_approved / kyc_rejected / risk_alert / deposit_arrived /
+> withdraw_done / liquidation / margin_warning）均已接入 producer；`system` 类型保留为管理端
+> `/api/v1/notification/publish` 手动广播（与公告模块各自独立通道，避免重复触达）。

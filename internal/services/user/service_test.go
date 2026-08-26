@@ -1,6 +1,7 @@
 package user
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -414,5 +415,32 @@ func TestReviewKYCPublishesNotification(t *testing.T) {
 	}
 	if rejected.Body != "材料不清晰" {
 		t.Fatalf("expected reject reason in body, got %q", rejected.Body)
+	}
+}
+
+// TestRiskAlertOnFailedLogin 验证既有账号登录失败时推送风险预警通知。
+func TestRiskAlertOnFailedLogin(t *testing.T) {
+	notifSvc := notification.New(notification.NewMemStore())
+	svc := NewService(NewMemStore(), middleware.NewTokenVerifier("test-secret"), NewLogNotifier(), notifSvc, Config{})
+	uid := registerTestUser(t, svc, "risk@example.com", "secret123")
+
+	// 对既有账号发起一次失败登录（authErr != nil，userID 已知）。
+	svc.RecordLoginWithMeta("risk@example.com", errors.New("bad password"), uid, "203.0.113.9", "curl/8.0")
+	list, err := notifSvc.List(uid, false, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].Type != notification.TypeRiskAlert {
+		t.Fatalf("expected 1 risk_alert notification, got %+v", list)
+	}
+	if list[0].Title != "账号登录异常提醒" {
+		t.Fatalf("unexpected title: %s", list[0].Title)
+	}
+
+	// 成功登录不应再产生风险预警（仅历史/会话）。
+	svc.RecordLoginWithMeta("risk@example.com", nil, uid, "203.0.113.9", "curl/8.0")
+	list2, _ := notifSvc.List(uid, false, 10)
+	if len(list2) != 1 {
+		t.Fatalf("successful login must not add risk_alert, got %d", len(list2))
 	}
 }

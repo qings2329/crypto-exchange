@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
+
+	"github.com/coldlar/crypto-exchange/internal/notification"
 )
 
 // 本文件实现用户安全中心四组能力：API Key、登录历史、会话管理、防钓鱼码。
@@ -202,6 +205,14 @@ func (s *Service) RecordLoginWithMeta(target string, authErr error, userID int64
 				LastActiveAt: now,
 			})
 		}
+	} else if userID != 0 && s.notifSvc != nil {
+		// 既有账号登录失败（疑似撞库/盗号尝试）：推送风险预警，让用户及时感知异常。
+		_, _ = s.notifSvc.Publish(notification.PublishInput{
+			UserID: userID,
+			Type:   notification.TypeRiskAlert,
+			Title:  "账号登录异常提醒",
+			Body:   fmt.Sprintf("您的账号于 %s 在 %s 发生一次登录失败，请确认是否为本人操作。", entry.CreatedAt.Format("2006-01-02 15:04"), ip),
+		})
 	}
 }
 
