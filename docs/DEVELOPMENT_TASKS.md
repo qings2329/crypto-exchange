@@ -972,3 +972,31 @@ TP-SL（止盈/止损）订单在 `Server.tpsl` 内存 map 中存储，进程重
   - 配套 `fakeUserStore`（实现 user.Store 全接口最小内存）、`fakeCommissionStore`。
 
 > 验证：`go test ./...` 35 包全绿；`go vet` 通过。
+
+---
+
+## 39. 交易机器人接真实行情（替换 MockPrice）（2026-08-26，已完成）
+
+闭合「bot 行情源写死 MockPrice{P:100}」的演示缺口：网格/定投/MA 策略此前用固定价 100 计算下单量，
+与真实市场脱节，无法用于实盘或贴近真实的联调。
+
+### 改动
+
+1. **行情源适配器**（`internal/bot/price_source.go`）：
+   - `OraclePriceSource` 实现 `PriceSource` 接口，包裹 `*oracle.Oracle` 并调用 `IndexPrice(symbol)`；
+   - oracle 无价/价为非正时返回 error，由 tick 逻辑拒绝本轮（F5：非法价不下单），与既有 MockPrice 行为一致；
+   - `DefaultOracle()` 构造离线演示预言机：BTC_USDT/ETH_USDT/BTC_USDT_PERP/ETH_USDT_PERP 各配 2 个静态源
+     （满足预言机 MinFeeds=2 聚合要求），保证无 config 时服务可独立启动。
+2. **装配接线**（`cmd/bot/main.go`）：
+   - `configs` 配置了 `oracle.feeds`（http 类型指向真实 REST 源 Binance/Okx/Coinbase）→ `oracle.NewFromConfig` 走真实行情；
+   - 未配置 → `DefaultOracle()` 静态回退（与 futures 服务同模式）；
+   - `oracleSvc.Start()` 启动后台轮询，`NewOraclePriceSource` 注入 `bot.NewService`。
+3. **向后兼容**：`MockPrice` 保留（单测/特殊演示仍可用），`NewService(price=nil)` 仍回退到 MockPrice。
+
+### 测试
+
+- `internal/bot/price_source_test.go`：+`TestOraclePriceSource`（适配真实指数价、未配置符号报错）、
+  +`TestDefaultOracle`（离线预言机驱动）、+`TestServiceUsesOraclePrice`（服务注入 OraclePriceSource 后
+  tick 用真实价算量，qty≈0.1 而非 MockPrice=100 时的 40，证明已脱离写死价）。
+
+> 验证：`go test ./...` 35 包全绿；`go vet` 通过。真实行情需在 configs 配置 `oracle.feeds` 段（与 futures 共享同一份声明式配置）。

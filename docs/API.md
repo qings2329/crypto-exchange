@@ -12,6 +12,7 @@
 - **安全中心**：服务 `internal/services/user`（同一前缀 `/api/v1/user` 下 `api-keys`/`sessions`/`login-history`/`anti-phishing` 子路由，见 [安全中心模块](#security)）。
 - **理财中心 / 新币挖矿**：服务 `internal/earn`（独立二进制 `cmd/earn`，监听 `:8093`），前缀 `/api/v1/earn` 与 `/api/v1/launchpad`（见 [理财中心模块](#earn)）。
 - **跟单交易**：服务 `internal/copytrade`（独立二进制 `cmd/copytrade`，监听 `:8099`），前缀 `/api/v1/copytrade`（见 [跟单模块](#copytrade)）。
+- **交易机器人**：服务 `internal/bot`（独立二进制 `cmd/bot`，监听 `:8098`），前缀 `/api/v1/bot`（见 [机器人模块](#bot)）。
 
 ---
 
@@ -36,6 +37,8 @@
   - [基础约定](#earn-basics) · [数据模型](#earn-models) · [接口列表](#earn-endpoints) · [错误映射](#earn-errors) · [存储与迁移](#earn-store) · [前端对接](#earn-frontend)
 - [跟单交易模块](#copytrade)
   - [基础约定](#copytrade-basics) · [数据模型](#copytrade-models) · [接口列表](#copytrade-endpoints) · [错误映射](#copytrade-errors)
+- [交易机器人模块](#bot)
+  - [基础约定](#bot-basics) · [数据模型](#bot-models) · [接口列表](#bot-endpoints) · [错误映射](#bot-errors)
 - [错误码总览](#errors)
 
 ---
@@ -1041,6 +1044,61 @@ created_by, created_at, last_used_at?, revoked_at?`。吊销为软删除，保�
 
 ---
 
+<a id="bot"></a>
+# 交易机器人模块
+
+> 服务：`internal/bot`（独立二进制 `cmd/bot`，监听 `:8098`）。
+> 路由前缀：`/api/v1/bot`。范围：网格/定投(DCA)/均线(MA) 策略的创建、启停、后台 tick 代用户下单。
+
+<a id="bot-basics"></a>
+## 机器人基础约定
+
+- **Base URL**：`/api/v1/bot`
+- **认证**：用户接口需 `middleware.Auth`；管理/调试接口需 `AdminGuard`。
+- **行情源（§39）**：策略 tick 由 `PriceSource` 取价，生产接 `oracle` 真实指数价（configs 配置 `oracle.feeds`），离线回退 `DefaultOracle` 静态演示价；行情非法（NaN/Inf/非正/无价）拒绝本轮（F5）。
+- **代下单（F4/F1）**：经 `spot/futures` 的 `/order`，携带策略授权 token（F4）与 `client_oid=bot:<strategyID>:<round>`（F1 下游幂等）。
+
+<a id="bot-models"></a>
+## 数据模型
+
+| 结构 | 关键字段 |
+| --- | --- |
+| BotStrategy | id, user_id, market(spot/futures), symbol, side(buy/sell), type(grid/dca/ma), status(active/stopped), params(各策略参数), user_token, grid_state(网格状态) |
+| BotOrder | id, strategy_id, user_id, market, symbol, side, price, qty, client_oid, exchange_order_id, status |
+
+<a id="bot-endpoints"></a>
+## 接口列表
+
+路径省略前缀 `/api/v1/bot`。鉴权：User；Admin 接口需 `AdminGuard`。
+
+#### POST `/strategies`
+创建策略（默认 stopped，需显式启动）。请求体：`{ "market":"spot","symbol":"BTC_USDT","side":"buy","type":"grid","params":{...} }`；F5 参数校验失败 → `400`。
+
+#### GET `/strategies`
+我的策略列表。响应：`{ "strategies": [...] }`。
+
+#### POST `/strategies/:id/start`
+启动策略（仅本人）。响应：`{ "ok": true }`。
+
+#### POST `/strategies/:id/stop`
+停止策略（仅本人）。响应：`{ "ok": true }`。
+
+#### POST `/admin/tick`
+管理：强制触发一次指定策略 tick（调试/联调）。请求体：`{ "id": 1 }`；响应：`{ "ok": true }`。
+
+<a id="bot-errors"></a>
+## 机器人错误映射
+
+| HTTP | code | 场景 |
+| --- | --- | --- |
+| 401 | 401 | 未认证 / Token 非法 |
+| 400 | 400 | 参数校验（market/side/type 非法、网格上下界、DCA 周期/额、MA 窗口） |
+| 403 | 403 | 非本人操作 |
+| 404 | 404 | 策略不存在 |
+| 500 | 500 | 服务端内部异常（代下单/账本） |
+
+---
+
 <a id="errors"></a>
 ## 错误码总览
 
@@ -1079,5 +1137,10 @@ created_by, created_at, last_used_at?, revoked_at?`。吊销为软删除，保�
 | Copytrade | 403 | 403 | 非本人操作 |
 | Copytrade | 404 | 404 | lead/follow 不存在 |
 | Copytrade | 500 | 500 | 服务端内部异常（代下单/账本） |
+| Bot | 401 | 401 | 未认证 / Token 非法 |
+| Bot | 400 | 400 | 参数校验（market/side/type 非法、网格上下界、DCA/MA 参数） |
+| Bot | 403 | 403 | 非本人操作 |
+| Bot | 404 | 404 | 策略不存在 |
+| Bot | 500 | 500 | 服务端内部异常（代下单/账本） |
 
-> 注：OTC 与 Wealth 使用带业务子码（4010/4030/4000/…、5000）的 `code`；用户服务、公告服务与合约钱包（Wallet）当前 `code` 直接复用 HTTP 状态码（401/400/403/404/500）。两者均遵循统一 `{code,message,data}` 信封。Notification/Security/Earn/Launchpad/Copytrade 同属 HTTP 状态码复用组。
+> 注：OTC 与 Wealth 使用带业务子码（4010/4030/4000/…、5000）的 `code`；用户服务、公告服务与合约钱包（Wallet）当前 `code` 直接复用 HTTP 状态码（401/400/403/404/500）。两者均遵循统一 `{code,message,data}` 信封。Notification/Security/Earn/Launchpad/Copytrade/Bot 同属 HTTP 状态码复用组。
