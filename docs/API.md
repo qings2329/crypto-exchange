@@ -279,11 +279,12 @@ go build -o bin/otc ./cmd/otc
 {
   "user_id": 7, "language": "zh-CN", "theme": "light",
   "notify_order": true, "notify_security": true, "notify_marketing": false,
+  "trade_interval": "1m", "change_basis": "24h",
   "updated_at": "2026-08-17T10:00:00Z"
 }
 ```
 
-默认值（未设置时 `GET /preferences` 返回）：`language=zh-CN`、`theme=light`、`notify_order=true`、`notify_security=true`、`notify_marketing=false`。
+默认值（未设置时 `GET /preferences` 返回）：`language=zh-CN`、`theme=light`、`notify_order=true`、`notify_security=true`、`notify_marketing=false`、`trade_interval=""`（前端按本地默认，如 `1m`）、`change_basis=""`（前端按本地默认，如 `24h`）。
 
 <a id="user-endpoints"></a>
 ## 用户设置接口列表
@@ -311,7 +312,7 @@ go build -o bin/otc ./cmd/otc
 获取偏好（无记录返回默认值，不报错）。鉴权：User；响应：`data` = `UserPreferences`。
 
 #### PUT `/preferences`
-保存偏好（全量覆盖）。鉴权：User；请求体：`UserPreferences` 字段（`user_id` 以服务端 token 为准，忽略请求体值）；响应：`{ "ok": true }`；`language`/`theme` 长度 > 32 → `400`（ErrInvalidPref）。
+保存偏好（全量覆盖）。鉴权：User；请求体：`UserPreferences` 字段（`user_id` 以服务端 token 为准，忽略请求体值）；响应：`{ "ok": true }`；`language`/`theme` 长度 > 32、`trade_interval`/`change_basis` 长度 > 16 → `400`（ErrInvalidPref）。`trade_interval`/`change_basis` 为空串表示清除、回退前端本地默认。
 
 <a id="user-errors"></a>
 ## 用户设置错误映射
@@ -334,6 +335,7 @@ go build -o bin/otc ./cmd/otc
 - 个人设置相关迁移（与 9101~9104 错开）：
   - **9105** `alter_ce_users_profile`：`ce_users` 增加 `nickname VARCHAR(64)`、`avatar VARCHAR(512)`（默认空串）。
   - **9106** `create_ce_user_preferences`：新建 `ce_user_preferences`（`user_id` 主键，`language`/`theme`/`notify_order`/`notify_security`/`notify_marketing`/`updated_at`）。
+  - **9113** `alter_ce_user_preferences_trade`：`ce_user_preferences` 增加 `trade_interval VARCHAR(16)`、`change_basis VARCHAR(16)`（默认空串），承载交易页 K 线周期与涨跌幅基准（前端新增，向后兼容：历史记录两列均为空串）。
 - `UpdateUser`/`CreateUser`/查询已纳入 `nickname`/`avatar`；偏好读取对「无记录」容错返回默认值。
 
 <a id="user-frontend"></a>
