@@ -40,7 +40,8 @@ func main() {
 	}
 
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
-	svc := user.NewService(store, verifier, user.NewLogNotifier(), newUserNotifSvc(cfg.MySQL.DSN, log), user.Config{})
+	notifSvc := newUserNotifSvc(cfg.MySQL.DSN, log)
+	svc := user.NewService(store, verifier, user.NewLogNotifier(), notifSvc, user.Config{})
 	h := user.NewHandler(svc, verifier)
 
 	// 公告模块：与用户模块共用同一数据库（同一份 ce_schema_migrations，版本号已错开）。

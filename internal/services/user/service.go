@@ -616,6 +616,12 @@ func (s *Service) UpdatePreferences(userID int64, in *UserPreferences) error {
 	if in.Theme != "" && len(in.Theme) > 32 {
 		return ErrInvalidPref
 	}
+	if in.TradeInterval != "" && len(in.TradeInterval) > 16 {
+		return ErrInvalidPref
+	}
+	if in.ChangeBasis != "" && len(in.ChangeBasis) > 16 {
+		return ErrInvalidPref
+	}
 	p := &UserPreferences{
 		UserID:         userID,
 		Language:       in.Language,
@@ -624,6 +630,8 @@ func (s *Service) UpdatePreferences(userID int64, in *UserPreferences) error {
 		NotifyOrder:    in.NotifyOrder,
 		NotifySecurity: in.NotifySecurity,
 		NotifyMarketing: in.NotifyMarketing,
+		TradeInterval:  in.TradeInterval,
+		ChangeBasis:    in.ChangeBasis,
 	}
 	return s.store.UpdatePreferences(p)
 }

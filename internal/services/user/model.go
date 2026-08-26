@@ -60,6 +60,8 @@ type UserPreferences struct {
 	NotifyOrder    bool      `json:"notify_order"`    // 订单相关通知
 	NotifySecurity bool      `json:"notify_security"` // 安全相关通知（登录/改密等）
 	NotifyMarketing bool     `json:"notify_marketing"` // 营销推送
+	TradeInterval  string    `json:"trade_interval"`   // 交易页 K 线默认周期：1m/15m/1h/1d（前端新增）
+	ChangeBasis    string    `json:"change_basis"`     // 涨跌幅基准：24h/1h/today（今日开盘），前端新增
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 

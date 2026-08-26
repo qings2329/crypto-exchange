@@ -8,6 +8,8 @@ type Store interface {
 	List(userID int64, onlyUnread bool, limit int) ([]*Notification, error)
 	// ListAll 返回全部用户的通知（运营/排查用），按时间倒序。
 	ListAll(limit int) ([]*Notification, error)
+	// ListSince 返回 ID 严格大于 minID 的通知（按 ID 升序），用于实时推送的增量轮询。
+	ListSince(minID int64, limit int) ([]*Notification, error)
 	// MarkRead 将某条通知标记为已读；仅当属于该用户时生效。
 	MarkRead(userID, id int64) error
 	// MarkAllRead 将该用户全部未读标记为已读。

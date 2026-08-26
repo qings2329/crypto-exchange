@@ -34,6 +34,7 @@ const (
 	userMigVerLogins    = 9110
 	userMigVerSessions  = 9111
 	userMigVerAntiPhish = 9112
+	userMigVerPrefsTrade = 9113
 )
 
 // UserMigrations 是用户模块的建表迁移，运行时由 main 调 migrate.New(db, UserMigrations).Up()。
@@ -214,6 +215,15 @@ ALTER TABLE ce_users DROP COLUMN referrer_id;`,
     PRIMARY KEY (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		Down: "DROP TABLE IF EXISTS ce_user_anti_phishing;",
+	},
+	{
+		Version: userMigVerPrefsTrade,
+		Name:    "alter_ce_user_preferences_trade",
+		Up: `ALTER TABLE ce_user_preferences
+    ADD COLUMN trade_interval VARCHAR(16) NOT NULL DEFAULT '' COMMENT '交易页 K 线默认周期：1m/15m/1h/1d',
+    ADD COLUMN change_basis  VARCHAR(16) NOT NULL DEFAULT '' COMMENT '涨跌幅基准：24h/1h/today（今日开盘）';`,
+		Down: `ALTER TABLE ce_user_preferences DROP COLUMN change_basis;
+ALTER TABLE ce_user_preferences DROP COLUMN trade_interval;`,
 	},
 }
 
@@ -474,12 +484,12 @@ func (s *mysqlStore) UpdateKYC(k *KYCSubmission) error {
 
 func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
 	var p UserPreferences
-	var lang, theme, tz sql.NullString
+	var lang, theme, tz, tradeInterval, changeBasis sql.NullString
 	var notifyOrder, notifySecurity, notifyMarketing int
 	err := s.db.QueryRow(
-		`SELECT user_id, language, theme, timezone, notify_order, notify_security, notify_marketing, updated_at
+		`SELECT user_id, language, theme, timezone, notify_order, notify_security, notify_marketing, trade_interval, change_basis, updated_at
 		 FROM ce_user_preferences WHERE user_id=?`, userID).
-		Scan(&p.UserID, &lang, &theme, &tz, &notifyOrder, &notifySecurity, &notifyMarketing, &p.UpdatedAt)
+		Scan(&p.UserID, &lang, &theme, &tz, &notifyOrder, &notifySecurity, &notifyMarketing, &tradeInterval, &changeBasis, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrNotFound
 	}
@@ -489,6 +499,8 @@ func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
 	p.Language = lang.String
 	p.Theme = theme.String
 	p.Timezone = tz.String
+	p.TradeInterval = tradeInterval.String
+	p.ChangeBasis = changeBasis.String
 	p.NotifyOrder = notifyOrder == 1
 	p.NotifySecurity = notifySecurity == 1
 	p.NotifyMarketing = notifyMarketing == 1
@@ -498,13 +510,14 @@ func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
 func (s *mysqlStore) UpdatePreferences(p *UserPreferences) error {
 	p.UpdatedAt = time.Now()
 	_, err := s.db.Exec(
-		`INSERT INTO ce_user_preferences (user_id, language, theme, timezone, notify_order, notify_security, notify_marketing, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO ce_user_preferences (user_id, language, theme, timezone, notify_order, notify_security, notify_marketing, trade_interval, change_basis, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON DUPLICATE KEY UPDATE language=VALUES(language), theme=VALUES(theme), timezone=VALUES(timezone),
 		 notify_order=VALUES(notify_order), notify_security=VALUES(notify_security),
-		 notify_marketing=VALUES(notify_marketing), updated_at=VALUES(updated_at)`,
+		 notify_marketing=VALUES(notify_marketing), trade_interval=VALUES(trade_interval),
+		 change_basis=VALUES(change_basis), updated_at=VALUES(updated_at)`,
 		p.UserID, p.Language, p.Theme, p.Timezone, boolToInt(p.NotifyOrder), boolToInt(p.NotifySecurity),
-		boolToInt(p.NotifyMarketing), p.UpdatedAt)
+		boolToInt(p.NotifyMarketing), p.TradeInterval, p.ChangeBasis, p.UpdatedAt)
 	return err
 }
 

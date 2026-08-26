@@ -58,6 +58,15 @@ func (s *mysqlStore) ListAll(limit int) ([]*Notification, error) {
 	return s.query(q)
 }
 
+// ListSince 返回 ID 严格大于 minID 的通知（按 ID 升序），供实时推送增量轮询。
+func (s *mysqlStore) ListSince(minID int64, limit int) ([]*Notification, error) {
+	q := `SELECT id, user_id, type, title, body, status, created_at FROM ce_notifications WHERE id > ? ORDER BY id ASC`
+	if limit > 0 {
+		q += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	return s.query(q, minID)
+}
+
 func (s *mysqlStore) MarkRead(userID, id int64) error {
 	res, err := s.db.Exec(
 		`UPDATE ce_notifications SET status = 'read' WHERE id = ? AND user_id = ? AND status = 'unread'`,

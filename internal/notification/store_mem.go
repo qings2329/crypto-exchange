@@ -1,6 +1,7 @@
 package notification
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -47,10 +48,8 @@ func (s *memStore) List(userID int64, onlyUnread bool, limit int) ([]*Notificati
 		}
 		out = append(out, n)
 	}
-	// 按时间倒序（ID 单调递增近似）。
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
+	// 按 ID 倒序（seq 单调递增近似时间倒序），确保与 MySQL 实现一致且确定。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
@@ -67,6 +66,24 @@ func (s *memStore) ListAll(limit int) ([]*Notification, error) {
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 		out[i], out[j] = out[j], out[i]
 	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListSince 返回 ID 严格大于 minID 的通知（按 ID 升序），供实时推送增量轮询。
+func (s *memStore) ListSince(minID int64, limit int) ([]*Notification, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*Notification, 0)
+	for _, n := range s.all {
+		if n.ID > minID {
+			out = append(out, n)
+		}
+	}
+	// 按 ID 升序（seq 单调递增）。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}

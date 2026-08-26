@@ -366,6 +366,56 @@ func TestPreferencesTimezone(t *testing.T) {
 	}
 }
 
+// TestPreferencesTrade 验证交易偏好（K 线周期 / 涨跌幅基准）可正确写入并读回，
+// 避免服务层在重建 UserPreferences 时静默丢弃这两个前端新增字段。
+func TestPreferencesTrade(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "trade@example.com", "secret123")
+
+	// 未设置时默认为空串（前端按本地默认处理）
+	def, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get preferences: %v", err)
+	}
+	if def.TradeInterval != "" || def.ChangeBasis != "" {
+		t.Fatalf("expected empty trade prefs, got %+v", def)
+	}
+
+	in := &UserPreferences{
+		Language:      "en",
+		Theme:         "dark",
+		TradeInterval: "15m",
+		ChangeBasis:   "today",
+	}
+	if err := svc.UpdatePreferences(id, in); err != nil {
+		t.Fatalf("update trade prefs: %v", err)
+	}
+	got, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if got.TradeInterval != "15m" || got.ChangeBasis != "today" {
+		t.Fatalf("trade prefs not persisted: %+v", got)
+	}
+	// 同一次写入的语言/主题也应保持
+	if got.Language != "en" || got.Theme != "dark" {
+		t.Fatalf("language/theme drift: %+v", got)
+	}
+
+	// 改回空串应被保留，而非回退成默认
+	in2 := &UserPreferences{TradeInterval: "", ChangeBasis: ""}
+	if err := svc.UpdatePreferences(id, in2); err != nil {
+		t.Fatalf("clear trade prefs: %v", err)
+	}
+	got2, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get after clear: %v", err)
+	}
+	if got2.TradeInterval != "" || got2.ChangeBasis != "" {
+		t.Fatalf("expected empty trade prefs after clear, got %+v", got2)
+	}
+}
+
 // TestReviewKYCPublishesNotification 验证 ReviewKYC 通过/驳回均写入通知中心。
 func TestReviewKYCPublishesNotification(t *testing.T) {
 	notifSvc := notification.New(notification.NewMemStore())

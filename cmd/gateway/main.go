@@ -110,6 +110,13 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		r.Any(path, proxy(target))
 	}
 
+	// 通知中心契约路径为 /api/v1/user/notifications*，但实际由 cmd/notification 提供。
+	// 该前缀比通用 /api/v1/user/* 更具体（含静态段 notifications），httprouter 会优先匹配，
+	// 故显式反代到 notification 服务，避免误命中 user 服务（其未注册通知路由）。
+	if nt := cfg.Services["notification"]; nt != "" {
+		r.Any("/api/v1/user/notifications/*path", proxy(nt))
+	}
+
 	// 管理后台（cmd/admin）反代：admin 是独立鉴权域（admin token），不在 cfg.Services 内，
 	// 故单独反代。目标地址由 admin.addr 推导（同机部署，演示/默认即 localhost:<port>）；
 	// 仅当配置了 admin.addr 才启用，未配置则与之前一致（admin 仅直连 :8095）。
