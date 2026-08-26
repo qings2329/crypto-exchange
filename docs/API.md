@@ -445,7 +445,7 @@ go build -o bin/otc ./cmd/otc
 <a id="ann-admin-backend"></a>
 ## 管理后端（cmd/admin）接入
 
-独立管理后端 `cmd/admin`（监听 `:8090`，路由前缀 `/api/admin`）同样承载公告管理，复用同一套 `internal/announcement` 的 `Handler`/`Service`/`Store`，与 `cmd/user` 共享 `ce_announcements` 表（迁移版本 9401）。
+独立管理后端 `cmd/admin`（监听 `:8095`，路由前缀 `/api/admin`）同样承载公告管理，复用同一套 `internal/announcement` 的 `Handler`/`Service`/`Store`，与 `cmd/user` 共享 `ce_announcements` 表（迁移版本 9401）。
 
 - 注册位置：`adminapi.Server.RegisterRoutes` 在已套 `middleware.Auth + middleware.AdminGuard` 的 `admin` 分组下调用 `annH.RegisterAdminRoutes(admin)`，无需重复鉴权。
 - 存储：与 `cmd/admin` 其他模块一致——`cfg.MySQL.DSN` 非空时开 `announcement.NewMySQLStore(dsn)`，否则降级为内存实现。
