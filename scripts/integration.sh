@@ -13,6 +13,14 @@
 #   3) 链上质押生息（staking）：用户委托质押一笔资产（本金锁定到 SysStaking，复式记账），
 #      管理员触发一次奖励归集（accrue），链上待领奖励计入平台对用户欠付的 SysStakingReward
 #      负债；并验证解质押→释放把本金（及累计奖励）原子归还用户账本（F3）。
+#   4) 借贷（lending）：用户存款→借款→管理员计息→还款→提款，全流程复式记账，验证资金闭环（F3）。
+#   5) 安全中心（user）：创建 API Key、登录历史、会话列表、防钓鱼码读写（新端点覆盖）。
+#   6) 通知中心（notification）：未读列表 / 未读数 / 全部已读（新端点覆盖，内存模式验证鉴权与接通）。
+#
+# 鉴权 token 由本脚本用「共享开发密钥」本地签发（与 TokenVerifier.HMAC-SHA256 完全一致），
+# 与线上各服务本地校验 token 的方式一致。user / notification 服务亦在本脚本中启动（内存模式），
+# 仅为覆盖安全中心与通知中心端点；其通知生产与消费为两个独立内存实例，故流程 6 仅验证端点接通与鉴权，
+# 跨服务通知往返由 e2e_test.go（共享 notification.Service 实例）强校验。
 #
 # 鉴权 token 由本脚本用「共享开发密钥」本地签发（与 TokenVerifier.HMAC-SHA256 完全一致），
 # 与线上各服务本地校验 token 的方式一致——因此无需 user 服务往返（user 不参与资金流）。
@@ -182,12 +190,16 @@ SPOT_PORT="$(free_port)"
 BOT_PORT="$(free_port)"
 COPY_PORT="$(free_port)"
 STAKE_PORT="$(free_port)"
+LEND_PORT="$(free_port)"
+EARN_PORT="$(free_port)"
+USER_PORT="$(free_port)"
+NOTIF_PORT="$(free_port)"
 CFG_TMP="$(mktemp /tmp/ce-int-config.XXXX.yaml)"
 make_config "$CONFIG" "$CFG_TMP" "$MATCH_PORT"
 
 # ---- build binaries ----
 echo "== building binaries (go) =="
-for svc in matching spot bot copytrade staking; do
+for svc in matching spot bot copytrade staking lending earn user notification; do
   echo "  building $svc ..."
   if ! go build -o "$BIN/$svc" "./cmd/$svc"; then
     echo "  [FAIL] build $svc"; FAILED=1; exit 1
@@ -195,12 +207,16 @@ for svc in matching spot bot copytrade staking; do
 done
 
 # ---- launch services（内存模式 + 空闲端口）----
-echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT stake=$STAKE_PORT) =="
+echo "== launching services (ports: match=$MATCH_PORT spot=$SPOT_PORT bot=$BOT_PORT copy=$COPY_PORT stake=$STAKE_PORT lend=$LEND_PORT user=$USER_PORT notif=$NOTIF_PORT) =="
 "$BIN/matching"  --config "$CFG_TMP" --mysql-dsn "" --addr ":$MATCH_PORT" >"$LOGDIR/matching.log"  2>&1 & PIDS+=($!)
 "$BIN/spot"      --config "$CFG_TMP" --mysql-dsn "" --addr ":$SPOT_PORT" >"$LOGDIR/spot.log"       2>&1 & PIDS+=($!)
 "$BIN/bot"       --config "$CFG_TMP" --mysql-dsn "" --addr ":$BOT_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/bot.log" 2>&1 & PIDS+=($!)
 "$BIN/copytrade" --config "$CFG_TMP" --mysql-dsn "" --addr ":$COPY_PORT" --spot-url "http://127.0.0.1:$SPOT_PORT" >"$LOGDIR/copytrade.log" 2>&1 & PIDS+=($!)
 "$BIN/staking"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$STAKE_PORT" >"$LOGDIR/staking.log"   2>&1 & PIDS+=($!)
+"$BIN/lending"   --config "$CFG_TMP" --mysql-dsn "" --addr ":$LEND_PORT" >"$LOGDIR/lending.log"   2>&1 & PIDS+=($!)
+"$BIN/earn"      --config "$CFG_TMP" --mysql-dsn "" --addr ":$EARN_PORT" >"$LOGDIR/earn.log"      2>&1 & PIDS+=($!)
+"$BIN/user"       --config "$CFG_TMP" --addr ":$USER_PORT" >"$LOGDIR/user.log"        2>&1 & PIDS+=($!)
+"$BIN/notification" --config "$CFG_TMP" --addr ":$NOTIF_PORT" >"$LOGDIR/notification.log" 2>&1 & PIDS+=($!)
 
 wait_for "http://127.0.0.1:$MATCH_PORT/health"                 "matching"  || FAILED=1
 wait_for_match_leader "http://127.0.0.1:$MATCH_PORT/health"     "matching"  || FAILED=1
@@ -208,12 +224,20 @@ wait_for "http://127.0.0.1:$SPOT_PORT/api/v1/spot/depth"       "spot"      || FA
 wait_for "http://127.0.0.1:$BOT_PORT/api/v1/bot/strategies"    "bot"       || FAILED=1
 wait_for "http://127.0.0.1:$COPY_PORT/api/v1/copytrade/leads"  "copytrade" || FAILED=1
 wait_for "http://127.0.0.1:$STAKE_PORT/api/v1/staking/products" "staking"  || FAILED=1
+wait_for "http://127.0.0.1:$LEND_PORT/api/v1/lending/pools"    "lending"   || FAILED=1
+wait_for "http://127.0.0.1:$EARN_PORT/api/v1/earn/products"    "earn"      || FAILED=1
+wait_for "http://127.0.0.1:$USER_PORT/api/v1/user/login-history" "user"     || FAILED=1
+wait_for "http://127.0.0.1:$NOTIF_PORT/api/v1/user/notifications" "notification" || FAILED=1
 [ "$FAILED" -ne 0 ] && { echo "services failed to start"; exit 1; }
 
 SPOT="http://127.0.0.1:$SPOT_PORT"
 BOT="http://127.0.0.1:$BOT_PORT"
 COPY="http://127.0.0.1:$COPY_PORT"
 STAKE="http://127.0.0.1:$STAKE_PORT"
+LEND="http://127.0.0.1:$LEND_PORT"
+EARN="http://127.0.0.1:$EARN_PORT"
+USER="http://127.0.0.1:$USER_PORT"
+NOTIF="http://127.0.0.1:$NOTIF_PORT"
 
 # tokens: 共享开发密钥本地签发
 ADMIN_TOKEN="$(mint_token 999 admin)"
@@ -221,6 +245,7 @@ BOT_USER_TOKEN="$(mint_token 2 user)"   # spot 内存账本预置 1-4 余额
 LEAD_TOKEN="$(mint_token 3 user)"       # 创建 lead
 FOLLOWER_TOKEN="$(mint_token 4 user)"   # 承接复制单（spot 内存账本有余额）
 STAKE_USER_TOKEN="$(mint_token 1 user)" # staking 内存账本预置 1-4 余额（uid=1 有 10 ETH）
+USER_TOKEN="$(mint_token 1 user)"       # 安全中心 / 通知中心（user 与 notification 服务共用）
 
 # ================= 流程 1：bot → spot =================
 echo "== flow 1: bot -> spot (F4 身份边界) =="
@@ -331,6 +356,150 @@ check "staking release -> 200 (本金+奖励原子归还)" "$([ "$RESP_CODE" = "
 do_call POST "$STAKE/api/v1/staking/release" "$STAKE_USER_TOKEN" \
   '{"delegation_id":'"$DELEG_ID"'}'
 check "staking release 终态幂等：重复释放被拒 (非 200)" "$([ "$RESP_CODE" != "200" ] && echo 1 || echo 0)"
+
+# ================= 流程 4：lending 存款 -> 借款 -> 利息归集 -> 还款 -> 提款 =================
+echo "== flow 4: lending 存借还提 (F2 利息 / F3 原子 / F4 鉴权) =="
+LEND_USER_TOKEN="$(mint_token 1 user)"
+
+# 4.1 列出资金池（启动时 seed 了一个 USDT 池）
+do_call GET "$LEND/api/v1/lending/pools" "$LEND_USER_TOKEN" ""
+check "lending list pools -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+LEND_POOL_ID="$(echo "$RESP_BODY" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); ps=d.get("data",{}).get("pools",[])
+    print(ps[0]["id"] if ps else "")
+except Exception:
+    print("")')"
+check "lending pool id parsed" "$([ -n "$LEND_POOL_ID" ] && echo 1 || echo 0)"
+
+# 4.2 用户存款 500 USDT 到资金池（复式记账：用户可用→SysLendingPool）。
+# 注意：handler 的 amount/borrow_amount/collateral 均为「人类可读金额字符串」，非数字。
+do_call POST "$LEND/api/v1/lending/lend" "$LEND_USER_TOKEN" \
+  '{"pool_id":'"$LEND_POOL_ID"',"amount":"500"}'
+check "lending lend 500 USDT -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+LEND_ORDER_ID="$(extract_id "$RESP_BODY")"
+check "lending order id parsed" "$([ -n "$LEND_ORDER_ID" ] && echo 1 || echo 0)"
+
+# 4.3 借款 100 USDT，抵押 200 USDT（collateral_req=1.5，100*1.5=150 ≤ 200）
+do_call POST "$LEND/api/v1/lending/borrow" "$LEND_USER_TOKEN" \
+  '{"pool_id":'"$LEND_POOL_ID"',"borrow_amount":"100","collateral":"200"}'
+check "lending borrow 100 USDT -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+BORROW_ORDER_ID="$(extract_id "$RESP_BODY")"
+check "lending borrow order id parsed" "$([ -n "$BORROW_ORDER_ID" ] && echo 1 || echo 0)"
+
+# 4.4 我的存款/借款列表
+do_call GET "$LEND/api/v1/lending/my/lends" "$LEND_USER_TOKEN" ""
+check "lending my lends -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+check "lending 我的存款列表含 active 记录" "$(echo "$RESP_BODY" | python3 -c '
+import sys,json
+try:
+    d=json.load(sys.stdin); ls=d.get("data",{}).get("lends",[])
+    print("1" if any(x.get("status")=="active" for x in ls) else "0")
+except Exception:
+    print("0")')"
+
+do_call GET "$LEND/api/v1/lending/my/borrows" "$LEND_USER_TOKEN" ""
+check "lending my borrows -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.5 管理员触发利息归集（accrue 一次，计息到 borrowers）
+do_call POST "$LEND/api/v1/lending/admin/accrue" "$ADMIN_TOKEN" ""
+check "lending admin accrue -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.6 还款（连本带利）：repay 按「借款订单 id」走路径参数。
+do_call POST "$LEND/api/v1/lending/repay/$BORROW_ORDER_ID" "$LEND_USER_TOKEN" '{}'
+check "lending repay -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 4.7 提取存款（复式记账：SysLendingPool→用户可用）：withdraw 按「存款订单 id」走路径参数。
+do_call POST "$LEND/api/v1/lending/withdraw/$LEND_ORDER_ID" "$LEND_USER_TOKEN" '{}'
+check "lending withdraw -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# ================= 流程 5：earn 理财申购计息赎回 + launchpool 质押领奖解押 =================
+echo "== flow 5: earn/launchpad (F2 定点 / F3 原子 / 预算 fail-safe) =="
+
+EARN_USER_TOKEN="$(mint_token 1 user)" # earn 内存账本预置 1-4 余额
+
+# 5.1 理财产品列表（服务启动时种子发行）
+do_call GET "$EARN/api/v1/earn/products" "$EARN_USER_TOKEN" ""
+check "earn list products -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 5.2 未勾选风险揭示必须被拒（agreed=false → 400）
+do_call POST "$EARN/api/v1/earn/subscribe" "$EARN_USER_TOKEN" '{"product_id":1,"amount":100,"agreed":false}'
+check "earn subscribe w/o agreement -> 400" "$([ "$RESP_CODE" = "400" ] && echo 1 || echo 0)"
+
+# 5.3 正常申购（agreed=true）
+do_call POST "$EARN/api/v1/earn/subscribe" "$EARN_USER_TOKEN" '{"product_id":1,"amount":100,"agreed":true}'
+check "earn subscribe -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+SUB_ID="$(extract_id "$RESP_BODY")"
+
+# 5.4 活期立即赎回（本金+≈0 收益回账）
+do_call POST "$EARN/api/v1/earn/subscriptions/$SUB_ID/redeem" "$EARN_USER_TOKEN" '{}'
+check "earn redeem flexible -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 5.5 Launchpool 项目列表（含推导状态 ongoing + 池）
+do_call GET "$EARN/api/v1/launchpad/projects" "$EARN_USER_TOKEN" ""
+check "launchpad list projects -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+LP_ID="$(echo "$RESP_BODY" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin).get("data",{}).get("projects",[]); print(d[0]["id"] if d else "")
+except Exception:
+    print("")')"
+
+# 5.6 质押进 USDT 池（服务启动已由 uid=1 预充 NEW 奖励预算）
+STAKE_BODY="$(printf '{"project_id":%s,"pool_id":"usdt","amount":500}' "$LP_ID")"
+do_call POST "$EARN/api/v1/launchpad/stake" "$EARN_USER_TOKEN" "$STAKE_BODY"
+check "launchpad stake -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+POS_ID="$(extract_id "$RESP_BODY")"
+
+# 5.7 无奖励可领时 harvest 被拒（40x）
+HV_BODY="$(printf '{"position_id":%s}' "$POS_ID")"
+do_call POST "$EARN/api/v1/launchpad/harvest" "$EARN_USER_TOKEN" "$HV_BODY"
+check "launchpad harvest empty -> 400" "$([ "$RESP_CODE" != "200" ] && echo 1 || echo 0)"
+
+# 5.8 全额解押
+UN_BODY="$(printf '{"position_id":%s,"amount":0}' "$POS_ID")"
+do_call POST "$EARN/api/v1/launchpad/unstake" "$EARN_USER_TOKEN" "$UN_BODY"
+check "launchpad unstake all -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# ================= 流程 6：安全中心 + 通知中心（新模块端点覆盖）=================
+echo "== flow 6: user security-center + notification center (新端点覆盖) =="
+
+# 6.1 安全中心：创建 API Key（用户服务内闭环）
+do_call POST "$USER/api/v1/user/api-keys" "$USER_TOKEN" '{"label":"it-key","permissions":["read","trade"]}'
+check "security: create api-key -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+APIKEY_ID="$(echo "$RESP_BODY" | python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin); print(d.get("data",{}).get("api_key",{}).get("id",""))
+except Exception:
+    print("")')"
+check "security: api-key id parsed" "$([ -n "$APIKEY_ID" ] && echo 1 || echo 0)"
+
+# 6.2 安全中心：登录历史（注册/创建 key 等会留下审计记录；至少能列出）
+do_call GET "$USER/api/v1/user/login-history" "$USER_TOKEN" ""
+check "security: login-history -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.3 安全中心：会话列表
+do_call GET "$USER/api/v1/user/sessions" "$USER_TOKEN" ""
+check "security: sessions -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.4 安全中心：防钓鱼码读取（初始应返回空或默认）
+do_call GET "$USER/api/v1/user/anti-phishing" "$USER_TOKEN" ""
+check "security: anti-phishing get -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.5 安全中心：设置防钓鱼码
+do_call POST "$USER/api/v1/user/anti-phishing" "$USER_TOKEN" '{"code":"CE-INTEG"}'
+check "security: anti-phishing set -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.6 通知中心：未读列表（内存模式初始为空，验证端点接通 + 鉴权）
+do_call GET "$NOTIF/api/v1/user/notifications" "$USER_TOKEN" ""
+check "notification: list -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.7 通知中心：未读数
+do_call GET "$NOTIF/api/v1/user/notifications/unread-count" "$USER_TOKEN" ""
+check "notification: unread-count -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
+
+# 6.8 通知中心：全部已读（空操作不应报错）
+do_call POST "$NOTIF/api/v1/user/notifications/read-all" "$USER_TOKEN" ""
+check "notification: read-all -> 200" "$([ "$RESP_CODE" = "200" ] && echo 1 || echo 0)"
 
 echo "========================================="
 if [ "$FAILED" -eq 0 ]; then

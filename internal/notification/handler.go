@@ -38,6 +38,17 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// 运营/排查：全部通知（全局 Auth 已挂载；此处追加 AdminGuard，仅管理员可见全量通知，
 	// 避免任意登录用户越权读取他人通知内容）。
 	r.GET("/api/v1/notification/admin/list", middleware.AdminGuard(), h.listAll)
+
+	// 用户侧别名路由：对齐 crypto-exchange-web/src/api/client.ts 的站内信契约
+	// （/api/v1/user/notifications*，响应字段 notifications/read/count）。
+	u := r.Group("/api/v1/user/notifications")
+	{
+		u.GET("", h.userList)
+		u.GET("/unread-count", h.userCount)
+		u.POST("/read-all", h.readAllAlias)
+		u.POST("/:id/read", h.userRead)
+		u.DELETE("/:id", h.userDelete)
+	}
 }
 
 func uid(c *gin.Context) int64 {
@@ -118,4 +129,95 @@ func (h *Handler) listAll(c *gin.Context) {
 		return
 	}
 	response.JSON(c, gin.H{"items": ns, "count": len(ns)})
+}
+
+// userNotificationView 是前端契约形状的投影：
+// {id, level(info|warning|critical), title, content, read(bool), created_at}。
+type userNotificationView struct {
+	ID        int64     `json:"id"`
+	Level     string    `json:"level"`
+	Title     string    `json:"title"`
+	Content   string    `json:"content"`
+	Read      bool      `json:"read"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func toUserView(ns []*Notification) []userNotificationView {
+	out := make([]userNotificationView, 0, len(ns))
+	for _, n := range ns {
+		out = append(out, userNotificationView{
+			ID:        n.ID,
+			Level:     LevelOf(n.Type),
+			Title:     n.Title,
+			Content:   n.Body,
+			Read:      n.Status == StatusRead,
+			CreatedAt: n.CreatedAt,
+		})
+	}
+	return out
+}
+
+// userList GET /api/v1/user/notifications?only_unread=&limit= → {notifications:[...], unread:n}
+func (h *Handler) userList(c *gin.Context) {
+	userID := uid(c)
+	onlyUnread := c.Query("only_unread") == "true" || c.Query("unread") == "true"
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	ns, err := h.svc.List(userID, onlyUnread, limit)
+	if err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	unread, err := h.svc.UnreadCount(userID)
+	if err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	response.JSON(c, gin.H{"notifications": toUserView(ns), "unread": unread})
+}
+
+// userCount GET /api/v1/user/notifications/unread-count → {count:n}
+func (h *Handler) userCount(c *gin.Context) {
+	n, err := h.svc.UnreadCount(uid(c))
+	if err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	response.JSON(c, gin.H{"count": n})
+}
+
+// userRead POST /api/v1/user/notifications/:id/read → {ok:true}
+func (h *Handler) userRead(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		response.Error(c, 400, 400, "invalid id")
+		return
+	}
+	if err := h.svc.MarkRead(uid(c), id); err != nil {
+		response.Error(c, 404, 404, err.Error())
+		return
+	}
+	response.JSON(c, gin.H{"ok": true})
+}
+
+// readAllAlias POST /api/v1/user/notifications/read-all → {ok:true}
+func (h *Handler) readAllAlias(c *gin.Context) {
+	if _, err := h.svc.MarkAllRead(uid(c)); err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	response.JSON(c, gin.H{"ok": true})
+}
+
+// userDelete DELETE /api/v1/user/notifications/:id → {ok:true}
+func (h *Handler) userDelete(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		response.Error(c, 400, 400, "invalid id")
+		return
+	}
+	if err := h.svc.Delete(uid(c), id); err != nil {
+		response.Error(c, 404, 404, err.Error())
+		return
+	}
+	response.JSON(c, gin.H{"ok": true})
 }

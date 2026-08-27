@@ -41,11 +41,15 @@ func (s *mysqlStore) CreateStrategy(st *BotStrategy) error {
 	if err != nil {
 		return err
 	}
+	var gridStateJSON []byte
+	if st.GridState != nil {
+		gridStateJSON, _ = json.Marshal(st.GridState)
+	}
 	res, err := s.db.Exec(`INSERT INTO ce_bot_strategies
-		(user_id, name, market, symbol, side, type, params, status, user_token, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(user_id, name, market, symbol, side, type, params, status, grid_state, user_token, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		st.UserID, st.Name, string(st.Market), st.Symbol, st.Side, string(st.Type),
-		string(params), string(st.Status), st.UserToken, st.CreatedAt)
+		string(params), string(st.Status), gridStateJSON, st.UserToken, st.CreatedAt)
 	if err != nil {
 		return err
 	}
@@ -56,13 +60,13 @@ func (s *mysqlStore) CreateStrategy(st *BotStrategy) error {
 }
 
 func (s *mysqlStore) GetStrategy(id int64) (*BotStrategy, error) {
-	row := s.db.QueryRow(`SELECT id, user_id, name, market, symbol, side, type, params, status, user_token, created_at
+	row := s.db.QueryRow(`SELECT id, user_id, name, market, symbol, side, type, params, status, grid_state, user_token, created_at
 		FROM ce_bot_strategies WHERE id = ?`, id)
 	return scanStrategy(row)
 }
 
 func (s *mysqlStore) ListStrategiesByUser(uid int64) ([]*BotStrategy, error) {
-	rows, err := s.db.Query(`SELECT id, user_id, name, market, symbol, side, type, params, status, user_token, created_at
+	rows, err := s.db.Query(`SELECT id, user_id, name, market, symbol, side, type, params, status, grid_state, user_token, created_at
 		FROM ce_bot_strategies WHERE user_id = ? ORDER BY id`, uid)
 	if err != nil {
 		return nil, err
@@ -72,7 +76,7 @@ func (s *mysqlStore) ListStrategiesByUser(uid int64) ([]*BotStrategy, error) {
 }
 
 func (s *mysqlStore) ListActiveStrategies() ([]*BotStrategy, error) {
-	rows, err := s.db.Query(`SELECT id, user_id, name, market, symbol, side, type, params, status, user_token, created_at
+	rows, err := s.db.Query(`SELECT id, user_id, name, market, symbol, side, type, params, status, grid_state, user_token, created_at
 		FROM ce_bot_strategies WHERE status = ? ORDER BY id`, string(StrategyActive))
 	if err != nil {
 		return nil, err
@@ -82,7 +86,7 @@ func (s *mysqlStore) ListActiveStrategies() ([]*BotStrategy, error) {
 }
 
 func (s *mysqlStore) ListAllStrategies() ([]*BotStrategy, error) {
-	rows, err := s.db.Query(`SELECT id, user_id, name, market, symbol, side, type, params, status, user_token, created_at
+	rows, err := s.db.Query(`SELECT id, user_id, name, market, symbol, side, type, params, status, grid_state, user_token, created_at
 		FROM ce_bot_strategies ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -96,11 +100,15 @@ func (s *mysqlStore) UpdateStrategy(st *BotStrategy) error {
 	if err != nil {
 		return err
 	}
+	var gridStateJSON []byte
+	if st.GridState != nil {
+		gridStateJSON, _ = json.Marshal(st.GridState)
+	}
 	_, err = s.db.Exec(`UPDATE ce_bot_strategies SET
-		name=?, market=?, symbol=?, side=?, type=?, params=?, status=?, user_token=?
+		name=?, market=?, symbol=?, side=?, type=?, params=?, status=?, grid_state=?, user_token=?
 		WHERE id = ?`,
 		st.Name, string(st.Market), st.Symbol, st.Side, string(st.Type), string(params),
-		string(st.Status), st.UserToken, st.ID)
+		string(st.Status), gridStateJSON, st.UserToken, st.ID)
 	return err
 }
 
@@ -144,8 +152,9 @@ func (s *mysqlStore) CountOrdersByStrategy(sid int64) (int64, error) {
 func scanStrategy(row *sql.Row) (*BotStrategy, error) {
 	var st BotStrategy
 	var market, side, typ, status, token, params string
+	var gridStateJSON sql.NullString
 	err := row.Scan(&st.ID, &st.UserID, &st.Name, &market, &st.Symbol, &side, &typ,
-		&params, &status, &token, &st.CreatedAt)
+		&params, &status, &gridStateJSON, &token, &st.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrStrategyNotFound
 	}
@@ -158,6 +167,10 @@ func scanStrategy(row *sql.Row) (*BotStrategy, error) {
 	st.Status = StrategyStatus(status)
 	st.UserToken = token
 	_ = json.Unmarshal([]byte(params), &st.Params)
+	if gridStateJSON.Valid && gridStateJSON.String != "" {
+		st.GridState = &GridState{}
+		_ = json.Unmarshal([]byte(gridStateJSON.String), st.GridState)
+	}
 	return &st, nil
 }
 
@@ -166,8 +179,9 @@ func scanStrategies(rows *sql.Rows) ([]*BotStrategy, error) {
 	for rows.Next() {
 		var st BotStrategy
 		var market, side, typ, status, token, params string
+		var gridStateJSON sql.NullString
 		if err := rows.Scan(&st.ID, &st.UserID, &st.Name, &market, &st.Symbol, &side, &typ,
-			&params, &status, &token, &st.CreatedAt); err != nil {
+			&params, &status, &gridStateJSON, &token, &st.CreatedAt); err != nil {
 			return nil, err
 		}
 		st.Market = Market(market)
@@ -176,6 +190,10 @@ func scanStrategies(rows *sql.Rows) ([]*BotStrategy, error) {
 		st.Status = StrategyStatus(status)
 		st.UserToken = token
 		_ = json.Unmarshal([]byte(params), &st.Params)
+		if gridStateJSON.Valid && gridStateJSON.String != "" {
+			st.GridState = &GridState{}
+			_ = json.Unmarshal([]byte(gridStateJSON.String), st.GridState)
+		}
 		out = append(out, &st)
 	}
 	return out, rows.Err()

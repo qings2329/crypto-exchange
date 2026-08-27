@@ -1,6 +1,7 @@
 package otc
 
 import (
+	"encoding/json"
 	"bytes"
 	"mime/multipart"
 	"net/http"
@@ -170,5 +171,74 @@ func TestAdminEndpointsRequireAdmin(t *testing.T) {
 		if w2.Code != http.StatusOK {
 			t.Fatalf("%s: admin should be 200, got %d %s", path, w2.Code, w2.Body.String())
 		}
+	}
+}
+
+// TestOtcPrices 契约：法币报价端点（asset/fiat 缺省、汇率换算、无行情资产 404）。
+func TestOtcPrices(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := NewMemStore()
+	l := ledger.New()
+	prices := map[string]float64{"BTC": 50000}
+	svc := NewService(store, l, Config{}, zap.NewNop(), func(a string) (float64, bool) {
+		p, ok := prices[a]
+		return p, ok
+	})
+	verifier := middleware.NewTokenVerifier("test-secret-otc")
+	r := gin.New()
+	svc.RegisterRoutes(r, verifier)
+	tok := "Bearer " + verifier.Issue(1, time.Hour)
+
+	get := func(q string) *httptest.ResponseRecorder {
+		req, _ := http.NewRequest(http.MethodGet, "/api/v1/otc/prices"+q, nil)
+		req.Header.Set("Authorization", tok)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Asset     string    `json:"asset"`
+			Fiat      string    `json:"fiat"`
+			BasePrice float64   `json:"base_price"`
+			FiatRate  float64   `json:"fiat_rate"`
+			UpdatedAt time.Time `json:"updated_at"`
+		} `json:"data"`
+	}
+	decode := func(w *httptest.ResponseRecorder) {
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v body=%s", err, w.Body.String())
+		}
+	}
+
+	// BTC/CNY：50000 × 7.23 = 361500。
+	w := get("?asset=BTC&fiat=CNY")
+	if w.Code != http.StatusOK {
+		t.Fatalf("btc/cny: %d %s", w.Code, w.Body.String())
+	}
+	decode(w)
+	if resp.Data.Asset != "BTC" || resp.Data.Fiat != "CNY" ||
+		resp.Data.BasePrice != 361500 || resp.Data.FiatRate != 7.23 {
+		t.Fatalf("quote wrong: %+v", resp.Data)
+	}
+
+	// 缺省参数 → USDT/CNY，稳定币基准 1。
+	w = get("")
+	decode(w)
+	if resp.Data.Asset != "USDT" || resp.Data.Fiat != "CNY" || resp.Data.BasePrice != 7.23 {
+		t.Fatalf("default quote wrong: %+v", resp.Data)
+	}
+
+	// 未知法币 → 汇率回退 1；未知资产无行情 → 404。
+	w = get("?asset=USDT&fiat=JPY")
+	decode(w)
+	if resp.Data.FiatRate != 1 || resp.Data.BasePrice != 1 {
+		t.Fatalf("fallback rate wrong: %+v", resp.Data)
+	}
+	w = get("?asset=DOGE&fiat=USD")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("no-price asset should 404, got %d %s", w.Code, w.Body.String())
 	}
 }

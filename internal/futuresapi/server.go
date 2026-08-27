@@ -13,11 +13,13 @@ package futuresapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -27,6 +29,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/risk"
@@ -65,6 +68,27 @@ type Server struct {
 	userSvcURL string
 	kycFetcher func(c *gin.Context) (int, error) // 可注入，便于测试；默认从 user 服务取 kyc_level
 
+	// 交易白名单（地址簿）：用户维护的可信提现/转账地址。
+	addrBookMu sync.Mutex
+	addrBook   map[int64][]AddrBookEntry
+	addrSeq    int64
+
+	// 内部划转：资金账户(可用) ⇄ 合约保证金(冻结)。与账本可用余额分离计账。
+	marginMu   sync.Mutex
+	marginAcct map[int64]map[string]float64 // uid -> asset -> 保证金余额
+
+	// 持仓止盈止损（TP/SL）：按 (uid|symbol|side) 持久化。
+	// tpsl     内存热缓存；tpslStore 写穿持久化层（MySQL 或 mem 降级），重启恢复。
+	tpslMu    sync.Mutex
+	tpsl      map[int64]map[string]TPState
+	tpslStore TPSLStore
+
+	// 通知服务（§37 业务事件→通知）：强平/保证金预警等业务事件写入站内信。
+	// 内存存储，重启后已读状态丢失，不影响通知内容。
+	notifSvc        *notification.Service
+	marginWarned    map[string]bool // "uid:symbol" → 已预警（防止重复发送）
+	marginWarnedMu  sync.Mutex
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -96,6 +120,10 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 		riskSvc:    riskSvc,
 		userSvcURL: userSvcURL,
 		kycFetcher: newKYCFetcher(userSvcURL),
+
+		addrBook:   make(map[int64][]AddrBookEntry),
+		marginAcct: make(map[int64]map[string]float64),
+		tpsl:       make(map[int64]map[string]TPState),
 	}
 
 	// 账本资金安全防线（演示值，生产按资产风险配置）。
@@ -113,6 +141,62 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
 	})
 	ledgerSvc.StartReconciler(15 * time.Second)
+
+	// TP-SL 持久化：MySQL 可用时落库；不可用时退化为纯内存（重启丢失）。
+	if dsn != "" {
+		if db, derr := sql.Open("mysql", dsn); derr == nil {
+			if perr := db.Ping(); perr == nil {
+				if store, sErr := NewMySQLTPSLStore(db); sErr == nil {
+					s.tpslStore = store
+					log.Info("tpsl store: mysql")
+				} else {
+					log.Warn("tpsl mysql migrate failed, fallback to mem", zap.Error(sErr))
+					_ = db.Close()
+				}
+			} else {
+				log.Warn("tpsl mysql ping failed, fallback to mem", zap.Error(perr))
+				_ = db.Close()
+			}
+		} else {
+			log.Warn("tpsl sql.Open failed, fallback to mem", zap.Error(derr))
+		}
+	}
+	if s.tpslStore == nil {
+		s.tpslStore = NewMemTPSLStore()
+		log.Info("tpsl store: in-memory")
+	}
+	// 启动时从持久层全量加载到内存热缓存。
+	if loaded, lErr := s.tpslStore.LoadAll(); lErr == nil {
+		s.tpsl = loaded
+		log.Info("tpsl loaded from store", zap.Int("entries", tpslCount(s.tpsl)))
+	} else {
+		log.Warn("tpsl load failed, starting empty", zap.Error(lErr))
+	}
+
+	// §37 业务事件→通知：初始化通知服务（MySQL 持久化；不可用时退化为内存）。
+	if dsn != "" {
+		if ndb, nerr := sql.Open("mysql", dsn); nerr == nil {
+			if nping := ndb.Ping(); nping == nil {
+				if nstore, nsErr := notification.NewMySQLStore(ndb); nsErr == nil {
+					s.notifSvc = notification.New(nstore)
+					log.Info("notification store: mysql")
+				} else {
+					log.Warn("notification mysql migrate failed, fallback to mem", zap.Error(nsErr))
+					_ = ndb.Close()
+				}
+			} else {
+				log.Warn("notification mysql ping failed, fallback to mem", zap.Error(nping))
+				_ = ndb.Close()
+			}
+		} else {
+			log.Warn("notification sql.Open failed, fallback to mem", zap.Error(nerr))
+		}
+	}
+	if s.notifSvc == nil {
+		s.notifSvc = notification.New(notification.NewMemStore())
+		log.Info("notification store: in-memory")
+	}
+	s.marginWarned = make(map[string]bool)
 
 	// 指数价预言机：优先使用配置中的真实 REST 喂价（oracle.NewFromConfig）；
 	// 未配置喂价源时回退到内置 StaticFeed 演示（模拟多交易所价差）。
@@ -268,6 +352,11 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	if auth, ok := s.chainWithdraw.(settlement.WithdrawAuthorizer); ok {
 		s.chainAuthorizer = auth
 	}
+	// M4：若网关为真实 RPC 网关（实现 SetWithdrawHoldResolver），注入 ledger hold 解析器，
+	// 使离线签名器在广播前真正校验 hold 存在/状态/要素一致（绑定真实提现记录，纵深防御）。
+	if rgw, ok := s.chainWithdraw.(*settlement.RPCWithdrawGateway); ok {
+		rgw.SetWithdrawHoldResolver(ledgerHoldResolver{ledgerSvc})
+	}
 	s.chainWithdraw.Start()
 	s.startChainWatchers()
 
@@ -301,6 +390,7 @@ func (s *Server) startChainWatchers() {
 					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
 					zap.Float64("amount", ev.Amount.HumanFloat()), zap.String("tx", ev.TxHash))
 				s.hub.Broadcast("SYS", ginH{"type": "chain_deposit", "data": ev})
+				s.publishDepositNotice(ev)
 			case <-s.ctx.Done():
 				return
 			}
@@ -356,11 +446,12 @@ func (s *Server) startChainWatchers() {
 						s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
 						continue
 					}
-					s.log.Info("on-chain withdraw settled",
-						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-						zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
-						zap.String("tx", ev.TxHash))
-					s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
+				s.log.Info("on-chain withdraw settled",
+					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
+					zap.String("tx", ev.TxHash))
+				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
+				s.publishWithdrawNotice(ev)
 				case settlement.WithdrawFailed:
 					if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
 						s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
@@ -566,12 +657,71 @@ func (s *Server) liqScanLoop() {
 				if evs := s.liquidator.UpdateMarkPrice(sym, mark); len(evs) > 0 {
 					s.broadcastLiquidations(evs)
 				}
+				// §37 保证金预警：扫描所有仓位，标记价接近强平价时发送预警通知。
+				s.emitMarginWarnings(sym, mark)
 			}
 		}
 	}
 }
 
-// broadcastLiquidations 广播强平事件（onTrade 与 liqScanLoop 共用）：记录审计日志并推送 WS。
+// MarginWarnRatio 保证金预警阈值：保证金率低于此值时触发预警通知（如 1.2 = 保证金率 120%）。
+// 略高于 SafeMarginRatio(1.1)，为用户留出反应时间。
+const MarginWarnRatio = 1.2
+
+// emitMarginWarnings 扫描所有仓位，对保证金率低于预警阈值的仓位发送站内通知。
+// 每个 (user, symbol) 组合仅预警一次（内存去重），防止行情震荡期重复打扰。
+func (s *Server) emitMarginWarnings(symbol string, mark float64) {
+	if s.notifSvc == nil || mark <= 0 {
+		return
+	}
+	positions := s.liquidator.AllPositions(symbol)
+	for _, p := range positions {
+		if p.Size <= 0 {
+			continue
+		}
+		var marginRatio float64
+		if p.Mode == futures.Isolated {
+			// 逐仓：marginRatio = (margin + UPNL) / notional
+			upnl := p.UPNL(mark)
+			notional := p.Notional(mark)
+			if notional > 0 {
+				marginRatio = (p.Margin + upnl) / notional
+			}
+		} else {
+			// 全仓：用强平价近似推导保证金率
+			// mark 接近强平价 → 保证金率低
+			if p.LiqPriceVal > 0 && mark > 0 {
+				if p.Side == futures.Long {
+					marginRatio = mark / p.LiqPriceVal
+				} else {
+					marginRatio = p.LiqPriceVal / mark
+				}
+			}
+		}
+		if marginRatio <= 0 || marginRatio >= MarginWarnRatio {
+			continue
+		}
+		key := fmt.Sprintf("%d:%s", p.UserID, symbol)
+		s.marginWarnedMu.Lock()
+		if s.marginWarned[key] {
+			s.marginWarnedMu.Unlock()
+			continue
+		}
+		s.marginWarned[key] = true
+		s.marginWarnedMu.Unlock()
+
+		sideStr := sideName(p.Side)
+		s.notifSvc.Publish(notification.PublishInput{
+			UserID: p.UserID,
+			Type:   notification.TypeMarginWarning,
+			Title:  "保证金不足预警",
+			Body: fmt.Sprintf("您的 %s %s 仓位保证金率 %.1f%%，接近强平价 %.2f，请及时追加保证金",
+				symbol, sideStr, marginRatio*100, p.LiqPriceVal),
+		})
+	}
+}
+
+// broadcastLiquidations 广播强平事件（onTrade 与 liqScanLoop 共用）：记录审计日志、推送 WS 并发送站内通知。
 func (s *Server) broadcastLiquidations(evs []futures.LiquidationEvent) {
 	for _, ev := range evs {
 		s.log.Warn("liquidation",
@@ -581,7 +731,60 @@ func (s *Server) broadcastLiquidations(evs []futures.LiquidationEvent) {
 			zap.Float64("fee", ev.Fee),
 			zap.Bool("partial", ev.Partial))
 		s.hub.Broadcast(ev.Symbol, ginH{"type": "liquidation", "data": ev})
+		// §37 强平站内通知：写入用户通知中心。
+		s.publishLiquidationNotice(ev)
 	}
+}
+
+// publishLiquidationNotice 向被强平用户发送站内通知（§37 业务事件→通知）。
+// 部分强平与全额强平分别标题，body 含标的/方向/强平价/手续费等关键风控信息。
+func (s *Server) publishLiquidationNotice(ev futures.LiquidationEvent) {
+	if s.notifSvc == nil {
+		return
+	}
+	title := "合约仓位被强平"
+	body := fmt.Sprintf("您的 %s %s 仓位已被强制平仓", ev.Symbol, sideName(ev.Side))
+	if ev.Partial {
+		title = "合约仓位部分强平"
+		body = fmt.Sprintf("您的 %s %s 仓位已被部分强平（平仓 %.4f，剩余 %.4f）",
+			ev.Symbol, sideName(ev.Side), ev.Size, ev.RemainingSize)
+	}
+	body += fmt.Sprintf("。标记价 %.2f，强平手续费 %.4f USDT", ev.LiqPrice, ev.Fee)
+	if ev.Realized != 0 {
+		body += fmt.Sprintf("，实现盈亏 %.2f USDT", ev.Realized)
+	}
+	s.notifSvc.Publish(notification.PublishInput{
+		UserID: ev.UserID,
+		Type:   notification.TypeLiquidation,
+		Title:  title,
+		Body:   body,
+	})
+}
+
+// publishDepositNotice 充值到账通知。
+func (s *Server) publishDepositNotice(ev settlement.DepositEvent) {
+	if s.notifSvc == nil {
+		return
+	}
+	s.notifSvc.Publish(notification.PublishInput{
+		UserID: ev.UserID,
+		Type:   notification.TypeDepositArrived,
+		Title:  "充值到账",
+		Body:   fmt.Sprintf("您的 %s 充值 %.4f 已到账，交易哈希 %s", ev.Asset, ev.Amount.HumanFloat(), ev.TxHash),
+	})
+}
+
+// publishWithdrawNotice 提现完成通知。
+func (s *Server) publishWithdrawNotice(ev settlement.WithdrawEvent) {
+	if s.notifSvc == nil {
+		return
+	}
+	s.notifSvc.Publish(notification.PublishInput{
+		UserID: ev.UserID,
+		Type:   notification.TypeWithdrawDone,
+		Title:  "提现已完成",
+		Body:   fmt.Sprintf("您的 %s 提现 %.4f 已到账链上，交易哈希 %s", ev.Asset, ev.Amount.HumanFloat(), ev.TxHash),
+	})
 }
 
 // fundingLoop 周期性对所有持仓结算一次资金费用（标记价 + 溢价 EMA + 持仓，净额零和转账）。
@@ -716,4 +919,36 @@ func (s *Server) Close() {
 		s.chainWithdraw.Stop()
 	}
 	s.ledgerSvc.StopReconciler()
+}
+
+// ledgerHoldResolver 将 ledger.WithdrawHold 适配为 settlement.WithdrawHoldResolver（M4 来源校验）：
+// 提现广播前据此真正查询 ledger 提现冻结记录，校验 hold 存在/状态/要素一致，使离线签名器绑定
+// 真实提现记录而非接受自证布尔。返回的去耦视图不含私钥/余额等敏感上下文。
+type ledgerHoldResolver struct {
+	l *ledger.Ledger
+}
+
+func (r ledgerHoldResolver) ResolveWithdrawHold(ctx context.Context, id string) (settlement.WithdrawHoldView, bool) {
+	e, ok := r.l.WithdrawHold(id)
+	if !ok {
+		return settlement.WithdrawHoldView{}, false
+	}
+	return settlement.WithdrawHoldView{
+		UserID:    e.UserID,
+		Asset:     e.Asset,
+		Chain:     settlement.Chain(e.Chain),
+		Amount:    e.Amount,
+		Fee:       e.Fee,
+		Address:   e.Address,
+		Finalized: e.Finalized,
+		Cancelled: e.Cancelled,
+	}, true
+}
+
+func tpslCount(m map[int64]map[string]TPState) int {
+	c := 0
+	for _, km := range m {
+		c += len(km)
+	}
+	return c
 }

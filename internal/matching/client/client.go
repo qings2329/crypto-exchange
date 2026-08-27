@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -347,6 +348,25 @@ func (c *Client) GetOrder(orderID int64) (matching.OrderView, bool) {
 	return out, true
 }
 
+// OrderState 三态查询订单：known=true 时 v 为订单视图；known=false 且 err=nil 表示撮合
+// 明确无此订单（HTTP 404，已从登记簿淘汰）；err!=nil 表示撮合不可达或响应异常——调用方
+// （如 spot 重启恢复）必须保守处理，不得把「查不到」当作「订单不存在」而误释放冻结。
+func (c *Client) OrderState(orderID int64) (matching.OrderView, bool, error) {
+	resp, err := c.http.Get(fmt.Sprintf("%s/orders/%d", c.baseURL, orderID))
+	if err != nil {
+		return matching.OrderView{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return matching.OrderView{}, false, nil
+	}
+	var out matching.OrderView
+	if err := unwrap(resp, &out); err != nil {
+		return matching.OrderView{}, false, err
+	}
+	return out, true, nil
+}
+
 // ListTrades 经 cmd/matching /trades 查询指定用户成交流水。
 func (c *Client) ListTrades(userID int64, symbol string, limit int) []matching.TradeView {
 	var out []matching.TradeView
@@ -355,10 +375,24 @@ func (c *Client) ListTrades(userID int64, symbol string, limit int) []matching.T
 		q += "&symbol=" + symbol
 	}
 	if limit > 0 {
-		q += fmt.Sprintf("&limit=%d", limit)
+		q += "&limit=" + strconv.Itoa(limit)
 	}
 	if err := c.getJSON("/trades?"+q, &out); err != nil {
 		return nil
 	}
 	return out
+}
+
+// RecentTrades 查询交易对最近的全市场公开成交（user_id=0），用于 spot 服务重启后
+// 补结算停机窗口内漏掉的成交（配合账本幂等指纹去重，重放安全）。
+func (c *Client) RecentTrades(symbol string, limit int) ([]matching.TradeView, error) {
+	var out []matching.TradeView
+	q := "symbol=" + url.QueryEscape(symbol)
+	if limit > 0 {
+		q += "&limit=" + strconv.Itoa(limit)
+	}
+	if err := c.getJSON("/trades?"+q, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

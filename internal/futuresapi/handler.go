@@ -43,6 +43,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 
 	// 钱包 / 风控 / 指标（见 handler_wallet.go）
 	s.registerWalletRoutes(r)
+	// 补齐端点：地址簿白名单 / 内部划转 / 持仓 TP-SL（契约对齐 mock 网关）
+	s.registerGapRoutes(r)
 }
 
 // handleOrder 开/平仓：action=open 开仓，action=close 平仓（骨架仅支持整仓反向市价/限价）。
@@ -115,7 +117,13 @@ func (s *Server) handleOrder(c *gin.Context) {
 				mode = futures.Cross
 			}
 			// 资金闭环：开仓前从钱包冻结保证金；余额不足则拒绝开仓。
-			if err := s.ledgerSvc.Freeze(uid, "USDT", settlement.AssetAmountFromFloat(margin, settlement.AssetDecimalsByName("USDT"))); err != nil {
+			// M5：margin 来自用户请求（或价格派生），须经 Safe 拦截 NaN/Inf，避免冻结 0 金额造成无抵押开仓。
+			marginAmt, err := settlement.AssetAmountFromFloatSafe(margin, settlement.AssetDecimalsByName("USDT"))
+			if err != nil {
+				response.Error(c, 400, 400, "invalid margin: "+err.Error())
+				return
+			}
+			if err := s.ledgerSvc.Freeze(uid, "USDT", marginAmt); err != nil {
 				response.Error(c, 400, 400, "insufficient margin: "+err.Error())
 				return
 			}
@@ -250,6 +258,8 @@ func (s *Server) handlePositions(c *gin.Context) {
 			crossBalances[fmt.Sprintf("%d", p.UserID)] = s.liquidator.CrossBalance(symbol, p.UserID)
 		}
 	}
+	// 注入持仓止盈止损（TP/SL），契约对齐 PUT /futures/tpsl。
+	positions = s.decorateWithTPSL(positions)
 	response.JSON(c, gin.H{
 		"mark_price":     book.MarkPrice(),
 		"positions":      positions,
@@ -259,6 +269,27 @@ func (s *Server) handlePositions(c *gin.Context) {
 
 func (s *Server) handleLiquidations(c *gin.Context) {
 	response.JSON(c, gin.H{"liquidations": s.liquidator.RecentLiquidations()})
+}
+
+// decorateWithTPSL 为持仓切片注入已设置的止盈止损（按 uid|symbol|side 维一键查找）。
+func (s *Server) decorateWithTPSL(positions []futures.Position) []futures.Position {
+	if len(positions) == 0 {
+		return positions
+	}
+	s.tpslMu.Lock()
+	defer s.tpslMu.Unlock()
+	out := make([]futures.Position, 0, len(positions))
+	for _, p := range positions {
+		np := p
+		if uidMap, ok := s.tpsl[p.UserID]; ok {
+			if st, ok2 := uidMap[tpslKey(p.UserID, p.Symbol, sideName(p.Side))]; ok2 {
+				np.TP = st.TP
+				np.SL = st.SL
+			}
+		}
+		out = append(out, np)
+	}
+	return out
 }
 
 func (s *Server) handleADL(c *gin.Context) {

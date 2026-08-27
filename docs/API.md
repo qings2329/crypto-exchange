@@ -8,6 +8,11 @@
 - **公告模块**：服务 `internal/announcement`（挂载于用户服务 `cmd/user`，共用同一数据库；亦经独立管理后端 `cmd/admin` 以 `/api/admin/announcements` 暴露），前缀 `/api/v1/announcement`（见 [公告模块](#ann)）。
 - **理财资管**：服务 `internal/wealth`（独立二进制 `cmd/wealth`，监听 `:8092`），前缀 `/api/v1/wealth`（见 [理财模块](#wealth)）。
 - **钱包与资金流水**：服务 `internal/futuresapi`（合约钱包服务），前缀 `/api/v1/futures/wallet`（见 [钱包与资金流水](#wallet)）。
+- **站内通知**：服务 `internal/notification`（独立二进制 `cmd/notification`，监听 `:8088`），用户侧前缀 `/api/v1/user/notifications`（见 [站内通知模块](#notify)）。
+- **安全中心**：服务 `internal/services/user`（同一前缀 `/api/v1/user` 下 `api-keys`/`sessions`/`login-history`/`anti-phishing` 子路由，见 [安全中心模块](#security)）。
+- **理财中心 / 新币挖矿**：服务 `internal/earn`（独立二进制 `cmd/earn`，监听 `:8093`），前缀 `/api/v1/earn` 与 `/api/v1/launchpad`（见 [理财中心模块](#earn)）。
+- **跟单交易**：服务 `internal/copytrade`（独立二进制 `cmd/copytrade`，监听 `:8099`），前缀 `/api/v1/copytrade`（见 [跟单模块](#copytrade)）。
+- **交易机器人**：服务 `internal/bot`（独立二进制 `cmd/bot`，监听 `:8098`），前缀 `/api/v1/bot`（见 [机器人模块](#bot)）。
 
 ---
 
@@ -24,6 +29,16 @@
   - [基础约定](#wealth-basics) · [数据模型](#wealth-models) · [接口列表](#wealth-endpoints) · [错误映射](#wealth-errors) · [存储与迁移](#wealth-store) · [前端对接](#wealth-frontend)
 - [钱包与资金流水](#wallet)
   - [数据模型](#wallet-models) · [接口列表](#wallet-endpoints) · [前端对接](#wallet-frontend)
+- [站内通知模块](#notify)
+  - [基础约定](#notify-basics) · [数据模型](#notify-models) · [接口列表](#notify-endpoints) · [错误映射](#notify-errors) · [业务事件来源](#notify-events)
+- [安全中心模块](#security)
+  - [基础约定](#security-basics) · [接口列表](#security-endpoints) · [错误映射](#security-errors)
+- [理财中心 / 新币挖矿模块](#earn)
+  - [基础约定](#earn-basics) · [数据模型](#earn-models) · [接口列表](#earn-endpoints) · [错误映射](#earn-errors) · [存储与迁移](#earn-store) · [前端对接](#earn-frontend)
+- [跟单交易模块](#copytrade)
+  - [基础约定](#copytrade-basics) · [数据模型](#copytrade-models) · [接口列表](#copytrade-endpoints) · [错误映射](#copytrade-errors)
+- [交易机器人模块](#bot)
+  - [基础约定](#bot-basics) · [数据模型](#bot-models) · [接口列表](#bot-endpoints) · [错误映射](#bot-errors)
 - [错误码总览](#errors)
 
 ---
@@ -264,11 +279,12 @@ go build -o bin/otc ./cmd/otc
 {
   "user_id": 7, "language": "zh-CN", "theme": "light",
   "notify_order": true, "notify_security": true, "notify_marketing": false,
+  "trade_interval": "1m", "change_basis": "24h",
   "updated_at": "2026-08-17T10:00:00Z"
 }
 ```
 
-默认值（未设置时 `GET /preferences` 返回）：`language=zh-CN`、`theme=light`、`notify_order=true`、`notify_security=true`、`notify_marketing=false`。
+默认值（未设置时 `GET /preferences` 返回）：`language=zh-CN`、`theme=light`、`notify_order=true`、`notify_security=true`、`notify_marketing=false`、`trade_interval=""`（前端按本地默认，如 `1m`）、`change_basis=""`（前端按本地默认，如 `24h`）。
 
 <a id="user-endpoints"></a>
 ## 用户设置接口列表
@@ -296,7 +312,7 @@ go build -o bin/otc ./cmd/otc
 获取偏好（无记录返回默认值，不报错）。鉴权：User；响应：`data` = `UserPreferences`。
 
 #### PUT `/preferences`
-保存偏好（全量覆盖）。鉴权：User；请求体：`UserPreferences` 字段（`user_id` 以服务端 token 为准，忽略请求体值）；响应：`{ "ok": true }`；`language`/`theme` 长度 > 32 → `400`（ErrInvalidPref）。
+保存偏好（全量覆盖）。鉴权：User；请求体：`UserPreferences` 字段（`user_id` 以服务端 token 为准，忽略请求体值）；响应：`{ "ok": true }`；`language`/`theme` 长度 > 32、`trade_interval`/`change_basis` 长度 > 16 → `400`（ErrInvalidPref）。`trade_interval`/`change_basis` 为空串表示清除、回退前端本地默认。
 
 <a id="user-errors"></a>
 ## 用户设置错误映射
@@ -319,6 +335,7 @@ go build -o bin/otc ./cmd/otc
 - 个人设置相关迁移（与 9101~9104 错开）：
   - **9105** `alter_ce_users_profile`：`ce_users` 增加 `nickname VARCHAR(64)`、`avatar VARCHAR(512)`（默认空串）。
   - **9106** `create_ce_user_preferences`：新建 `ce_user_preferences`（`user_id` 主键，`language`/`theme`/`notify_order`/`notify_security`/`notify_marketing`/`updated_at`）。
+  - **9113** `alter_ce_user_preferences_trade`：`ce_user_preferences` 增加 `trade_interval VARCHAR(16)`、`change_basis VARCHAR(16)`（默认空串），承载交易页 K 线周期与涨跌幅基准（前端新增，向后兼容：历史记录两列均为空串）。
 - `UpdateUser`/`CreateUser`/查询已纳入 `nickname`/`avatar`；偏好读取对「无记录」容错返回默认值。
 
 <a id="user-frontend"></a>
@@ -428,7 +445,7 @@ go build -o bin/otc ./cmd/otc
 <a id="ann-admin-backend"></a>
 ## 管理后端（cmd/admin）接入
 
-独立管理后端 `cmd/admin`（监听 `:8090`，路由前缀 `/api/admin`）同样承载公告管理，复用同一套 `internal/announcement` 的 `Handler`/`Service`/`Store`，与 `cmd/user` 共享 `ce_announcements` 表（迁移版本 9401）。
+独立管理后端 `cmd/admin`（监听 `:8095`，路由前缀 `/api/admin`）同样承载公告管理，复用同一套 `internal/announcement` 的 `Handler`/`Service`/`Store`，与 `cmd/user` 共享 `ce_announcements` 表（迁移版本 9401）。
 
 - 注册位置：`adminapi.Server.RegisterRoutes` 在已套 `middleware.Auth + middleware.AdminGuard` 的 `admin` 分组下调用 `annH.RegisterAdminRoutes(admin)`，无需重复鉴权。
 - 存储：与 `cmd/admin` 其他模块一致——`cfg.MySQL.DSN` 非空时开 `announcement.NewMySQLStore(dsn)`，否则降级为内存实现。
@@ -714,6 +731,376 @@ created_by, created_at, last_used_at?, revoked_at?`。吊销为软删除，保�
 
 ---
 
+<a id="notify"></a>
+# 站内通知模块
+
+> 服务：`internal/notification`（独立二进制 `cmd/notification`，监听 `:8088`）。
+> 用户侧前缀 `/api/v1/user/notifications`；管理/写入侧前缀 `/api/v1/notification`（由 notification 服务自身或业务服务调用）。
+> 范围：强平、保证金预警、KYC、充值到账、提现完成、系统公告等站内信的统一收发。
+
+<a id="notify-basics"></a>
+## 通知基础约定
+
+- **Base URL**：用户侧 `/api/v1/user/notifications`；写入侧 `/api/v1/notification`。
+- **认证**：用户侧接口需 `middleware.Auth` Bearer Token（仅查本人）；写入侧由内部服务调用（网关/鉴权由调用方保证）。
+- 统一响应信封见 [通用约定](#common)。
+
+<a id="notify-models"></a>
+## 通知数据模型（`UserNotification` 投影）
+
+业务内部为 `{type, body, status}`，对外投影为前端契约：
+
+```json
+{
+  "id": "123",                 // 字符串（前端 id:string 契约）
+  "type": "liquidation",       // 见下方类型枚举
+  "level": "critical",         // info | warning | critical
+  "content": "您的 BTC_USDT_PERP long 仓位已被强制平仓...",
+  "read": false,               // bool（内部 status: unread/read 投影）
+  "created_at": "2026-08-26T10:00:00Z"
+}
+```
+
+| 类型 type | level | 说明 |
+| --- | --- | --- |
+| `liquidation` | critical | 合约仓位被强平（部分/全额） |
+| `margin_warning` | warning | 保证金率逼近强平价预警 |
+| `risk_alert` | critical | 风控告警 |
+| `kyc_rejected` | warning | KYC 审核被拒 |
+| `kyc_approved` | info | KYC 审核通过 |
+| `deposit_arrived` | info | 链上充值到账 |
+| `withdraw_done` | info | 提现完成 |
+| `system` | info | 系统通知 |
+
+<a id="notify-endpoints"></a>
+## 接口列表
+
+路径省略前缀 `/api/v1/user/notifications`。鉴权：User。
+
+#### GET `/`
+列表（含未读计数）。响应：`{ "notifications": [UserNotification...], "unread": 3 }`。
+
+#### GET `/unread-count`
+未读数量。响应：`{ "count": 3 }`。
+
+#### POST `/:id/read`
+标记单条已读（路径参数 `:id`）。响应：`{ "ok": true }`；越权/不存在 → `404`。
+
+#### POST `/read-all`
+全部标记已读。响应：`{ "ok": true }`。
+
+#### DELETE `/:id`
+删除单条。响应：`{ "ok": true }`；重复删除 → `404`。
+
+<a id="notify-errors"></a>
+## 通知错误映射
+
+| HTTP | code | 场景 |
+| --- | --- | --- |
+| 401 | 401 | 未认证 / Token 非法 |
+| 404 | 404 | 非本人通知 / 不存在 |
+| 500 | 500 | 服务端内部异常 |
+
+<a id="notify-events"></a>
+## 业务事件来源（§37）
+
+由业务服务在关键事件发生时调用 `notification.Service.Publish` 写入：
+
+- **合约强平**（`internal/futuresapi`）：`onLiquidation` → 经 `broadcastLiquidations` → `publishLiquidationNotice`，向被强平用户推送 `liquidation` 站内信。
+- **保证金预警**（`internal/futuresapi`）：`liqScanLoop` 每轮 `emitMarginWarnings` 扫描所有仓位，保证金率低于 `MarginWarnRatio=1.2` 时推送 `margin_warning` 站内信（每 user+symbol 内存去重，行情回升后再次下跌可重新触发）。
+- 其余类型（KYC/充值/提现/系统）由对应业务线写入。
+
+---
+
+<a id="security"></a>
+# 安全中心模块
+
+> 服务：`internal/services/user`，前缀 `/api/v1/user`（与用户设置同域）。
+> 范围：API Key 管理、登录历史、会话管理、防钓鱼码。
+
+<a id="security-basics"></a>
+## 安全中心基础约定
+
+- **Base URL**：`/api/v1/user`
+- **认证**：所有接口均经 `middleware.Auth` 鉴权（Bearer Token）；API Key 创建/列举/启停/吊销另受本人归属校验（跨用户越权 → `404`）。
+- 统一响应信封见 [通用约定](#common)。
+
+<a id="security-endpoints"></a>
+## 接口列表
+
+### API Key
+
+#### POST `/api-keys`
+创建 API Key。鉴权：User；请求体：`{ "label": "my-bot", "permissions": ["read","trade"], "ip_whitelist": "1.2.3.4,5.6.7.8" }`。
+- `permissions` ⊂ `read|trade|withdraw`；非法值 → `400`。
+- 响应：`{ "api_key": { "key": "<明文 cxk_...>", "id": 1, "label": "...", "permissions": [...], "status": "active" } }`；**明文 key 仅创建响应返回一次**，存储只落 `sha256` 哈希。
+
+#### GET `/api-keys`
+列表。鉴权：User；响应：`{ "api_keys": [...], "total": n }`（不含 secret/哈希）。
+
+#### PUT `/api-keys`
+启用/停用。鉴权：User；请求体：`{ "id": 1, "status": "active"|"disabled" }`；跨用户 → `404`。
+
+#### DELETE `/api-keys/:id`
+吊销（硬删）。鉴权：User；响应：`{ "ok": true }`；跨用户 → `404`。
+
+### 登录历史
+
+#### GET `/login-history`
+登录记录（成功/失败均记录）。鉴权：User；响应：`{ "entries": [{ "id": "171...", "ip": "127.0.0.1", "location": "本地", "success": true, "created_at": "..." }] }`；`id` 为字符串（前端 id:string 契约）。
+
+### 会话
+
+#### GET `/sessions`
+当前用户会话列表。鉴权：User；响应：`{ "sessions": [{ "id": "...", "current": true, "last_active_at": "..." }] }`；`current` 由「最近活跃」启发式推导（当前会话标记）。
+
+#### POST `/sessions/:id/revoke`
+注销指定会话。鉴权：User；注销当前会话 → `400`；不存在 → `404`；响应：`{ "ok": true }`。
+
+#### POST `/sessions/revoke-all`
+注销除当前外的所有会话。鉴权：User；响应：`{ "revoked": 2 }`（被注销数）。
+
+### 防钓鱼码
+
+#### GET `/anti-phishing`
+获取防钓鱼码（未设置为空串）。鉴权：User；响应：`{ "code": "XYZ789" }`。
+
+#### POST `/anti-phishing`
+设置/清除。鉴权：User；请求体：`{ "code": "XYZ789" }`（空串清除）；超长（>32）→ `400`；响应：`{ "ok": true }`。
+
+<a id="security-errors"></a>
+## 安全中心错误映射
+
+| HTTP | code | 场景 |
+| --- | --- | --- |
+| 401 | 401 | 未认证 / Token 非法 |
+| 400 | 400 | 参数校验失败（permissions 非法、防钓鱼码超长、注销当前会话） |
+| 404 | 404 | 非本人资源 / 不存在 |
+| 500 | 500 | 服务端内部异常 |
+
+---
+
+<a id="earn"></a>
+# 理财中心 / 新币挖矿模块
+
+> 服务：`internal/earn`（独立二进制 `cmd/earn`，监听 `:8093`）。
+> 路由前缀：`/api/v1/earn`（理财中心：活期/定期申购、计息、赎回）、`/api/v1/launchpad`（新币挖矿：项目、质押、领奖、解押）。
+
+<a id="earn-basics"></a>
+## 理财基础约定
+
+- **Base URL**：`/api/v1/earn` 与 `/api/v1/launchpad`
+- **认证**：用户接口需 `middleware.Auth`；管理接口（`/admin/*`）需 `AdminGuard`。
+- **中央托管模型**：申购本金 `user → SysWealth`（理财）/ `user → SysStaking`（挖矿），赎回/领奖时由系统账户支出；计息定点整数（`YIELD_SCALE`），预算闸口在服务层显式校验。
+
+<a id="earn-models"></a>
+## 数据模型
+
+### EarnProduct / EarnSubscription
+与 [理财资管模块](#wealth) 的 `WealthProduct`/`WealthHolding` 结构类似（活期/定期/年化/起购/持仓本金/已计收益），差异在于本模块由 `cmd/earn` 独立服务托管，路由前缀为 `/api/v1/earn`。
+
+### LaunchProject / LaunchPosition
+| 字段 | 说明 |
+| --- | --- |
+| id | 项目 ID |
+| asset | 奖励资产 |
+| status | upcoming / ongoing / ended（由 now 推导） |
+| funded_total | 管理员预充预算（库存，供对账） |
+| stake_amount | 用户质押量 |
+
+<a id="earn-endpoints"></a>
+## 接口列表
+
+路径省略前缀 `/api/v1/earn`。鉴权：User；Admin 接口需 `AdminGuard`。
+
+#### GET `/products`
+理财产品列表（含 `current`/`fixed`）。响应：`{ "products": [...] }`。
+
+#### POST `/subscribe`
+申购。请求体：`{ "product_id": 1, "amount": 1000 }`；需勾选风险揭示 `agreed`（前端/服务端双校验）；响应：`data` = 持仓。
+
+#### POST `/redeem`
+赎回（定期未到期拒绝）。请求体：`{ "holding_id": 10 }`；响应：`data` = 持仓（status=redeemed）。
+
+#### GET `/subscriptions`
+我的持仓。响应：`{ "subscriptions": [...] }`。
+
+#### GET `/admin/products`
+管理：产品列表。
+
+#### POST `/admin/products`
+管理：创建产品。
+
+#### POST `/admin/accrue`
+管理：手动计提（通常后台 60s 循环自动执行）。响应：`{ "accrued": <本轮回填总额> }`。
+
+路径省略前缀 `/api/v1/launchpad`。鉴权：User；Admin 接口需 `AdminGuard`。
+
+#### GET `/projects`
+挖矿项目列表（含状态推导）。响应：`{ "projects": [...] }`。
+
+#### POST `/stake`
+质押。请求体：`{ "project_id": 1, "amount": 100 }`；响应：`data` = 仓位。
+
+#### POST `/harvest`
+领奖。响应：`data` = 领取记录；预算不足 → `ErrPoolExhausted`（先持久化 Pending，fail-safe）。
+
+#### POST `/unstake`
+解押。请求体：`{ "position_id": 1, "amount": 0 }`（`amount=0` 全额）；响应：`data` = 仓位。
+
+#### POST `/admin/projects`
+管理：创建项目（id 唯一、资产白名单校验）。
+
+#### POST `/admin/projects/:id/fund`
+管理：预充奖励预算 `token → SysStakingReward`。
+
+<a id="earn-errors"></a>
+## 理财错误映射
+
+| HTTP | code | 场景 |
+| --- | --- | --- |
+| 401 | 401 | 未认证 / Token 非法 |
+| 400 | 400 | 参数/业务前置校验（未勾选风险揭示、min/max 超限、定期锁定、预算不足） |
+| 404 | 404 | 产品/项目/持仓不存在 |
+| 500 | 500 | 服务端内部异常（账本转账） |
+
+<a id="earn-store"></a>
+## 存储与迁移
+
+- 迁移 **9611–9614**：`ce_earn_products` / `ce_earn_subscriptions` / `ce_launch_projects`（含 `funded_total`）/ `ce_launch_positions`；金额列 `VARCHAR(64)` 定点存储。
+- MemStore + MySQLStore 同构；`cmd/earn/main.go` 配置 DSN 则连 MySQL 跑迁移，否则内存。
+
+<a id="earn-frontend"></a>
+## 前端对接
+
+- 类型与封装见 `src/api/client.ts`：`earnProducts()`、`earnSubscribe(id, amount)`、`earnRedeem(holdingId)`、`earnSubscriptions()`；`launchProjects()`、`launchStake(id, amt)`、`launchHarvest()`、`launchUnstake(posId, amt)`。
+- 页面 `src/pages/Earn.tsx` / `src/pages/Launchpad.tsx` 已按上述契约对齐；mock 网关路由族一致，切真实后端即插即用。
+
+---
+
+<a id="copytrade"></a>
+# 跟单交易模块
+
+> 服务：`internal/copytrade`（独立二进制 `cmd/copytrade`，监听 `:8099`）。
+> 路由前缀：`/api/v1/copytrade`。范围：带单高手（lead）注册、粉丝关注（follow）、自动复制成交、平台复制费结算。
+
+<a id="copytrade-basics"></a>
+## 跟单基础约定
+
+- **Base URL**：`/api/v1/copytrade`
+- **认证**：用户接口需 `middleware.Auth`；管理接口需 `AdminGuard`。
+- **自动跟单数据流**：撮合引擎成交 → Kafka `exchange.trades` → `cmd/copytrade` 订阅 → `svc.OnTrade` → 识别被跟单 lead → 按 `copyRatio` 计算粉丝名义额（不超过 `allocatedAmount`）→ 以粉丝授权 token 经下游 `spot/futures` 的 `/order` 代下单（F4）→ 平台复制费 `follower → SysCopyTradeFee`（F2 定点）。
+- **F1 幂等**：`(eventID, followID)` 去重；`client_oid = copytrade:<followID>:<eventID>` 下游再防重。
+
+<a id="copytrade-models"></a>
+## 数据模型
+
+| 结构 | 关键字段 |
+| --- | --- |
+| LeadTrader | id, name, bio, status(active/closed) |
+| Follow | id, lead_id, follower_id, copy_ratio, allocated_amount, follower_token, status(active/stopped) |
+| CopyRecord | id, lead_id, follower_id, symbol, side, price, qty, notional, fee_amount, exchange_order_id, status(done/failed) |
+
+<a id="copytrade-endpoints"></a>
+## 接口列表
+
+路径省略前缀 `/api/v1/copytrade`。鉴权：User；Admin 接口需 `AdminGuard`。
+
+#### POST `/leads`
+注册为带单高手。请求体：`{ "name": "TraderA", "bio": "..." }`；响应：`data` = LeadTrader。
+
+#### GET `/leads`
+在售带单列表。响应：`{ "leads": [...] }`。
+
+#### POST `/leads/:id/close`
+关闭带单（仅本人）。响应：`{ "ok": true }`。
+
+#### POST `/follows`
+关注并授权跟单。请求体：`{ "lead_id": 1, "copy_ratio": 0.1, "allocated_amount": 1000, "follower_token": "<粉丝 Bearer>" }`；响应：`data` = Follow。
+
+#### GET `/follows`
+我的跟单关系。响应：`{ "follows": [...] }`。
+
+#### POST `/follows/:id/stop`
+停止跟单（仅本人）。响应：`{ "ok": true }`。
+
+#### GET `/admin/leads` · `/admin/follows` · `/admin/copies`
+管理：全量带单/跟单/复制成交列表。
+
+#### POST `/admin/simulate-trade`
+管理：模拟一笔成交驱动复制（演示/联调用）。
+
+#### GET `/admin/reconcile`
+管理：复制费业务对账（各资产 `已入账复制费之和 == SysCopyTradeFee 余额`），返回偏差。
+
+<a id="copytrade-errors"></a>
+## 跟单错误映射
+
+| HTTP | code | 场景 |
+| --- | --- | --- |
+| 401 | 401 | 未认证 / Token 非法 |
+| 400 | 400 | 参数校验（copy_ratio≤0、缺 token、lead 非 active） |
+| 403 | 403 | 非本人操作（关闭/停止他人带单） |
+| 404 | 404 | lead/follow 不存在 |
+| 500 | 500 | 服务端内部异常（代下单/账本） |
+
+---
+
+<a id="bot"></a>
+# 交易机器人模块
+
+> 服务：`internal/bot`（独立二进制 `cmd/bot`，监听 `:8098`）。
+> 路由前缀：`/api/v1/bot`。范围：网格/定投(DCA)/均线(MA) 策略的创建、启停、后台 tick 代用户下单。
+
+<a id="bot-basics"></a>
+## 机器人基础约定
+
+- **Base URL**：`/api/v1/bot`
+- **认证**：用户接口需 `middleware.Auth`；管理/调试接口需 `AdminGuard`。
+- **行情源（§39）**：策略 tick 由 `PriceSource` 取价，生产接 `oracle` 真实指数价（configs 配置 `oracle.feeds`），离线回退 `DefaultOracle` 静态演示价；行情非法（NaN/Inf/非正/无价）拒绝本轮（F5）。
+- **代下单（F4/F1）**：经 `spot/futures` 的 `/order`，携带策略授权 token（F4）与 `client_oid=bot:<strategyID>:<round>`（F1 下游幂等）。
+
+<a id="bot-models"></a>
+## 数据模型
+
+| 结构 | 关键字段 |
+| --- | --- |
+| BotStrategy | id, user_id, market(spot/futures), symbol, side(buy/sell), type(grid/dca/ma), status(active/stopped), params(各策略参数), user_token, grid_state(网格状态) |
+| BotOrder | id, strategy_id, user_id, market, symbol, side, price, qty, client_oid, exchange_order_id, status |
+
+<a id="bot-endpoints"></a>
+## 接口列表
+
+路径省略前缀 `/api/v1/bot`。鉴权：User；Admin 接口需 `AdminGuard`。
+
+#### POST `/strategies`
+创建策略（默认 stopped，需显式启动）。请求体：`{ "market":"spot","symbol":"BTC_USDT","side":"buy","type":"grid","params":{...} }`；F5 参数校验失败 → `400`。
+
+#### GET `/strategies`
+我的策略列表。响应：`{ "strategies": [...] }`。
+
+#### POST `/strategies/:id/start`
+启动策略（仅本人）。响应：`{ "ok": true }`。
+
+#### POST `/strategies/:id/stop`
+停止策略（仅本人）。响应：`{ "ok": true }`。
+
+#### POST `/admin/tick`
+管理：强制触发一次指定策略 tick（调试/联调）。请求体：`{ "id": 1 }`；响应：`{ "ok": true }`。
+
+<a id="bot-errors"></a>
+## 机器人错误映射
+
+| HTTP | code | 场景 |
+| --- | --- | --- |
+| 401 | 401 | 未认证 / Token 非法 |
+| 400 | 400 | 参数校验（market/side/type 非法、网格上下界、DCA 周期/额、MA 窗口） |
+| 403 | 403 | 非本人操作 |
+| 404 | 404 | 策略不存在 |
+| 500 | 500 | 服务端内部异常（代下单/账本） |
+
+---
+
 <a id="errors"></a>
 ## 错误码总览
 
@@ -736,5 +1123,26 @@ created_by, created_at, last_used_at?, revoked_at?`。吊销为软删除，保�
 | Wealth | 500 | 5000 | 服务端内部异常（持久化 / 账本转账失败） |
 | Wallet | 401 | 401 | 未认证 / Token 非法 |
 | Wallet | 500 | 500 | 服务端内部异常（账本读取） |
+| Notification | 401 | 401 | 未认证 / Token 非法 |
+| Notification | 404 | 404 | 非本人通知 / 不存在 |
+| Notification | 500 | 500 | 服务端内部异常 |
+| Security | 401 | 401 | 未认证 / Token 非法 |
+| Security | 400 | 400 | 参数校验（permissions 非法、防钓鱼码超长、注销当前会话） |
+| Security | 404 | 404 | 非本人资源 / 不存在 |
+| Security | 500 | 500 | 服务端内部异常 |
+| Earn/Launchpad | 401 | 401 | 未认证 / Token 非法 |
+| Earn/Launchpad | 400 | 400 | 参数/业务前置校验（未勾选风险揭示、min/max 超限、定期锁定、预算不足） |
+| Earn/Launchpad | 404 | 404 | 产品/项目/持仓不存在 |
+| Earn/Launchpad | 500 | 500 | 服务端内部异常（账本转账） |
+| Copytrade | 401 | 401 | 未认证 / Token 非法 |
+| Copytrade | 400 | 400 | 参数校验（copy_ratio≤0、缺 token、lead 非 active） |
+| Copytrade | 403 | 403 | 非本人操作 |
+| Copytrade | 404 | 404 | lead/follow 不存在 |
+| Copytrade | 500 | 500 | 服务端内部异常（代下单/账本） |
+| Bot | 401 | 401 | 未认证 / Token 非法 |
+| Bot | 400 | 400 | 参数校验（market/side/type 非法、网格上下界、DCA/MA 参数） |
+| Bot | 403 | 403 | 非本人操作 |
+| Bot | 404 | 404 | 策略不存在 |
+| Bot | 500 | 500 | 服务端内部异常（代下单/账本） |
 
-> 注：OTC 与 Wealth 使用带业务子码（4010/4030/4000/…、5000）的 `code`；用户服务、公告服务与合约钱包（Wallet）当前 `code` 直接复用 HTTP 状态码（401/400/403/404/500）。两者均遵循统一 `{code,message,data}` 信封。
+> 注：OTC 与 Wealth 使用带业务子码（4010/4030/4000/…、5000）的 `code`；用户服务、公告服务与合约钱包（Wallet）当前 `code` 直接复用 HTTP 状态码（401/400/403/404/500）。两者均遵循统一 `{code,message,data}` 信封。Notification/Security/Earn/Launchpad/Copytrade/Bot 同属 HTTP 状态码复用组。

@@ -14,14 +14,21 @@ type memStore struct {
 	rules   map[int64]*RiskRule
 	blk     map[string]*BlacklistEntry // key: kind + ":" + target
 	events  map[int64]*RiskEvent
+	freqCnt map[string]*freqWindow     // key: "userID:kind"
+}
+
+type freqWindow struct {
+	count   int
+	resetAt time.Time
 }
 
 // NewMemStore 返回内存实现的 Store。
 func NewMemStore() Store {
 	return &memStore{
-		rules:  make(map[int64]*RiskRule),
-		blk:    make(map[string]*BlacklistEntry),
-		events: make(map[int64]*RiskEvent),
+		rules:   make(map[int64]*RiskRule),
+		blk:     make(map[string]*BlacklistEntry),
+		events:  make(map[int64]*RiskEvent),
+		freqCnt: make(map[string]*freqWindow),
 	}
 }
 
@@ -147,4 +154,17 @@ func (s *memStore) ListEvents(userID int64, limit int) ([]*RiskEvent, error) {
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (s *memStore) IncFrequencyCount(key string, window time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	fw, ok := s.freqCnt[key]
+	if !ok || now.After(fw.resetAt) {
+		fw = &freqWindow{count: 0, resetAt: now.Add(window)}
+		s.freqCnt[key] = fw
+	}
+	fw.count++
+	return fw.count, nil
 }

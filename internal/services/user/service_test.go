@@ -1,16 +1,18 @@
 package user
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 )
 
 func newTestService() *Service {
 	store := NewMemStore()
 	verifier := middleware.NewTokenVerifier("test-secret")
-	svc := NewService(store, verifier, NewLogNotifier(), Config{
+	svc := NewService(store, verifier, NewLogNotifier(), nil, Config{
 		AccessTTL:  15 * time.Minute,
 		RefreshTTL: time.Hour,
 		CodeTTL:    time.Minute,
@@ -24,7 +26,7 @@ func TestRegisterLoginEmail(t *testing.T) {
 	email := "alice@example.com"
 
 	// 未发码直接注册应失败
-	if _, err := svc.Register(email, "secret123", "000000"); err == nil {
+	if _, err := svc.Register(email, "secret123", "000000", ""); err == nil {
 		t.Fatal("register without code should fail")
 	}
 
@@ -36,7 +38,7 @@ func TestRegisterLoginEmail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get code: %v", err)
 	}
-	id, err := svc.Register(email, "secret123", code)
+	id, err := svc.Register(email, "secret123", code, "")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -45,7 +47,7 @@ func TestRegisterLoginEmail(t *testing.T) {
 	}
 
 	// 重复注册冲突
-	if _, err := svc.Register(email, "secret123", code); err != ErrUserExists {
+	if _, err := svc.Register(email, "secret123", code, ""); err != ErrUserExists {
 		t.Fatalf("expected ErrUserExists, got %v", err)
 	}
 
@@ -88,7 +90,7 @@ func TestRegisterPhone(t *testing.T) {
 		t.Fatalf("send code: %v", err)
 	}
 	code, _ := latestCode(svc, phone, PurposeRegister)
-	if _, err := svc.Register(phone, "secret123", code); err != nil {
+	if _, err := svc.Register(phone, "secret123", code, ""); err != nil {
 		t.Fatalf("register phone: %v", err)
 	}
 	if _, err := svc.Login(phone, "secret123", ""); err != nil {
@@ -101,7 +103,7 @@ func TestResetPassword(t *testing.T) {
 	email := "bob@example.com"
 	_ = svc.SendCode(email, PurposeRegister)
 	code, _ := latestCode(svc, email, PurposeRegister)
-	if _, err := svc.Register(email, "oldpass1", code); err != nil {
+	if _, err := svc.Register(email, "oldpass1", code, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	// 找回：发重置码
@@ -125,7 +127,7 @@ func TestTFAFlow(t *testing.T) {
 	email := "carol@example.com"
 	_ = svc.SendCode(email, PurposeRegister)
 	code, _ := latestCode(svc, email, PurposeRegister)
-	id, err := svc.Register(email, "secret123", code)
+	id, err := svc.Register(email, "secret123", code, "")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -171,7 +173,7 @@ func TestKYCFlow(t *testing.T) {
 	email := "dave@example.com"
 	_ = svc.SendCode(email, PurposeRegister)
 	code, _ := latestCode(svc, email, PurposeRegister)
-	id, err := svc.Register(email, "secret123", code)
+	id, err := svc.Register(email, "secret123", code, "")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -216,7 +218,7 @@ func registerTestUser(t *testing.T, svc *Service, email, password string) int64 
 	if err != nil {
 		t.Fatalf("get code: %v", err)
 	}
-	if _, err := svc.Register(email, password, code); err != nil {
+	if _, err := svc.Register(email, password, code, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	u, err := svc.store.GetByEmail(email)
@@ -361,5 +363,134 @@ func TestPreferencesTimezone(t *testing.T) {
 	}
 	if got2.Timezone != "" {
 		t.Fatalf("expected empty timezone after clear, got %q", got2.Timezone)
+	}
+}
+
+// TestPreferencesTrade 验证交易偏好（K 线周期 / 涨跌幅基准）可正确写入并读回，
+// 避免服务层在重建 UserPreferences 时静默丢弃这两个前端新增字段。
+func TestPreferencesTrade(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "trade@example.com", "secret123")
+
+	// 未设置时默认为空串（前端按本地默认处理）
+	def, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get preferences: %v", err)
+	}
+	if def.TradeInterval != "" || def.ChangeBasis != "" {
+		t.Fatalf("expected empty trade prefs, got %+v", def)
+	}
+
+	in := &UserPreferences{
+		Language:      "en",
+		Theme:         "dark",
+		TradeInterval: "15m",
+		ChangeBasis:   "today",
+	}
+	if err := svc.UpdatePreferences(id, in); err != nil {
+		t.Fatalf("update trade prefs: %v", err)
+	}
+	got, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if got.TradeInterval != "15m" || got.ChangeBasis != "today" {
+		t.Fatalf("trade prefs not persisted: %+v", got)
+	}
+	// 同一次写入的语言/主题也应保持
+	if got.Language != "en" || got.Theme != "dark" {
+		t.Fatalf("language/theme drift: %+v", got)
+	}
+
+	// 改回空串应被保留，而非回退成默认
+	in2 := &UserPreferences{TradeInterval: "", ChangeBasis: ""}
+	if err := svc.UpdatePreferences(id, in2); err != nil {
+		t.Fatalf("clear trade prefs: %v", err)
+	}
+	got2, err := svc.GetPreferences(id)
+	if err != nil {
+		t.Fatalf("get after clear: %v", err)
+	}
+	if got2.TradeInterval != "" || got2.ChangeBasis != "" {
+		t.Fatalf("expected empty trade prefs after clear, got %+v", got2)
+	}
+}
+
+// TestReviewKYCPublishesNotification 验证 ReviewKYC 通过/驳回均写入通知中心。
+func TestReviewKYCPublishesNotification(t *testing.T) {
+	notifSvc := notification.New(notification.NewMemStore())
+	store := NewMemStore()
+	verifier := middleware.NewTokenVerifier("test-secret")
+	svc := NewService(store, verifier, NewLogNotifier(), notifSvc, Config{})
+
+	uid := registerTestUser(t, svc, "kyc@example.com", "secret123")
+	if err := svc.SubmitKYC(uid, KYCRequest{RealName: "张三", IDNumber: "110"}); err != nil {
+		t.Fatalf("submit kyc: %v", err)
+	}
+
+	// 通过
+	if err := svc.ReviewKYC(uid, true, "", "reviewer-a"); err != nil {
+		t.Fatalf("review kyc approve: %v", err)
+	}
+	list, err := notifSvc.List(uid, false, 10)
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+	if len(list) != 1 || list[0].Type != notification.TypeKYCAproved {
+		t.Fatalf("expected 1 approved notification, got %+v", list)
+	}
+
+	// 再次提交并驳回
+	if err := svc.SubmitKYC(uid, KYCRequest{RealName: "张三", IDNumber: "110"}); err != nil {
+		t.Fatalf("submit kyc again: %v", err)
+	}
+	if err := svc.ReviewKYC(uid, false, "材料不清晰", "reviewer-b"); err != nil {
+		t.Fatalf("review kyc reject: %v", err)
+	}
+	list, err = notifSvc.List(uid, false, 10)
+	if err != nil {
+		t.Fatalf("list notifications again: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 notifications, got %d", len(list))
+	}
+	var rejected *notification.Notification
+	for _, n := range list {
+		if n.Type == notification.TypeKYCRejected {
+			rejected = n
+		}
+	}
+	if rejected == nil {
+		t.Fatalf("rejected notification missing: %+v", list)
+	}
+	if rejected.Body != "材料不清晰" {
+		t.Fatalf("expected reject reason in body, got %q", rejected.Body)
+	}
+}
+
+// TestRiskAlertOnFailedLogin 验证既有账号登录失败时推送风险预警通知。
+func TestRiskAlertOnFailedLogin(t *testing.T) {
+	notifSvc := notification.New(notification.NewMemStore())
+	svc := NewService(NewMemStore(), middleware.NewTokenVerifier("test-secret"), NewLogNotifier(), notifSvc, Config{})
+	uid := registerTestUser(t, svc, "risk@example.com", "secret123")
+
+	// 对既有账号发起一次失败登录（authErr != nil，userID 已知）。
+	svc.RecordLoginWithMeta("risk@example.com", errors.New("bad password"), uid, "203.0.113.9", "curl/8.0")
+	list, err := notifSvc.List(uid, false, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 || list[0].Type != notification.TypeRiskAlert {
+		t.Fatalf("expected 1 risk_alert notification, got %+v", list)
+	}
+	if list[0].Title != "账号登录异常提醒" {
+		t.Fatalf("unexpected title: %s", list[0].Title)
+	}
+
+	// 成功登录不应再产生风险预警（仅历史/会话）。
+	svc.RecordLoginWithMeta("risk@example.com", nil, uid, "203.0.113.9", "curl/8.0")
+	list2, _ := notifSvc.List(uid, false, 10)
+	if len(list2) != 1 {
+		t.Fatalf("successful login must not add risk_alert, got %d", len(list2))
 	}
 }

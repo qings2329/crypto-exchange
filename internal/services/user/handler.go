@@ -52,6 +52,11 @@ func (h *Handler) Register(r *gin.Engine) {
 	auth.POST("/tfa/disable", h.tfaDisable)
 	auth.POST("/kyc/submit", h.kycSubmit)
 	auth.GET("/kyc", h.kycGet)
+	auth.GET("/referrals", h.getReferrals)
+	auth.GET("/referral-code", h.getReferralCode)
+
+	// 安全中心（API Key / 登录历史 / 会话 / 防钓鱼码）。
+	h.registerSecurityRoutes(auth)
 
 	// 管理后台聚合接口（仅管理员；cmd/admin 以 admin token 代理调用）。
 	// 此处再叠加 AdminGuard 作为纵深防御：即便上游网关漏配，普通用户也无法越权操作他人账户 / 审核 KYC。
@@ -68,15 +73,16 @@ func (h *Handler) Register(r *gin.Engine) {
 
 func (h *Handler) register(c *gin.Context) {
 	var req struct {
-		Target   string `json:"target"`
-		Password string `json:"password"`
-		Code     string `json:"code"`
+		Target       string `json:"target"`
+		Password     string `json:"password"`
+		Code         string `json:"code"`
+		ReferralCode string `json:"referral_code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Target == "" || req.Password == "" || req.Code == "" {
 		response.Error(c, http.StatusBadRequest, 400, "target, password and code required")
 		return
 	}
-	id, err := h.svc.Register(req.Target, req.Password, req.Code)
+	id, err := h.svc.Register(req.Target, req.Password, req.Code, req.ReferralCode)
 	if err != nil {
 		fail(c, err)
 		return
@@ -131,6 +137,15 @@ func (h *Handler) login(c *gin.Context) {
 		return
 	}
 	res, err := h.svc.Login(req.Target, req.Password, req.TFACode)
+	// 登录历史/会话登记：能归属到具体用户（含密码错误的既有账号）即记录。
+	if res != nil {
+		h.svc.RecordLoginWithMeta(req.Target, err, res.User.ID, c.ClientIP(), c.Request.UserAgent())
+	} else if uerr := err; uerr != nil {
+		// 失败场景下重新定位用户以归属历史（定位不到则跳过）。
+		if uid, ok := h.svc.LookupUserID(req.Target); ok {
+			h.svc.RecordLoginWithMeta(req.Target, uerr, uid, c.ClientIP(), c.Request.UserAgent())
+		}
+	}
 	if err != nil {
 		fail(c, err)
 		return
@@ -510,4 +525,49 @@ func fail(c *gin.Context, err error) {
 	default:
 		response.Error(c, http.StatusInternalServerError, 500, err.Error())
 	}
+}
+
+// ---- 邀请 ----
+
+func (h *Handler) getReferralCode(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, http.StatusUnauthorized, 401, "unauthorized")
+		return
+	}
+	user, _, err := h.svc.GetProfile(uid)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"referral_code": user.ReferralCode})
+}
+
+func (h *Handler) getReferrals(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok {
+		response.Error(c, http.StatusUnauthorized, 401, "unauthorized")
+		return
+	}
+	users, err := h.svc.GetReferrals(uid)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	type refInfo struct {
+		UserID    int64  `json:"user_id"`
+		Nickname  string `json:"nickname"`
+		Email     string `json:"email"`
+		CreatedAt string `json:"created_at"`
+	}
+	out := make([]refInfo, 0, len(users))
+	for _, u := range users {
+		out = append(out, refInfo{
+			UserID:    u.ID,
+			Nickname:  u.Nickname,
+			Email:     u.Email,
+			CreatedAt: u.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	response.JSON(c, gin.H{"referrals": out, "total": len(out)})
 }

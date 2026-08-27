@@ -410,7 +410,7 @@ func TestNewWithdrawGatewayETHUsesNodeNonceGas(t *testing.T) {
 	sig, _ := newRealSignerWithSource(HotWalletConfig{SignerKey: knownVectorPriv}, SignerSources{})
 	to := "0x3535353535353535353535353535353535353535"
 	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
-	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to)
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to, "")
 	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), to, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
@@ -487,7 +487,7 @@ func TestNewWithdrawGatewayETHERC20UsesOfflineSigner(t *testing.T) {
 	userAddr := "0x1111111111111111111111111111111111111111"
 	// 1.5 USDT 经网关内部 ToDecimals(6) → 1500000 最小单位。
 	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
-	rg.AuthorizeWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), userAddr)
+	rg.AuthorizeWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), userAddr, "")
 	ev, err := rg.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), userAddr, false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
@@ -555,7 +555,7 @@ func TestNewWithdrawGatewayBTCUsesOfflineSignerMainPath(t *testing.T) {
 	}
 
 	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
-	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "BTC", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), deriveP2WPKHAddress(priv.PubKey()))
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "BTC", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), deriveP2WPKHAddress(priv.PubKey()), "")
 	ev, err := g.SubmitWithdraw(1, "BTC", ChainBTC, amt(ChainBTC, 0.5), amt(ChainBTC, 0.0005), deriveP2WPKHAddress(priv.PubKey()), false)
 	if err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
@@ -612,7 +612,7 @@ func TestSubmitWithdrawLogsERC20RoutedAndBroadcast(t *testing.T) {
 	buf, restore := captureLog(t)
 	defer restore()
 	// M4：经工厂装配且配置了离线签名器（enforceAuth=true），须先登记门控授权。
-	g.AuthorizeWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), "0x1111111111111111111111111111111111111111")
+	g.AuthorizeWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), "0x1111111111111111111111111111111111111111", "")
 	if _, err := g.SubmitWithdraw(1, "USDT", ChainETH, amt(ChainETH, 1.5), amt(ChainETH, 0.001), "0x1111111111111111111111111111111111111111", false); err != nil {
 		t.Fatalf("SubmitWithdraw: %v", err)
 	}
@@ -776,7 +776,7 @@ func TestRPCWithdrawGatewayAuthorizedWithdrawOK(t *testing.T) {
 		signer:              &emptyRawSigner{},
 		enforceAuth:         true,
 	}
-	if _, err := g.AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0xabc"); err != nil {
+	if _, err := g.AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0xabc", ""); err != nil {
 		t.Fatalf("AuthorizeWithdraw: %v", err)
 	}
 	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0xabc", false)
@@ -797,5 +797,89 @@ func TestChainSignerRejectsUnauthorizedTx(t *testing.T) {
 	}
 	if _, err := cs.Sign(context.Background(), &UnsignedTx{Chain: ChainETH, To: "0xabc", Amount: amt(ChainETH, 1), Authorized: true}); err != nil {
 		t.Fatalf("authorized tx should reach base signer: %v", err)
+	}
+}
+
+// memHoldResolver 是 WithdrawHoldResolver 的内存假实现，用于 M4 来源校验回归测试。
+type memHoldResolver struct {
+	holds map[string]WithdrawHoldView
+}
+
+func (m *memHoldResolver) ResolveWithdrawHold(_ context.Context, id string) (WithdrawHoldView, bool) {
+	h, ok := m.holds[id]
+	return h, ok
+}
+
+// TestRPCWithdrawGatewayRejectsHoldMismatch 回归 M4：注入 WithdrawHoldResolver 后，网关必须在
+// 签名前校验绑定的 hold 真实存在且要素与本次提现一致，否则拒签（防离线签名器伪造来源转移资金）。
+func TestRPCWithdrawGatewayRejectsHoldMismatch(t *testing.T) {
+	const (
+		userID = int64(1)
+		asset  = "ETH"
+		chain  = ChainETH
+		addr   = "0xabc"
+		holdID = "hold-1"
+	)
+	amtV := amt(chain, 1.0)
+	feeV := amt(chain, 0.001)
+
+	newGateway := func(r WithdrawHoldResolver) *RPCWithdrawGateway {
+		g := &RPCWithdrawGateway{
+			MockWithdrawGateway: NewMockWithdrawGateway(2, time.Second),
+			signer:              &emptyRawSigner{},
+			enforceAuth:         true,
+			holdResolver:        r,
+		}
+		// 预登记：将 holdID 绑定到本次提现要素（AuthorizeWithdraw 写入 authorized 映射，
+		// 供 lookupHoldID 取回 holdID 后交由 resolver 查真实 hold）。
+		if _, err := g.AuthorizeWithdraw(userID, asset, chain, amtV, feeV, addr, holdID); err != nil {
+			t.Fatalf("AuthorizeWithdraw: %v", err)
+		}
+		return g
+	}
+	consented := func() map[string]WithdrawHoldView {
+		return map[string]WithdrawHoldView{
+			holdID: {UserID: userID, Asset: asset, Chain: chain, Amount: amtV, Fee: feeV, Address: addr},
+		}
+	}
+
+	// (a) hold 不存在 → 拒
+	g := newGateway(&memHoldResolver{holds: map[string]WithdrawHoldView{}})
+	if _, err := g.SubmitWithdraw(userID, asset, chain, amtV, feeV, addr, false); err == nil {
+		t.Fatalf("case(a): expected withdraw rejected when bound hold not found")
+	}
+
+	// (b) hold 已 Finalized → 拒
+	g = newGateway(&memHoldResolver{holds: map[string]WithdrawHoldView{
+		holdID: {UserID: userID, Asset: asset, Chain: chain, Amount: amtV, Fee: feeV, Address: addr, Finalized: true},
+	}})
+	if _, err := g.SubmitWithdraw(userID, asset, chain, amtV, feeV, addr, false); err == nil {
+		t.Fatalf("case(b): expected withdraw rejected when bound hold is finalized")
+	}
+
+	// (c) 要素不一致（金额不同）→ 拒
+	g = newGateway(&memHoldResolver{holds: map[string]WithdrawHoldView{
+		holdID: {UserID: userID, Asset: asset, Chain: chain, Amount: amt(chain, 2.0), Fee: feeV, Address: addr},
+	}})
+	if _, err := g.SubmitWithdraw(userID, asset, chain, amtV, feeV, addr, false); err == nil {
+		t.Fatalf("case(c): expected withdraw rejected when amount mismatches hold")
+	}
+
+	// (c2) 要素不一致（地址不同）→ 拒
+	g = newGateway(&memHoldResolver{holds: map[string]WithdrawHoldView{
+		holdID: {UserID: userID, Asset: asset, Chain: chain, Amount: amtV, Fee: feeV, Address: "0xother"},
+	}})
+	if _, err := g.SubmitWithdraw(userID, asset, chain, amtV, feeV, addr, false); err == nil {
+		t.Fatalf("case(c2): expected withdraw rejected when address mismatches hold")
+	}
+
+	// (d) 要素一致 → 放行
+	g = newGateway(&memHoldResolver{holds: consented()})
+	ev, err := g.SubmitWithdraw(userID, asset, chain, amtV, feeV, addr, false)
+	if err != nil {
+		t.Fatalf("case(d): consented hold should pass: %v", err)
+	}
+	if ev == nil || ev.TxHash == "" {
+		t.Fatalf("case(d): expected a broadcasted withdraw event")
 	}
 }

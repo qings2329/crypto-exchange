@@ -10,7 +10,7 @@ import (
 )
 
 // API Key 迁移版本（错开账户 92xx、公告 94xx、审计 9801、理财 97xx 等）。
-const apiKeyMigVer = 9802
+const apiKeyMigVer = 9813
 
 // Migrations 是 ce_admin_api_keys 表的建表迁移，由 NewMySQLStore 应用。
 var Migrations = []migrate.Migration{

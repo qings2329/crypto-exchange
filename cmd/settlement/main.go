@@ -25,6 +25,8 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/mq"
+	"github.com/coldlar/crypto-exchange/internal/referral"
+	"github.com/coldlar/crypto-exchange/internal/services/user"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
@@ -57,6 +59,21 @@ func main() {
 		log.Warn("clearing store fallback to in-memory", zap.Error(cerr))
 	}
 	clearer := settlement.NewClearer(clearStore, cfg.Settlement.TradeFeeRate)
+
+	// 邀请佣金钩子：taker 有邀请人时记录佣金（可选，需配置 referral_commission_rate）。
+	if cfg.Settlement.ReferralCommissionRate > 0 && cfg.MySQL.DSN != "" {
+		if userStore, uerr := user.NewMySQLStore(cfg.MySQL.DSN); uerr != nil {
+			log.Warn("settlement referral: user store unavailable, referral disabled", zap.Error(uerr))
+		} else if refStore, rerr := referral.NewMySQLStore(cfg.MySQL.DSN); rerr != nil {
+			log.Warn("settlement referral: referral store unavailable, referral disabled", zap.Error(rerr))
+		} else {
+			refSvc := referral.NewService(refStore, log)
+			hook := referral.NewHookAdapter(userStore, refSvc, cfg.Settlement.ReferralCommissionRate)
+			clearer.SetReferralHook(hook)
+			log.Info("settlement referral hook enabled",
+				zap.Float64("commission_rate", cfg.Settlement.ReferralCommissionRate))
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -140,7 +157,10 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	addr := ":8086"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8086"
+	}
 	log.Info("settlement service starting", zap.String("addr", addr))
 	go func() {
 		sig := make(chan os.Signal, 1)

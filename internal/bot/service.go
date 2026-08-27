@@ -215,11 +215,16 @@ func (s *Service) Tick(ctx context.Context, id int64) error {
 
 // tick 执行单个策略的一轮：依类型产生下单信号，代用户下单。
 // F1 幂等：client_oid = bot:strategyID:round，round 取「该策略已持久化订单数」——
-//   订单成功入库后计数才增长，故 CreateOrder 失败重试时复用同一 client_oid，被下游 spot/futures
-//   幂等去重、不会重复下单；进程重启后从 DB 续接，不会与历史 client_oid 碰撞漏单；并发两轮以同一
-//   序号下单同样被下游去重。F4 授权：代下单用策略绑定的用户 token，下游校验 token->userID，杜绝越权。
+//
+//	订单成功入库后计数才增长，故 CreateOrder 失败重试时复用同一 client_oid，被下游 spot/futures
+//	幂等去重、不会重复下单；进程重启后从 DB 续接，不会与历史 client_oid 碰撞漏单；并发两轮以同一
+//	序号下单同样被下游去重。F4 授权：代下单用策略绑定的用户 token，下游校验 token->userID，杜绝越权。
+//
 // F5/越仓：累计额达 MaxPosition 即暂停本轮；行情非法（NaN/Inf/非正）拒绝本轮下单。
 func (s *Service) tick(st *BotStrategy) error {
+	if st.Type == StrategyGrid {
+		return s.tickGrid(st)
+	}
 	// F1：以持久化订单数作为本轮序号（成功入库才增长）。
 	count, err := s.store.CountOrdersByStrategy(st.ID)
 	if err != nil {
@@ -257,6 +262,59 @@ func (s *Service) tick(st *BotStrategy) error {
 		ExchangeOrderID: exID, Status: "submitted", CreatedAt: time.Now().Unix(),
 	}
 	return s.store.CreateOrder(o)
+}
+
+// tickGrid 执行一轮网格策略：
+//  1. 获取当前价格
+//  2. 如果 GridState 为 nil，用 InitGridState 初始化
+//  3. 调用 TickGrid 计算本轮应下的订单
+//  4. 执行订单并持久化状态
+func (s *Service) tickGrid(st *BotStrategy) error {
+	price, err := s.price.Price(string(st.Market), st.Symbol)
+	if err != nil {
+		return err
+	}
+	if math.IsNaN(price) || math.IsInf(price, 0) || price <= 0 {
+		return fmt.Errorf("bot: invalid price %.8f for %s", price, st.Symbol)
+	}
+
+	cfg, err := CalcGridConfig(st.Params)
+	if err != nil {
+		return err
+	}
+
+	// 初始化网格状态（首次 tick）
+	if st.GridState == nil {
+		st.GridState = InitGridState(cfg, price, st.Params.OrderAmount)
+	}
+
+	// 计算本轮订单
+	gridOrders := TickGrid(st.GridState, cfg, price, st.Params.OrderAmount, st.Params.MaxPosition)
+
+	// 执行订单
+	for _, go2 := range gridOrders {
+		clientOID := fmt.Sprintf("grid:%d:%d:%d", st.ID, st.GridState.TradeCnt, go2.Level)
+		exID, err := s.exec.Execute(context.Background(), st.UserToken, string(st.Market), st.Symbol, go2.Side, go2.Price, go2.Qty, clientOID)
+		if err != nil {
+			s.log.Warn("grid order failed",
+				zap.Int64("strategy", st.ID),
+				zap.Int("level", go2.Level),
+				zap.Error(err),
+			)
+			continue // 单笔失败不阻塞整个网格
+		}
+		o := &BotOrder{
+			StrategyID: st.ID, UserID: st.UserID, Market: st.Market, Symbol: st.Symbol,
+			Side: go2.Side, Price: go2.Price, Qty: go2.Qty, ClientOID: clientOID,
+			ExchangeOrderID: exID, Status: "submitted", CreatedAt: time.Now().Unix(),
+		}
+		if err := s.store.CreateOrder(o); err != nil {
+			s.log.Warn("grid order persist failed", zap.Error(err))
+		}
+	}
+
+	// 持久化网格状态
+	return s.store.UpdateStrategy(st)
 }
 
 func maxf(a, b float64) float64 {

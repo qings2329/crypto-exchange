@@ -78,6 +78,16 @@ const (
 	// SysCopyTradeFee 跟单平台分成收入账户：复制成交后从粉丝收益中扣取的平台费 Credit 本账户
 	// （余额为正，表示平台累计收取的跟单分成）；交易员抽成经用户可用↔交易员账户结算。
 	SysCopyTradeFee int64 = -12
+	// SysLendingPool 借贷资金池中央托管账户：用户存款入池时从用户可用 Debit、Credit 本账户；
+	// 借款放出时从本账户 Debit、Credit 借款用户；还款时反向。余额恒等于「总存款 - 总借款」。
+	SysLendingPool int64 = -13
+	// SysLendingCollateral 借贷抵押品托管账户：借款人冻结抵押品时从用户可用 Debit、Credit 本账户；
+	// 还款释放时反向。余额恒等于「Σ活跃借款抵押品」。
+	SysLendingCollateral int64 = -14
+	// SysReferralCommission 邀请佣金中转账户：被邀请人产生交易手续费时，
+	// 佣金从系统收入中划出到本账户，再转入邀请人可用余额。
+	// 余额恒等于「已产生但未结算的佣金」，结算完成后归 0。
+	SysReferralCommission int64 = -15
 )
 
 // 快照 schema 版本。v2 起金额以 AssetAmount（定点整数）序列化；v0/v1（无 version 字段）
@@ -2492,6 +2502,9 @@ type ledgerSnapshotV1 struct {
 // migrateV1ToV2 将旧 float64 快照迁移为定点化 LedgerSnapshot：每个金额按资产标准 decimals
 // 用 AssetAmountFromFloat 缩放（丢失的浮点残差在最小单位内截断，可接受）。
 func migrateV1ToV2(v1 ledgerSnapshotV1) LedgerSnapshot {
+	// 保留裸 FromFloat：本函数将本系统自行序列化的 V1 快照（float 字段）重水化为 V2 定点结构，
+	// 数据为内部受信任来源（非用户请求/外部行情），NaN/Inf 不可达；此处仅做单位量化，故不引入
+	// Safe 校验（M5 保留项）。
 	decOf := func(asset string) int { return settlement.AssetDecimalsByName(asset) }
 	snap := LedgerSnapshot{
 		SchemaVersion:        ledgerSnapshotSchemaVersion,

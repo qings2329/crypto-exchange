@@ -3,6 +3,7 @@ package risk
 import (
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
@@ -11,7 +12,9 @@ import (
 
 // mysqlStore 是风控的 MySQL 实现，表名遵守 ce_ 约定。
 type mysqlStore struct {
-	db *sql.DB
+	db      *sql.DB
+	mu      sync.Mutex
+	freqCnt map[string]*freqWindow // 频率计数器（内存，窗口级短生命周期无需持久化）
 }
 
 // NewMySQLStore 创建 MySQL 存储并执行迁移建表（幂等）。
@@ -19,7 +22,7 @@ func NewMySQLStore(db *sql.DB) (*mysqlStore, error) {
 	if err := migrate.New(db, RiskMigrations).Up(); err != nil {
 		return nil, fmt.Errorf("risk migrate up: %w", err)
 	}
-	return &mysqlStore{db: db}, nil
+	return &mysqlStore{db: db, freqCnt: make(map[string]*freqWindow)}, nil
 }
 
 func (s *mysqlStore) UpsertRule(r *RiskRule) (*RiskRule, error) {
@@ -222,4 +225,17 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func (s *mysqlStore) IncFrequencyCount(key string, window time.Duration) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	fw, ok := s.freqCnt[key]
+	if !ok || now.After(fw.resetAt) {
+		fw = &freqWindow{count: 0, resetAt: now.Add(window)}
+		s.freqCnt[key] = fw
+	}
+	fw.count++
+	return fw.count, nil
 }

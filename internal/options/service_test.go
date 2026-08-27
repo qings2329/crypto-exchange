@@ -13,6 +13,11 @@ func eqAmt(a settlement.AssetAmount, human float64, asset string) bool {
 	return a.Cmp(settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))) == 0
 }
 
+// aa 按资产小数位把人类单位字面量构造为定点 AssetAmount（测试构造合约字段用）。
+func aa(asset string, human float64) settlement.AssetAmount {
+	return settlement.AssetAmountFromFloat(human, settlement.AssetDecimalsByName(asset))
+}
+
 func newTestService() (*Service, *ledger.Ledger) {
 	store := NewMemStore()
 	l := ledger.New()
@@ -37,9 +42,9 @@ func newTestService() (*Service, *ledger.Ledger) {
 
 func mustContract(s *Service, premium float64, expiry time.Time) *OptionContract {
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "USDT", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "USDT", Strike: aa("USDT", 40000),
 		Expiry: expiry, Type: TypeCall, Style: StyleAmerican,
-		ContractSize: 1, Premium: premium,
+		ContractSize: aa("USDT", 1), Premium: aa("USDT", premium),
 	}
 	if err := s.CreateContract(c); err != nil {
 		panic(err)
@@ -290,9 +295,9 @@ func TestQuoteRejectsMissingPrice(t *testing.T) {
 	svc, _ := newTestService()
 	// ETH 不在 priceFn 中（无行情），premium 显式给定以通过创建。
 	c := &OptionContract{
-		Underlying: "ETH", QuoteAsset: "USDT", Strike: 100,
+		Underlying: "ETH", QuoteAsset: "USDT", Strike: aa("USDT", 100),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall,
-		Style: StyleAmerican, ContractSize: 1, Premium: 100,
+		Style: StyleAmerican, ContractSize: aa("USDT", 1), Premium: aa("USDT", 100),
 	}
 	if err := svc.CreateContract(c); err != nil {
 		t.Fatalf("create: %v", err)
@@ -335,9 +340,9 @@ func TestBlackScholes(t *testing.T) {
 func TestCreateContractRejectsUnsupportedAsset(t *testing.T) {
 	svc, _ := newTestService()
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "XYZ", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "XYZ", Strike: aa("USDT", 40000),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
-		ContractSize: 1, Premium: 100,
+		ContractSize: aa("USDT", 1), Premium: aa("USDT", 100),
 	}
 	if err := svc.CreateContract(c); err != ErrUnsupportedAsset {
 		t.Fatalf("expected ErrUnsupportedAsset, got %v", err)
@@ -348,9 +353,9 @@ func TestCreateContractRejectsUnsupportedAsset(t *testing.T) {
 func TestCreateContractRejectsBadContractSize(t *testing.T) {
 	svc, _ := newTestService()
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "USDT", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "USDT", Strike: aa("USDT", 40000),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
-		ContractSize: -1, Premium: 100,
+		ContractSize: aa("USDT", -1), Premium: aa("USDT", 100),
 	}
 	if err := svc.CreateContract(c); err == nil {
 		t.Fatal("expected error for negative contract_size")
@@ -377,9 +382,9 @@ func TestExerciseRejectsBadSpot(t *testing.T) {
 func TestOpenPositionRejectsUnsupportedAsset(t *testing.T) {
 	svc, _ := newTestService()
 	c := &OptionContract{
-		Underlying: "BTC", QuoteAsset: "XYZ", Strike: 40000,
+		Underlying: "BTC", QuoteAsset: "XYZ", Strike: aa("USDT", 40000),
 		Expiry: time.Now().Add(time.Hour), Type: TypeCall, Style: StyleAmerican,
-		ContractSize: 1, Premium: 100,
+		ContractSize: aa("USDT", 1), Premium: aa("USDT", 100),
 	}
 	if err := svc.store.CreateContract(c); err != nil {
 		t.Fatalf("seed contract: %v", err)
@@ -423,5 +428,47 @@ func TestExerciseCCPSolvencyGuard(t *testing.T) {
 	// 缺口 20000-2000=18000 由保险基金承担：保险剩 20000-18000=2000。
 	if insAfter, _, _ := l.Balance(ledger.SysInsurance, "USDT"); !eqAmt(insAfter, 2000, "USDT") {
 		t.Fatalf("insurance after exercise %v want 2000 (backstop 18000)", insAfter)
+	}
+}
+
+// TestExerciseCCPPartialInsuranceBackstop F3-4：CCP 余额 + 保险基金均不足以覆盖全额 payoff 时，
+// 三者按「CCP 付尽现有 → 保险基金补 → 剩余记穿仓损失」分摊；用户始终足额收到、CCP 不为负。
+// 锁定三路组合分摊逻辑（前两个测试分别只覆盖「保险全兜底」「纯穿仓损失」单一路径）。
+func TestExerciseCCPPartialInsuranceBackstop(t *testing.T) {
+	svc, l := newTestService()
+	// 保险基金仅 5000，不足以单独覆盖缺口。
+	ins := settlement.AssetAmountFromFloat(5000, settlement.AssetDecimalsByName("USDT"))
+	if err := l.CreditAvailable(ledger.SysInsurance, "USDT", ins, "seed_ins", ""); err != nil {
+		t.Fatalf("seed insurance: %v", err)
+	}
+	const uid = int64(1)
+	c := mustContract(svc, 1000, time.Now().Add(time.Hour))
+	p, err := svc.OpenPosition(uid, c.ID, SideLong, 2)
+	if err != nil {
+		t.Fatalf("open long: %v", err)
+	}
+	// 开仓付权利金 2*1000=2000 入 CCP；CCP 余额=2000。
+	if ccp, _, _ := l.Balance(ledger.SysOptions, "USDT"); !eqAmt(ccp, 2000, "USDT") {
+		t.Fatalf("CCP before exercise %v want 2000", ccp)
+	}
+	// 行权 payoff=20000（数量2，ITV=20000）。
+	if err := svc.Exercise(uid, p.ID); err != nil {
+		t.Fatalf("exercise: %v", err)
+	}
+	// 用户足额收到 20000：账户 = 100000 - 2000 + 20000 = 118000。
+	if avail, _, _ := l.Balance(uid, "USDT"); !eqAmt(avail, 118000, "USDT") {
+		t.Fatalf("user after exercise %v want 118000 (full payoff)", avail)
+	}
+	// CCP 付尽现有 2000 → 0（不为负）。
+	if ccp, _, _ := l.Balance(ledger.SysOptions, "USDT"); ccp.Sign() != 0 {
+		t.Fatalf("CCP after exercise %v want 0", ccp)
+	}
+	// 保险 5000 全用于补缺口 → 0。
+	if insAfter, _, _ := l.Balance(ledger.SysInsurance, "USDT"); !eqAmt(insAfter, 0, "USDT") {
+		t.Fatalf("insurance after exercise %v want 0", insAfter)
+	}
+	// 剩余缺口 20000-2000-5000=13000 由穿仓损失账户承担。
+	if loss, _, _ := l.Balance(ledger.SysLiquidationLoss, "USDT"); !eqAmt(loss, -13000, "USDT") {
+		t.Fatalf("deficit after exercise %v want -13000", loss)
 	}
 }

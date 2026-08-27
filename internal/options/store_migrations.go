@@ -53,13 +53,28 @@ var OptionsMigrations = []migrate.Migration{
 		Version: 9503,
 		Name:    "alter_ce_option_positions_fixedpoint",
 		Up: `ALTER TABLE ce_option_positions
-				ADD COLUMN quote_asset VARCHAR(16) NOT NULL DEFAULT '' AFTER quantity,
+				ADD COLUMN IF NOT EXISTS quote_asset VARCHAR(16) NOT NULL DEFAULT '' AFTER quantity,
 				MODIFY premium VARCHAR(64) NOT NULL DEFAULT '0',
 				MODIFY margin  VARCHAR(64) NOT NULL DEFAULT '0'`,
 		Down: `ALTER TABLE ce_option_positions
 				MODIFY premium DOUBLE NOT NULL DEFAULT 0,
 				MODIFY margin  DOUBLE NOT NULL DEFAULT 0,
 				DROP COLUMN quote_asset`,
+	},
+	{
+		// F2 补全：ce_option_contracts 的 strike/contract_size/premium 由 DOUBLE 改为 VARCHAR(64)，
+		// 以字符串精确存储 AssetAmount.HumanString（最小单位十进制），与持仓表定点化一致，
+		// 消除 float64 列精度丢失（行权价/权利金直接参与资金计算，精度损失会造成结算差额）。
+		Version: 9504,
+		Name:    "alter_ce_option_contracts_fixedpoint",
+		Up: `ALTER TABLE ce_option_contracts
+				MODIFY strike        VARCHAR(64) NOT NULL DEFAULT '0',
+				MODIFY contract_size VARCHAR(64) NOT NULL DEFAULT '1',
+				MODIFY premium       VARCHAR(64) NOT NULL DEFAULT '0'`,
+		Down: `ALTER TABLE ce_option_contracts
+				MODIFY strike        DOUBLE NOT NULL DEFAULT 0,
+				MODIFY contract_size DOUBLE NOT NULL DEFAULT 1,
+				MODIFY premium       DOUBLE NOT NULL DEFAULT 0`,
 	},
 }
 

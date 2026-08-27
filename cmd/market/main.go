@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -41,7 +42,10 @@ func main() {
 	r.Use(middleware.Common(log, cfg)...)
 	server.RegisterRoutes(r)
 
-	addr := ":8083"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8083"
+	}
 	log.Info("market service starting", zap.String("addr", addr))
 	if err := cfg.Listen(r, addr); err != nil {
 		log.Fatal("server exited", zap.Error(err))

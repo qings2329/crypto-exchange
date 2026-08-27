@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
@@ -42,6 +43,13 @@ func main() {
 
 	// 钱包总账（复式记账），承载保证金冻结、资金费结算与强平没收。
 	ledgerSvc := ledger.New()
+	// 对账巡检：探测不平账并告警。与其余有账本服务一致——futures 是资金核心服务，
+	// 此前漏接此接线，账本不平衡不会被后台巡检发现（已对齐 staking/margin/otc 等）。
+	ledgerSvc.SetReconcileAlertHook(func(dev map[string]settlement.AssetAmount) {
+		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
+	})
+	ledgerSvc.StartReconciler(15 * time.Second)
+	defer ledgerSvc.StopReconciler()
 
 	// 持久化 DSN：优先 --mysql-dsn，否则取 config.MySQL.DSN。
 	dsn := *mysqlDSN
@@ -151,7 +159,10 @@ func main() {
 	r.Use(middleware.Common(log, cfg)...)
 	server.RegisterRoutes(r, verifier)
 
-	addr := ":8084"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8084"
+	}
 	log.Info("futures service starting", zap.String("addr", addr))
 	if err := cfg.Listen(r, addr); err != nil {
 		log.Fatal("server exited", zap.Error(err))

@@ -1,10 +1,13 @@
 package futuresapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +27,8 @@ import (
 func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.GET("/api/v1/futures/wallet", s.handleWallet)
 	r.POST("/api/v1/futures/wallet/deposit", middleware.AdminGuard(), s.handleDeposit)
+	// 用户侧自助充值（演示语义）：uid 取 token；白名单/单笔上限/频控见 handleDepositSelf。
+	r.POST("/api/v1/futures/wallet/deposit/self", s.handleDepositSelf)
 	r.POST("/api/v1/futures/wallet/deposit/chain", middleware.AdminGuard(), s.handleDepositChain)
 	r.GET("/api/v1/futures/wallet/deposits", s.handleDeposits)
 	r.POST("/api/v1/futures/wallet/deposit/reorg", middleware.AdminGuard(), s.handleDepositReorg)
@@ -68,6 +73,92 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.GET("/metrics", s.handleMetrics)
 }
 
+// selfDepositGuard 是用户侧自助充值的内存频控（uid -> 最近请求时间窗）。
+var (
+	selfDepositMu     sync.Mutex
+	selfDepositWindow = map[int64][]time.Time{}
+)
+
+const (
+	selfDepositMaxAmount = 10000.0            // 单笔上限（USDT 计）
+	selfDepositMaxPerMin = 6                  // 每分钟最多次数
+	selfDepositAssets    = "USDT,BTC,ETH"     // 资产白名单（对齐 mock 网关 WALLET_ASSETS）
+)
+
+// allowSelfDeposit 滑动窗口频控：每 uid 每分钟最多 selfDepositMaxPerMin 次。
+func allowSelfDeposit(uid int64) bool {
+	now := time.Now()
+	selfDepositMu.Lock()
+	defer selfDepositMu.Unlock()
+	recent := selfDepositWindow[uid][:0]
+	for _, ts := range selfDepositWindow[uid] {
+		if now.Sub(ts) < time.Minute {
+			recent = append(recent, ts)
+		}
+	}
+	if len(recent) >= selfDepositMaxPerMin {
+		selfDepositWindow[uid] = recent
+		return false
+	}
+	selfDepositWindow[uid] = append(recent, now)
+	return true
+}
+
+// handleDepositSelf 用户侧自助充值（模拟链上确认后即时入账的演示语义）。
+// 安全边界：归属用户一律取 token uid（防冒充）；资产白名单；单笔上限 + 分钟级频控，
+// 防止脚本无限刷入虚假资金。与管理端 faucet（POST /deposit，AdminGuard）并存。
+func (s *Server) handleDepositSelf(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok || uid <= 0 {
+		response.Error(c, http.StatusUnauthorized, 401, "unauthorized")
+		return
+	}
+	var req struct {
+		Asset   string          `json:"asset"`
+		Amount  json.Number     `json:"amount"`
+		Network string          `json:"network"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Error(c, 400, 400, "bad request")
+		return
+	}
+	asset := strings.ToUpper(strings.TrimSpace(req.Asset))
+	if asset == "" {
+		asset = "USDT"
+	}
+	if !strings.Contains(","+selfDepositAssets+",", ","+asset+",") {
+		response.Error(c, 400, 400, "unsupported deposit asset")
+		return
+	}
+	amt, err := req.Amount.Float64()
+	if err != nil || amt <= 0 || amt > selfDepositMaxAmount {
+		response.Error(c, 400, 400, "invalid amount (0 < amount <= "+strconv.FormatFloat(selfDepositMaxAmount, 'f', -1, 64)+")")
+		return
+	}
+	if !allowSelfDeposit(uid) {
+		response.Error(c, 429, 429, "too many deposits, retry later")
+		return
+	}
+	depAmt, err := settlement.AssetAmountFromFloatSafe(amt, settlement.AssetDecimalsByName(asset))
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
+	// ref 唯一化：同额快速连充不被账本指纹去重吞掉。
+	ref := fmt.Sprintf("deposit:self:%d:%d", uid, time.Now().UnixNano())
+	if err := s.ledgerSvc.Deposit(uid, asset, depAmt, ref); err != nil {
+		response.Error(c, 500, 500, err.Error())
+		return
+	}
+	avail, frozen, _ := s.ledgerSvc.Balance(uid, asset)
+	response.JSON(c, gin.H{
+		"status":    "ok",
+		"asset":     asset,
+		"available": avail.HumanFloat(),
+		"frozen":    frozen.HumanFloat(),
+	})
+}
+
 // handleWallet 钱包余额查询（可用 / 冻结 + 保险基金 / 资金池）。
 func (s *Server) handleWallet(c *gin.Context) {
 	var uid int64
@@ -102,7 +193,13 @@ func (s *Server) handleDeposit(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
-	if err := s.ledgerSvc.Deposit(req.UserID, "USDT", settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName("USDT")), "deposit"); err != nil {
+	// M5：req.Amount 来自用户请求，须拦截 NaN/Inf，避免充值 0 落账。
+	depAmt, err := settlement.AssetAmountFromFloatSafe(req.Amount, settlement.AssetDecimalsByName("USDT"))
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
+	if err := s.ledgerSvc.Deposit(req.UserID, "USDT", depAmt, "deposit"); err != nil {
 		response.Error(c, 500, 500, err.Error())
 		return
 	}
@@ -122,8 +219,12 @@ func (s *Server) handleDepositChain(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request")
 		return
 	}
-	ev, err := s.chainGateway.SubmitDeposit(req.UserID, req.Asset, settlement.Chain(req.Chain),
-		settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimals(settlement.Chain(req.Chain), req.Asset)), req.Address)
+	depAmt, err := settlement.AssetAmountFromFloatSafe(req.Amount, settlement.AssetDecimals(settlement.Chain(req.Chain), req.Asset))
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
+	ev, err := s.chainGateway.SubmitDeposit(req.UserID, req.Asset, settlement.Chain(req.Chain), depAmt, req.Address)
 	if err != nil {
 		response.Error(c, 400, 400, err.Error())
 		return
@@ -225,35 +326,46 @@ func (s *Server) handleWithdrawChain(c *gin.Context) {
 		asset = "USDT"
 	}
 	dec := settlement.AssetDecimals(settlement.Chain(req.Chain), asset)
-	amt := settlement.AssetAmountFromFloat(req.Amount, dec)
+	// M5：req.Amount/req.Fee 来自用户请求，须拦截 NaN/Inf，避免提现 0/负值落账。
+	amt, err := settlement.AssetAmountFromFloatSafe(req.Amount, dec)
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
 	var feeAmt settlement.AssetAmount
 	if req.Fee > 0 {
-		feeAmt = settlement.AssetAmountFromFloat(req.Fee, dec)
+		feeAmt, err = settlement.AssetAmountFromFloatSafe(req.Fee, dec)
+		if err != nil {
+			response.Error(c, 400, 400, "invalid fee: "+err.Error())
+			return
+		}
 	} else {
 		feeAmt = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, amt)
 	}
-	// 冻结额由与链上广播同源的 AssetAmount 派生，确保账本冻结额 == 链上划出额，消除 float 漂移（F2）。
-	total := amt.Add(feeAmt)
 	if s.ledgerSvc.IsOutflowRestricted(req.UserID, asset) {
 		response.Error(c, 403, 403, "outflow restricted: repay outstanding bad debt first")
 		return
 	}
-	avail, _, ok := s.ledgerSvc.Balance(req.UserID, asset)
-	if !ok || avail.Cmp(total) < 0 {
-		response.Error(c, 400, 400, "insufficient available balance")
+	// M4 + 真实 hold 绑定：经 ledger.RequestWithdrawHold 创建提现冻结记录（内部已做余额、
+	// 地址白名单、风控引擎、每日限额校验），取得 holdID 作为离线签名器来源校验锚点。账本划出
+	// 仍由 WatchWithdraw 的 WithdrawCredited 事件驱动（与原有 FreezeWithdraw 路径一致，无双划出）。
+	id, _, err := s.ledgerSvc.RequestWithdrawHold(req.UserID, asset, amt, feeAmt, req.Chain, req.Address)
+	if err != nil {
+		response.Error(c, 400, 400, err.Error())
 		return
 	}
-	if err := s.ledgerSvc.FreezeWithdraw(req.UserID, asset, total); err != nil {
-		response.Error(c, 500, 500, err.Error())
-		return
-	}
-	// M4 网关侧鉴权门控：广播前登记授权，使离线签名器仅接受经门控的提现（防任意来源驱动签名）。
-	s.authorizeWithdraw(req.UserID, asset, settlement.Chain(req.Chain), amt, feeAmt, req.Address)
+	// M4 网关侧鉴权门控：广播前登记授权（绑定真实 holdID），使离线签名器仅接受经门控的提现。
+	s.authorizeWithdraw(req.UserID, asset, settlement.Chain(req.Chain), amt, feeAmt, req.Address, id)
 	ev, err := s.chainWithdraw.SubmitWithdraw(req.UserID, asset, settlement.Chain(req.Chain),
 		amt, feeAmt, req.Address, req.WillFail)
 	if err != nil {
-		_ = s.ledgerSvc.UnfreezeWithdraw(req.UserID, asset, total) // 受理失败回退提现冻结
+		_ = s.ledgerSvc.CancelWithdrawHold(id) // 受理失败回退提现冻结（释放当日预占额度）
 		response.Error(c, 400, 400, err.Error())
+		return
+	}
+	// 广播成功：固化 hold 广播状态（供 M4 校验 hold 已广播、审计追溯）。账本划出由 WatchWithdraw 事件负责。
+	if err := s.ledgerSvc.SetWithdrawTxHash(id, ev.TxHash); err != nil {
+		response.Error(c, 500, 500, err.Error())
 		return
 	}
 	response.JSON(c, gin.H{
@@ -361,10 +473,19 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 		asset = "USDT"
 	}
 	dec := settlement.AssetDecimals(settlement.Chain(req.Chain), asset)
-	amt := settlement.AssetAmountFromFloat(req.Amount, dec)
+	// M5：req.Amount/req.Fee 来自用户请求，须拦截 NaN/Inf，避免提现 0/负值落账。
+	amt, err := settlement.AssetAmountFromFloatSafe(req.Amount, dec)
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
 	var feeAmt settlement.AssetAmount
 	if req.Fee > 0 {
-		feeAmt = settlement.AssetAmountFromFloat(req.Fee, dec)
+		feeAmt, err = settlement.AssetAmountFromFloatSafe(req.Fee, dec)
+		if err != nil {
+			response.Error(c, 400, 400, "invalid fee: "+err.Error())
+			return
+		}
 	} else {
 		feeAmt = s.feeModel.Estimate(settlement.Chain(req.Chain), asset, amt)
 	}
@@ -410,14 +531,16 @@ func (s *Server) handleWithdrawRequest(c *gin.Context) {
 }
 
 // authorizeWithdraw 在链上广播前登记提现门控授权（M4）：网关据此放行离线签名器签名。
-// 网关未实现 WithdrawAuthorizer（如旧测试桩 / 模拟网关）时静默跳过，不阻断既有行为。
-func (s *Server) authorizeWithdraw(userID int64, asset string, chain settlement.Chain, amount, fee settlement.AssetAmount, address string) {
+// holdID 为对应的 ledger 提现冻结记录 ID，网关在签名前据此真正查 ledger.WithdrawHold 校验
+// hold 存在/状态/要素一致（绑定真实提现记录，纵深防御）。网关未实现 WithdrawAuthorizer
+// （如旧测试桩 / 模拟网关）时静默跳过，不阻断既有行为。
+func (s *Server) authorizeWithdraw(userID int64, asset string, chain settlement.Chain, amount, fee settlement.AssetAmount, address string, holdID string) {
 	if s.chainAuthorizer == nil {
 		return
 	}
-	if _, err := s.chainAuthorizer.AuthorizeWithdraw(userID, asset, chain, amount, fee, address); err != nil {
-		log.Printf("[futuresapi] WARN withdraw authorize failed: user=%d asset=%s chain=%s to=%s err=%v",
-			userID, asset, chain, address, err)
+	if _, err := s.chainAuthorizer.AuthorizeWithdraw(userID, asset, chain, amount, fee, address, holdID); err != nil {
+		log.Printf("[futuresapi] WARN withdraw authorize failed: user=%d asset=%s chain=%s to=%s hold=%s err=%v",
+			userID, asset, chain, address, holdID, err)
 	}
 }
 
@@ -449,9 +572,9 @@ func (s *Server) finalizeHold(id string, requireCooling bool) (*ledger.WithdrawH
 		txHash = claimedTx
 	} else {
 		var ev *settlement.WithdrawEvent
-		// M4 网关侧鉴权门控：广播前登记授权（要素与本次 SubmitWithdraw 完全一致），使离线签名器
-		// 仅接受经门控的提现。
-		s.authorizeWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain), e.Amount, e.Fee, e.Address)
+		// M4 网关侧鉴权门控：广播前登记授权（绑定真实 holdID，要素与本次 SubmitWithdraw 一致），
+		// 使离线签名器仅接受经门控、绑定真实提现记录的提现。
+		s.authorizeWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain), e.Amount, e.Fee, e.Address, id)
 		ev, berr = s.chainWithdraw.SubmitWithdraw(e.UserID, e.Asset, settlement.Chain(e.Chain),
 			e.Amount, e.Fee, e.Address, false)
 		if berr != nil {
@@ -791,8 +914,13 @@ func (s *Server) handleWalletFee(c *gin.Context) {
 		return
 	}
 	f, ok := s.feeModel.Lookup(settlement.Chain(chain), asset)
-	est := s.feeModel.Estimate(settlement.Chain(chain), asset,
-		settlement.AssetAmountFromFloat(amount, settlement.AssetDecimals(settlement.Chain(chain), asset)))
+	// M5：query 字符串 "NaN" 经 ParseFloat 会得到 NaN 且无错误，须 Safe 拦截，避免 fee 估算落 0。
+	amt, err := settlement.AssetAmountFromFloatSafe(amount, settlement.AssetDecimals(settlement.Chain(chain), asset))
+	if err != nil {
+		response.Error(c, 400, 400, "bad amount")
+		return
+	}
+	est := s.feeModel.Estimate(settlement.Chain(chain), asset, amt)
 	response.JSON(c, gin.H{
 		"chain":      chain,
 		"asset":      asset,
@@ -835,7 +963,13 @@ func (s *Server) handleBadDebtRepay(c *gin.Context) {
 		req.Asset = "USDT"
 	}
 	ref := fmt.Sprintf("repay:%d", uid)
-	if err := s.ledgerSvc.RepayBadDebt(uid, req.Asset, settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset)), ref); err != nil {
+	// M5：req.Amount 来自用户请求，须拦截 NaN/Inf，避免坏债还款落 0。
+	repayAmt, err := settlement.AssetAmountFromFloatSafe(req.Amount, settlement.AssetDecimalsByName(req.Asset))
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
+	if err := s.ledgerSvc.RepayBadDebt(uid, req.Asset, repayAmt, ref); err != nil {
 		response.Error(c, 400, 400, err.Error())
 		return
 	}
@@ -1005,7 +1139,12 @@ func (s *Server) handleSweep(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request: asset required")
 		return
 	}
-	amount := settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset))
+	// M5：req.Amount 来自用户请求（0 表示全额归集），须拦截 NaN/Inf。
+	amount, err := settlement.AssetAmountFromFloatSafe(req.Amount, settlement.AssetDecimalsByName(req.Asset))
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
 	if amount.Sign() <= 0 {
 		amount = s.ledgerSvc.HotWalletBalance(req.Asset)
 	}
@@ -1033,7 +1172,12 @@ func (s *Server) handleUnsweep(c *gin.Context) {
 		response.Error(c, 400, 400, "bad request: asset required")
 		return
 	}
-	amount := settlement.AssetAmountFromFloat(req.Amount, settlement.AssetDecimalsByName(req.Asset))
+	// M5：req.Amount 来自用户请求（0 表示全额调拨），须拦截 NaN/Inf。
+	amount, err := settlement.AssetAmountFromFloatSafe(req.Amount, settlement.AssetDecimalsByName(req.Asset))
+	if err != nil {
+		response.Error(c, 400, 400, "invalid amount: "+err.Error())
+		return
+	}
 	if amount.Sign() <= 0 {
 		amount = s.ledgerSvc.ColdWalletBalance(req.Asset)
 	}

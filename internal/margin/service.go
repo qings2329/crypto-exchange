@@ -26,12 +26,12 @@ func finitePositive(x, max float64) bool {
 
 // Config 是杠杆业务参数。
 type Config struct {
-	MaxLeverage      int           // 最大杠杆倍数
-	HourlyRate       float64       // 小时利率（如 0.0001 = 0.01%/h）
-	MaintenanceRatio float64       // 维持维持率（强平价 = 抵押 /(债务*维持率)）
-	CollateralAsset  string        // 抵押资产（默认 USDT）
-	AccrueInterval   time.Duration // 后台计息/强平轮询间隔
-	LiquidationPenalty float64     // 强平时抵押罚没比例（如 0.05）
+	MaxLeverage        int           // 最大杠杆倍数
+	HourlyRate         float64       // 小时利率（如 0.0001 = 0.01%/h）
+	MaintenanceRatio   float64       // 维持维持率（强平价 = 抵押 /(债务*维持率)）
+	CollateralAsset    string        // 抵押资产（默认 USDT）
+	AccrueInterval     time.Duration // 后台计息/强平轮询间隔
+	LiquidationPenalty float64       // 强平时抵押罚没比例（如 0.05）
 }
 
 // PriceFunc 取某借入资产的标记价（以抵押资产计价，如 USDT）。返回 (price, ok)。
@@ -103,8 +103,15 @@ func (s *Service) Borrow(userID int64, asset string, amount float64, leverage in
 	}
 
 	collateral := amount / float64(leverage)
-	collAmt := settlement.AssetAmountFromFloat(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset))
-	amt := settlement.AssetAmountFromFloat(amount, settlement.AssetDecimalsByName(asset))
+	// M5：amount/collateral 源自用户请求，须拦截 NaN/Inf，避免无抵押/0 借入。
+	collAmt, err := settlement.AssetAmountFromFloatSafe(collateral, settlement.AssetDecimalsByName(s.cfg.CollateralAsset))
+	if err != nil {
+		return nil, err
+	}
+	amt, err := settlement.AssetAmountFromFloatSafe(amount, settlement.AssetDecimalsByName(asset))
+	if err != nil {
+		return nil, err
+	}
 
 	// 检查抵押是否充足。
 	avail, _, ok := s.ledger.Balance(userID, s.cfg.CollateralAsset)
@@ -168,7 +175,11 @@ func (s *Service) Repay(userID int64, asset string, amount float64) error {
 		return ErrNothingOwed
 	}
 	dec := settlement.AssetDecimalsByName(asset)
-	repayAmt := settlement.AssetAmountFromFloat(amount, dec)
+	// M5：amount 源自用户请求，须拦截 NaN/Inf，避免还款落 0。
+	repayAmt, err := settlement.AssetAmountFromFloatSafe(amount, dec)
+	if err != nil {
+		return err
+	}
 	if repayAmt.Cmp(total) > 0 {
 		repayAmt = total
 	}
@@ -238,6 +249,8 @@ func (s *Service) accrue(a *MarginAccount) {
 	hours := now.Sub(a.LastAccrual).Hours()
 	if hours > 0 && a.Debt.Sign() > 0 {
 		dec := settlement.AssetDecimalsByName(a.Asset)
+		// 保留裸 FromFloat：a.Debt 为账本内部定点值、HourlyRate/hours 为可信配置，不接受用户输入，
+		// NaN/Inf 不可达；此处仅做金额量化（利息按小时累加，F2/F3 已定点化）。
 		delta := settlement.AssetAmountFromFloat(a.Debt.HumanFloat()*s.cfg.HourlyRate*hours, dec)
 		a.InterestAccrued = a.InterestAccrued.Add(delta)
 		a.LastAccrual = now
@@ -315,6 +328,8 @@ func (s *Service) Liquidate(userID int64, asset string) (bool, error) {
 
 	// 计算强平动作金额。
 	collAmt := a.CollateralAmount
+	// 保留裸 FromFloat：a.CollateralAmount 为账本内部定点值、LiquidationPenalty 为可信配置，不接受
+	// 用户输入，NaN/Inf 不可达；此处仅做惩罚金量化（强平金额已 F2 定点化）。
 	penaltyAmt := settlement.AssetAmountFromFloat(a.CollateralAmount.HumanFloat()*s.cfg.LiquidationPenalty, settlement.AssetDecimalsByName(a.CollateralAsset))
 	avail, _, ok2 := s.ledger.Balance(userID, asset)
 	seize := a.Debt

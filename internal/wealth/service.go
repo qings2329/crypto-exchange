@@ -116,9 +116,18 @@ func (s *Service) Subscribe(userID, productID int64, amount float64) (*WealthHol
 		return nil, ErrProductNotOpen
 	}
 	dec := settlement.AssetDecimalsByName(p.Asset)
-	amt := settlement.AssetAmountFromFloat(amount, dec)
+	// M5：amount 已经济 finitePositive 守卫，此处仍经 Safe 落账（防御性）；p.MinAmount 为落库产品额，
+	// 须拦截 NaN/Inf，避免起购额记 0 致任意申购通过。
+	amt, err := settlement.AssetAmountFromFloatSafe(amount, dec)
+	if err != nil {
+		return nil, err
+	}
+	minAmt, err := settlement.AssetAmountFromFloatSafe(p.MinAmount, dec)
+	if err != nil {
+		return nil, err
+	}
 	// 起购额判断在定点空间做，去掉 float 的 1e-9 容差。
-	if amt.Cmp(settlement.AssetAmountFromFloat(p.MinAmount, dec)) < 0 {
+	if amt.Cmp(minAmt) < 0 {
 		return nil, ErrBelowMinAmount
 	}
 	// 校验用户可用余额。
@@ -161,7 +170,7 @@ func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Tim
 	// 利息整数化（#47）：直接按定点整数运算，避免 Principal.HumanFloat() 的 float 精度丢失与每期尾差累积。
 	delta := h.YieldToAmount(now, p.AnnualRate, dec)
 	if delta.Sign() > 0 {
-		ref := fmt.Sprintf("wealth_accrue product=%d holding=%d", p.ID, h.ID)
+		ref := fmt.Sprintf("wealth_accrue product=%d holding=%d t=%d", p.ID, h.ID, now.Unix())
 		if err := s.ledger.Transfer(ledger.SysWealth, ledger.SysWealthYieldPayable, p.Asset, delta, "wealth_accrue", ref); err != nil {
 			if s.log != nil {
 				s.log.Error("wealth accrue: move yield failed", zap.Int64("user_id", h.UserID), zap.String("asset", p.Asset), zap.Error(err))
@@ -174,18 +183,21 @@ func (s *Service) accrueHolding(h *WealthHolding, p *WealthProduct, now time.Tim
 	return delta
 }
 
-// Accrue 对全部持有中持仓执行一次应计收益（通常在后台循环调用）。返回本轮回填的总收益（人类单位）。
+// Accrue 对全部持有中持仓执行一次应计收益（通常在后台循环调用）。返回本轮回填的总收益（定点金额）。
 //
 // s.mu 串行化：与 Redeem 互斥，避免后台计息与赎回并发导致 AccruedYield 重复累加、赎回时超额兑付。
-func (s *Service) Accrue(now time.Time) (float64, error) {
+//
+// 总收益以 AssetAmount 累加以消除 per-持仓 HumanFloat() 浮点求和的尾差累积（M5 收尾）；响应经
+// MarshalJSON 序列化为十进制字符串，与该服务持仓响应（AccruedYield 等）风格一致。
+func (s *Service) Accrue(now time.Time) (settlement.AssetAmount, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	all, err := s.store.ListAllHoldings()
 	if err != nil {
-		return 0, err
+		return settlement.AssetAmount{}, err
 	}
-	total := 0.0
+	var total settlement.AssetAmount
 	for _, h := range all {
 		if h.Status != HoldingActive {
 			continue
@@ -195,7 +207,7 @@ func (s *Service) Accrue(now time.Time) (float64, error) {
 			continue
 		}
 		if d := s.accrueHolding(h, p, now); d.Sign() > 0 {
-			total += d.HumanFloat()
+			total = total.Add(d)
 			_ = s.store.UpdateHolding(h)
 		}
 	}

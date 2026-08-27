@@ -24,7 +24,7 @@ func (s *Server) ok(c *gin.Context, data interface{}) {
 }
 
 func (s *Server) fail(c *gin.Context, code int, msg string) {
-	c.JSON(code, gin.H{"code": code, "message": msg})
+	response.Error(c, code, code, msg)
 }
 
 func parseInt64(c *gin.Context, param string) (int64, bool) {

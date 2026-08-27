@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/bot"
+	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -57,9 +58,22 @@ func main() {
 		log.Info("bot store: in-memory")
 	}
 
+	// 行情源（§39）：configs 配置了 oracle.feeds 则用真实 REST 喂价；否则回退内置静态演示价。
+	var oracleSvc *oracle.Oracle
+	if len(cfg.Oracle.Feeds) > 0 {
+		oracleSvc = oracle.NewFromConfig(cfg.Oracle)
+		log.Info("bot oracle: real feed config", zap.Int("symbols", len(cfg.Oracle.Feeds)))
+	} else {
+		oracleSvc = bot.DefaultOracle()
+		log.Info("bot oracle: static demo fallback (no oracle.feeds in config)")
+	}
+	oracleSvc.Start()
+	defer oracleSvc.Stop()
+	priceSrc := bot.NewOraclePriceSource(oracleSvc)
+
 	// 下单执行器：默认调 spot/futures 的 /order，复用下游 F1(client_oid)/F4(token) 资金安全。
 	exec := bot.NewHTTPExecutor(*spotURL, *futuresURL)
-	svc := bot.NewService(store, nil, exec, bot.Config{TickInterval: 10 * time.Second}, log)
+	svc := bot.NewService(store, priceSrc, exec, bot.Config{TickInterval: 10 * time.Second}, log)
 
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
 	r := gin.New()

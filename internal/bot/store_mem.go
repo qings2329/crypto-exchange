@@ -28,6 +28,10 @@ func (m *MemStore) CreateStrategy(s *BotStrategy) error {
 	m.stratSeq++
 	s.ID = m.stratSeq
 	cp := *s
+	if s.GridState != nil {
+		gs := *s.GridState
+		cp.GridState = &gs
+	}
 	m.strategies[s.ID] = &cp
 	return nil
 }
@@ -40,6 +44,10 @@ func (m *MemStore) GetStrategy(id int64) (*BotStrategy, error) {
 		return nil, ErrStrategyNotFound
 	}
 	cp := *s
+	if s.GridState != nil {
+		gs := *s.GridState
+		cp.GridState = &gs
+	}
 	return &cp, nil
 }
 
@@ -50,6 +58,10 @@ func (m *MemStore) ListStrategiesByUser(uid int64) ([]*BotStrategy, error) {
 	for _, s := range m.strategies {
 		if s.UserID == uid {
 			cp := *s
+			if s.GridState != nil {
+				gs := *s.GridState
+				cp.GridState = &gs
+			}
 			out = append(out, &cp)
 		}
 	}
@@ -64,6 +76,10 @@ func (m *MemStore) ListActiveStrategies() ([]*BotStrategy, error) {
 	for _, s := range m.strategies {
 		if s.Status == StrategyActive {
 			cp := *s
+			if s.GridState != nil {
+				gs := *s.GridState
+				cp.GridState = &gs
+			}
 			out = append(out, &cp)
 		}
 	}
@@ -77,6 +93,10 @@ func (m *MemStore) ListAllStrategies() ([]*BotStrategy, error) {
 	out := make([]*BotStrategy, 0, len(m.strategies))
 	for _, s := range m.strategies {
 		cp := *s
+		if s.GridState != nil {
+			gs := *s.GridState
+			cp.GridState = &gs
+		}
 		out = append(out, &cp)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -90,6 +110,10 @@ func (m *MemStore) UpdateStrategy(s *BotStrategy) error {
 		return ErrStrategyNotFound
 	}
 	cp := *s
+	if s.GridState != nil {
+		gs := *s.GridState
+		cp.GridState = &gs
+	}
 	m.strategies[s.ID] = &cp
 	return nil
 }

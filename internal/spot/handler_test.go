@@ -3,6 +3,7 @@ package spot
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,6 +31,7 @@ type fakeMatcher struct {
 	depthBids   []matching.Level
 	depthAsks   []matching.Level
 	depthFail   bool
+	unreachable bool // OrderState/RecentTrades 模拟撮合不可达（恢复路径保守分支）
 	mu          sync.Mutex
 }
 
@@ -63,6 +65,34 @@ func (f *fakeMatcher) GetOrder(orderID int64) (matching.OrderView, bool) {
 	defer f.mu.Unlock()
 	v, ok := f.orders[orderID]
 	return v, ok
+}
+
+// OrderState 三态查询：unreachable=true 时模拟撮合不可达（返回 err）；
+// 否则按 orders 表返回 known/not-found。
+func (f *fakeMatcher) OrderState(orderID int64) (matching.OrderView, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unreachable {
+		return matching.OrderView{}, false, fmt.Errorf("connection refused (fake)")
+	}
+	v, ok := f.orders[orderID]
+	return v, ok, nil
+}
+
+// RecentTrades 返回预置的全市场成交（按 symbol 过滤，与真实 /trades 行为一致）。
+func (f *fakeMatcher) RecentTrades(symbol string, limit int) ([]matching.TradeView, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.unreachable {
+		return nil, fmt.Errorf("connection refused (fake)")
+	}
+	out := make([]matching.TradeView, 0)
+	for _, v := range f.trades {
+		if v.Symbol == symbol {
+			out = append(out, v)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeMatcher) ListOrders(userID int64, symbol, status string, limit int) []matching.OrderView {

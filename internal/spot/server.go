@@ -3,6 +3,7 @@ package spot
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -26,6 +27,11 @@ type matcherClient interface {
 	Submit(symbol string, o *matching.Order) bool
 	CancelOrder(symbol string, orderID int64) (bool, error)
 	GetOrder(orderID int64) (matching.OrderView, bool)
+	// OrderState 三态查询（known / not-found / unreachable），供重启恢复区分「订单已终结」
+	// 与「撮合暂时不可达」——后者必须保守保留冻结，不可误释放。
+	OrderState(orderID int64) (matching.OrderView, bool, error)
+	// RecentTrades 拉取交易对最近全市场成交，供重启后补结算停机窗口漏掉的成交。
+	RecentTrades(symbol string, limit int) ([]matching.TradeView, error)
 	ListOrders(userID int64, symbol, status string, limit int) []matching.OrderView
 	ListTrades(userID int64, symbol string, limit int) []matching.TradeView
 	Depth(symbol string) (bids, asks []matching.Level, ok bool)
@@ -627,6 +633,66 @@ func (s *Server) handleReconcile(c *gin.Context) {
 // Close 停止行情订阅。
 func (s *Server) Close() {
 	s.cancel()
+}
+
+// catchUpSymbols 与 NewServer 中 Watch 订阅的交易对保持一致（补结算覆盖范围）。
+var catchUpSymbols = []string{"BTC_USDT", "ETH_USDT"}
+
+// CatchUpSettlement 重启补账：拉取各交易对最近的全市场公开成交并逐笔重放结算，
+// 弥补停机窗口内 WS 成交事件丢失导致的经济漏记（订单在簿已成交、资金却未划转）。
+//
+// 安全性前提（缺一不可，由 cmd/spot 装配保证）：
+//  1. 账本幂等指纹已持久化（SetIdempotencyDB）：重启前已结算过的成交重放时，
+//     transferCoreLocked 按 ref 指纹判定重复并静默跳过（internal/ledger），不会双付。
+//  2. 本方法必须在 RestoreOrders 之前调用：此时 openOrders 为空，settleFill 走
+//     「无冻结记录→纯转账」分支——漏结的成交从可用余额正确划转一次；若订单仍挂簿，
+//     其既有冻结不受影响，后续成交/撤单按原逻辑递减/释放。
+//
+// 停机窗口超过 RecentTrades 回看深度（limit）时，更早的漏结成交无法由此弥补，
+// 依赖 /spot/admin/reconcile 对账告警人工介入。
+func (s *Server) CatchUpSettlement() {
+	const lookback = 1000
+	for _, symbol := range catchUpSymbols {
+		trades, err := s.client.RecentTrades(symbol, lookback)
+		if err != nil {
+			s.log.Warn("spot catchup: fetch recent trades failed, skip",
+				zap.String("symbol", symbol), zap.Error(err))
+			continue
+		}
+		// 按时间正序重放（与撮合产出顺序一致）；settledRefs + 账本指纹双重去重保证幂等。
+		sort.Slice(trades, func(i, j int) bool { return trades[i].Time < trades[j].Time })
+		settled := 0
+		for _, v := range trades {
+			if v.Market != "spot" {
+				continue // 合约成交由 futures 服务记账
+			}
+			if err := s.settleFill(symbol, viewToTrade(v)); err != nil {
+				s.log.Warn("spot catchup: settle replay failed",
+					zap.String("symbol", symbol), zap.Int64("id", v.ID), zap.Error(err))
+				continue
+			}
+			settled++
+		}
+		s.log.Info("spot catchup: replayed recent trades", zap.String("symbol", symbol),
+			zap.Int("total", len(trades)), zap.Int("settled_or_deduped", settled))
+	}
+}
+
+// viewToTrade 把撮合的只读成交视图还原为结算所需的 Trade（字段一一对应）。
+func viewToTrade(v matching.TradeView) matching.Trade {
+	side := matching.Buy
+	if v.TakerSide == "sell" {
+		side = matching.Sell
+	}
+	return matching.Trade{
+		Price:     v.Price,
+		Qty:       v.Qty,
+		TakerID:   v.TakerID,
+		MakerID:   v.MakerID,
+		TakerSide: side,
+		TakerOID:  v.TakerOID,
+		MakerOID:  v.MakerOID,
+	}
 }
 
 // SetStore 注入订单持久化实现（可选）。cmd/spot 配置了 MySQL DSN 时注入；

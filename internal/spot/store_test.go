@@ -35,8 +35,13 @@ func (m *memStore) LoadOrders() ([]OrderRecord, error) {
 
 // TestRestoreOrdersRebuildsClientOIDMap 验证 #58 核心：重启后由持久化记录重建 clientOIDMap，
 // 使同 client_oid 的重试仍被判重、不再双冻。无 client_oid 的记录不应进入映射（避免脏键）。
+// 两笔订单在撮合侧均为 open（与账本快照已恢复的冻结一致），故 openOrders 一并重建。
 func TestRestoreOrdersRebuildsClientOIDMap(t *testing.T) {
-	s := newTestServer()
+	fm := &fakeMatcher{orders: map[int64]matching.OrderView{
+		101: {ID: 101, UserID: 1, Status: matching.OrderOpen},
+		102: {ID: 102, UserID: 2, Status: matching.OrderPartial},
+	}}
+	s := newRestoreServer(fm)
 	store := newMemStore()
 	s.SetStore(store)
 

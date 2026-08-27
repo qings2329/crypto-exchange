@@ -54,6 +54,12 @@ func (s *Service) handleCreateProduct(c *gin.Context) {
 		return
 	}
 	dec := settlement.AssetDecimalsByName(req.Asset)
+	// M5：req.MinAmount 来自用户请求，须拦截 NaN/Inf，避免产品最小额记 0。
+	minAmt, err := settlement.AssetAmountFromFloatSafe(req.MinAmount, dec)
+	if err != nil {
+		response.Error(c, 400, 4001, "invalid min_amount")
+		return
+	}
 	p := &StakingProduct{
 		Name:         req.Name,
 		Chain:        req.Chain,
@@ -62,7 +68,7 @@ func (s *Service) handleCreateProduct(c *gin.Context) {
 		Asset:        req.Asset,
 		AnnualRate:   req.AnnualRate,
 		DurationDays: req.DurationDays,
-		MinAmount:    settlement.AssetAmountFromFloat(req.MinAmount, dec),
+		MinAmount:    minAmt,
 		Status:       ProductActive,
 	}
 	if err := s.store.CreateProduct(p); err != nil {
@@ -107,7 +113,13 @@ func (s *Service) handleSubscribe(c *gin.Context) {
 		return
 	}
 	dec := settlement.AssetDecimalsByName(p.Asset)
-	d, err := s.Subscribe(uid, req.ProductID, settlement.AssetAmountFromFloat(req.Amount, dec))
+	// M5：req.Amount 来自用户请求，须拦截 NaN/Inf，避免认购额记 0。
+	subAmt, err := settlement.AssetAmountFromFloatSafe(req.Amount, dec)
+	if err != nil {
+		response.Error(c, 400, 4001, "invalid amount")
+		return
+	}
+	d, err := s.Subscribe(uid, req.ProductID, subAmt)
 	if err != nil {
 		response.Error(c, 400, 4002, err.Error())
 		return

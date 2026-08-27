@@ -5,11 +5,11 @@
 # 生产启用 Kafka 时加 TAGS=kafka，例如：make build TAGS=kafka
 # 该标签同时控制 mq 包的 KafkaPublisher/KafkaSubscriber 实现。
 
-SERVICES := user gateway spot market futures settlement margin notification risk options otc wealth
+SERVICES := user gateway spot market futures settlement margin notification risk options otc wealth staking bot copytrade admin lending
 BIN_DIR := bin
 TAGS ?=
 
-.PHONY: all build clean test lint run-% $(SERVICES)
+.PHONY: all build clean test test-cover test-race lint run-% $(SERVICES)
 
 all: build
 
@@ -25,6 +25,13 @@ run-%:
 
 test:
 	@go test -tags=$(TAGS) ./...
+
+test-race:
+	@go test -race -tags=$(TAGS) ./...
+
+test-cover:
+	@go test -race -coverprofile=coverage.out -covermode=atomic -tags=$(TAGS) ./...
+	@go tool cover -func=coverage.out | tail -1
 
 lint:
 	@go vet -tags=$(TAGS) ./...

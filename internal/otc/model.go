@@ -24,6 +24,7 @@ var (
 	ErrAdNotFound            = errors.New("advertisement not found")
 	ErrOrderNotFound         = errors.New("order not found")
 	ErrCounterpartyNotFound  = errors.New("counterparty not found")
+	ErrNoPrice               = errors.New("no reference price for asset")
 	ErrInvalidSide           = errors.New("side must be buy or sell")
 	ErrInvalidAmount         = errors.New("amount must be positive")
 	ErrInvalidTransition     = errors.New("invalid order status transition")

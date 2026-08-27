@@ -70,7 +70,10 @@ func main() {
 		log.Info("staking store: in-memory")
 	}
 
-	svc := staking.NewService(store, ledgerSvc, nil, staking.Config{AccrueInterval: 60 * time.Second}, log)
+	svc := staking.NewService(store, ledgerSvc, nil, staking.Config{
+		AccrueInterval:    60 * time.Second,
+		ReconcileInterval: 60 * time.Second,
+	}, log)
 
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
 	r := gin.New()

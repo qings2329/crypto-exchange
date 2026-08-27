@@ -24,10 +24,10 @@ func finitePositive(x, max float64) bool {
 
 // Config 是期权业务参数。
 type Config struct {
-	QuoteAsset    string        // 计价资产（默认 USDT）
-	RiskFreeRate  float64       // 无风险利率（年化，定价用）
-	Volatility    float64       // 波动率（年化，定价用）
-	MarginRatio   float64       // 卖方保证金率（按名义价值）
+	QuoteAsset     string        // 计价资产（默认 USDT）
+	RiskFreeRate   float64       // 无风险利率（年化，定价用）
+	Volatility     float64       // 波动率（年化，定价用）
+	MarginRatio    float64       // 卖方保证金率（按名义价值）
 	SettleInterval time.Duration // 后台到期结算轮询间隔
 }
 
@@ -78,7 +78,7 @@ func (s *Service) CreateContract(c *OptionContract) error {
 	if c.Underlying == "" {
 		return fmt.Errorf("underlying required")
 	}
-	if c.Strike <= 0 {
+	if c.Strike.Sign() <= 0 {
 		return fmt.Errorf("strike must be positive")
 	}
 	if c.Type != TypeCall && c.Type != TypePut {
@@ -96,21 +96,30 @@ func (s *Service) CreateContract(c *OptionContract) error {
 	if !settlement.KnownAsset(c.QuoteAsset) {
 		return ErrUnsupportedAsset
 	}
+	dec := settlement.AssetDecimalsByName(c.QuoteAsset)
+	// 对齐定点小数位（handler 可能用默认 decimals 构造，此处统一到合约计价资产）。
+	c.Strike = c.Strike.ToDecimals(dec)
+	c.ContractSize = c.ContractSize.ToDecimals(dec)
+	c.Premium = c.Premium.ToDecimals(dec)
+	// 行权价必须为正。
+	if c.Strike.Sign() <= 0 {
+		return fmt.Errorf("strike must be positive")
+	}
 	// 合约乘数必须为正：负数/零直接拒绝（不再静默置 1，F5-5）。
-	if c.ContractSize <= 0 || !finitePositive(c.ContractSize, maxOptionAmount) {
+	if c.ContractSize.Sign() <= 0 || !finitePositive(c.ContractSize.HumanFloat(), maxOptionAmount) {
 		return fmt.Errorf("contract_size must be positive")
 	}
 	// 权利金：显式给定优先；否则用 BS 实时定价（需行情）。
-	if c.Premium <= 0 {
+	if c.Premium.Sign() <= 0 {
 		spot, ok := s.priceFn(c.Underlying)
 		if !ok {
 			return ErrPremiumRequired
 		}
 		t := s.yearsToExpiry(c.Expiry)
-		price, _ := BlackScholes(c.Type, spot, c.Strike, t, s.cfg.RiskFreeRate, s.cfg.Volatility)
-		c.Premium = price * c.size()
+		price, _ := BlackScholes(c.Type, spot, c.Strike.HumanFloat(), t, s.cfg.RiskFreeRate, s.cfg.Volatility)
+		c.Premium = settlement.AssetAmountFromFloat(price*c.size().HumanFloat(), dec)
 	}
-	if math.IsNaN(c.Premium) || math.IsInf(c.Premium, 0) {
+	if math.IsNaN(c.Premium.HumanFloat()) || math.IsInf(c.Premium.HumanFloat(), 0) {
 		return fmt.Errorf("invalid premium")
 	}
 	return s.store.CreateContract(c)
@@ -146,8 +155,8 @@ func (s *Service) Quote(contractID int64) (premium, delta float64, err error) {
 		return 0, 0, ErrNoPriceFeed
 	}
 	t := s.yearsToExpiry(c.Expiry)
-	price, d := BlackScholes(c.Type, spot, c.Strike, t, s.cfg.RiskFreeRate, s.cfg.Volatility)
-	return price * c.size(), d, nil
+	price, d := BlackScholes(c.Type, spot, c.Strike.HumanFloat(), t, s.cfg.RiskFreeRate, s.cfg.Volatility)
+	return price * c.size().HumanFloat(), d, nil
 }
 
 // OpenPosition 开仓：long 买方支付权利金，short 卖方收权利金并冻结保证金。
@@ -174,11 +183,14 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	}
 	quote := c.QuoteAsset
 	dec := settlement.AssetDecimalsByName(quote)
-	premiumTotal := c.Premium * quantity
-	if math.IsNaN(premiumTotal) || math.IsInf(premiumTotal, 0) {
+	// 合约权利金单价已是定点（创建时落库，受信任）；对齐小数位后直接取整点单价。
+	premiumPos := c.Premium.ToDecimals(dec)
+	premiumTotal := c.Premium.HumanFloat() * quantity
+	// M5：权利金总量 = 合约报价 × 用户请求数量，须拦截 NaN/Inf（quantity 为用户输入）。
+	premiumAmt, err := settlement.AssetAmountFromFloatSafe(premiumTotal, dec)
+	if err != nil {
 		return nil, ErrInvalidQuantity
 	}
-	premiumAmt := settlement.AssetAmountFromFloat(premiumTotal, dec)
 
 	if side == SideLong {
 		avail, _, _ := s.ledger.Balance(userID, quote)
@@ -189,7 +201,7 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 		p := &OptionPosition{
 			UserID: userID, ContractID: contractID, Side: SideLong, Quantity: quantity,
 			QuoteAsset: quote,
-			Premium:    settlement.AssetAmountFromFloat(c.Premium, dec),
+			Premium:    premiumPos,
 			Margin:     settlement.AssetAmount{Decimals: dec},
 			Status:     StatusOpen,
 		}
@@ -205,11 +217,12 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	}
 
 	// short：冻结保证金并收取权利金（来自系统对手方）。
-	margin := c.Strike * c.size() * quantity * s.cfg.MarginRatio
-	if math.IsNaN(margin) || math.IsInf(margin, 0) {
+	margin := c.Strike.HumanFloat() * c.size().HumanFloat() * quantity * s.cfg.MarginRatio
+	// M5：保证金 = 行权价×规模×用户数量×保证金率，须拦截 NaN/Inf（quantity 为用户输入）。
+	marginAmt, err := settlement.AssetAmountFromFloatSafe(margin, dec)
+	if err != nil {
 		return nil, ErrInvalidQuantity
 	}
-	marginAmt := settlement.AssetAmountFromFloat(margin, dec)
 	avail, _, _ := s.ledger.Balance(userID, quote)
 	if avail.Cmp(marginAmt) < 0 {
 		return nil, ErrInsufficientBalance
@@ -217,7 +230,7 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 	p := &OptionPosition{
 		UserID: userID, ContractID: contractID, Side: SideShort, Quantity: quantity,
 		QuoteAsset: quote,
-		Premium:    settlement.AssetAmountFromFloat(c.Premium, dec),
+		Premium:    premiumPos,
 		Margin:     marginAmt,
 		Status:     StatusOpen,
 	}
@@ -241,10 +254,11 @@ func (s *Service) OpenPosition(userID, contractID int64, side PositionSide, quan
 //
 // 偿付能力护栏（F3-4）：CCP 采用中性模型，理论上"收的权利金 ≈ 付的内在价值"，但在极端行情下
 // 内在价值可能超过 CCP 现有余额。为避免 CCP 被击穿为负（资不抵债），本方法：
-//  1) 若 CCP 现有余额足以覆盖，直接全额支付；
-//  2) 否则 CCP 付尽现有余额，缺口依次由保险基金（SysInsurance）、穿仓损失账户
+//  1. 若 CCP 现有余额足以覆盖，直接全额支付；
+//  2. 否则 CCP 付尽现有余额，缺口依次由保险基金（SysInsurance）、穿仓损失账户
 //     （SysLiquidationLoss，平台承担、后续社会化分摊）垫付，保证用户足额收到、
 //     且 CCP 余额不为负（下限护栏为 0）。
+//
 // 全部步骤经账本 Batch 原子执行（任一子步失败整体回滚），并使用同一 ref 保证可重试幂等。
 func (s *Service) payoffFromCCP(userID int64, asset string, amount settlement.AssetAmount, ref string) error {
 	if amount.Sign() <= 0 {
@@ -323,7 +337,8 @@ func (s *Service) Exercise(userID, positionID int64) error {
 		return ErrNoPriceFeed
 	}
 	dec := settlement.AssetDecimalsByName(c.QuoteAsset)
-	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot)*p.Quantity, dec)
+	// c.IntrinsicValue(spot) 返回定点「每张」内在价值；乘持仓张数（float，整数无精度损失）得总内在价值。
+	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot).HumanFloat()*p.Quantity, dec)
 	// 中性 CCP：long 开仓时已付权利金给 SysOptions（short 收权利金亦经 SysOptions），
 	// 行权时由 SysOptions 支付全部内在价值，不再扣减权利金。原 .Sub(PremiumTotal()) 属
 	// 双重计权利金（long 既已付过又从收益里再扣），F3-1 修复。payoff 即内在价值，恒 >=0。
@@ -376,7 +391,8 @@ func (s *Service) SettlePosition(positionID int64) (bool, error) {
 	}
 	quote := c.QuoteAsset
 	dec := settlement.AssetDecimalsByName(quote)
-	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot)*p.Quantity, dec)
+	// c.IntrinsicValue(spot) 返回定点「每张」内在价值；乘持仓张数（float，整数无精度损失）得总内在价值。
+	itvAmt := settlement.AssetAmountFromFloat(c.IntrinsicValue(spot).HumanFloat()*p.Quantity, dec)
 
 	// 先落终态。
 	p.Status = StatusExpired

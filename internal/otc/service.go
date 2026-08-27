@@ -3,6 +3,7 @@ package otc
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,9 +18,9 @@ import (
 
 // Config 是 OTC 业务参数。
 type Config struct {
-	Asset              string        // 默认加密资产（演示用 BTC）
-	ReconcileInterval  time.Duration // 后台对账轮询间隔
-	UploadDir          string        // 付款凭证文件落盘目录（默认 uploads/otc）
+	Asset             string        // 默认加密资产（演示用 BTC）
+	ReconcileInterval time.Duration // 后台对账轮询间隔
+	UploadDir         string        // 付款凭证文件落盘目录（默认 uploads/otc）
 }
 
 // PriceFunc 取资产参考价（当前 OTC 核心流程不强制依赖行情，预留扩展）。返回 (price, ok)。
@@ -116,8 +117,15 @@ func (s *Service) TakeOrder(adID, takerID int64, fiatAmount float64, paymentMeth
 	if cryptoAmount.Sign() <= 0 {
 		return nil, ErrInvalidAmount
 	}
-	minA := settlement.AssetAmountFromFloat(ad.MinAmount, dec)
-	maxA := settlement.AssetAmountFromFloat(ad.MaxAmount, dec)
+	// M5：ad.MinAmount/MaxAmount 为用户建广告时提交并经落库的金额，须拦截 NaN/Inf，避免区间记 0 致任意成交。
+	minA, err := settlement.AssetAmountFromFloatSafe(ad.MinAmount, dec)
+	if err != nil {
+		return nil, err
+	}
+	maxA, err := settlement.AssetAmountFromFloatSafe(ad.MaxAmount, dec)
+	if err != nil {
+		return nil, err
+	}
 	if cryptoAmount.Cmp(minA) < 0 || cryptoAmount.Cmp(maxA) > 0 {
 		return nil, ErrAmountOutOfRange
 	}
@@ -501,4 +509,53 @@ func (s *Service) Close() {
 	default:
 		close(s.stop)
 	}
+}
+
+// FiatQuote 是法币报价：base_price = 参考价(USD) × fiat_rate。
+type FiatQuote struct {
+	Asset     string    `json:"asset"`
+	Fiat      string    `json:"fiat"`
+	BasePrice float64   `json:"base_price"`
+	FiatRate  float64   `json:"fiat_rate"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// fiatRates 法币对 USD 汇率（与前端 mock 网关口径一致，演示用；真实部署接汇率源）。
+var fiatRates = map[string]float64{"USD": 1, "CNY": 7.23, "EUR": 0.92}
+
+// FiatQuote 计算法币报价。稳定币 USDT 无行情时按 1 USD 计；其余资产必须有 priceFn
+// 报价，否则返回 ErrNoPrice。
+func (s *Service) FiatQuote(asset, fiat string) (*FiatQuote, error) {
+	asset = strings.ToUpper(strings.TrimSpace(asset))
+	fiat = strings.ToUpper(strings.TrimSpace(fiat))
+	if asset == "" {
+		asset = "USDT"
+	}
+	if fiat == "" {
+		fiat = "CNY"
+	}
+	rate, ok := fiatRates[fiat]
+	if !ok {
+		rate = 1
+	}
+	usd := 0.0
+	if s.priceFn != nil {
+		if p, pok := s.priceFn(asset); pok && p > 0 {
+			usd = p
+		}
+	}
+	if usd <= 0 {
+		if asset != "USDT" {
+			return nil, ErrNoPrice
+		}
+		usd = 1
+	}
+	base := math.Round(usd*rate*100) / 100
+	return &FiatQuote{
+		Asset:     asset,
+		Fiat:      fiat,
+		BasePrice: base,
+		FiatRate:  rate,
+		UpdatedAt: time.Now().UTC(),
+	}, nil
 }

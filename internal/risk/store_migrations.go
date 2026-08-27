@@ -6,7 +6,7 @@ import "github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 // ledger(9001)/user(9101)/margin(9201)/notification(9301) 冲突。
 var RiskMigrations = []migrate.Migration{
 	{
-		Version: 9401,
+		Version: 9411,
 		Name:    "create_ce_risk_rules",
 		Up: `CREATE TABLE IF NOT EXISTS ce_risk_rules (
 			id                BIGINT        NOT NULL AUTO_INCREMENT,
@@ -26,7 +26,7 @@ var RiskMigrations = []migrate.Migration{
 		Down: `DROP TABLE IF EXISTS ce_risk_rules`,
 	},
 	{
-		Version: 9402,
+		Version: 9412,
 		Name:    "create_ce_risk_blacklist",
 		Up: `CREATE TABLE IF NOT EXISTS ce_risk_blacklist (
 			id         BIGINT        NOT NULL AUTO_INCREMENT,
@@ -40,7 +40,7 @@ var RiskMigrations = []migrate.Migration{
 		Down: `DROP TABLE IF EXISTS ce_risk_blacklist`,
 	},
 	{
-		Version: 9403,
+		Version: 9413,
 		Name:    "create_ce_risk_events",
 		Up: `CREATE TABLE IF NOT EXISTS ce_risk_events (
 			id         BIGINT        NOT NULL AUTO_INCREMENT,
@@ -55,7 +55,7 @@ var RiskMigrations = []migrate.Migration{
 		Down: `DROP TABLE IF EXISTS ce_risk_events`,
 	},
 	{
-		Version: 9404,
+		Version: 9414,
 		Name:    "risk_rules_max_amount_fixedpoint",
 		Up: `ALTER TABLE ce_risk_rules MODIFY max_amount_per_day VARCHAR(64) NOT NULL DEFAULT '0'`,
 		Down: `ALTER TABLE ce_risk_rules MODIFY max_amount_per_day DOUBLE NOT NULL DEFAULT 0`,

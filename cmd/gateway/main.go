@@ -32,7 +32,10 @@ func main() {
 
 	r := buildRouter(cfg, log)
 
-	addr := ":8080"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8080"
+	}
 	log.Info("gateway starting", zap.String("addr", addr))
 	if err := cfg.Listen(r, addr); err != nil {
 		log.Fatal("server exited", zap.Error(err))
@@ -59,6 +62,11 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		"/api/v1/user/verify",
 		"/api/v1/user/forgot",
 		"/api/v1/user/reset",
+		// refresh/logout 走刷新令牌（body 中的 refresh_token）而非 Bearer access token；
+		// 后端 user 服务将其列入公开组，故网关亦豁免，否则已登出（无 access token）的
+		// 用户无法经网关刷新或登出，造成与后端策略不一致的 401（非漏洞，仅为策略对齐）。
+		"/api/v1/user/refresh",
+		"/api/v1/user/logout",
 		"/api/v1/spot/depth",
 		"/api/v1/spot/ws",
 		"/api/v1/market/ticker",
@@ -66,6 +74,9 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		"/api/v1/market/depth",
 		"/api/v1/market/trades",
 		"/api/v1/market/klines",
+		// 前端（crypto-exchange-web）兼容端点：单数 /kline 及其 WS 子路径 /kline/ws。
+		// 遵循 AuthWithSkips 的「精确或 pre+"/" 前缀」匹配，故仅列 /api/v1/market/kline 即可同时豁免两者。
+		"/api/v1/market/kline",
 		// 管理后台（cmd/admin）用独立 admin token 鉴权，不走普通用户鉴权域；
 		// 整段豁免后由 admin 后端自行校验 admin token（零信任：后端二次校验）。
 		// 这样 web-admin 可经网关统一入口访问 /api/admin/*（含新增的 /api/admin/apikeys）。
@@ -100,6 +111,13 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		}
 		path := "/api/v1/" + svc + "/*path"
 		r.Any(path, proxy(target))
+	}
+
+	// 通知中心契约路径为 /api/v1/user/notifications*，但实际由 cmd/notification 提供。
+	// 该前缀比通用 /api/v1/user/* 更具体（含静态段 notifications），httprouter 会优先匹配，
+	// 故显式反代到 notification 服务，避免误命中 user 服务（其未注册通知路由）。
+	if nt := cfg.Services["notification"]; nt != "" {
+		r.Any("/api/v1/user/notifications/*path", proxy(nt))
 	}
 
 	// 管理后台（cmd/admin）反代：admin 是独立鉴权域（admin token），不在 cfg.Services 内，

@@ -731,3 +731,507 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - **修复真实 bug（跨服务 market 字段丢失）**：spot 下单经 `matching` HTTP `/order` 时，`matching` 客户端 `Submit` 与 `/order` handler 均未传输 `Market` 字段，导致撮合引擎存储的订单 `market=""`，spot `GET /orders` 按 `v.Market != "spot"` 过滤时把全部订单丢弃——用户查不到自己任何现货订单。已修复：客户端 `Submit` 增加 `"market": o.Market`，`/order` handler 读取并写入 `o.Market`。该 bug 由二进制集成脚本（真实链路）首次暴露，in-process e2e 因使用假下游未能覆盖。
 
 > 验证：`go build ./...`、`go vet`、`go test ./internal/matching/... ./internal/spot/... ./internal/bot/... ./internal/copytrade/... ./e2e/...` 全绿；`bash scripts/integration.sh` 全流程 ALL PASS。
+
+## 32. 现货资金安全闭环：账本快照持久化 + openOrders 对账重建 + 停机补账（2026-08-25，已完成）
+
+闭合 §19/审计指出的现货资金安全缺口：撮合引擎有独立快照/WAL（§17），重启后旧挂单仍在簿；
+而 spot 侧账本为进程内内存、openOrders 冻结登记不重建——僵尸单成交走「无冻结记录→纯转账」
+分支，从重置后的种子余额划转（账实脱钩）。
+
+### 改动
+
+1. **账本快照持久化**（`cmd/spot/main.go`，镜像 §18 futures 方案）：
+   - 启动时 `LoadSnapshotFromMySQL(dsn, "spot")` → `Restore`；库无快照/加载失败回退种子充值；
+   - defer + SIGINT/SIGTERM 双路 `SaveToMySQL(dsn, "spot")`，余额/冻结跨重启保留；
+   - `SetIdempotencyDB(db, "spot")` 接线（此前仅 futures 有），转账指纹跨进程防双付。
+2. **openOrders 对账重建**（`internal/spot/store.go` `RestoreOrders` 重写）：
+   - 新增三态查询 `matching.Client.OrderState`：known(200) / not-found(404) / unreachable(err)，
+     区分「订单已终结」与「撮合暂时不可达」；
+   - open/partial → 正常重建冻结登记与 clientOIDMap；
+   - 终态或撮合不认识 → 释放残留冻结 + 删除持久化记录 + 清理幂等键（杜绝僵尸冻结）；
+   - 撮合不可达 → **保守保留**冻结登记（不误释放，用户撤单可自愈，reconcile 可发现）。
+3. **停机补账**（`internal/spot/server.go` `CatchUpSettlement` + `Client.RecentTrades`）：
+   - 重启后拉取各交易对最近 1000 笔全市场公开成交按时间正序重放 `settleFill`，
+     弥补 WS 成交事件丢失导致的经济漏记（在簿已成交、资金未划转）；
+   - 防双付三重保障：settledRefs 内存去重 + 账本 ref 指纹持久化跳过 + Batch 原子性；
+   - **调用顺序约束（关键）**：必须先于 RestoreOrders——此刻 openOrders 尚空，settleFill
+     走纯转账分支、所有操作携带成交 ref 受指纹保护；若先恢复冻结登记再重放，旧成交的
+     Unfreeze 无 ref 不受指纹保护会二次解冻。幂等库不可用时跳过补账并告警。
+
+### 测试
+
+- `internal/spot/restore_test.go` ×6：open 单重建 / 终态单释放冻结（账平校验）/ 撮合不可达
+  保守保留 / 补账一次结清且重放不双付 / 合约成交不参与补账 / 恢复单后续成交正确递减；
+- fakeMatcher 扩展 `OrderState`（含 unreachable 开关）/ `RecentTrades`（symbol 过滤保真）；
+- 既有 `TestRestoreOrdersRebuildsClientOIDMap` 适配新对账语义。
+
+> 验证：`go build ./...` 通过；`go test ./...` 34 包全绿。已知边界：停机窗口超过
+> RecentTrades 回看深度时更早漏结依赖 `/spot/admin/reconcile` 告警人工介入；NewServer 的
+> Watch 订阅先于恢复流程启动，极端竞态下早到成交走纯转账分支（幂等安全，仅登记滞后）。
+
+## 33. 业务线落地：理财中心 earn + 新币挖矿 launchpad（2026-08-25，已完成）
+
+对齐前端 `Earn.tsx`/`Launchpad.tsx` 契约（§24 缺口清单 A-2），新包 `internal/earn` 覆盖两条
+路由族：`/api/v1/earn/*`（活期/定期申购、计息、赎回）与 `/api/v1/launchpad/*`（项目列表、
+质押、领奖、解押）。复用 §28 wealth 的定点整数计息公式与两阶段出金模式。
+
+### 改动
+
+1. **理财中心**：
+   - 申购：agreed 风险揭示必勾选；min/max 限额；余额校验后本金 user→SysWealth
+     （ref `earn_sub:<id>`），两阶段「先落单后转账」失败回滚；
+   - 计息：`AccrueAll` 按 YIELD_SCALE 定点整数计息 SysWealth→SysWealthYieldPayable，
+     ref 携带 unix 时间戳（`earn_accrue:<sub>:<ts>`，规避账本指纹去重吞掉跨期利息——
+     wealth #47 的 ref 无时间戳属潜在隐患，此处已规避）；
+   - 赎回：定期未到期拒绝（Maturity 锁定）；先落终态再 Batch 双腿出金
+     （part=principal/yield），Batch 失败回滚终态；
+2. **Launchpool**：
+   - 项目：管理员创建（pools 校验：id 唯一、资产白名单 KnownAsset）、状态由 now 推导
+     upcoming/ongoing/ended；奖励预算由管理员 FundProject 预充 token→SysStakingReward
+     （funded_total 累计入库存，供对账）；
+   - 质押 user→SysStaking（ref `lp_stake:<pos>:<seq>`）；同一池重复质押合并仓位；
+   - 领奖 Harvest：**系统账户允许透支**，预算闸口必须在服务层显式做——池余额不足时
+     先持久化 Pending 再返回 ErrPoolExhausted（fail-safe 可追溯）；
+   - 解押 Unstake：partial 或全额（amount=0），seq 引用防指纹去重。
+3. **持久化**：迁移 9611-9614（ce_earn_products / ce_earn_subscriptions /
+   ce_launch_projects 含 funded_total / ce_launch_positions），金额列 VARCHAR(64)
+   HumanString 存储、读取 AssetAmountFromString 解析；MemStore + MySQLStore 同构。
+4. **装配**：`cmd/earn/main.go`（--addr :8093，种子产品 + 进行中 NEW 项目由 admin 预充
+   预算，RunLoop 60s 自动计息）。
+5. **集成脚本**：integration.sh 新增流程 5（产品列表/agreed 护栏/申购赎回/项目列表/
+   质押/harvest fail-safe/解押），earn 二进制纳入构建与探活。
+
+### 测试
+
+- `internal/earn/service_test.go` ×8：活期申赎闭环 / agreed+min/max 护栏 / 定期锁定与到期
+  赎回 / 定点计息入 YieldPayable / 质押领奖解押全流程（区间断言容忍 AddDate 半年天数）/
+  状态门控与预算 fail-safe / 重复质押不因幂等指纹被吞 / 部分解押与护栏；
+- `internal/earn/handler_test.go` ×2：admin 端点 F4 鉴权护栏（403 矩阵）/ 未勾选揭示 400。
+
+> 验证：`go build ./... && go vet ./...` 通过；`go test ./...` **35 包全绿**；
+> integration.sh ALL PASS（含新流程 5）。前端无需改动——mock/gateway.mjs 的 earn/
+> launchpad 路由族与本服务逐字段对齐，切真实后端即插即用。
+
+## 34. 用户侧缺口收口：通知契约对齐 + 安全中心四组端点（2026-08-25，已完成）
+
+闭合 §24 缺口清单中的用户域两项：**站内信前缀错配**与 **api-keys / sessions /
+login-history / anti-phishing 全缺**。公告（announcement）经复核两侧已逐字段对齐
+（用户端 GET /api/v1/announcement/list、管理端 CRUD、mock 与 vite 代理均已通），无需改动。
+
+### 改动
+
+1. **通知别名路由**（`internal/notification`，保留旧路由兼容 adminapi）：
+   - 新增 `/api/v1/user/notifications` 五端点：GET 列表（`{notifications,unread}`）、
+     GET unread-count（`{count}`）、POST `/:id/read`（路径参数版单条已读）、
+     POST read-all、**DELETE `/:id`（新增删除能力，Store 接口 + mem/mysql 三层补齐）**；
+   - 响应形状投影 userNotificationView：内部 `{type,body,status}` → 前端
+     `{level(info|warning|critical),content,read(bool)}`，LevelOf 映射：risk_alert→critical、
+     kyc_rejected→warning、其余→info；
+   - gin v1.10 验证静态段（read-all）与参数段（:id/read）可共存。
+2. **安全中心四组端点**（`internal/services/user`，security.go / security_handler.go）：
+   - **API Key**：POST 创建校验 label/permissions（⊂read|trade|withdraw）/ip_whitelist，
+     生成 `cxk_<prefix>_<secret>` 明文（secret 仅创建响应返回一次，存储只落 sha256(secret)
+     哈希）；GET `{api_keys,total}` 不泄露 secret；PUT 启停（仅 active|disabled）；DELETE 硬删；
+   - **登录历史**：Login 成功/失败均记录（失败按 target 反查归属用户；未知目标跳过），
+     IP→归属地演示映射（本地/内网/未知），entry id 以字符串序列化（前端 id:string 契约）；
+   - **会话**：登录成功建会话（随机 32 hex id）；current 不落库——读取时推导「最近活跃」
+     并触碰 last_active_at（调用方即当前会话）；不可注销当前会话（400）；注销全部返回 revoked 计数；
+   - **防钓鱼码**：GET 回显（未设置为空串）、POST 设置/空串清除、超长 400；
+3. **迁移 9109-9112**：ce_user_api_keys / ce_user_login_history / ce_user_sessions /
+   ce_user_anti_phishing（permissions/ip_whitelist 逗号分隔存储）。
+
+### 测试
+
+- `internal/notification/handler_test.go` +TestUserNotificationContract：五端点全链路
+  （列表形状/unread/count 键/critical 投影/越权 404/read-all 归零/DELETE 及重复删除 404）；
+- `internal/services/user/security_test.go` ×3：API Key 全生命周期（含三类 400 守卫、
+  secret 泄露检查、跨用户 404）；登录历史+会话（成功/失败双记录、字符串 id、current 推导、
+  当前会话 400、未知 404、revoked 计数）；防钓鱼码设置回显清除。
+
+> 验证：`go build ./... && go vet ./...` 通过；`go test ./...` 35 包全绿。
+> 已知边界：会话 current 为「最近活跃」启发式（真实部署建议把 session id 写入 access token
+> claim 精确绑定）；登录历史归属地为演示值（可接 GeoIP 替换 locFromIP）。
+
+## 35. 契约缺口收口 II：OTC 法币报价 + 用户侧自助充值（2026-08-25，已完成）
+
+1. **GET /api/v1/otc/prices**（`internal/otc`）：补齐前端虚构的后端缺口。
+   base_price = 参考价(USD) × fiat_rate；汇率表 USD=1/CNY=7.23/EUR=0.92 与 mock 网关
+   同口径（真实部署接汇率源）；USDT 无行情按 1 USD 稳定币基准，其余资产必须有
+   priceFn 报价否则 404；未知法币回退 rate=1。响应 {asset,fiat,base_price,fiat_rate,updated_at}。
+2. **POST /api/v1/futures/wallet/deposit/self**（`internal/futuresapi`）：
+   修复「充值被 AdminGuard 拒绝 + body 要求 user_id」与前端用户侧充值的双重错配：
+   - 归属 uid 一律取 token（防冒充，body user_id 忽略）；管理端 faucet（POST /deposit，
+     AdminGuard + body user_id 指定入账对象）保留并存；
+   - 资产白名单 USDT/BTC/ETH（对齐 mock WALLET_ASSETS）；单笔上限 10000、滑动窗频控
+     6 次/分钟（内存实现），防脚本刷入虚假资金；
+   - ledger ref 唯一化（deposit:self:uid:unixnano），同额快速连充不被指纹去重吞掉；
+   - 响应 {status,asset,available,frozen}（HumanFloat 数值口径对齐 mock）。
+
+### 测试
+
+- `internal/otc/handler_test.go` +TestOtcPrices：BTC/CNY 换算、缺省参数 USDT/CNY、
+  未知法币回退、无行情资产 404；
+- `internal/futuresapi/handler_wallet_f4_test.go` +TestDepositSelfUserFlow：正常入账
+  （10000+500）、白名单/上限/负数 400、body user_id 冒充无效、频控第 7 次 429。
+
+> 验证：`go test ./...` 35 包全绿；前端 client.ts 切换至 /deposit/self 后 tsc/vitest 全绿，
+> mock 网关新增同名别名路由保持开发流一致。
+
+---
+
+## 36. TP-SL 持久化（重启不丢失用户止盈止损设置）
+
+### 问题
+
+TP-SL（止盈/止损）订单在 `Server.tpsl` 内存 map 中存储，进程重启后全部丢失。
+用户设置的止盈止损在交易所重启后静默消失，存在重大风控缺口。
+
+### 改动
+
+1. **`internal/futuresapi/tpsl_store.go`**（新增文件）：
+   - `TPSLStore` interface：`Upsert(uid int64, key string, tp, sl *float64) error`、
+     `LoadAll() (map[int64]map[string]TPState, error)`、`Delete(uid int64, key string) error`；
+   - `MemTPSLStore`：内存实现（map + sync.RWMutex），单元测试覆盖往返语义；
+   - `MySQLTPSLStore`：MySQL 持久化实现，迁移 **9951** 创建表 `ce_futures_tpsl`
+     （user_id, key, tp, sl, created_at, updated_at）；UPSERT ON DUPLICATE KEY UPDATE；
+   - `key` 格式：`{symbol}:{pos_side}`（如 `BTC_USDT_PERP:long`）。
+
+2. **`internal/futuresapi/server.go`**：
+   - Server struct 新增 `tpslStore TPSLStore` 字段；
+   - `NewServer` 中：若提供 `*sql.DB` 则创建 `MySQLTPSLStore`，否则 `MemTPSLStore`；
+   - 启动时 `LoadAll()` 从 store 加载到内存 map，日志记录恢复条目数。
+
+3. **`internal/futuresapi/handler_gaps.go`** — `handleSetTPSL`：
+   - 更新内存 map 后调用 `s.tpslStore.Upsert(...)` 写穿持久化；
+   - 写穿失败仅 warn 日志，不阻塞用户操作（内存优先保可用性）。
+
+### 测试
+
+- `internal/futuresapi/tpsl_store_test.go`：
+  - `TestTPSLStoreRoundtrip`：Upsert → LoadAll 一致性 → 覆盖写 → Delete 清除；
+  - `TestTPSLWriteThroughViaServer`：通过 handler 设置 TP-SL → 验证 store 落库 →
+    新 Server 实例共用同一 store（模拟重启）→ decorateWithTPSL 恢复验证。
+
+> 验证：`go test ./...` 35 包全绿。
+
+---
+
+## 37. 业务事件→通知：强平与保证金预警写入站内信（2026-08-26，已完成）
+
+闭合「合约强平/逼近爆仓仅留 WS 广播、不入用户通知中心」的缺口：用户强平时无站内信、
+无 app 推送入口，安全事件不可见。
+
+### 改动
+
+1. **通知类型扩展**（`internal/notification/model.go`）：
+   - 新增 `TypeLiquidation = "liquidation"`（强平）、`TypeMarginWarning = "margin_warning"`（保证金预警）；
+   - `LevelOf` 映射：liquidation→critical、margin_warning→warning（与 risk_alert 同级 critical、kyc_rejected 同级 warning 一致）；
+   - `validType` 同步放行两类型（未知类型仍降级为 system，不阻塞调用方）。
+2. **futuresapi 接入通知服务**（`internal/futuresapi/server.go`）：
+   - Server 新增 `notifSvc *notification.Service`（内存 store，重启清空已读状态，不影响内容）+ `marginWarned map` 去重；
+   - `NewServer` 内初始化（与风险/账本同进程，无需跨服务 RPC）；
+   - `broadcastLiquidations` 在 WS 广播的同时调用 `publishLiquidationNotice`，向被强平用户推送站内信（部分/全额强平分标题，body 含标的/方向/强平价/手续费/实现盈亏）；
+   - 新增 `emitMarginWarnings` + 常量 `MarginWarnRatio=1.2`：liqScanLoop 每轮扫描所有仓位，
+     逐仓按 `(margin+UPNL)/notional`、全仓按 `mark/liqPrice`（多）或 `liqPrice/mark`（空）推算保证金率，
+     低于阈值且未在 `marginWarned` 去重集合中时发送「保证金不足预警」站内信（每 user+symbol 仅一次，避免震荡期骚扰）。
+3. **copytrade 自动跟单（已具备，本次验证）**：`cmd/copytrade/main.go` 经 Kafka `exchange.trades` 订阅
+   驱动 `svc.OnTrade`；本次确认链路完整（已有 26+ handler_test 覆盖 API、service_test 覆盖复制逻辑）。
+
+### 测试
+
+- `internal/notification/handler_test.go`：+`TestLevelOfNewTypes`（映射）、+`TestNewNotificationTypesPublished`（两类型经 Publish 落库且 level 正确）；
+- `internal/futuresapi/notify_test.go`：+`TestLiquidationNoticePublished`（全额/部分强平标题与落库）、+`TestMarginWarningEmitted`（逼近爆仓触发预警、内存去重、重置后可恢复）。
+
+> 验证：`go test ./...` 35 包全绿；`go vet` 通过。
+
+---
+
+## 38. 推荐防刷：新用户冷却期 + 自邀请拒绝（2026-08-26，已完成）
+
+闭合「推荐佣金可被注册即刷量」的缺口：原实现仅结算层校验 `referrer==taker` 自交易，
+未限制被邀请人注册后立刻自买自卖刷佣金，也无冷却窗口。
+
+### 改动
+
+1. **冷却期**（`internal/referral/hook.go`）：
+   - `HookAdapter` 新增 `cooldownDays int` + `now func() time.Time`（可注入）；
+   - `NewHookAdapterWithCooldown(userStore, svc, rate, cooldownDays)` 构造器；
+   - `RecordTradeFee` 在结算层佣金落账前检查被邀请人 `CreatedAt`：若 `now-CreatedAt < cooldownDays*24h` 则跳过（不计佣金）；
+   - 默认 `DefaultCooldownDays = 7`，`NewHookAdapter` 包装沿用默认；`cmd/settlement/main.go` 调用不变。
+2. **自邀请拒绝**（`internal/referral/hook.go`）：保留 `referrer==taker` 直接报错（`fmt.Errorf("referrer cannot be taker")`），
+   与原有 settlement 层防自交易一致；注册层 `user.Service.Register` 已按 referral_code 查邀请人，
+   自引用在 DB 层天然不可能（自身 code 注册时方生成）。
+
+### 测试
+
+- `internal/referral/hook_test.go`：+`TestReferralCooldown`：
+  - 注册 1h 的 taker 在 7 天冷却期内不计佣金（0 条）；
+  - 注册 30 天的 taker 正常计入（1 条）；
+  - `cooldownDays=0` 关闭冷却后刚注册用户也计入（1 条）；
+  - 自邀请（referrer==taker）返回错误且 0 条佣金（原有规则保留）。
+  - 配套 `fakeUserStore`（实现 user.Store 全接口最小内存）、`fakeCommissionStore`。
+
+> 验证：`go test ./...` 35 包全绿；`go vet` 通过。
+
+---
+
+## 39. 交易机器人接真实行情（替换 MockPrice）（2026-08-26，已完成）
+
+闭合「bot 行情源写死 MockPrice{P:100}」的演示缺口：网格/定投/MA 策略此前用固定价 100 计算下单量，
+与真实市场脱节，无法用于实盘或贴近真实的联调。
+
+### 改动
+
+1. **行情源适配器**（`internal/bot/price_source.go`）：
+   - `OraclePriceSource` 实现 `PriceSource` 接口，包裹 `*oracle.Oracle` 并调用 `IndexPrice(symbol)`；
+   - oracle 无价/价为非正时返回 error，由 tick 逻辑拒绝本轮（F5：非法价不下单），与既有 MockPrice 行为一致；
+   - `DefaultOracle()` 构造离线演示预言机：BTC_USDT/ETH_USDT/BTC_USDT_PERP/ETH_USDT_PERP 各配 2 个静态源
+     （满足预言机 MinFeeds=2 聚合要求），保证无 config 时服务可独立启动。
+2. **装配接线**（`cmd/bot/main.go`）：
+   - `configs` 配置了 `oracle.feeds`（http 类型指向真实 REST 源 Binance/Okx/Coinbase）→ `oracle.NewFromConfig` 走真实行情；
+   - 未配置 → `DefaultOracle()` 静态回退（与 futures 服务同模式）；
+   - `oracleSvc.Start()` 启动后台轮询，`NewOraclePriceSource` 注入 `bot.NewService`。
+3. **向后兼容**：`MockPrice` 保留（单测/特殊演示仍可用），`NewService(price=nil)` 仍回退到 MockPrice。
+
+### 测试
+
+- `internal/bot/price_source_test.go`：+`TestOraclePriceSource`（适配真实指数价、未配置符号报错）、
+  +`TestDefaultOracle`（离线预言机驱动）、+`TestServiceUsesOraclePrice`（服务注入 OraclePriceSource 后
+  tick 用真实价算量，qty≈0.1 而非 MockPrice=100 时的 40，证明已脱离写死价）。
+
+> 验证：`go test ./...` 35 包全绿；`go vet` 通过。真实行情需在 configs 配置 `oracle.feeds` 段（与 futures 共享同一份声明式配置）。
+
+---
+
+## §40 通知生产端补全（KYC/充值/提现三类事件）
+
+### 背景
+
+通知中心（§34）已定义 `kyc_approved`/`kyc_rejected`/`deposit_arrived`/`withdraw_done` 四种类型，
+但此前**只有 futures 的强平/保证金预警**调用 `Publish`。业务闭环不完整——KYC 审核、链上充值到账、
+链上提现完成这三类站内信始终无人写入。本次补全 producer 侧。
+
+### 改动
+
+1. **KYC 审核结果**（`internal/services/user/service.go` `ReviewKYC`）：
+   - `Service` 新增 `notifSvc *notification.Service` 字段，`NewService` 增加该入参（允许 nil）；
+   - 审核通过/驳回后调用 `notifSvc.Publish`，类型 `kyc_approved`/`kyc_rejected`，驳回时 `Body` 带驳回原因；
+   - `cmd/user/main.go` 新增 `newUserNotifSvc(dsn, log)`：DSN 非空则 `notification.NewMySQLStore` 持久化，
+     否则降级内存；与 announcement 同级装配。
+2. **充值到账 / 提现完成**（`internal/futuresapi/server.go` `startChainWatchers`）：
+   - `ReceiveOnChain` 成功后调用 `publishDepositNotice`（类型 `deposit_arrived`）；
+   - `WithdrawCredited` settle 成功后调用 `publishWithdrawNotice`（类型 `withdraw_done`）；
+   - 通知服务由内存升级为 **MySQL 持久化**（DSN 非空时 `notification.NewMySQLStore`，与 TP-SL 存储同模式），
+     重启不丢站内信；不可用时退化内存。
+
+### 测试
+
+- `internal/services/user/service_test.go`：+`TestReviewKYCPublishesNotification`
+  （通过/驳回各生成对应类型，驳回 body 带原因）。
+- `internal/futuresapi/notify_test.go`：+`TestDepositNoticePublished`、+`TestWithdrawNoticePublished`
+  （抽离 `publishDepositNotice`/`publishWithdrawNotice` 便于单测）。
+
+> 验证：`go test ./internal/services/user/... ./internal/futuresapi/...` 全绿。
+> 注：settlement 侧仅记日志不推送，futures 是唯一生产消费链上事件的落账点，故 producer 集中在此。
+
+---
+
+## §41 e2e/集成脚本覆盖新模块（安全中心 + 通知中心）
+
+### 背景
+
+此前 `scripts/integration.sh`（5 条资金流）与 `e2e/e2e_test.go` 仅覆盖 bot/copytrade/lending 等旧线，
+安全中心（API Key/登录历史/会话/防钓鱼码）与通知中心（§34/§37）**完全没有端到端验证**。本次补齐。
+
+### 改动
+
+1. **`cmd/user/main.go`、`cmd/notification/main.go` 增加 `-addr` 启动参数**（原硬编码 `:8081`/`:8088`），
+   以便 `integration.sh` 在动态空闲端口拉起这两个服务。
+2. **`scripts/integration.sh`**：
+   - 构建/启动新增 `user`、`notification` 两个服务（内存模式，`make_config` 已置空 DSN 退内存）；
+   - 新增 **flow 6**：安全中心创建 API Key / 登录历史 / 会话列表 / 防钓鱼码读写，
+     以及通知中心未读列表 / 未读数 / 全部已读（验证端点接通 + Bearer 鉴权）。
+   - 注：内存模式下 user 的 notifSvc 与 notification 服务是**两个独立内存实例**，故 flow 6 仅验端点与鉴权；
+     真正的「生产→消费」跨服务往返由 `e2e_test.go` 共享实例强校验。
+3. **`e2e/e2e_test.go`** 新增：
+   - `TestSecurityCenterE2E`：进程内拉起 user 服务，走真实 HTTP 验证安全中心四组端点闭环
+     （含防钓鱼码设置后回读一致）；
+   - `TestNotificationCenterE2E`：user 服务与 notification 服务**共享同一 `notification.Service` 实例**，
+     直接 Publish 模拟强平事件 → 经 `/api/v1/user/notifications*` 读链路（列表/未读数/全部已读）全闭环。
+
+### 测试
+
+- `bash scripts/integration.sh` → `INTEGRATION: ALL PASS`（含 flow 6）。
+- `go test ./e2e/... -run 'TestSecurityCenterE2E|TestNotificationCenterE2E'` 全绿。
+
+---
+
+## §42 wealth 计息 ref 加时间戳（闭环已知隐患）
+
+### 背景
+
+`internal/wealth/service.go` 的 `accrueHolding` 在调用账本 `Transfer("wealth_accrue", ref)` 时，
+ref 为 `wealth_accrue product=<PID> holding=<HID>` —— **不含任何时间分量**。账本以
+`from|to|asset|amount|decimals|biz|ref` 计算幂等指纹，同一持仓两次**金额相同**的计息会产生相同指纹，
+第二笔被账本静默丢弃（`transferSeen` 命中直接 `return nil`）。earn 模块（§31）已用 `t=%d` 规避，
+wealth 此前未修，属潜在资金漏记隐患。
+
+### 改动
+
+- `internal/wealth/service.go:173`：`ref` 追加 `t=%d` 与 `now.Unix()`，即
+  `fmt.Sprintf("wealth_accrue product=%d holding=%d t=%d", p.ID, h.ID, now.Unix())`，
+  镜像 earn 的模式。`now` 已是 `accrueHolding` 入参，无需改签名，同时覆盖 `Accrue` 周期与 `Redeem` 前补计两条路径。
+
+### 测试
+
+- `internal/wealth/service_test.go`：`TestWealthAccrueIntegerExact` 原有「两次计息累计 20」的持仓层断言，
+  本次**新增账本层断言**——`l.Balance(SysWealthYieldPayable, "USDT") == 20`，
+  证明两期计息均真实落账（修复前该 ref 会让第二笔被幂等吞掉，payable 仅 10）。
+- `go test ./internal/wealth/...` 通过；`go test ./...` 全绿。
+
+> 前端方面：Bot 页（`pages/BotGrid.tsx`）与通知中心（`pages/Notifications.tsx`）此前已实现并接入
+> `App.tsx` 路由（`/bot`、`/notifications`），API 契约（`api.userNotifications*` /
+> `api.botStrategies*`）与后端一致，类型检查与单测均通过，无需改动。
+
+---
+
+## §43 risk_alert 通知生产端（失败登录风险预警）
+
+### 背景
+
+通知类型 `risk_alert`（§34 定义）此前**无 producer**。安全中心虽记录登录历史与会话
+（`RecordLoginWithMeta`），但「异常登录」不会主动触达用户，通知中心永远收不到安全类消息。
+
+### 改动
+
+- `internal/services/user/security.go` `RecordLoginWithMeta`：当 `authErr != nil` 且能定位到既有账号
+  （`userID != 0`）时，经 `notifSvc` 发布 `risk_alert` 类型通知
+  （标题「账号登录异常提醒」，正文含时间/IP）。成功登录不触发，避免误报。
+- 复用既有的 `notifSvc` 字段（§40 引入），无需新增装配。
+
+### 测试
+
+- `internal/services/user/service_test.go`：+`TestRiskAlertOnFailedLogin`
+  （失败登录产生 1 条 risk_alert；随后成功登录不再新增）。
+
+> 至此通知中心所有「业务生产」类型（kyc_approved / kyc_rejected / risk_alert / deposit_arrived /
+> withdraw_done / liquidation / margin_warning）均已接入 producer；`system` 类型保留为管理端
+> `/api/v1/notification/publish` 手动广播（与公告模块各自独立通道，避免重复触达）。
+
+---
+
+## §44 真实 MySQL 集成测试 + 迁移缺陷修复
+
+### 背景
+
+既有单元测试大量使用内存存储，MySQL 路径仅在「能连上 DB 时」被覆盖，CI 中常被跳过。
+用户要求：集成测试**直连 configs/config.yaml 的 MySQL**（不用 Docker），验证各模块迁移与读写链路。
+
+### 新增
+
+- `internal/integration/mysql_test.go`：`TestMySQLStoresMigrate`（全模块 Up 迁移建表）、
+  `TestMySQLNotificationRoundTrip`、`TestMySQLAnnouncementRoundTrip`。
+  - DSN 来源：环境变量 `CE_MYSQL_TEST_DSN` 优先；否则尝试在「config.yaml 同一台 MySQL」上
+    自动建隔离测试库 `wallet_it`（需建库权限）；两者皆不可用时 `t.Skip`
+    （绝不在已漂移/有数据的线上库上直接迁移或读写）。
+  - 该测试在默认环境（无干净测试库）下**安全跳过**，仅在提供了干净 MySQL 时运行。
+
+### 修复（测试过程中暴露的真实缺陷）
+
+1. **`internal/pkg/migrate/migrate.go` 锁泄漏**：`withLock` 仅 `defer conn.Close()`，而 `*sql.Conn`
+   归还连接池不会真正断开底层连接，导致 `GET_LOCK('ce_migrate')` 泄漏在池内连接上，后续迁移
+   全部 `got=0` 超时。已补 `defer conn.ExecContext(ctx, "SELECT RELEASE_LOCK('ce_migrate')")`。
+2. **全局迁移版本号冲突（严重）**：`migrate` 包用单张 `ce_schema_migrations` 且版本全局唯一，
+   但多个模块复用同一版本号，导致后注册模块的迁移被**静默跳过**：
+   - `9301` notification ↔ referral → notification 改 `9320`
+   - `9401` announcement(const) ↔ risk → risk 改 `9411~9414`
+   - `9801` spot / staking / settlement(const) / adminapi(const) → settlement `9811`、adminapi `9812`（spot 保留 9801，staking 已改 9800）
+   - `9802` staking / apikeys(const) → apikeys `9813`
+   - `9805` bot / copytrade → copytrade `9809`
+3. **迁移非幂等**：`bot/copytrade/options/wealth/user` 的 `ALTER ADD COLUMN` 与
+   `referral` 的 `CREATE TABLE` 在全新库上因「列已存在于 CREATE TABLE」而报重复，
+   已全部补 `IF NOT EXISTS`；`user` 9108 先为空白 `referral_code` 补齐 `RC<id>` 再建唯一索引，
+   避免既有数据重复键。
+
+## §45 MySQL 集成测试扩展 + 充值提现链路 + Down 回滚验证
+
+### 背景
+
+§44 新增了迁移建表 + 通知/公告的往返测试，但用户、风控、理财产品等核心模块仍缺真实
+MySQL 往返覆盖；充值→提现资金闭环（F3）无端到端账本验证；迁移可逆性（Down）无集成验证。
+
+### 新增测试（`internal/integration/mysql_test.go`）
+
+1. **TestMySQLUserRoundTrip**：注册→GetByID→GetByEmail→更新昵称→SaveKYC→GetKYC→
+   UpdateKYC，覆盖用户与 KYC 子模块在真实 MySQL 上的全链路（含预清理防脏数据）。
+2. **TestMySQLRiskRoundTrip**：UpsertRule→GetRule→ListRules→RecordEvent→
+   ListEvents→AddBlacklist→IsBlacklisted→RemoveBlacklist，覆盖风控规则/事件/黑名单三张表。
+3. **TestMySQLWealthRoundTrip**：CreateProduct→GetProduct→ListProducts→CreateHolding→
+   GetHolding→ListHoldings→UpdateHolding→DeleteHolding，覆盖理财产品与持仓。
+4. **TestMySQLDepositWithdrawFlow**：在复式账本上模拟充值（CreditAvailable）→余额验证→
+   冻结提现（FreezeWithdraw）→提现确认（WithdrawFrozenBalance）→余额验证→
+   交易冻结（Freeze）→解冻（Unfreeze），覆盖 F3 资金闭环边界。
+5. **TestMySQLDownRollback**：对有 Down 迁移的模块（bot/copytrade/lending/staking）执行
+   Up→验证表存在→Down(-1)→验证表消失，覆盖 F2 迁移可逆性边界。
+
+### 修复
+
+- **memStore.List 排序不确定性**：`internal/notification/store_mem.go` 的 List 方法此前
+  对 map 迭代结果做反转近似时间倒序，但 map 迭代顺序不确定，导致 `TestUserNotificationContract`
+  偶发失败。改为 `sort.Slice` 按 ID 降序排列，与 MySQL 实现一致。
+
+## §46 WebSocket Hub 测试覆盖 + 来源白名单 + 迁移规范化
+
+### 背景
+
+`internal/ws/hub.go` 是 spot/market/futuresapi/notification 四个服务共用的 WebSocket
+广播中心，此前零测试覆盖；CheckOrigin 硬编码 `return true`（允许任意来源）；copytrade
+迁移切片未按版本升序排列，违反 `migrate.New` 契约。
+
+### 新增
+
+1. **`internal/ws/hub_test.go`**（8 个测试）：
+   - `TestHub_BroadcastMatchingSymbol`：验证仅订阅了目标 symbol 的客户端收到消息
+   - `TestHub_BroadcastAllToEmptySubscription`：无 symbol 订阅的客户端接收所有广播
+   - `TestHub_BroadcastEmptySymbolToAll`：`symbol=""` 广播推送给所有连接
+   - `TestHub_BroadcastBufferFull`：send 缓冲满时 Broadcast 不阻塞（`select default` 路径）
+   - `TestHub_UnregisterOnClientClose`：客户端断连后自动注销，不再出现在广播列表
+   - `TestContainsSymbol`：辅助函数单元测试
+   - `TestHub_CheckOriginWithAllowedOrigins`：验证 `NewHubWithOrigins` 白名单生效
+   - `TestHub_MultiSymbolSubscription`：逗号分隔多 symbol 订阅正确过滤
+
+2. **`NewHubWithOrigins(origins []string)` 构造函数**：
+   - 传入允许的 Origin 列表，CheckOrigin 仅接受匹配的 WebSocket 连接
+   - `NewHub()` 保持向后兼容（接受所有来源，适合开发环境）
+   - 各 cmd/ 调用方无需修改，按需在生产配置中切换
+
+### 修复
+
+3. **copytrade 迁移版本排序**：`internal/copytrade/store_migrations.go` 从 `[9809,9806,9807,9808]`
+   改为 `[9806,9807,9808,9809]`，符合 `migrate.New` 文档约定的「按 Version 升序传入」。
+
+4. **Down 回滚测试扩展**：`TestMySQLDownRollback` 从 4 个模块（bot/copytrade/lending/staking）
+   扩展至全部 17 个有 Down 迁移的模块，每个子测试验证 Up→表存在→Down→表消失。
+
+## §47 Admin 架构治理 + 监听地址配置化 + 错误响应统一
+
+### 背景
+
+Admin 后台 referral handler 每次请求 `sql.Open` 新建 MySQL 连接（连接泄漏风险）；
+9 个微服务硬编码监听地址（忽略 `cfg.Server.Port`）；adminapi `s.fail()` 返回格式
+`{"code":N,"message":"..."}` 缺少 `data` 字段，与用户端 `response.Error` 不一致。
+
+### 修复
+
+1. **admin referral handler 注入 referral.Store**：`Server` 新增 `referralStore` 字段，
+   `NewServer` 中按 MySQL 优先/内存降级初始化；`handleAdminReferralCommissions` 改用
+   `s.referralStore.ListAll(limit, offset)` 一行查询，消除每请求 `sql.Open` + `defer db.Close()`。
+2. **新增 `referral.NewMemStore()`**：实现 `referral.Store` 接口（开发/测试降级用），
+   提供 `RecordCommission/GetCommissionByRef/ListCommissionsByReferrer/ListAll/TotalByReferrer`。
+3. **adminapi `s.fail()` 统一响应格式**：改用 `response.Error(c, code, code, msg)`，
+   返回 `{"code":N,"message":"...","data":null}`，与用户端 API 响应结构一致。
+4. **9 个服务监听地址配置化**：gateway/futures/market/margin/options/otc/risk/settlement/wealth
+   从硬编码 `":NNNN"` 改为 `fmt.Sprintf(":%d", cfg.Server.Port)` 优先、零值回退默认端口；
+   其余 9 个服务已使用 `flag.String` 或 `cfg.Admin.Addr`，无需修改。
+5. **referral store COUNT 错误传播**：`ListAll` 与 `ListCommissionsByReferrer` 的
+   `COUNT(*)` 查询错误不再静默丢弃，改为包装返回。

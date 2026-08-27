@@ -45,6 +45,8 @@ type User struct {
 	PhoneVerified bool
 	Nickname     string // 昵称（个人设置可编辑，可选）
 	Avatar       string // 头像 URL（个人设置可编辑，可选）
+	ReferrerID   int64  // 邀请人 ID（0 表示无邀请人）
+	ReferralCode string // 本人的邀请码（8 位大写字母+数字，注册时自动生成）
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -58,6 +60,8 @@ type UserPreferences struct {
 	NotifyOrder    bool      `json:"notify_order"`    // 订单相关通知
 	NotifySecurity bool      `json:"notify_security"` // 安全相关通知（登录/改密等）
 	NotifyMarketing bool     `json:"notify_marketing"` // 营销推送
+	TradeInterval  string    `json:"trade_interval"`   // 交易页 K 线默认周期：1m/15m/1h/1d（前端新增）
+	ChangeBasis    string    `json:"change_basis"`     // 涨跌幅基准：24h/1h/today（今日开盘），前端新增
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 

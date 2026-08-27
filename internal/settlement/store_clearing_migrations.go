@@ -3,7 +3,7 @@ package settlement
 import "github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 
 // clearingMigVer 是清算流水表的迁移版本号（错开 ledger 90xx、matching 200、admin 92xx）。
-const clearingMigVer = 9801
+const clearingMigVer = 9811
 
 // ClearingMigrations 是交易清算流水表的建表迁移，运行时由 NewMySQLClearingStore 应用。
 var ClearingMigrations = []migrate.Migration{

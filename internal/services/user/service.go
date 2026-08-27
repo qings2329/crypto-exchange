@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 )
 
@@ -51,18 +52,20 @@ func (c Config) withDefaults() Config {
 
 // Service 实现账户体系业务（注册/登录/验证码/找回/2FA/KYC）。
 type Service struct {
-	store    Store
-	verifier *middleware.TokenVerifier
-	notifier Notifier
-	cfg      Config
+	store     Store
+	verifier  *middleware.TokenVerifier
+	notifier  Notifier
+	notifSvc  *notification.Service // 业务事件→通知中心（强平/预警/审核结果等）
+	cfg       Config
 }
 
-// NewService 构造用户服务。
-func NewService(store Store, verifier *middleware.TokenVerifier, notifier Notifier, cfg Config) *Service {
+// NewService 构造用户服务。notifSvc 可为 nil（不推送站内信）。
+func NewService(store Store, verifier *middleware.TokenVerifier, notifier Notifier, notifSvc *notification.Service, cfg Config) *Service {
 	return &Service{
 		store:    store,
 		verifier: verifier,
 		notifier: notifier,
+		notifSvc: notifSvc,
 		cfg:      cfg.withDefaults(),
 	}
 }
@@ -154,7 +157,8 @@ func (s *Service) verifyCode(target, purpose, code string) (*VerifyCode, error) 
 // ---- 注册 ----
 
 // Register 用邮箱或手机注册。register 用途的验证码必传；通过后创建用户并标记该渠道已验证。
-func (s *Service) Register(target, password, code string) (int64, error) {
+// referralCode 为可选的邀请码，传入时关联邀请人。
+func (s *Service) Register(target, password, code, referralCode string) (int64, error) {
 	if len(password) < s.cfg.MinPwdLen {
 		return 0, fmt.Errorf("password too short (min %d)", s.cfg.MinPwdLen)
 	}
@@ -176,11 +180,48 @@ func (s *Service) Register(target, password, code string) (int64, error) {
 	} else {
 		return 0, ErrInvalidAccount
 	}
+	// 处理邀请码：查找邀请人并关联（§38：自引用检查见 settlement 层 hook）。
+	if referralCode != "" {
+		referrer, err := s.store.GetByReferralCode(referralCode)
+		if err == nil && referrer.ID != 0 {
+			u.ReferrerID = referrer.ID
+		}
+	}
+	// 生成唯一邀请码（8 位大写字母+数字）
+	u.ReferralCode = s.generateReferralCode()
 	if err := s.store.CreateUser(u); err != nil {
 		return 0, err
 	}
 	_ = s.store.ConsumeCode(vc.ID)
 	return u.ID, nil
+}
+
+// generateReferralCode 生成 8 位大写字母+数字的唯一邀请码。
+func (s *Service) generateReferralCode() string {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	for i := 0; i < 100; i++ { // 最多重试 100 次
+		code := make([]byte, 8)
+		for j := range code {
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+			code[j] = charset[n.Int64()]
+		}
+		c := string(code)
+		if _, err := s.store.GetByReferralCode(c); err != nil {
+			return c // 唯一
+		}
+	}
+	// 极不可能：退回时间戳哈希
+	return fmt.Sprintf("%08X", time.Now().UnixNano()%0xFFFFFFFF)
+}
+
+// GetByReferralCode 按邀请码查询用户。
+func (s *Service) GetByReferralCode(code string) (*User, error) {
+	return s.store.GetByReferralCode(code)
+}
+
+// GetReferrals 获取用户邀请的所有下线。
+func (s *Service) GetReferrals(userID int64) ([]*User, error) {
+	return s.store.GetReferrals(userID)
 }
 
 // VerifyAccount 注册后补充验证（如邮箱验证）。
@@ -453,7 +494,26 @@ func (s *Service) ReviewKYC(userID int64, approve bool, rejectReason, reviewer s
 	if err := s.store.UpdateKYC(sub); err != nil {
 		return err
 	}
-	return s.store.UpdateUser(u)
+	if err := s.store.UpdateUser(u); err != nil {
+		return err
+	}
+	// 业务事件：KYC 审核结果写入通知中心
+	typ, title, body := notification.TypeKYCAproved, "KYC 认证通过", "您的 KYC 认证已通过，账户等级已提升。"
+	if !approve {
+		typ, title = notification.TypeKYCRejected, "KYC 认证被驳回"
+		body = rejectReason
+	}
+	if s.notifSvc != nil {
+		if _, perr := s.notifSvc.Publish(notification.PublishInput{
+			UserID: userID,
+			Type:   typ,
+			Title:  title,
+			Body:   body,
+		}); perr != nil {
+			return fmt.Errorf("publish kyc notification: %w", perr)
+		}
+	}
+	return nil
 }
 
 // GetProfile 取回用户档案与 KYC 状态。
@@ -556,6 +616,12 @@ func (s *Service) UpdatePreferences(userID int64, in *UserPreferences) error {
 	if in.Theme != "" && len(in.Theme) > 32 {
 		return ErrInvalidPref
 	}
+	if in.TradeInterval != "" && len(in.TradeInterval) > 16 {
+		return ErrInvalidPref
+	}
+	if in.ChangeBasis != "" && len(in.ChangeBasis) > 16 {
+		return ErrInvalidPref
+	}
 	p := &UserPreferences{
 		UserID:         userID,
 		Language:       in.Language,
@@ -564,6 +630,8 @@ func (s *Service) UpdatePreferences(userID int64, in *UserPreferences) error {
 		NotifyOrder:    in.NotifyOrder,
 		NotifySecurity: in.NotifySecurity,
 		NotifyMarketing: in.NotifyMarketing,
+		TradeInterval:  in.TradeInterval,
+		ChangeBasis:    in.ChangeBasis,
 	}
 	return s.store.UpdatePreferences(p)
 }

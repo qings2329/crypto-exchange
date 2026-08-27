@@ -1,12 +1,17 @@
 package staking
 
 import (
+	"context"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func newTestService() (*Service, *ledger.Ledger, Store) {
@@ -185,5 +190,60 @@ func TestSubscribeBelowMin(t *testing.T) {
 	// 0.5 < 1 起质押额
 	if _, err := svc.Subscribe(1, p.ID, settlement.AssetAmountFromFloat(0.5, dec)); err != ErrBelowMinAmount {
 		t.Fatalf("want ErrBelowMinAmount, got %v", err)
+	}
+}
+
+// TestStakingReconcileDeviationAlert 锁定新增的 reconcileAndAlert 告警路径：当在押本金与
+// SysStaking 账本余额出现非零偏差时，应通过 logger 告警（F3 纵深），而非静默放过。
+func TestStakingReconcileDeviationAlert(t *testing.T) {
+	svc, l, store := newTestService()
+	dec := settlement.AssetDecimalsByName("ETH")
+	p := &StakingProduct{
+		Name: "ETH", Chain: "eth", Validator: "v", ContractAddr: "c",
+		Asset: "ETH", MinAmount: settlement.NewAssetAmount(big.NewInt(0), dec), Status: ProductActive,
+	}
+	if err := store.CreateProduct(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.ReceiveOnChain(1, "ETH", settlement.AssetAmountFromFloat(10, dec), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Subscribe(1, p.ID, settlement.AssetAmountFromFloat(5, dec)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 制造偏差：从 SysStaking 转走 1 ETH，使账本余额(4) < 在押本金(5)。
+	if err := l.Transfer(ledger.SysStaking, 999, "ETH", settlement.AssetAmountFromFloat(1, dec), "drift", "drift"); err != nil {
+		t.Fatal(err)
+	}
+
+	core, logs := observer.New(zapcore.WarnLevel)
+	svc.log = zap.New(core)
+	svc.reconcileAndAlert()
+
+	found := false
+	for _, e := range logs.All() {
+		if e.Level == zapcore.WarnLevel && strings.Contains(e.Message, "staking reconciliation deviation") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected 'staking reconciliation deviation' alert on non-zero deviation")
+	}
+}
+
+// TestStakingRunLoopExitsOnCancel 锁定 RunLoop 生命周期：设 ReconcileInterval 走 ticker 路径，
+// ctx 取消后应干净退出（不泄漏 goroutine、不死锁）。
+func TestStakingRunLoopExitsOnCancel(t *testing.T) {
+	svc, _, _ := newTestService()
+	svc.cfg.ReconcileInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { svc.RunLoop(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunLoop did not exit after ctx cancel")
 	}
 }

@@ -68,39 +68,49 @@ const (
 // OptionContract 是期权合约模板（由管理员创建）。
 type OptionContract struct {
 	ID           int64         `json:"id"`
-	Underlying   string        `json:"underlying"`     // 标的资产，如 BTC
-	QuoteAsset   string        `json:"quote_asset"`    // 计价资产，如 USDT
-	Strike       float64       `json:"strike"`         // 行权价（以 quote 计）
-	Expiry       time.Time     `json:"expiry"`         // 到期时间
-	Type         OptionType    `json:"type"`           // call / put
-	Style        ExerciseStyle `json:"style"`          // european / american
-	ContractSize float64       `json:"contract_size"`  // 每张合约对应标的数量，默认 1
-	Premium      float64       `json:"premium"`        // 开仓权利金单价（每张，quote 计）
-	CreatedAt    time.Time     `json:"created_at"`
+	Underlying   string                 `json:"underlying"`     // 标的资产，如 BTC
+	QuoteAsset   string                 `json:"quote_asset"`    // 计价资产，如 USDT
+	Strike       settlement.AssetAmount `json:"strike"`         // 行权价（以 quote 计，定点）
+	Expiry       time.Time              `json:"expiry"`         // 到期时间
+	Type         OptionType             `json:"type"`           // call / put
+	Style        ExerciseStyle          `json:"style"`          // european / american
+	ContractSize settlement.AssetAmount `json:"contract_size"`  // 每张合约对应标的数量，默认 1（定点）
+	Premium      settlement.AssetAmount `json:"premium"`        // 开仓权利金单价（每张，quote 计，定点）
+	CreatedAt    time.Time              `json:"created_at"`
 	UpdatedAt    time.Time     `json:"updated_at"`
 }
 
-// size 返回合约乘数，默认 1。
-func (c *OptionContract) size() float64 {
-	if c.ContractSize <= 0 {
-		return 1
+// quoteDec 返回合约计价资产的小数位（定点化用）。
+func (c *OptionContract) quoteDec() int {
+	return settlement.AssetDecimalsByName(c.QuoteAsset)
+}
+
+// size 返回合约乘数（定点，默认 1）。
+func (c *OptionContract) size() settlement.AssetAmount {
+	if c.ContractSize.Sign() <= 0 {
+		return settlement.AssetAmount{Decimals: c.quoteDec()}
 	}
 	return c.ContractSize
 }
 
-// IntrinsicValue 按现货价 spot 计算「每张」内在价值（quote 计）。
-func (c *OptionContract) IntrinsicValue(spot float64) float64 {
+// IntrinsicValue 按现货价 spot（quote 计，外部行情为 float）计算「每张」内在价值（quote 计，定点）。
+// 定点减法消除行权价 float 精度损失；乘数/数量通常为整数，经 float 桥接无精度损失（沿用 PremiumTotal 模式）。
+func (c *OptionContract) IntrinsicValue(spot float64) settlement.AssetAmount {
+	dec := c.quoteDec()
+	spotAmt := settlement.AssetAmountFromFloat(spot, dec)
 	switch c.Type {
 	case TypeCall:
-		if spot > c.Strike {
-			return (spot - c.Strike) * c.size()
+		if spot > c.Strike.HumanFloat() {
+			iv := spotAmt.Sub(c.Strike)
+			return settlement.AssetAmountFromFloat(iv.HumanFloat()*c.size().HumanFloat(), dec)
 		}
 	case TypePut:
-		if c.Strike > spot {
-			return (c.Strike - spot) * c.size()
+		if c.Strike.HumanFloat() > spot {
+			iv := c.Strike.Sub(spotAmt)
+			return settlement.AssetAmountFromFloat(iv.HumanFloat()*c.size().HumanFloat(), dec)
 		}
 	}
-	return 0
+	return settlement.AssetAmount{Decimals: dec}
 }
 
 // OptionPosition 是用户的一条期权持仓。
@@ -121,5 +131,7 @@ type OptionPosition struct {
 // PremiumTotal 返回该持仓支付/收取的权利金总额（quote 计，定点）。
 func (p *OptionPosition) PremiumTotal() settlement.AssetAmount {
 	dec := settlement.AssetDecimalsByName(p.QuoteAsset)
+	// 保留裸 FromFloat：p.Premium 与 p.Quantity 均为账本内部定点值，不接受用户输入，NaN/Inf 不可达；
+	// 此处仅做权利金总额量化（持仓已 F2 定点化）。
 	return settlement.AssetAmountFromFloat(p.Premium.HumanFloat()*p.Quantity, dec)
 }
