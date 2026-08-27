@@ -18,19 +18,38 @@ type Client struct {
 
 // Hub 管理所有 WebSocket 客户端，按 symbol 广播消息。
 type Hub struct {
-	mu      sync.RWMutex
-	clients map[*Client]struct{}
-	up      websocket.Upgrader
+	mu             sync.RWMutex
+	clients        map[*Client]struct{}
+	up             websocket.Upgrader
+	allowedOrigins map[string]struct{} // nil = 接受所有来源（开发期默认）
 }
 
-// NewHub 创建广播中心。
+// NewHub 创建广播中心（接受所有来源，适合开发环境）。
 func NewHub() *Hub {
 	return &Hub{
 		clients: make(map[*Client]struct{}),
 		up: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true }, // 开发期放开，生产按域名校验
+			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
+}
+
+// NewHubWithOrigins 创建带来源白名单的广播中心，仅允许指定 Origin 的 WebSocket 连接。
+func NewHubWithOrigins(origins []string) *Hub {
+	m := make(map[string]struct{}, len(origins))
+	for _, o := range origins {
+		m[o] = struct{}{}
+	}
+	h := NewHub()
+	h.allowedOrigins = m
+	h.up.CheckOrigin = func(r *http.Request) bool {
+		if len(h.allowedOrigins) == 0 {
+			return true
+		}
+		_, ok := h.allowedOrigins[r.Header.Get("Origin")]
+		return ok
+	}
+	return h
 }
 
 // Handle 升级 HTTP 为 WebSocket，并按 ?symbol= 订阅。
