@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -71,7 +72,10 @@ func main() {
 	r.Use(append(mws, middleware.Auth(verifier))...)
 	h.RegisterRoutes(r)
 
-	addr := ":8089"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8089"
+	}
 	srv := &http.Server{Addr: addr, Handler: r, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		logger.Info("risk service listening", zap.String("addr", addr))

@@ -32,7 +32,10 @@ func main() {
 
 	r := buildRouter(cfg, log)
 
-	addr := ":8080"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8080"
+	}
 	log.Info("gateway starting", zap.String("addr", addr))
 	if err := cfg.Listen(r, addr); err != nil {
 		log.Fatal("server exited", zap.Error(err))

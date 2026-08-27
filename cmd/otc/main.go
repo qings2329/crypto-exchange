@@ -104,7 +104,10 @@ func main() {
 	defer cancel()
 	go svc.RunLoop(ctx)
 
-	addr := ":8091"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8091"
+	}
 	log.Info("otc service starting", zap.String("addr", addr))
 
 	// 信号退出：先停循环再退出。

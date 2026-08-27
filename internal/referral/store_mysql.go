@@ -91,7 +91,9 @@ func (s *mysqlStore) GetCommissionByRef(bizRef string) (*ReferralCommission, err
 
 func (s *mysqlStore) ListCommissionsByReferrer(referrerID int64, limit, offset int) ([]*ReferralCommission, int, error) {
 	var total int
-	s.db.QueryRow(`SELECT COUNT(*) FROM ce_referral_commissions WHERE referrer_id = ?`, referrerID).Scan(&total)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM ce_referral_commissions WHERE referrer_id = ?`, referrerID).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count commissions by referrer: %w", err)
+	}
 
 	rows, err := s.db.Query(
 		`SELECT id, referrer_id, taker_id, asset, amount, rate, status, biz_ref, created_at, updated_at
@@ -115,7 +117,9 @@ func (s *mysqlStore) ListCommissionsByReferrer(referrerID int64, limit, offset i
 
 func (s *mysqlStore) ListAll(limit, offset int) ([]*ReferralCommission, int, error) {
 	var total int
-	s.db.QueryRow(`SELECT COUNT(*) FROM ce_referral_commissions`).Scan(&total)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM ce_referral_commissions`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count all commissions: %w", err)
+	}
 
 	rows, err := s.db.Query(
 		`SELECT id, referrer_id, taker_id, asset, amount, rate, status, biz_ref, created_at, updated_at

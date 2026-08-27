@@ -157,7 +157,10 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	addr := ":8086"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8086"
+	}
 	log.Info("settlement service starting", zap.String("addr", addr))
 	go func() {
 		sig := make(chan os.Signal, 1)

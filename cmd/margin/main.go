@@ -107,7 +107,10 @@ func main() {
 	defer cancel()
 	go svc.RunLoop(ctx)
 
-	addr := ":8087"
+	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	if cfg.Server.Port == 0 {
+		addr = ":8087"
+	}
 	log.Info("margin service starting", zap.String("addr", addr))
 
 	// 信号退出：先停循环再退出。

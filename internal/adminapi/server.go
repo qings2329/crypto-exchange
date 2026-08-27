@@ -12,6 +12,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+	"github.com/coldlar/crypto-exchange/internal/referral"
 )
 
 // Server 是管理后台后端，聚合 7 个运营模块（风控/用户/交易对/账本/通知/充值提币/公链/币种），
@@ -29,7 +30,8 @@ type Server struct {
 	catalog     CatalogStore   // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
 	annH       *announcement.Handler // 公告管理（与用户服务共用同一份 ce_announcements 表与迁移版本 9401）
 	auditStore AuditStore    // 管理员操作审计日志（MySQL 优先，失败回退内存）
-	apiKeyStore apikeys.Store // API Key 管理（管理员为任意用户签发/吊销）
+	apiKeyStore  apikeys.Store    // API Key 管理（管理员为任意用户签发/吊销）
+	referralStore referral.Store  // 邀请佣金查询（替代每请求 sql.Open）
 	loginLimiter *loginIPLimiter // 基于 IP 的登录限流（防单 IP 爆破 + 缓解账户锁定 DoS）
 }
 
@@ -101,6 +103,20 @@ func NewServer(cfg *config.Config) *Server {
 	// API Key 管理存储：优先 MySQL；DSN 缺失或连接/迁移失败则降级为内存实现。
 	apiKeyStore := apikeys.NewStore(cfg.MySQL.DSN)
 
+	// 邀请佣金存储：优先 MySQL；DSN 缺失或连接/迁移失败则降级为内存实现。
+	var referralStore referral.Store
+	if cfg.MySQL.DSN != "" {
+		rs, rsErr := referral.NewMySQLStore(cfg.MySQL.DSN)
+		if rsErr != nil {
+			log.Printf("[admin] referral store: falling back to in-memory (mysql unavailable: %v)", rsErr)
+		} else {
+			referralStore = rs
+		}
+	}
+	if referralStore == nil {
+		referralStore = referral.NewMemStore()
+	}
+
 	return &Server{
 		cfg:         cfg,
 		verifier:    verifier,
@@ -112,6 +128,7 @@ func NewServer(cfg *config.Config) *Server {
 		annH:        annH,
 		auditStore:  auditStore,
 		apiKeyStore: apiKeyStore,
+		referralStore: referralStore,
 		loginLimiter: newLoginIPLimiter(
 			cfg.Admin.LoginRateLimitPerIP,
 			time.Duration(cfg.Admin.LoginRateWindowSec)*time.Second,
