@@ -700,7 +700,7 @@ func openIsolatedDB(t *testing.T, dbName string) *sql.DB {
 	return db
 }
 
-// TestMySQLDownRollback 验证有 Down 迁移的模块在真实 MySQL 上 Up→Down 全链路。
+// TestMySQLDownRollback 验证所有有 Down 迁移的模块在真实 MySQL 上 Up→Down 全链路。
 // 覆盖 F2（迁移可逆性）边界：Down 后表应消失，版本记录应清除。
 func TestMySQLDownRollback(t *testing.T) {
 	db := openIsolatedDB(t, "wallet_down_test")
@@ -708,13 +708,28 @@ func TestMySQLDownRollback(t *testing.T) {
 	type tc struct {
 		name       string
 		migrations []migrate.Migration
-		tables     []string // Up 后预期存在的表
+		tables     []string // Up 后预期存在的表（仅主 CREATE TABLE，ALTER 产生的辅助表不验证）
 	}
 	cases := []tc{
+		// ---- 既有覆盖 ----
 		{"bot", bot.Migrations, []string{"ce_bot_strategies", "ce_bot_orders"}},
-		{"copytrade", copytrade.Migrations, []string{"ce_copytrade_leads", "ce_copytrade_follows", "ce_copytrade_copies"}},
-		{"lending", lending.Migrations, nil}, // 表名由 migration 定义，此处只验证 Up/Down 不报错
+		{"copytrade", copytrade.Migrations, []string{"ce_copytrade_follows", "ce_copytrade_copies", "ce_copytrade_leads"}},
+		{"lending", lending.Migrations, nil},
 		{"staking", staking.Migrations, nil},
+		// ---- 新增覆盖 ----
+		{"notification", notification.NotificationMigrations, []string{"ce_notifications"}},
+		{"risk", risk.RiskMigrations, []string{"ce_risk_rules", "ce_risk_events", "ce_risk_blacklist"}},
+		{"wealth", wealth.WealthMigrations, []string{"ce_wealth_products", "ce_wealth_holdings"}},
+		{"user", user.UserMigrations, []string{"ce_users", "ce_user_kyc", "ce_user_sessions", "ce_user_login_history"}},
+		{"announcement", announcement.AnnouncementMigrations, []string{"ce_announcements"}},
+		{"apikeys", apikeys.Migrations, []string{"ce_admin_api_keys"}},
+		{"spot", spot.SpotMigrations, []string{"ce_spot_orders"}},
+		{"referral", referralInlineMigrations(), []string{"ce_referral_commissions"}},
+		{"margin", margin.MarginMigrations, []string{"ce_margin_accounts"}},
+		{"otc", otc.OtcMigrations, []string{"ce_otc_orders", "ce_otc_advertisements"}},
+		{"options", options.OptionsMigrations, []string{"ce_option_contracts", "ce_option_positions"}},
+		{"earn", earn.EarnMigrations, []string{"ce_earn_products", "ce_earn_subscriptions"}},
+		{"persist", persist.Migrations(), []string{"ce_matching_wal", "ce_matching_snapshot", "ce_matching_seq"}},
 	}
 
 	for _, c := range cases {
@@ -744,5 +759,31 @@ func TestMySQLDownRollback(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// referralInlineMigrations 返回 referral 模块的迁移（该模块迁移内联在 store_mysql.go 中，无包级导出变量）。
+func referralInlineMigrations() []migrate.Migration {
+	return []migrate.Migration{
+		{
+			Version: 9301,
+			Name:    "create_ce_referral_commissions",
+			Up: `CREATE TABLE IF NOT EXISTS ce_referral_commissions (
+				id BIGINT AUTO_INCREMENT PRIMARY KEY,
+				referrer_id BIGINT NOT NULL,
+				taker_id BIGINT NOT NULL,
+				asset VARCHAR(32) NOT NULL,
+				amount BIGINT NOT NULL DEFAULT 0,
+				rate DOUBLE NOT NULL DEFAULT 0,
+				status TINYINT NOT NULL DEFAULT 0 COMMENT '0=pending,1=confirmed',
+				biz_ref VARCHAR(128) NOT NULL DEFAULT '',
+				created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+				UNIQUE KEY uk_biz_ref (biz_ref),
+				KEY idx_referrer_id (referrer_id),
+				KEY idx_taker_id (taker_id)
+			) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+			Down: "DROP TABLE IF EXISTS ce_referral_commissions;",
+		},
 	}
 }
