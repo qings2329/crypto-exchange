@@ -1179,3 +1179,36 @@ MySQL 往返覆盖；充值→提现资金闭环（F3）无端到端账本验证
 - **memStore.List 排序不确定性**：`internal/notification/store_mem.go` 的 List 方法此前
   对 map 迭代结果做反转近似时间倒序，但 map 迭代顺序不确定，导致 `TestUserNotificationContract`
   偶发失败。改为 `sort.Slice` 按 ID 降序排列，与 MySQL 实现一致。
+
+## §46 WebSocket Hub 测试覆盖 + 来源白名单 + 迁移规范化
+
+### 背景
+
+`internal/ws/hub.go` 是 spot/market/futuresapi/notification 四个服务共用的 WebSocket
+广播中心，此前零测试覆盖；CheckOrigin 硬编码 `return true`（允许任意来源）；copytrade
+迁移切片未按版本升序排列，违反 `migrate.New` 契约。
+
+### 新增
+
+1. **`internal/ws/hub_test.go`**（8 个测试）：
+   - `TestHub_BroadcastMatchingSymbol`：验证仅订阅了目标 symbol 的客户端收到消息
+   - `TestHub_BroadcastAllToEmptySubscription`：无 symbol 订阅的客户端接收所有广播
+   - `TestHub_BroadcastEmptySymbolToAll`：`symbol=""` 广播推送给所有连接
+   - `TestHub_BroadcastBufferFull`：send 缓冲满时 Broadcast 不阻塞（`select default` 路径）
+   - `TestHub_UnregisterOnClientClose`：客户端断连后自动注销，不再出现在广播列表
+   - `TestContainsSymbol`：辅助函数单元测试
+   - `TestHub_CheckOriginWithAllowedOrigins`：验证 `NewHubWithOrigins` 白名单生效
+   - `TestHub_MultiSymbolSubscription`：逗号分隔多 symbol 订阅正确过滤
+
+2. **`NewHubWithOrigins(origins []string)` 构造函数**：
+   - 传入允许的 Origin 列表，CheckOrigin 仅接受匹配的 WebSocket 连接
+   - `NewHub()` 保持向后兼容（接受所有来源，适合开发环境）
+   - 各 cmd/ 调用方无需修改，按需在生产配置中切换
+
+### 修复
+
+3. **copytrade 迁移版本排序**：`internal/copytrade/store_migrations.go` 从 `[9809,9806,9807,9808]`
+   改为 `[9806,9807,9808,9809]`，符合 `migrate.New` 文档约定的「按 Version 升序传入」。
+
+4. **Down 回滚测试扩展**：`TestMySQLDownRollback` 从 4 个模块（bot/copytrade/lending/staking）
+   扩展至全部 17 个有 Down 迁移的模块，每个子测试验证 Up→表存在→Down→表消失。
