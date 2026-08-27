@@ -1152,3 +1152,30 @@ wealth 此前未修，属潜在资金漏记隐患。
    `referral` 的 `CREATE TABLE` 在全新库上因「列已存在于 CREATE TABLE」而报重复，
    已全部补 `IF NOT EXISTS`；`user` 9108 先为空白 `referral_code` 补齐 `RC<id>` 再建唯一索引，
    避免既有数据重复键。
+
+## §45 MySQL 集成测试扩展 + 充值提现链路 + Down 回滚验证
+
+### 背景
+
+§44 新增了迁移建表 + 通知/公告的往返测试，但用户、风控、理财产品等核心模块仍缺真实
+MySQL 往返覆盖；充值→提现资金闭环（F3）无端到端账本验证；迁移可逆性（Down）无集成验证。
+
+### 新增测试（`internal/integration/mysql_test.go`）
+
+1. **TestMySQLUserRoundTrip**：注册→GetByID→GetByEmail→更新昵称→SaveKYC→GetKYC→
+   UpdateKYC，覆盖用户与 KYC 子模块在真实 MySQL 上的全链路（含预清理防脏数据）。
+2. **TestMySQLRiskRoundTrip**：UpsertRule→GetRule→ListRules→RecordEvent→
+   ListEvents→AddBlacklist→IsBlacklisted→RemoveBlacklist，覆盖风控规则/事件/黑名单三张表。
+3. **TestMySQLWealthRoundTrip**：CreateProduct→GetProduct→ListProducts→CreateHolding→
+   GetHolding→ListHoldings→UpdateHolding→DeleteHolding，覆盖理财产品与持仓。
+4. **TestMySQLDepositWithdrawFlow**：在复式账本上模拟充值（CreditAvailable）→余额验证→
+   冻结提现（FreezeWithdraw）→提现确认（WithdrawFrozenBalance）→余额验证→
+   交易冻结（Freeze）→解冻（Unfreeze），覆盖 F3 资金闭环边界。
+5. **TestMySQLDownRollback**：对有 Down 迁移的模块（bot/copytrade/lending/staking）执行
+   Up→验证表存在→Down(-1)→验证表消失，覆盖 F2 迁移可逆性边界。
+
+### 修复
+
+- **memStore.List 排序不确定性**：`internal/notification/store_mem.go` 的 List 方法此前
+  对 map 迭代结果做反转近似时间倒序，但 map 迭代顺序不确定，导致 `TestUserNotificationContract`
+  偶发失败。改为 `sort.Slice` 按 ID 降序排列，与 MySQL 实现一致。
