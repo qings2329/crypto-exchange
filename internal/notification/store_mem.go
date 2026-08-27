@@ -63,9 +63,8 @@ func (s *memStore) ListAll(limit int) ([]*Notification, error) {
 	for _, n := range s.all {
 		out = append(out, n)
 	}
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
+	// 按 ID 倒序（seq 单调递增近似时间倒序），确保与 MySQL 实现一致且确定。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
