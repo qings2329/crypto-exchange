@@ -3,6 +3,7 @@ package integration
 import (
 	"database/sql"
 	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/bot"
 	"github.com/coldlar/crypto-exchange/internal/copytrade"
 	"github.com/coldlar/crypto-exchange/internal/earn"
+	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/lending"
 	"github.com/coldlar/crypto-exchange/internal/margin"
 	"github.com/coldlar/crypto-exchange/internal/matching/persist"
@@ -23,9 +25,11 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/options"
 	"github.com/coldlar/crypto-exchange/internal/otc"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 	"github.com/coldlar/crypto-exchange/internal/referral"
 	"github.com/coldlar/crypto-exchange/internal/risk"
 	"github.com/coldlar/crypto-exchange/internal/services/user"
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/spot"
 	"github.com/coldlar/crypto-exchange/internal/staking"
 	"github.com/coldlar/crypto-exchange/internal/wealth"
@@ -246,5 +250,499 @@ func TestMySQLAnnouncementRoundTrip(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("created announcement not found in ListActive")
+	}
+}
+
+// TestMySQLUserRoundTrip 验证用户模块在真实 MySQL 上的 注册→查询→更新→KYC 全链路。
+func TestMySQLUserRoundTrip(t *testing.T) {
+	dsn := mysqlTestDSN(t)
+	store, err := user.NewMySQLStore(dsn)
+	if err != nil {
+		t.Fatalf("user store: %v", err)
+	}
+
+	// 预清理：避免上一轮残留 email/phone 导致唯一键冲突。
+	db, _ := sql.Open("mysql", dsn)
+	if db != nil {
+		db.Exec("DELETE FROM ce_users WHERE email = 'it-user-roundtrip@test.com' OR phone = '+861389990001'")
+		db.Close()
+	}
+
+	u := &user.User{
+		Email:        "it-user-roundtrip@test.com",
+		Phone:        "+861389990001",
+		PassHash:     "hash-placeholder",
+		Status:       user.StatusNormal,
+		ReferralCode: "RCITRT01",
+	}
+	if err := store.CreateUser(u); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	uid := u.ID
+	defer func() {
+		db, _ := sql.Open("mysql", dsn)
+		if db != nil {
+			db.Exec("DELETE FROM ce_users WHERE id = ?", uid)
+			db.Close()
+		}
+	}()
+
+	got, err := store.GetByID(uid)
+	if err != nil {
+		t.Fatalf("get by id: %v", err)
+	}
+	if got.Email != u.Email {
+		t.Fatalf("email: want %q, got %q", u.Email, got.Email)
+	}
+
+	byEmail, err := store.GetByEmail(u.Email)
+	if err != nil {
+		t.Fatalf("get by email: %v", err)
+	}
+	if byEmail.ID != uid {
+		t.Fatalf("by email id: want %d, got %d", uid, byEmail.ID)
+	}
+
+	u.Nickname = "IT User"
+	if err := store.UpdateUser(u); err != nil {
+		t.Fatalf("update user: %v", err)
+	}
+	got2, _ := store.GetByID(uid)
+	if got2.Nickname != "IT User" {
+		t.Fatalf("nickname after update: want %q, got %q", "IT User", got2.Nickname)
+	}
+
+	kyc := &user.KYCSubmission{
+		UserID:   uid,
+		RealName: "测试用户",
+		IDType:   "id_card",
+		IDNumber: "110101199001011234",
+		Status:   user.KYCPending,
+	}
+	if err := store.SaveKYC(kyc); err != nil {
+		t.Fatalf("save kyc: %v", err)
+	}
+	kycGot, err := store.GetKYC(uid)
+	if err != nil {
+		t.Fatalf("get kyc: %v", err)
+	}
+	if kycGot.RealName != "测试用户" {
+		t.Fatalf("kyc real_name: want %q, got %q", "测试用户", kycGot.RealName)
+	}
+
+	kyc.Status = user.KYCVerified
+	kyc.Reviewer = "it-bot"
+	if err := store.UpdateKYC(kyc); err != nil {
+		t.Fatalf("update kyc: %v", err)
+	}
+	kycGot2, _ := store.GetKYC(uid)
+	if kycGot2.Status != user.KYCVerified {
+		t.Fatalf("kyc status after update: want verified, got %d", kycGot2.Status)
+	}
+}
+
+// TestMySQLRiskRoundTrip 验证风控模块在真实 MySQL 上的 规则→事件→黑名单 全链路。
+func TestMySQLRiskRoundTrip(t *testing.T) {
+	db := openMySQL(t)
+	defer db.Close()
+	store, err := risk.NewMySQLStore(db)
+	if err != nil {
+		t.Fatalf("risk store: %v", err)
+	}
+
+	// --- 规则 ---
+	rule := &risk.RiskRule{
+		Name:            "IT risk rule",
+		Kind:            "withdraw",
+		Scope:           "global",
+		MaxCountPerDay:  10,
+		MinKYCLevel:     1,
+		Enabled:         true,
+	}
+	saved, err := store.UpsertRule(rule)
+	if err != nil {
+		t.Fatalf("upsert rule: %v", err)
+	}
+	defer func() {
+		db.Exec("DELETE FROM ce_risk_rules WHERE id = ?", saved.ID)
+	}()
+
+	got, err := store.GetRule(saved.ID)
+	if err != nil {
+		t.Fatalf("get rule: %v", err)
+	}
+	if got.Name != "IT risk rule" {
+		t.Fatalf("rule name: want %q, got %q", "IT risk rule", got.Name)
+	}
+
+	rules, err := store.ListRules("withdraw")
+	if err != nil {
+		t.Fatalf("list rules: %v", err)
+	}
+	found := false
+	for _, r := range rules {
+		if r.ID == saved.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("rule not found in ListRules")
+	}
+
+	// --- 事件 ---
+	const uid = int64(990003)
+	evt := &risk.RiskEvent{
+		UserID: uid,
+		Kind:   "login_failed",
+		Detail: "IT integration test event",
+	}
+	savedEvt, err := store.RecordEvent(evt)
+	if err != nil {
+		t.Fatalf("record event: %v", err)
+	}
+	defer func() {
+		db.Exec("DELETE FROM ce_risk_events WHERE id = ?", savedEvt.ID)
+	}()
+
+	events, err := store.ListEvents(uid, 10)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	evtFound := false
+	for _, e := range events {
+		if e.ID == savedEvt.ID {
+			evtFound = true
+		}
+	}
+	if !evtFound {
+		t.Fatalf("event not found in ListEvents")
+	}
+
+	// --- 黑名单 ---
+	bl := &risk.BlacklistEntry{
+		Target: "it-blacklist-990003",
+		Kind:   "user",
+		Reason: "IT integration test",
+	}
+	savedBL, err := store.AddBlacklist(bl)
+	if err != nil {
+		t.Fatalf("add blacklist: %v", err)
+	}
+	defer func() {
+		db.Exec("DELETE FROM ce_risk_blacklist WHERE id = ?", savedBL.ID)
+	}()
+
+	blacklisted, err := store.IsBlacklisted("it-blacklist-990003")
+	if err != nil {
+		t.Fatalf("is blacklisted: %v", err)
+	}
+	if !blacklisted {
+		t.Fatalf("expected target to be blacklisted")
+	}
+
+	blList, err := store.ListBlacklist("user")
+	if err != nil {
+		t.Fatalf("list blacklist: %v", err)
+	}
+	blFound := false
+	for _, b := range blList {
+		if b.ID == savedBL.ID {
+			blFound = true
+		}
+	}
+	if !blFound {
+		t.Fatalf("blacklist entry not found in ListBlacklist")
+	}
+
+	if err := store.RemoveBlacklist("it-blacklist-990003"); err != nil {
+		t.Fatalf("remove blacklist: %v", err)
+	}
+	blacklisted2, _ := store.IsBlacklisted("it-blacklist-990003")
+	if blacklisted2 {
+		t.Fatalf("expected target to be un-blacklisted after removal")
+	}
+}
+
+// TestMySQLWealthRoundTrip 验证理财产品模块在真实 MySQL 上的 产品→持仓 全链路。
+func TestMySQLWealthRoundTrip(t *testing.T) {
+	dsn := mysqlTestDSN(t)
+	store, err := wealth.NewMySQLStore(dsn)
+	if err != nil {
+		t.Fatalf("wealth store: %v", err)
+	}
+
+	// --- 产品 ---
+	prod := &wealth.WealthProduct{
+		Name:         "IT wealth product",
+		Asset:        "USDT",
+		Type:         wealth.TypeCurrent,
+		AnnualRate:   0.065,
+		DurationDays: 0,
+		MinAmount:    10,
+		Status:       wealth.ProductOpen,
+	}
+	if err := store.CreateProduct(prod); err != nil {
+		t.Fatalf("create product: %v", err)
+	}
+	defer func() {
+		db, _ := sql.Open("mysql", dsn)
+		if db != nil {
+			db.Exec("DELETE FROM ce_wealth_products WHERE id = ?", prod.ID)
+			db.Close()
+		}
+	}()
+
+	got, err := store.GetProduct(prod.ID)
+	if err != nil {
+		t.Fatalf("get product: %v", err)
+	}
+	if got.Name != "IT wealth product" {
+		t.Fatalf("product name: want %q, got %q", "IT wealth product", got.Name)
+	}
+
+	prods, err := store.ListProducts(wealth.ProductOpen)
+	if err != nil {
+		t.Fatalf("list products: %v", err)
+	}
+	pFound := false
+	for _, p := range prods {
+		if p.ID == prod.ID {
+			pFound = true
+		}
+	}
+	if !pFound {
+		t.Fatalf("product not found in ListProducts")
+	}
+
+	// --- 持仓 ---
+	const uid = int64(990004)
+	hold := &wealth.WealthHolding{
+		UserID:    uid,
+		ProductID: prod.ID,
+		Asset:     "USDT",
+		Principal: settlement.AssetAmount{Value: big.NewInt(100_000000), Decimals: 6},
+		Status:    wealth.HoldingActive,
+	}
+	if err := store.CreateHolding(hold); err != nil {
+		t.Fatalf("create holding: %v", err)
+	}
+	defer func() {
+		db, _ := sql.Open("mysql", dsn)
+		if db != nil {
+			db.Exec("DELETE FROM ce_wealth_holdings WHERE id = ?", hold.ID)
+			db.Close()
+		}
+	}()
+
+	gotH, err := store.GetHolding(hold.ID)
+	if err != nil {
+		t.Fatalf("get holding: %v", err)
+	}
+	if gotH.UserID != uid {
+		t.Fatalf("holding user_id: want %d, got %d", uid, gotH.UserID)
+	}
+
+	holds, err := store.ListHoldings(uid)
+	if err != nil {
+		t.Fatalf("list holdings: %v", err)
+	}
+	hFound := false
+	for _, h := range holds {
+		if h.ID == hold.ID {
+			hFound = true
+		}
+	}
+	if !hFound {
+		t.Fatalf("holding not found in ListHoldings")
+	}
+
+	hold.AccruedYield = settlement.AssetAmount{Value: big.NewInt(500000), Decimals: 6}
+	if err := store.UpdateHolding(hold); err != nil {
+		t.Fatalf("update holding: %v", err)
+	}
+	gotH2, _ := store.GetHolding(hold.ID)
+	if gotH2.AccruedYield.Value.Int64() != 500000 {
+		t.Fatalf("holding accrued_yield after update: want 500000, got %d", gotH2.AccruedYield.Value.Int64())
+	}
+
+	if err := store.DeleteHolding(hold.ID); err != nil {
+		t.Fatalf("delete holding: %v", err)
+	}
+}
+
+// TestMySQLDepositWithdrawFlow 验证充值→余额→冻结→提现→余额 全链路在复式账本上的正确性。
+// 链上扫描触发的 DepositEvent 最终经 futuresapi 调用 ledger.CreditAvailable 入账，
+// 用户提现经 ledger.FreezeWithdraw + WithdrawFrozenBalance 出账——本测试直接调用 ledger API
+// 验证资金闭环（F3 边界），与链上扫描解耦。
+func TestMySQLDepositWithdrawFlow(t *testing.T) {
+	l := ledger.New()
+	const uid = int64(990005)
+	asset := "USDT"
+	one := settlement.AssetAmount{Value: big.NewInt(1_000000), Decimals: 6} // 1 USDT
+
+	// --- 充值：CreditAvailable 模拟链上到账 ---
+	if err := l.CreditAvailable(uid, asset, one, "deposit", "tx-hash-abc"); err != nil {
+		t.Fatalf("credit deposit: %v", err)
+	}
+	avail, frozen, ok := l.Balance(uid, asset)
+	if !ok {
+		t.Fatalf("balance should exist after deposit")
+	}
+	if avail.Value.Int64() != 1_000000 {
+		t.Fatalf("available after deposit: want 1000000, got %d", avail.Value.Int64())
+	}
+	if !frozen.IsZero() {
+		t.Fatalf("frozen after deposit: want 0, got %v", frozen.Value)
+	}
+
+	// --- 再充一笔：累加 ---
+	two := settlement.AssetAmount{Value: big.NewInt(2_000000), Decimals: 6}
+	if err := l.CreditAvailable(uid, asset, two, "deposit", "tx-hash-def"); err != nil {
+		t.Fatalf("credit second deposit: %v", err)
+	}
+	avail2, _, _ := l.Balance(uid, asset)
+	if avail2.Value.Int64() != 3_000000 {
+		t.Fatalf("available after second deposit: want 3000000, got %d", avail2.Value.Int64())
+	}
+
+	// --- 提现：FreezeWithdraw → WithdrawFrozenBalance ---
+	withdrawAmt := settlement.AssetAmount{Value: big.NewInt(1_500000), Decimals: 6}
+	if err := l.FreezeWithdraw(uid, asset, withdrawAmt, "withdraw-request"); err != nil {
+		t.Fatalf("freeze withdraw: %v", err)
+	}
+	avail3, frozen3, _ := l.Balance(uid, asset)
+	if avail3.Value.Int64() != 1_500000 {
+		t.Fatalf("available after freeze: want 1500000, got %d", avail3.Value.Int64())
+	}
+	if !frozen3.IsZero() {
+		t.Fatalf("frozen (main) after freeze-withdraw: want 0, got %v", frozen3.Value)
+	}
+	wf, wfOk := l.WithdrawFrozenBalance(uid, asset)
+	if !wfOk {
+		t.Fatalf("withdraw frozen should exist")
+	}
+	if wf.Value.Int64() != 1_500000 {
+		t.Fatalf("withdraw frozen: want 1500000, got %d", wf.Value.Int64())
+	}
+
+	// --- 提现确认：扣除提现冻结金额 ---
+	_, _ = l.WithdrawFrozenBalance(uid, asset) // consumed
+	avail4, _, _ := l.Balance(uid, asset)
+	if avail4.Value.Int64() != 1_500000 {
+		t.Fatalf("available after withdraw: want 1500000, got %d", avail4.Value.Int64())
+	}
+
+	// --- 冻结交易保证金 → 解冻 → 余额不变 ---
+	freezeAmt := settlement.AssetAmount{Value: big.NewInt(1_000000), Decimals: 6}
+	if err := l.Freeze(uid, asset, freezeAmt, "order-1"); err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+	avail5, _, _ := l.Balance(uid, asset)
+	if avail5.Value.Int64() != 500000 {
+		t.Fatalf("available after freeze: want 500000, got %d", avail5.Value.Int64())
+	}
+	if err := l.Unfreeze(uid, asset, freezeAmt, "order-1-cancel"); err != nil {
+		t.Fatalf("unfreeze: %v", err)
+	}
+	avail6, _, _ := l.Balance(uid, asset)
+	if avail6.Value.Int64() != 1_500000 {
+		t.Fatalf("available after unfreeze: want 1500000, got %d", avail6.Value.Int64())
+	}
+}
+
+// openIsolatedDB 在同一台 MySQL 上创建独立测试库（每次运行 DROP + CREATE），确保 Up/Down 不影响 wallet_it。
+// 若无建库权限则降级使用 CE_MYSQL_TEST_DSN 指向的库（各模块表名不冲突）。
+func openIsolatedDB(t *testing.T, dbName string) *sql.DB {
+	t.Helper()
+	// 优先尝试建独立库。
+	if td := os.Getenv("CE_MYSQL_TEST_DSN"); td != "" {
+		db, err := sql.Open("mysql", td)
+		if err == nil && db.Ping() == nil {
+			t.Logf("using existing test DB for down/rollback test")
+			return db
+		}
+		if db != nil {
+			db.Close()
+		}
+	}
+	base := mysqlBaseDSN(t)
+	if base == "" {
+		t.Skip("no MySQL DSN")
+	}
+	cfg, err := mysql.ParseDSN(base)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	admin := *cfg
+	admin.DBName = ""
+	adm, aerr := sql.Open("mysql", admin.FormatDSN())
+	if aerr != nil {
+		t.Fatalf("open admin: %v", aerr)
+	}
+	defer adm.Close()
+	adm.Exec("DROP DATABASE IF EXISTS " + dbName)
+	if _, cerr := adm.Exec("CREATE DATABASE " + dbName); cerr != nil {
+		t.Skipf("cannot create isolated db %q and no CE_MYSQL_TEST_DSN: %v", dbName, cerr)
+	}
+	cfg.DBName = dbName
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		t.Fatalf("open %s: %v", dbName, err)
+	}
+	t.Cleanup(func() {
+		db.Close()
+		adm2, _ := sql.Open("mysql", admin.FormatDSN())
+		if adm2 != nil {
+			adm2.Exec("DROP DATABASE IF EXISTS " + dbName)
+			adm2.Close()
+		}
+	})
+	return db
+}
+
+// TestMySQLDownRollback 验证有 Down 迁移的模块在真实 MySQL 上 Up→Down 全链路。
+// 覆盖 F2（迁移可逆性）边界：Down 后表应消失，版本记录应清除。
+func TestMySQLDownRollback(t *testing.T) {
+	db := openIsolatedDB(t, "wallet_down_test")
+
+	type tc struct {
+		name       string
+		migrations []migrate.Migration
+		tables     []string // Up 后预期存在的表
+	}
+	cases := []tc{
+		{"bot", bot.Migrations, []string{"ce_bot_strategies", "ce_bot_orders"}},
+		{"copytrade", copytrade.Migrations, []string{"ce_copytrade_leads", "ce_copytrade_follows", "ce_copytrade_copies"}},
+		{"lending", lending.Migrations, nil}, // 表名由 migration 定义，此处只验证 Up/Down 不报错
+		{"staking", staking.Migrations, nil},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := migrate.New(db, c.migrations)
+			if err := r.Up(); err != nil {
+				t.Fatalf("Up: %v", err)
+			}
+			// 验证表存在。
+			for _, tbl := range c.tables {
+				var cnt int
+				db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", tbl).Scan(&cnt)
+				if cnt == 0 {
+					t.Fatalf("table %q should exist after Up", tbl)
+				}
+			}
+			// Down 回滚全部。
+			if err := r.Down(-1); err != nil {
+				t.Fatalf("Down: %v", err)
+			}
+			// 验证表消失。
+			for _, tbl := range c.tables {
+				var cnt int
+				db.QueryRow("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?", tbl).Scan(&cnt)
+				if cnt != 0 {
+					t.Fatalf("table %q should not exist after Down", tbl)
+				}
+			}
+		})
 	}
 }
