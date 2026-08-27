@@ -1212,3 +1212,26 @@ MySQL 往返覆盖；充值→提现资金闭环（F3）无端到端账本验证
 
 4. **Down 回滚测试扩展**：`TestMySQLDownRollback` 从 4 个模块（bot/copytrade/lending/staking）
    扩展至全部 17 个有 Down 迁移的模块，每个子测试验证 Up→表存在→Down→表消失。
+
+## §47 Admin 架构治理 + 监听地址配置化 + 错误响应统一
+
+### 背景
+
+Admin 后台 referral handler 每次请求 `sql.Open` 新建 MySQL 连接（连接泄漏风险）；
+9 个微服务硬编码监听地址（忽略 `cfg.Server.Port`）；adminapi `s.fail()` 返回格式
+`{"code":N,"message":"..."}` 缺少 `data` 字段，与用户端 `response.Error` 不一致。
+
+### 修复
+
+1. **admin referral handler 注入 referral.Store**：`Server` 新增 `referralStore` 字段，
+   `NewServer` 中按 MySQL 优先/内存降级初始化；`handleAdminReferralCommissions` 改用
+   `s.referralStore.ListAll(limit, offset)` 一行查询，消除每请求 `sql.Open` + `defer db.Close()`。
+2. **新增 `referral.NewMemStore()`**：实现 `referral.Store` 接口（开发/测试降级用），
+   提供 `RecordCommission/GetCommissionByRef/ListCommissionsByReferrer/ListAll/TotalByReferrer`。
+3. **adminapi `s.fail()` 统一响应格式**：改用 `response.Error(c, code, code, msg)`，
+   返回 `{"code":N,"message":"...","data":null}`，与用户端 API 响应结构一致。
+4. **9 个服务监听地址配置化**：gateway/futures/market/margin/options/otc/risk/settlement/wealth
+   从硬编码 `":NNNN"` 改为 `fmt.Sprintf(":%d", cfg.Server.Port)` 优先、零值回退默认端口；
+   其余 9 个服务已使用 `flag.String` 或 `cfg.Admin.Addr`，无需修改。
+5. **referral store COUNT 错误传播**：`ListAll` 与 `ListCommissionsByReferrer` 的
+   `COUNT(*)` 查询错误不再静默丢弃，改为包装返回。
