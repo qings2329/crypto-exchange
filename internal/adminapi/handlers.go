@@ -66,23 +66,25 @@ func (s *Server) handleLogin(c *gin.Context) {
 	acc, err := s.adminStore.GetAccountByUsername(req.Username)
 	if err != nil || acc.Status != AdminStatusActive {
 		// 统一错误，避免用户枚举；且不区分"不存在/锁定"，与现有 no-enumeration 策略一致。
+		s.writeLoginAudit(c, nil, req.Username, "login_failed", "account not found or inactive", http.StatusUnauthorized)
 		s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
 		return
 	}
 	// 锁定检查置于 bcrypt 之前以节省算力；返回统一错误避免泄露锁定状态。
 	now := time.Now().Unix()
 	if acc.LockedUntil > now {
+		s.writeLoginAudit(c, acc, acc.Username, "login_failed", "account locked", http.StatusUnauthorized)
 		s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(acc.PasswordHash), []byte(req.Password)) != nil {
-		s.recordLoginFailure(acc, maxFails, lockSec)
+		s.recordLoginFailure(c, acc, maxFails, lockSec, "invalid password")
 		s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
 		return
 	}
 	if acc.TOTPEnabled {
 		if !VerifyTOTP(acc.TOTPSecret, req.TOTP, time.Now()) {
-			s.recordLoginFailure(acc, maxFails, lockSec)
+			s.recordLoginFailure(c, acc, maxFails, lockSec, "invalid totp")
 			s.fail(c, http.StatusUnauthorized, "invalid admin credentials")
 			return
 		}
@@ -106,6 +108,7 @@ func (s *Server) handleLogin(c *gin.Context) {
 		ttl = time.Hour
 	}
 	tok := s.verifier.IssueAdmin(acc.ID, "admin", perms, ttl)
+	s.writeLoginAudit(c, acc, acc.Username, "login", "admin login success", http.StatusOK)
 	s.ok(c, gin.H{
 		"token":         tok,
 		"expires_in":    s.cfg.Admin.TokenTTLSec,
@@ -115,8 +118,8 @@ func (s *Server) handleLogin(c *gin.Context) {
 
 // recordLoginFailure 累加失败次数；达到阈值则锁定账户 lockSec 秒（自动过期）。
 // 失败计数与锁定到期持久化到账户，跨重启/副本一致；成功登录由调用方清零。
-// 每次失败/锁定均写入审计日志，便于异常登录行为追溯。
-func (s *Server) recordLoginFailure(acc *AdminAccount, maxFails, lockSec int) {
+// 每次失败均写入审计日志，便于异常登录行为追溯。
+func (s *Server) recordLoginFailure(c *gin.Context, acc *AdminAccount, maxFails, lockSec int, reason string) {
 	acc.FailedAttempts++
 	if acc.FailedAttempts >= maxFails {
 		acc.LockedUntil = time.Now().Unix() + int64(lockSec)
@@ -131,6 +134,27 @@ func (s *Server) recordLoginFailure(acc *AdminAccount, maxFails, lockSec int) {
 		// 限流状态写入失败不阻断登录失败响应，仅记录（避免泄露内部错误）。
 		log.Printf("[admin] failed to persist login failure state for %q: %v", acc.Username, err)
 	}
+	s.writeLoginAudit(c, acc, acc.Username, "login_failed", reason, http.StatusUnauthorized)
+}
+
+// writeLoginAudit 记录管理员登录审计事件。登录路由在 admin 组与 auditMiddleware 之外，
+// 因此需在 handleLogin 中显式写入审计日志（成功与失败均记，仅元数据不含口令）。
+func (s *Server) writeLoginAudit(c *gin.Context, acc *AdminAccount, username, action, detail string, status int) {
+	aid := int64(0)
+	if acc != nil {
+		aid = acc.ID
+	}
+	_ = s.auditStore.Append(AuditEntry{
+		AdminID: aid,
+		Method:  http.MethodPost,
+		Path:    "/api/admin/login",
+		Action:  action,
+		Target:  "/api/admin/login",
+		Status:  status,
+		Detail:  detail,
+		IP:      c.ClientIP(),
+		Time:    time.Now().UnixNano(),
+	})
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
