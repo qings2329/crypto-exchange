@@ -37,3 +37,4 @@ internal/otc/uploads/
 configs/config.yaml
 configs/config.dev.yaml
 configs/*.local.yaml
+configs/configs/
