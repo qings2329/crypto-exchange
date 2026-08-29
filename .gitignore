@@ -32,3 +32,8 @@ internal/otc/uploads/
 
 # agent worktree / 会话占位目录（非仓库内容）
 .codebuddy/
+
+# 含敏感配置（密钥/DB/地址等），切勿提交；如需示例请放 config.example.yaml
+configs/config.yaml
+configs/config.dev.yaml
+configs/*.local.yaml
