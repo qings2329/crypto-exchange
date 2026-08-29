@@ -182,8 +182,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 
 		// 用户充值地址（按 userID 在各充值链确定性派生，无持久化）
 		admin.GET("/deposit-addresses", s.listUserDepositAddresses)
-		admin.POST("/withdrawals/:id/approve", middleware.RequirePerm(PermWithdrawApproval), s.approveWithdrawal)
-		admin.POST("/withdrawals/:id/reject", middleware.RequirePerm(PermWithdrawApproval), s.rejectWithdrawal)
+		admin.POST("/withdrawals/:id/approve", middleware.RequirePerm(PermFinanceApprove), s.approveWithdrawal)
+		admin.POST("/withdrawals/:id/reject", middleware.RequirePerm(PermFinanceApprove), s.rejectWithdrawal)
 
 		// 运营通知管理（list 实时聚合 notification 服务）
 		admin.GET("/notifications", s.listNotifications)
@@ -198,12 +198,12 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		admin.GET("/services", s.handleServices)
 
 		// 订单管理（跨用户查询/撤销，运营风控用）。读需 trade:read，撤销需 trade:manage（高危）。
-		orders := admin.Group("/orders", middleware.RequirePerm(PermTradeRead))
+		orders := admin.Group("/orders", middleware.RequirePerm(PermTradeView))
 		{
 			orders.GET("", s.handleAdminOrders)
 			orders.GET("/:id", s.handleAdminOrderDetail)
 		}
-		admin.GET("/trades", middleware.RequirePerm(PermTradeRead), s.handleAdminTrades)
+		admin.GET("/trades", middleware.RequirePerm(PermTradeView), s.handleAdminTrades)
 		admin.POST("/orders/:id/cancel", middleware.RequirePerm(PermTradeManage), s.handleAdminCancelOrder)
 
 		// 当前管理员自身信息（含角色/权限）；任何已登录管理员可访问。
@@ -242,10 +242,10 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		admin.GET("/permissions", middleware.RequirePerm(PermRoleManage), s.listPermissionDict)
 
 		// 审计日志（需 audit:read 权限）
-		admin.GET("/audit-logs", middleware.RequirePerm(PermAuditRead), s.handleAuditLogs)
+		admin.GET("/audit-logs", middleware.RequirePerm(PermAuditView), s.handleAuditLogs)
 
 		// API Key 管理（管理员为任意用户签发/吊销）。读需 apikey:read，签发/吊销需 apikey:manage（高危）。
-		apikeys := admin.Group("/apikeys", middleware.RequirePerm(PermApiKeyRead))
+		apikeys := admin.Group("/apikeys", middleware.RequirePerm(PermApiKeyView))
 		{
 			apikeys.GET("", s.listApiKeys)
 			apikeys.GET("/:id", s.getApiKey)

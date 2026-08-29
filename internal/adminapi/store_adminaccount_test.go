@@ -125,7 +125,7 @@ func TestSeedBootstrapSelfHeal(t *testing.T) {
 	}
 
 	// --- 2) 历史权限缺失时自愈 ---
-	if err := s.SetRolePermissions(super.ID, []string{PermDashboardView}); err != nil {
+	if err := s.SetRolePermissions(super.ID, []string{PermOpsView}); err != nil {
 		t.Fatalf("SetRolePermissions: %v", err)
 	}
 	if err := SeedBootstrap(s, "admin", "$2a$10$fakehash"); err != nil {

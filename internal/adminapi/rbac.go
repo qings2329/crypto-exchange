@@ -4,6 +4,9 @@ import "sort"
 
 // 本文件定义管理后台 RBAC 的权限字典（全部可被授予的细粒度权限 key），
 // 以及角色/权限的展示元数据。角色与权限的实体存储与分配见 store_adminaccount.go。
+//
+// 权限 key 采用与前端一致的规范命名（资源:动作，动作取 view/manage/approve/write），
+// 前端 src/lib/permissions.tsx 中的 PERMISSIONS 为唯一权威来源，本字典与之对齐。
 
 // 默认角色名（首次启动 SeedBootstrap 写入；之后可由管理员自定义新角色）。
 const (
@@ -12,52 +15,44 @@ const (
 	RoleOperator   = "operator"    // 只读操作员
 )
 
-// 权限 key 常量（建议按"资源:动作"命名）。
+// 权限 key 常量（与前端 PERMISSIONS 对齐）。
 const (
 	// 看板与风控
-	PermDashboardView = "dashboard:view" // 查看风控与运营看板
+	PermOpsView  = "ops:view"  // 运营看板（账本/服务健康）
+	PermRiskView = "risk:view" // 风控大盘查看
 
 	// 用户与账户
-	PermUserRead  = "user:read"
-	PermUserWrite = "user:write"
+	PermUserView  = "user:view"  // 用户列表查看
+	PermUserWrite = "user:write" // 用户写入（创建/冻结/解冻）
 
-	// 交易对配置
-	PermSymbolRead  = "symbol:read"
-	PermSymbolWrite = "symbol:write"
-
-	// 公链管理
-	PermChainRead  = "chain:read"
-	PermChainWrite = "chain:write"
-
-	// 币种管理
-	PermCoinRead  = "coin:read"
-	PermCoinWrite = "coin:write"
-
-	// 充值提币
-	PermDepositRead     = "deposit:read"
-	PermWithdrawApproval = "withdraw:approval"
-
-	// 订单管理（跨用户查询/撤销，运营风控用）
-	PermTradeRead  = "trade:read"  // 查看全部用户订单与成交
-	PermTradeManage = "trade:manage" // 撤销任意用户订单（高危）
-
-	// 运营通知
-	PermNotificationManage = "notification:manage"
-
-	// 账本与服务健康
-	PermLedgerRead  = "ledger:read"
-	PermServiceRead = "service:read"
-
-	// 管理员与权限管理（高危）
-	PermAdminManage = "admin:manage" // 新增/激活/禁用/重置管理员
-	PermRoleManage  = "role:manage"  // 角色与权限分配
+	// 订单与交易
+	PermTradeView   = "trade:view"   // 交易数据查看（订单/成交流水）
+	PermTradeManage = "trade:manage" // 交易管理（撤销订单）
 
 	// 审计日志
-	PermAuditRead = "audit:read" // 查看管理员操作审计日志
+	PermAuditView = "audit:view" // 审计日志查看
 
-	// API Key 管理（管理员为任意用户签发/吊销 API Key）
-	PermApiKeyRead  = "apikey:read"  // 查看 API Key 列表与详情
-	PermApiKeyManage = "apikey:manage" // 签发/吊销 API Key（高危）
+	// API Key 管理
+	PermApiKeyView   = "apikey:view"   // API Key 查看
+	PermApiKeyManage = "apikey:manage" // API Key 管理（签发/吊销）
+
+	// 资金/财务
+	PermFinanceView    = "finance:view"    // 资金/财务查看（充值提币）
+	PermFinanceApprove = "finance:approve" // 资金审批（提币审核）
+
+	// C2C 交易
+	PermC2CView   = "c2c:view"   // C2C 交易查看
+	PermC2CManage = "c2c:manage" // C2C 交易管理（冻结订单）
+
+	// 系统管理
+	PermAdminManage  = "admin:manage"  // 管理员管理
+	PermRoleManage   = "role:manage"   // 角色与权限管理
+	PermSystemConfig = "system:config" // 系统配置（交易对/币种/公链）
+	PermSysSettings  = "sys:settings"  // 安全设置
+
+	// 运营
+	PermNotificationWrite = "notification:write" // 发布运营通知
+	PermAnnouncementWrite = "announcement:write" // 发布公告
 )
 
 // PermissionDef 是权限字典中的一条展示元数据。
@@ -68,39 +63,35 @@ type PermissionDef struct {
 }
 
 // allPermissionDefs 是全部可被授予的权限（用于权限分配 UI 的字典）。
+// 与前端 src/lib/permissions.tsx 的 PERMISSIONS 保持一致。
 var allPermissionDefs = []PermissionDef{
-	{Key: PermDashboardView, Name: "查看风控与看板", Group: "看板"},
+	{Key: PermOpsView, Name: "运营看板（账本/服务健康）", Group: "看板"},
+	{Key: PermRiskView, Name: "风控大盘查看", Group: "看板"},
 
-	{Key: PermUserRead, Name: "查看用户与账户", Group: "用户"},
-	{Key: PermUserWrite, Name: "编辑/冻结用户", Group: "用户"},
+	{Key: PermUserView, Name: "用户列表查看", Group: "用户"},
+	{Key: PermUserWrite, Name: "用户写入（创建/冻结/解冻）", Group: "用户"},
 
-	{Key: PermSymbolRead, Name: "查看交易对", Group: "交易对"},
-	{Key: PermSymbolWrite, Name: "配置交易对", Group: "交易对"},
+	{Key: PermTradeView, Name: "交易数据查看（订单/成交流水）", Group: "交易"},
+	{Key: PermTradeManage, Name: "交易管理（撤销订单）", Group: "交易"},
 
-	{Key: PermChainRead, Name: "查看公链", Group: "公链"},
-	{Key: PermChainWrite, Name: "管理公链", Group: "公链"},
+	{Key: PermAuditView, Name: "审计日志查看", Group: "审计"},
 
-	{Key: PermCoinRead, Name: "查看币种", Group: "币种"},
-	{Key: PermCoinWrite, Name: "管理币种", Group: "币种"},
+	{Key: PermApiKeyView, Name: "API Key 查看", Group: "系统"},
+	{Key: PermApiKeyManage, Name: "API Key 管理（签发/吊销）", Group: "系统"},
 
-	{Key: PermDepositRead, Name: "查看充值", Group: "充值提币"},
-	{Key: PermWithdrawApproval, Name: "审批提币", Group: "充值提币"},
+	{Key: PermFinanceView, Name: "资金/财务查看（充值提币）", Group: "资金"},
+	{Key: PermFinanceApprove, Name: "资金审批（提币审核）", Group: "资金"},
 
-	{Key: PermTradeRead, Name: "查看用户订单", Group: "订单"},
-	{Key: PermTradeManage, Name: "撤销用户订单", Group: "订单"},
-
-	{Key: PermNotificationManage, Name: "管理运营通知", Group: "运营"},
-
-	{Key: PermLedgerRead, Name: "查看账本对账", Group: "运营"},
-	{Key: PermServiceRead, Name: "查看服务健康", Group: "运营"},
+	{Key: PermC2CView, Name: "C2C 交易查看", Group: "C2C"},
+	{Key: PermC2CManage, Name: "C2C 交易管理（冻结订单）", Group: "C2C"},
 
 	{Key: PermAdminManage, Name: "管理员管理", Group: "系统"},
 	{Key: PermRoleManage, Name: "角色与权限管理", Group: "系统"},
+	{Key: PermSystemConfig, Name: "系统配置（交易对/币种/公链）", Group: "系统"},
+	{Key: PermSysSettings, Name: "安全设置", Group: "系统"},
 
-	{Key: PermApiKeyRead, Name: "查看 API Key", Group: "系统"},
-	{Key: PermApiKeyManage, Name: "管理 API Key（签发/吊销）", Group: "系统"},
-
-	{Key: PermAuditRead, Name: "查看审计日志", Group: "审计"},
+	{Key: PermNotificationWrite, Name: "发布运营通知", Group: "运营"},
+	{Key: PermAnnouncementWrite, Name: "发布公告", Group: "运营"},
 }
 
 // AllPermissions 返回全部权限字典（按 key 排序，便于前端稳定展示）。

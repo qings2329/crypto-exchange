@@ -379,17 +379,19 @@ func SeedBootstrap(store AdminStore, bootstrapUsername, bootstrapHash string) er
 		perms []string
 	}{
 		{RoleAdmin, "运营管理员（不含系统管理）", []string{
-			PermDashboardView, PermUserRead, PermUserWrite,
-			PermSymbolRead, PermSymbolWrite, PermChainRead, PermChainWrite,
-			PermCoinRead, PermCoinWrite, PermDepositRead, PermWithdrawApproval,
-			PermNotificationManage, PermLedgerRead, PermServiceRead,
-			PermTradeRead, PermTradeManage,
-			PermApiKeyRead, PermApiKeyManage,
+			PermOpsView, PermRiskView,
+			PermUserView, PermUserWrite,
+			PermTradeView, PermTradeManage,
+			PermAuditView,
+			PermApiKeyView, PermApiKeyManage,
+			PermFinanceView, PermFinanceApprove,
+			PermC2CView, PermC2CManage,
+			PermSystemConfig,
+			PermNotificationWrite, PermAnnouncementWrite,
 		}},
 		{RoleOperator, "只读操作员", []string{
-			PermDashboardView, PermUserRead, PermSymbolRead, PermChainRead,
-			PermCoinRead, PermDepositRead, PermLedgerRead, PermServiceRead,
-			PermTradeRead, PermApiKeyRead,
+			PermOpsView, PermUserView, PermTradeView, PermAuditView,
+			PermFinanceView, PermC2CView, PermApiKeyView,
 		}},
 	}
 	for _, d := range defs {

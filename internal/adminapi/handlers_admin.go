@@ -44,6 +44,7 @@ type MeView struct {
 	RoleName    string    `json:"role_name"`
 	Permissions []string  `json:"permissions"`
 	TOTPEnabled bool      `json:"totp_enabled"`
+	ClientIP    string    `json:"client_ip"`
 }
 
 func (s *Server) toAdminView(a *AdminAccount) AdminView {
@@ -83,7 +84,7 @@ func (s *Server) adminMe(c *gin.Context) {
 		s.fail(c, http.StatusNotFound, "admin not found")
 		return
 	}
-	me := MeView{ID: acc.ID, Username: acc.Username, Status: acc.Status, RoleID: acc.RoleID, TOTPEnabled: acc.TOTPEnabled}
+	me := MeView{ID: acc.ID, Username: acc.Username, Status: acc.Status, RoleID: acc.RoleID, TOTPEnabled: acc.TOTPEnabled, ClientIP: c.ClientIP()}
 	if acc.RoleID != 0 {
 		if r, e := s.adminStore.GetRoleByID(acc.RoleID); e == nil {
 			me.RoleName = r.Name
