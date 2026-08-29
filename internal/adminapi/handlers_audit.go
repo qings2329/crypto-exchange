@@ -11,12 +11,17 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
 )
 
-// auditMiddleware 记录所有变更类（非 GET/HEAD）管理操作到审计日志。
+// auditMiddleware 仅记录操作成功的变更类（非 GET/HEAD）管理操作到审计日志。
 // 仅落元数据（方法/路由/状态码/IP/时间），不记录请求体，避免泄露口令等敏感信息。
 func (s *Server) auditMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Next()
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
+			return
+		}
+		// 仅记录成功操作（2xx 状态码）
+		status := c.Writer.Status()
+		if status < 200 || status >= 300 {
 			return
 		}
 		uid, _ := middleware.UserID(c)
@@ -35,7 +40,7 @@ func (s *Server) auditMiddleware() gin.HandlerFunc {
 			Path:    c.FullPath(),
 			Action:  action,
 			Target:  c.Request.URL.Path,
-			Status:  c.Writer.Status(),
+			Status:  status,
 			IP:      c.ClientIP(),
 			Time:    time.Now().UnixNano(),
 		})

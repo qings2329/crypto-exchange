@@ -131,14 +131,13 @@ func (s *Server) recordLoginFailure(c *gin.Context, acc *AdminAccount, maxFails,
 	}
 	// 持久化失败计数/锁定（失败也照常写入，便于跨实例共享限流状态）。
 	if err := s.adminStore.UpdateAccount(acc); err != nil {
-		// 限流状态写入失败不阻断登录失败响应，仅记录（避免泄露内部错误）。
 		log.Printf("[admin] failed to persist login failure state for %q: %v", acc.Username, err)
 	}
-	s.writeLoginAudit(c, acc, acc.Username, "login_failed", reason, http.StatusUnauthorized)
+	// 仅记录成功登录到审计日志；失败登录不涉及资源变更，无需审计。
 }
 
-// writeLoginAudit 记录管理员登录审计事件。登录路由在 admin 组与 auditMiddleware 之外，
-// 因此需在 handleLogin 中显式写入审计日志（成功与失败均记，仅元数据不含口令）。
+// writeLoginAudit 记录管理员成功登录审计事件。登录路由在 admin 组与 auditMiddleware 之外，
+// 因此需在 handleLogin 中显式写入。仅记录成功登录，失败登录不写入审计日志。
 func (s *Server) writeLoginAudit(c *gin.Context, acc *AdminAccount, username, action, detail string, status int) {
 	aid := int64(0)
 	if acc != nil {

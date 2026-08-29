@@ -88,12 +88,15 @@ func TestAdminAuditLog(t *testing.T) {
 	}
 }
 
-// TestLoginAudit 验证登录事件（成功与失败）都会被写入审计日志。
-// 登录路由位于 auditMiddleware 之外，须由 handleLogin 显式记录。
-func TestLoginAudit(t *testing.T) {
-	r, _ := newAdminServer(t) // 内部一次成功登录 -> 已产生 1 条 login 审计
+// TestLoginAuditOnlySuccess 验证仅成功登录写入审计日志；失败登录不写入。
+func TestLoginAuditOnlySuccess(t *testing.T) {
+	r, loginTok := newAdminServer(t) // 内部一次成功登录 -> 已产生 1 条 login 审计
+	tok := loginTok
 
-	// 失败登录（错误密码）-> 应新增一条 login_failed
+	// 获取当前审计条数
+	beforeCount := getAuditCount(t, r, tok)
+
+	// 失败登录（错误密码）-> 不应新增审计条目
 	body, _ := json.Marshal(map[string]string{"username": "admin", "password": "wrong"})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/login", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -102,8 +105,12 @@ func TestLoginAudit(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong-password login should be 401, got %d", w.Code)
 	}
+	afterFailCount := getAuditCount(t, r, tok)
+	if afterFailCount != beforeCount {
+		t.Fatalf("failed login should not produce audit entry: before=%d after=%d", beforeCount, afterFailCount)
+	}
 
-	// 再次成功登录 -> 应再新增一条 login
+	// 再次成功登录 -> 应新增一条 login 审计
 	body2, _ := json.Marshal(map[string]string{"username": "admin", "password": "admin123"})
 	req = httptest.NewRequest(http.MethodPost, "/api/admin/login", bytes.NewReader(body2))
 	req.Header.Set("Content-Type", "application/json")
@@ -112,38 +119,24 @@ func TestLoginAudit(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("good login should be 200, got %d", w.Code)
 	}
+	afterSuccessCount := getAuditCount(t, r, tok)
+	if afterSuccessCount != beforeCount+1 {
+		t.Fatalf("successful login should add 1 audit entry: before=%d after=%d", beforeCount, afterSuccessCount)
+	}
+}
 
-	// 以返回的 token 查询审计日志，最新两条应分别为 login 与 login_failed
+func getAuditCount(t *testing.T, r *gin.Engine, tok string) int {
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/audit-logs", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
 	var data struct {
 		Data struct {
-			Logs []map[string]any `json:"logs"`
+			Total int64 `json:"total"`
 		} `json:"data"`
 	}
-	var lg struct {
-		Data struct {
-			Token string `json:"token"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &lg); err != nil {
+	if err := json.Unmarshal(w.Body.Bytes(), &data); err != nil {
 		t.Fatal(err)
 	}
-	req = httptest.NewRequest(http.MethodGet, "/api/admin/audit-logs?limit=5", nil)
-	req.Header.Set("Authorization", "Bearer "+lg.Data.Token)
-	w2 := httptest.NewRecorder()
-	r.ServeHTTP(w2, req)
-	if err := json.Unmarshal(w2.Body.Bytes(), &data); err != nil {
-		t.Fatal(err)
-	}
-	if len(data.Data.Logs) < 2 {
-		t.Fatalf("expected >=2 audit entries, got %d", len(data.Data.Logs))
-	}
-	if data.Data.Logs[0]["action"] != "login" {
-		t.Fatalf("expected latest audit action 'login', got %v", data.Data.Logs[0]["action"])
-	}
-	if data.Data.Logs[1]["action"] != "login_failed" {
-		t.Fatalf("expected second audit action 'login_failed', got %v", data.Data.Logs[1]["action"])
-	}
-	if data.Data.Logs[1]["status"].(float64) != http.StatusUnauthorized {
-		t.Fatalf("expected login_failed audit status 401, got %v", data.Data.Logs[1]["status"])
-	}
+	return int(data.Data.Total)
 }
