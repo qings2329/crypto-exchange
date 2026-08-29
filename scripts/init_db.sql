@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS ce_admin_audit_logs (
 -- ---------------------------------------------------------------------------
 -- 2.1) 默认三角色 + 权限 + 引导管理员账户（幂等，可重复执行）
 --   角色固定 id：1=super_admin, 2=admin, 3=operator（与 SeedBootstrap 写入顺序一致）
---   账户 username='admin'，密码 '***REDACTED***'（bcrypt 哈希，bcrypt.DefaultCost），role_id=2
+--   账户 username='admin'，密码见部署文档（bcrypt 哈希，bcrypt.DefaultCost），role_id=2
 -- ---------------------------------------------------------------------------
 INSERT IGNORE INTO ce_admin_roles (id, name, description, created_at, updated_at)
 VALUES
@@ -213,7 +213,7 @@ INSERT IGNORE INTO ce_admin_role_perms (role_id, perm_key) VALUES
     (3, 'deposit:read'), (3, 'ledger:read'), (3, 'service:read'),
     (3, 'trade:read'), (3, 'apikey:read');
 
--- 引导管理员账户（密码 ***REDACTED*** 的 bcrypt 哈希；status='active' 方可登录）
+-- 引导管理员账户（密码为其 bcrypt 哈希；status='active' 方可登录）
 INSERT IGNORE INTO ce_admin_accounts
     (id, username, pass_hash, status, role_id, totp_enabled, created_at, updated_at, failed_attempts, locked_until)
 VALUES
