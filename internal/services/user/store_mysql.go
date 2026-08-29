@@ -482,6 +482,29 @@ func (s *mysqlStore) UpdateKYC(k *KYCSubmission) error {
 	return nil
 }
 
+func (s *mysqlStore) ListPendingKYC() ([]*KYCSubmission, error) {
+	rows, err := s.db.Query(
+		`SELECT user_id, real_name, id_type, id_number, doc_front, doc_back, status, reject_reason, submitted_at
+		 FROM ce_user_kyc WHERE status=1 ORDER BY submitted_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*KYCSubmission, 0)
+	for rows.Next() {
+		var k KYCSubmission
+		var docFront, docBack, rejectReason sql.NullString
+		if err := rows.Scan(&k.UserID, &k.RealName, &k.IDType, &k.IDNumber, &docFront, &docBack, &k.Status, &rejectReason, &k.SubmittedAt); err != nil {
+			return nil, err
+		}
+		k.DocFront = docFront.String
+		k.DocBack = docBack.String
+		k.RejectReason = rejectReason.String
+		out = append(out, &k)
+	}
+	return out, rows.Err()
+}
+
 func (s *mysqlStore) GetPreferences(userID int64) (*UserPreferences, error) {
 	var p UserPreferences
 	var lang, theme, tz, tradeInterval, changeBasis sql.NullString

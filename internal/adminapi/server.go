@@ -179,6 +179,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 充值提币记录（实时聚合 futures 链上事件）
 		admin.GET("/deposits", s.listDeposits)
 		admin.GET("/withdrawals", s.listWithdrawals)
+		admin.GET("/pending-withdrawals", s.listPendingWithdrawals)
+		admin.GET("/withdrawals/:id/detail", s.getWithdrawalDetail)
 
 		// 用户充值地址（按 userID 在各充值链确定性派生，无持久化）
 		admin.GET("/deposit-addresses", s.listUserDepositAddresses)
@@ -189,6 +191,15 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		admin.GET("/notifications", s.listNotifications)
 		admin.POST("/notifications", s.createNotification)
 		admin.DELETE("/notifications/:id", s.deleteNotification)
+
+		// KYC 审核
+		kyc := admin.Group("/kyc-reviews", middleware.RequirePerm(PermUserView))
+		{
+			kyc.GET("", s.listKycReviews)
+			kyc.GET("/:id", s.getKycReviewDetail)
+			kyc.POST("/:id/approve", middleware.RequirePerm(PermFinanceApprove), s.approveKyc)
+			kyc.POST("/:id/reject", middleware.RequirePerm(PermFinanceApprove), s.rejectKyc)
+		}
 
 		// 公告管理（与用户服务共用同一份 ce_announcements 数据；管理组已套 Auth+AdminGuard）。
 		s.annH.RegisterAdminRoutes(admin)

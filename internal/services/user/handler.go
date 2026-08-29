@@ -64,6 +64,8 @@ func (h *Handler) Register(r *gin.Engine) {
 	adminG := g.Group("")
 	adminG.Use(middleware.Auth(h.verifier), middleware.AdminGuard())
 	adminG.POST("/kyc/review", h.kycReview) // F4：审核他人 KYC 必须管理员
+	adminG.GET("/admin/kyc-reviews", h.listPendingKycReviews)
+	adminG.GET("/admin/kyc-reviews/:id", h.getKycReviewDetail)
 	adminG.GET("/admin/list", h.adminList)
 	adminG.POST("/admin", h.adminCreate)
 	adminG.PUT("/admin/:id", h.adminUpdate)
@@ -393,6 +395,53 @@ func (h *Handler) kycReview(c *gin.Context) {
 		level = int(KYCRejected)
 	}
 	response.JSON(c, gin.H{"kyc_level": level, "message": "review done"})
+}
+
+func (h *Handler) listPendingKycReviews(c *gin.Context) {
+	kycs, err := h.svc.ListPendingKYC()
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	out := make([]gin.H, 0, len(kycs))
+	for _, k := range kycs {
+		out = append(out, gin.H{
+			"id":           k.UserID,
+			"user_id":      k.UserID,
+			"full_name":    k.RealName,
+			"id_number":    k.IDNumber,
+			"country":      "",
+			"submitted_at": k.SubmittedAt.Format(time.RFC3339),
+			"status":       int(k.Status),
+		})
+	}
+	response.JSON(c, gin.H{"items": out, "total": len(out)})
+}
+
+func (h *Handler) getKycReviewDetail(c *gin.Context) {
+	userIDStr := c.Param("id")
+	userID, err := strconv.ParseInt(userIDStr, 10, 64)
+	if err != nil || userID == 0 {
+		fail(c, ErrNotFound)
+		return
+	}
+	kyc, err := h.svc.GetKYCForAdmin(userID)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{
+		"id":           kyc.UserID,
+		"user_id":      kyc.UserID,
+		"full_name":    kyc.RealName,
+		"id_number":    kyc.IDNumber,
+		"country":      "",
+		"submitted_at": kyc.SubmittedAt.Format(time.RFC3339),
+		"doc_front":    kyc.DocFront,
+		"doc_back":     kyc.DocBack,
+		"status":       int(kyc.Status),
+		"reject_reason": kyc.RejectReason,
+	})
 }
 
 // ---- 管理后台聚合接口 ----

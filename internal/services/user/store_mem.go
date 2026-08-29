@@ -254,6 +254,19 @@ func (s *memStore) UpdateKYC(k *KYCSubmission) error {
 	return nil
 }
 
+func (s *memStore) ListPendingKYC() ([]*KYCSubmission, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*KYCSubmission, 0)
+	for _, k := range s.kycs {
+		if k.Status == KYCPending {
+			cp := *k
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
 func (s *memStore) GetPreferences(userID int64) (*UserPreferences, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

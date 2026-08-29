@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/gin-gonic/gin"
@@ -1044,4 +1045,155 @@ func (s *Server) handleServices(c *gin.Context) {
 	health = append(health, ServiceHealth{Name: "admin", Status: "up", LatencyMs: 0, LastCheck: time.Now()})
 	sort.Slice(health, func(i, j int) bool { return health[i].Name < health[j].Name })
 	s.ok(c, health)
+}
+
+// --- KYC 审核 ---
+
+func (s *Server) listKycReviews(c *gin.Context) {
+	base := s.serviceURL("user")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "user service not configured")
+		return
+	}
+	ctx := c.Request.Context()
+	var resp struct {
+		Items []gin.H `json:"items"`
+		Total int     `json:"total"`
+	}
+	if err := s.up.Get(ctx, base, "/api/v1/user/admin/kyc-reviews", &resp); err != nil {
+		s.fail(c, http.StatusBadGateway, "kyc reviews failed: "+err.Error())
+		return
+	}
+	s.ok(c, gin.H{"items": resp.Items, "total": resp.Total})
+}
+
+func (s *Server) getKycReviewDetail(c *gin.Context) {
+	base := s.serviceURL("user")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "user service not configured")
+		return
+	}
+	ctx := c.Request.Context()
+	path := "/api/v1/user/admin/kyc-reviews/" + c.Param("id")
+	var detail gin.H
+	if err := s.up.Get(ctx, base, path, &detail); err != nil {
+		s.fail(c, http.StatusBadGateway, "kyc detail failed: "+err.Error())
+		return
+	}
+	s.ok(c, detail)
+}
+
+func (s *Server) approveKyc(c *gin.Context) {
+	base := s.serviceURL("user")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "user service not configured")
+		return
+	}
+	uid, _ := middleware.UserID(c)
+	reviewer := fmt.Sprintf("admin_%d", uid)
+	body := gin.H{"user_id": c.Param("id"), "approve": true, "reviewer": reviewer}
+	ctx := c.Request.Context()
+	var out gin.H
+	if err := s.up.Post(ctx, base, "/api/v1/user/admin/kyc/review", &out, body); err != nil {
+		s.fail(c, http.StatusBadGateway, "kyc approve failed: "+err.Error())
+		return
+	}
+	s.ok(c, out)
+}
+
+func (s *Server) rejectKyc(c *gin.Context) {
+	base := s.serviceURL("user")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "user service not configured")
+		return
+	}
+	uid, _ := middleware.UserID(c)
+	reviewer := fmt.Sprintf("admin_%d", uid)
+	var req struct {
+		RejectReason string `json:"reject_reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		s.fail(c, http.StatusBadRequest, "invalid body")
+		return
+	}
+	body := gin.H{"user_id": c.Param("id"), "approve": false, "reject_reason": req.RejectReason, "reviewer": reviewer}
+	ctx := c.Request.Context()
+	var out gin.H
+	if err := s.up.Post(ctx, base, "/api/v1/user/admin/kyc/review", &out, body); err != nil {
+		s.fail(c, http.StatusBadGateway, "kyc reject failed: "+err.Error())
+		return
+	}
+	s.ok(c, out)
+}
+
+// --- 大额提现人工审核 ---
+
+func (s *Server) listPendingWithdrawals(c *gin.Context) {
+	limit, offset := parsePage(c)
+	// 复用 listWithdrawals 逻辑，只取 pending 状态的记录
+	base := s.serviceURL("futures")
+	if base == "" {
+		s.ok(c, gin.H{"items": []gin.H{}, "total": 0})
+		return
+	}
+	ctx := c.Request.Context()
+	var resp struct {
+		Withdrawals []Withdrawal `json:"withdrawals"`
+		Total       int          `json:"total"`
+	}
+	if err := s.up.Get(ctx, base, "/api/v1/futures/wallet/withdraw/holds", &resp); err != nil {
+		s.ok(c, gin.H{"items": []gin.H{}, "total": 0})
+		return
+	}
+	pending := make([]gin.H, 0)
+	for _, w := range resp.Withdrawals {
+		if w.Status == "pending" {
+			pending = append(pending, gin.H{
+				"id":           w.ID,
+				"user_id":      w.UserID,
+				"coin":         w.Coin,
+				"amount":       w.Amount,
+				"chain":        w.Chain,
+				"address":      w.Address,
+				"submitted_at": w.Time.Format(time.RFC3339),
+				"status":       w.Status,
+			})
+		}
+	}
+		start := offset
+		if start > len(pending) {
+			start = len(pending)
+		}
+		end := start + limit
+		if end > len(pending) {
+			end = len(pending)
+		}
+		page := pending[start:end]
+		s.ok(c, gin.H{"items": page, "total": len(pending)})
+}
+
+func (s *Server) getWithdrawalDetail(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		s.fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	s.store.mu.RLock()
+	w, ok := s.store.wdByID[id]
+	s.store.mu.RUnlock()
+	if !ok {
+		s.fail(c, http.StatusNotFound, "withdrawal not found")
+		return
+	}
+	s.ok(c, gin.H{
+		"id":           w.ID,
+		"user_id":      w.UserID,
+		"coin":         w.Coin,
+		"amount":       w.Amount,
+		"chain":        w.Chain,
+		"address":      w.Address,
+		"tx_hash":      w.TxHash,
+		"status":       w.Status,
+		"submitted_at": w.Time.Format(time.RFC3339),
+	})
 }
