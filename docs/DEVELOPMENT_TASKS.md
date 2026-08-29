@@ -374,7 +374,7 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 
 **后端改造（角色鉴权，2026-08-14）**：
 - `internal/pkg/middleware/auth.go`：新增 `RoleUser`/`RoleAdmin` 常量；`TokenClaims` 加 `Role` 字段；保留 `Issue`/`Verify` 旧签名（默认 user，零回归），新增 `IssueRole(userID, role, ttl)`、`VerifyFull() (int64,string,bool)`；`Auth` 中间件内部改走 `VerifyFull` 并把 role 写入上下文；新增 `Role(c)`、`RequireRole(roles...)`、`AdminGuard()`（=RequireRole(admin)）。管理接口只需在 `Auth` 之后挂 `AdminGuard` 即可限制为管理员。
-- `internal/pkg/config/config.go`：新增具名类型 `AdminConfig` 与 `Config.Admin` 字段（addr/username/password/token_ttl_sec/allowed_origins）；`configs/config.yaml` 加 `admin` 段（addr :8095，避开 services 已占的 8090；凭据 admin/admin123，原型明文）。
+- `internal/pkg/config/config.go`：新增具名类型 `AdminConfig` 与 `Config.Admin` 字段（addr/username/password/token_ttl_sec/allowed_origins）；`configs/config.yaml` 加 `admin` 段（addr :8095，避开 services 已占的 8090；凭据 admin/***REDACTED***，原型明文）。
 - `internal/adminapi/`：新增管理后台聚合包。`store.go` 定义 7 模块类型 + 内存管理态（seed 示例数据，CRUD 落内存，重启丢失——原型骨架）；`handlers.go` 实现全部 handler（风控快照只读、用户 CRUD+冻结/解冻、交易对 upsert、公链/币种 CRUD、充值提币列表+提币审核、通知 CRUD、账本对账、服务健康）；`server.go` 装配并在 `/admin` 组挂 `Auth`+`AdminGuard`。
 - `cmd/admin/main.go`：管理后台后端；`-config` 约定（默认 configs/config.yaml）；把 `admin.allowed_origins` 并入 CORS 白名单；套 `middleware.Common` 安全中间件；`cfg.Listen`。
 - `internal/adminapi/server_test.go`：验证登录签发 admin token、错误凭据 401、未带 token 401、admin token 访问 200、风控快照可读。

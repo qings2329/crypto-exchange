@@ -18,7 +18,7 @@ func newTestServer(t *testing.T) (*gin.Engine, *config.Config) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	r := gin.New()
 	adminapi.NewServer(cfg).RegisterRoutes(r)
@@ -107,7 +107,7 @@ func TestAdminLoginAndRoleGuard(t *testing.T) {
 	}
 
 	// 2) 正确凭据 → 200 + token
-	code, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "admin123"})
+	code, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "***REDACTED***"})
 	if code != http.StatusOK {
 		t.Fatalf("expected 200 for good creds, got %d", code)
 	}
@@ -153,7 +153,7 @@ func TestAdminLoginLockout(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Admin.MaxLoginFailures = 2 // 测试用小阈值
 	cfg.Admin.LoginLockoutSec = 900
@@ -166,7 +166,7 @@ func TestAdminLoginLockout(t *testing.T) {
 		t.Fatalf("attempt1: expected 401, got %d", code)
 	}
 	// 2) 锁定前正确密码 → 200（并清零失败计数）
-	if code, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "admin123"}); code != http.StatusOK {
+	if code, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "***REDACTED***"}); code != http.StatusOK {
 		t.Fatalf("pre-lock good login: expected 200, got %d", code)
 	} else if data.(map[string]interface{})["token"] == "" {
 		t.Fatal("expected non-empty token")
@@ -177,7 +177,7 @@ func TestAdminLoginLockout(t *testing.T) {
 	postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "wrong2"})
 
 	// 4) 锁定后：即使正确密码也应被拒（证明锁定生效，而非仅计数）
-	if code, _ := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "admin123"}); code != http.StatusUnauthorized {
+	if code, _ := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "***REDACTED***"}); code != http.StatusUnauthorized {
 		t.Fatalf("locked correct login: expected 401, got %d", code)
 	}
 	// 5) 锁定后：错误密码同样被拒
@@ -192,7 +192,7 @@ func TestAdminLoginIPRateLimit(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Admin.LoginRateLimitPerIP = 2 // 单 IP 2 次/窗口
 	cfg.Admin.LoginRateWindowSec = 60
@@ -234,7 +234,7 @@ func TestAdminPreferences(t *testing.T) {
 	r, _ := newTestServer(t)
 
 	// 登录拿 token
-	_, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "admin123"})
+	_, data := postJSON(t, r, "/api/admin/login", "", map[string]string{"username": "admin", "password": "***REDACTED***"})
 	tok, _ := data.(map[string]interface{})["token"].(string)
 	if tok == "" {
 		t.Fatal("expected non-empty admin token")

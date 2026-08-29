@@ -32,7 +32,7 @@ func TestAdminRoleDelete(t *testing.T) {
 
 	// 登录拿 admin token（默认账户拥有 role:manage）。
 	_, data := postJSON(t, r, "/api/admin/login", "", map[string]string{
-		"username": "admin", "password": "admin123",
+		"username": "admin", "password": "***REDACTED***",
 	})
 	tok, _ := data.(map[string]interface{})["token"].(string)
 	if tok == "" {

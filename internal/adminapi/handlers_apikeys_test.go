@@ -13,7 +13,7 @@ import (
 func loginToken(t *testing.T, r *gin.Engine) string {
 	t.Helper()
 	code, data := postJSON(t, r, "/api/admin/login", "", map[string]string{
-		"username": "admin", "password": "admin123",
+		"username": "admin", "password": "***REDACTED***",
 	})
 	if code != http.StatusOK {
 		t.Fatalf("login failed: %d", code)

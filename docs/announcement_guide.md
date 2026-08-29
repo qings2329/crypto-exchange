@@ -36,7 +36,7 @@
 # 向管理后台登录，拿到 access_token（默认演示账号见各环境配置）
 curl -s -X POST http://localhost:8090/api/admin/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"admin123"}'
+  -d '{"username":"admin","password":"***REDACTED***"}'
 ```
 
 响应示例：

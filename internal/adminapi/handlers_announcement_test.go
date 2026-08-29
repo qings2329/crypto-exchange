@@ -19,14 +19,14 @@ func newAdminServer(t *testing.T) (*gin.Engine, string) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	// MySQL.DSN 留空 -> 公告存储回退内存。
 
 	r := gin.New()
 	NewServer(cfg).RegisterRoutes(r)
 
-	b, _ := json.Marshal(map[string]string{"username": "admin", "password": "admin123"})
+	b, _ := json.Marshal(map[string]string{"username": "admin", "password": "***REDACTED***"})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/login", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

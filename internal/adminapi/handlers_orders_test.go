@@ -70,7 +70,7 @@ func atoi(s string) int {
 func loginAdmin(t *testing.T, r *gin.Engine) string {
 	t.Helper()
 	code, data := postJSON(t, r, "/api/admin/login", "", map[string]string{
-		"username": "admin", "password": "admin123",
+		"username": "admin", "password": "***REDACTED***",
 	})
 	if code != http.StatusOK {
 		t.Fatalf("admin login failed: code=%d", code)
@@ -100,7 +100,7 @@ func TestAdminOrderManagement(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Matching.URL = match.URL
 	r := gin.New()

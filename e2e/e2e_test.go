@@ -445,7 +445,7 @@ func TestAdminLendingBotProxyE2E(t *testing.T) {
 	adminCfg := &config.Config{}
 	adminCfg.Auth.Secret = secret
 	adminCfg.Admin.Username = "admin"
-	adminCfg.Admin.Password = "admin123"
+	adminCfg.Admin.Password = "***REDACTED***"
 	adminCfg.Admin.TokenTTLSec = 3600
 	adminCfg.Services = map[string]string{
 		"lending": lendSrv.URL,
@@ -533,7 +533,7 @@ func TestAdminLendingBotProxyE2E(t *testing.T) {
 // e2eLoginAdmin 登录管理后台并返回 admin token。
 func e2eLoginAdmin(t *testing.T, r *gin.Engine) string {
 	t.Helper()
-	b, _ := json.Marshal(map[string]string{"username": "admin", "password": "admin123"})
+	b, _ := json.Marshal(map[string]string{"username": "admin", "password": "***REDACTED***"})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/login", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

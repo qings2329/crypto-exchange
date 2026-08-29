@@ -111,7 +111,7 @@ func TestLoginAuditOnlySuccess(t *testing.T) {
 	}
 
 	// 再次成功登录 -> 应新增一条 login 审计
-	body2, _ := json.Marshal(map[string]string{"username": "admin", "password": "admin123"})
+	body2, _ := json.Marshal(map[string]string{"username": "admin", "password": "***REDACTED***"})
 	req = httptest.NewRequest(http.MethodPost, "/api/admin/login", bytes.NewReader(body2))
 	req.Header.Set("Content-Type", "application/json")
 	w = httptest.NewRecorder()

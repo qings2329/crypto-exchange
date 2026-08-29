@@ -99,7 +99,7 @@ func newAdminWithFutures(t *testing.T, futuresURL, userURL string) (*gin.Engine,
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"futures": futuresURL}
 	if userURL != "" {
@@ -109,7 +109,7 @@ func newAdminWithFutures(t *testing.T, futuresURL, userURL string) (*gin.Engine,
 	adminapi.NewServer(cfg).RegisterRoutes(r)
 
 	// 登录拿 admin token（super_admin 自动含 withdraw:approval 权限）。
-	b, _ := json.Marshal(map[string]string{"username": "admin", "password": "admin123"})
+	b, _ := json.Marshal(map[string]string{"username": "admin", "password": "***REDACTED***"})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/login", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

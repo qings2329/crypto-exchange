@@ -57,7 +57,7 @@ func TestAdminLendingPoolsProxy(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"lending": fakeLending.URL}
 
@@ -88,7 +88,7 @@ func TestAdminLendingLendsProxy(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"lending": fakeLending.URL}
 
@@ -118,7 +118,7 @@ func TestAdminLendingBorrowsProxy(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"lending": fakeLending.URL}
 
@@ -149,7 +149,7 @@ func TestAdminBotStrategiesProxy(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"bot": fakeBot.URL}
 
@@ -177,7 +177,7 @@ func TestAdminBotTickProxy(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"bot": fakeBot.URL}
 
@@ -200,7 +200,7 @@ func TestAdminLendingUpstreamUnavailable(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{} // no lending configured
 
@@ -223,7 +223,7 @@ func TestAdminBotUpstreamUnavailable(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{} // no bot configured
 
@@ -247,7 +247,7 @@ func TestAdminLendingNoToken(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"lending": fakeLending.URL}
 
@@ -275,7 +275,7 @@ func TestAdminLendingPoolsCreateProxy(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"lending": fakeLending.URL}
 
@@ -303,7 +303,7 @@ func TestAdminBotTickMissingID(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Auth.Secret = "test-secret"
 	cfg.Admin.Username = "admin"
-	cfg.Admin.Password = "admin123"
+	cfg.Admin.Password = "***REDACTED***"
 	cfg.Admin.TokenTTLSec = 3600
 	cfg.Services = map[string]string{"bot": fakeBot.URL}
 
