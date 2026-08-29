@@ -204,6 +204,15 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 公告管理（与用户服务共用同一份 ce_announcements 数据；管理组已套 Auth+AdminGuard）。
 		s.annH.RegisterAdminRoutes(admin)
 
+		// 理财资管（代理 wealth 服务）
+		wealth := admin.Group("/wealth", middleware.RequirePerm(PermSystemConfig))
+		{
+			wealth.GET("/products", s.listWealthProducts)
+			wealth.POST("/products", s.createWealthProduct)
+			wealth.GET("/holdings", s.listWealthHoldings)
+			wealth.POST("/holdings/accrue", s.accrueWealth)
+		}
+
 		// 运营看板：账本对账（实时聚合 futures）+ 服务健康（探活各服务）
 		admin.GET("/ledger", s.handleLedger)
 		admin.GET("/services", s.handleServices)
