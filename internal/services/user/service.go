@@ -529,6 +529,16 @@ func (s *Service) GetProfile(userID int64) (*User, *KYCSubmission, error) {
 	return u, k, nil
 }
 
+// ListPendingKYC 返回所有待审核的 KYC 提交记录（按提交时间倒序）。
+func (s *Service) ListPendingKYC() ([]*KYCSubmission, error) {
+	return s.store.ListPendingKYC()
+}
+
+// GetKYCForAdmin 返回指定用户的完整 KYC 提交材料（含证件图片 URL）。
+func (s *Service) GetKYCForAdmin(userID int64) (*KYCSubmission, error) {
+	return s.store.GetKYC(userID)
+}
+
 // ---- 个人设置 ----
 
 const (

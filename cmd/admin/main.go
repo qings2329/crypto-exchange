@@ -16,6 +16,7 @@ import (
 func main() {
 	cfgPath := flag.String("config", "configs/config.yaml", "path to config file")
 	mysqlDSN := flag.String("mysql-dsn", "", "MySQL DSN for admin persistence (trading pairs/chains/coins/notifications/accounts); overrides config mysql.dsn")
+	memOnly := flag.Bool("mem-only", false, "Force in-memory store for admin persistence (bypasses MySQL even if config has dsn)")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -23,7 +24,8 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 	// 命令行 --mysql-dsn 优先于配置文件中的 mysql.dsn，便于本地一键指定可持久化数据库。
-	if *mysqlDSN != "" {
+	// --mem-only 强制使用内存存储（等价于传入空 DSN）。
+	if *memOnly || *mysqlDSN != "" {
 		cfg.MySQL.DSN = *mysqlDSN
 	}
 	if cfg.Server.Mode != "" {
