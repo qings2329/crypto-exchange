@@ -82,3 +82,85 @@ func TestMemAdminStoreUpdateRole(t *testing.T) {
 		t.Fatalf("不存在角色应返回 ErrAdminNotFound, got %v", err)
 	}
 }
+
+// TestSeedBootstrapSelfHeal 锁定 seed 的自愈能力（针对"管理员/角色管理 insufficient permission"问题）：
+//  1. 首次播种：bootstrap 管理员归属 super_admin，且 super_admin 持有全量权限
+//     （含 admin:manage、role:manage）。
+//  2. 历史数据修复：super_admin 角色存在但权限被旧版本/改动遗漏时，再次播种会补全
+//     admin:manage/role:manage 全量权限。
+//  3. 角色漂移修复：bootstrap 管理员被移到其他角色时，再次播种会归位 super_admin。
+func TestSeedBootstrapSelfHeal(t *testing.T) {
+	has := func(perms []string, key string) bool {
+		for _, p := range perms {
+			if p == key {
+				return true
+			}
+		}
+		return false
+	}
+
+	s := NewMemAdminStore()
+
+	// --- 1) 首次播种 ---
+	if err := SeedBootstrap(s, "admin", "$2a$10$fakehash"); err != nil {
+		t.Fatalf("首次播种失败: %v", err)
+	}
+	super, err := s.GetRoleByName(RoleSuperAdmin)
+	if err != nil {
+		t.Fatalf("super_admin 角色应存在: %v", err)
+	}
+	perms, err := s.GetRolePermissions(super.ID)
+	if err != nil {
+		t.Fatalf("GetRolePermissions: %v", err)
+	}
+	if !has(perms, PermAdminManage) || !has(perms, PermRoleManage) {
+		t.Fatalf("播种后 super_admin 应含 admin:manage/role:manage，实际: %v", perms)
+	}
+	acc, err := s.GetAccountByUsername("admin")
+	if err != nil {
+		t.Fatalf("bootstrap admin 应存在: %v", err)
+	}
+	if acc.RoleID != super.ID || acc.Status != AdminStatusActive {
+		t.Fatalf("bootstrap admin 应归属 super_admin 且 active，got role=%d status=%s", acc.RoleID, acc.Status)
+	}
+
+	// --- 2) 历史权限缺失时自愈 ---
+	if err := s.SetRolePermissions(super.ID, []string{PermDashboardView}); err != nil {
+		t.Fatalf("SetRolePermissions: %v", err)
+	}
+	if err := SeedBootstrap(s, "admin", "$2a$10$fakehash"); err != nil {
+		t.Fatalf("二次播种失败: %v", err)
+	}
+	perms2, err := s.GetRolePermissions(super.ID)
+	if err != nil {
+		t.Fatalf("GetRolePermissions: %v", err)
+	}
+	if !has(perms2, PermAdminManage) || !has(perms2, PermRoleManage) {
+		t.Fatalf("二次播种应补全 super_admin 权限，实际: %v", perms2)
+	}
+
+	// --- 3) 角色漂移时归位 ---
+	op, err := s.GetRoleByName(RoleOperator)
+	if err != nil {
+		t.Fatalf("operator 角色应存在: %v", err)
+	}
+	acc3, err := s.GetAccountByUsername("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc3.RoleID = op.ID
+	if err := s.UpdateAccount(acc3); err != nil {
+		t.Fatalf("UpdateAccount: %v", err)
+	}
+	if err := SeedBootstrap(s, "admin", "$2a$10$fakehash"); err != nil {
+		t.Fatalf("三次播种失败: %v", err)
+	}
+	acc4, err := s.GetAccountByUsername("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc4.RoleID != super.ID {
+		t.Fatalf("角色漂移后 bootstrap admin 应归位 super_admin，got role=%d", acc4.RoleID)
+	}
+}
+

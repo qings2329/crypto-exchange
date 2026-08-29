@@ -342,17 +342,15 @@ func NewAdminStore(dsn string) (store AdminStore, isMem bool, err error) {
 	return ms, false, nil
 }
 
-// SeedBootstrap 在库中无账户时，写入默认三角色（super_admin/admin/operator）与
-// 由 config 引导的超级管理员账户。已有账户则跳过。
+// SeedBootstrap 确保默认角色与引导管理员账户存在且权限完整。
+// 与"仅空库播种"的旧实现不同，这里每次启动都会自愈：
+//   - super_admin 角色始终存在且持有全量权限（补齐被历史版本/手动改动遗漏的权限，
+//     保证登录 token 携带 admin:manage、role:manage 等，从而可访问管理员/角色管理）；
+//   - admin/operator 只在不存在时创建，不覆盖后续自定义；
+//   - 由 config 引导的 bootstrap 管理员账户始终存在且归属 super_admin（纠正角色漂移）。
+//
 // bootstrapHash 为 bcrypt 哈希（来自 config 的 password_hash 或明文回退哈希）。
 func SeedBootstrap(store AdminStore, bootstrapUsername, bootstrapHash string) error {
-	n, err := store.CountAccounts()
-	if err != nil {
-		return err
-	}
-	if n > 0 {
-		return nil
-	}
 	if bootstrapUsername == "" {
 		bootstrapUsername = "admin"
 	}
@@ -360,13 +358,26 @@ func SeedBootstrap(store AdminStore, bootstrapUsername, bootstrapHash string) er
 		return errors.New("bootstrap admin password hash is empty")
 	}
 
-	// 默认角色与权限
+	// 1. 确保 super_admin 角色存在，并刷成全量权限。
+	super, err := store.GetRoleByName(RoleSuperAdmin)
+	if errors.Is(err, ErrAdminNotFound) {
+		super = &Role{Name: RoleSuperAdmin, Description: "超级管理员（全部权限）"}
+		if err := store.CreateRole(super); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := store.SetRolePermissions(super.ID, allPermKeys()); err != nil {
+		return err
+	}
+
+	// 2. 默认三角色中的 admin（运营/只读操作员）仅在不存在时创建，避免覆盖后续自定义。
 	defs := []struct {
-		name string
-		desc string
+		name  string
+		desc  string
 		perms []string
 	}{
-		{RoleSuperAdmin, "超级管理员（全部权限）", allPermKeys()},
 		{RoleAdmin, "运营管理员（不含系统管理）", []string{
 			PermDashboardView, PermUserRead, PermUserWrite,
 			PermSymbolRead, PermSymbolWrite, PermChainRead, PermChainWrite,
@@ -382,25 +393,41 @@ func SeedBootstrap(store AdminStore, bootstrapUsername, bootstrapHash string) er
 		}},
 	}
 	for _, d := range defs {
-		r := &Role{Name: d.name, Description: d.desc}
-		if err := store.CreateRole(r); err != nil {
-			return err
-		}
-		if err := store.SetRolePermissions(r.ID, d.perms); err != nil {
+		if _, err := store.GetRoleByName(d.name); errors.Is(err, ErrAdminNotFound) {
+			r := &Role{Name: d.name, Description: d.desc}
+			if err := store.CreateRole(r); err != nil {
+				return err
+			}
+			if err := store.SetRolePermissions(r.ID, d.perms); err != nil {
+				return err
+			}
+		} else if err != nil {
 			return err
 		}
 	}
-	super, err := store.GetRoleByName(RoleSuperAdmin)
+
+	// 3. 确保 bootstrap 管理员账户存在，且始终归属 super_admin（自愈角色漂移）。
+	acc, err := store.GetAccountByUsername(bootstrapUsername)
+	if errors.Is(err, ErrAdminNotFound) {
+		acc = &AdminAccount{
+			Username:     bootstrapUsername,
+			PasswordHash: bootstrapHash,
+			Status:       AdminStatusActive,
+			RoleID:       super.ID,
+		}
+		return store.CreateAccount(acc)
+	}
 	if err != nil {
 		return err
 	}
-	acc := &AdminAccount{
-		Username:     bootstrapUsername,
-		PasswordHash: bootstrapHash,
-		Status:       AdminStatusActive,
-		RoleID:       super.ID,
+	if acc.RoleID != super.ID || acc.Status != AdminStatusActive {
+		acc.RoleID = super.ID
+		acc.Status = AdminStatusActive
+		if err := store.UpdateAccount(acc); err != nil {
+			return err
+		}
 	}
-	return store.CreateAccount(acc)
+	return nil
 }
 
 // allPermKeys 返回权限字典中的全部 key（供超级管理员角色使用）。
