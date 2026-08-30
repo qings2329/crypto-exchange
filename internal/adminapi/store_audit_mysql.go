@@ -79,14 +79,14 @@ func (s *mysqlAuditStore) Append(e AuditEntry) error {
 	return nil
 }
 
-func (s *mysqlAuditStore) List(limit, offset int) ([]AuditEntry, int64, error) {
+func (s *mysqlAuditStore) List(limit, offset int, f AuditFilter) ([]AuditEntry, int64, error) {
+	where, args := auditWhere(f)
 	var total int64
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM ce_admin_audit_logs`).Scan(&total); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM ce_admin_audit_logs`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	query := `SELECT id, admin_id, method, path, action, target, status, detail, ip, time
-		FROM ce_admin_audit_logs ORDER BY time DESC, id DESC`
-	args := []interface{}{}
+		FROM ce_admin_audit_logs` + where + ` ORDER BY time DESC, id DESC`
 	if limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, limit)
@@ -109,4 +109,40 @@ func (s *mysqlAuditStore) List(limit, offset int) ([]AuditEntry, int64, error) {
 		out = append(out, e)
 	}
 	return out, total, rows.Err()
+}
+
+// auditWhere 根据过滤条件构造 WHERE 子句与参数（无过滤时返回空字符串）。
+func auditWhere(f AuditFilter) (string, []interface{}) {
+	conds := []string{}
+	args := []interface{}{}
+	if f.Action != "" {
+		conds = append(conds, "action = ?")
+		args = append(args, f.Action)
+	}
+	if f.Method != "" {
+		conds = append(conds, "method = ?")
+		args = append(args, f.Method)
+	}
+	if f.AdminID > 0 {
+		conds = append(conds, "admin_id = ?")
+		args = append(args, f.AdminID)
+	}
+	if f.Keyword != "" {
+		conds = append(conds, "(path LIKE ? OR target LIKE ? OR method LIKE ?)")
+		kw := "%" + f.Keyword + "%"
+		args = append(args, kw, kw, kw)
+	}
+	if len(conds) == 0 {
+		return "", nil
+	}
+	return " WHERE " + joinConds(conds), args
+}
+
+// joinConds 以 AND 连接过滤条件。
+func joinConds(conds []string) string {
+	out := conds[0]
+	for _, c := range conds[1:] {
+		out += " AND " + c
+	}
+	return out
 }

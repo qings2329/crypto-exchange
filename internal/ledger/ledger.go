@@ -1530,6 +1530,24 @@ func (l *Ledger) WithdrawAddressCount() int {
 
 // isWithdrawAddressAllowedLocked 在已持锁时判断某地址是否已可用于提现（已登记+已验证+过
 // 验证冷静期）。调用方须在 RequestWithdrawHold 等持锁上下文中复用，避免重复加锁死锁。
+// SeedVerifiedWithdrawAddress 演示种子里登记一个「已验证且已过验证期」的提现地址，
+// 使种子提现 hold 能立即通过白名单校验（跳过新增地址的验证冷静期等待）。
+func (l *Ledger) SeedVerifiedWithdrawAddress(userID int64, asset, chain, address string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.withdrawAddressBook[userID] == nil {
+		l.withdrawAddressBook[userID] = map[string]*WithdrawAddress{}
+	}
+	l.withdrawAddressBook[userID][addrBookKey(asset, chain, address)] = &WithdrawAddress{
+		UserID:      userID,
+		Asset:       asset,
+		Chain:       chain,
+		Address:     address,
+		Verified:    true,
+		VerifyUntil: time.Now().Add(-time.Minute),
+	}
+}
+
 func (l *Ledger) isWithdrawAddressAllowedLocked(userID int64, asset, chain, address string) bool {
 	inner, ok := l.withdrawAddressBook[userID]
 	if !ok {

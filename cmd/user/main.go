@@ -44,6 +44,36 @@ func main() {
 	svc := user.NewService(store, verifier, user.NewLogNotifier(), notifSvc, user.Config{})
 	h := user.NewHandler(svc, verifier)
 
+	// 演示用户种子：仅纯内存（无 MySQL）部署时注入若干测试账号，供管理后台「用户管理」列表/详情展示。
+	// DSN 存在时走真实 MySQL，不注入，避免污染生产数据。
+	if cfg.MySQL.DSN == "" {
+		demoUsers := []struct {
+			email  string
+			status user.Status
+			kyc    user.KYCLevel
+		}{
+			{"alice@test.com", user.StatusNormal, user.KYCVerified},
+			{"bob@test.com", user.StatusNormal, user.KYCPending},
+			{"u123@test.com", user.StatusNormal, user.KYCNone},
+			{"carol@test.com", user.StatusFrozen, user.KYCRejected},
+			{"dave@test.com", user.StatusNormal, user.KYCVerified},
+		}
+		for _, du := range demoUsers {
+			id, err := svc.AdminCreate(du.email, "test#Pwd123")
+			if err != nil {
+				if err != user.ErrUserExists {
+					log.Warn("seed demo user failed", zap.Error(err))
+				}
+				continue
+			}
+			st, kyc := du.status, du.kyc
+			if uerr := svc.AdminUpdate(id, user.AdminUpdateInput{Status: &st, KYCLevel: &kyc}); uerr != nil {
+				log.Warn("seed demo user update failed", zap.Int64("id", id), zap.Error(uerr))
+			}
+		}
+		log.Info("seeded demo users (in-memory mode)")
+	}
+
 	// 公告模块：与用户模块共用同一数据库（同一份 ce_schema_migrations，版本号已错开）。
 	// 优先 MySQL；DSN 缺失则降级为内存实现（重启即丢，仅开发用）。
 	var aStore announcement.Store

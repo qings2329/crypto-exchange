@@ -57,12 +57,46 @@ func main() {
 		dsn = cfg.MySQL.DSN
 	}
 
-	// 演示种子充值：经链上充值（复式记账）预置 USDT，使账本从创世起即全局平衡（对账巡检不误报）。
-	seedDemo := func() {
-		for _, uid := range []int64{1, 2, 3, 4} {
-			_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
+	// seedWithdrawHoldsDemo 预置若干提现 hold：先登记「已验证且已过验证期」的地址，再发起提现。
+	// 金额、地址均为演示假数据（纯内存部署专用）。
+	seedWithdrawHoldsDemo := func() {
+		usdt := settlement.AssetDecimalsByName("USDT")
+		type wh struct {
+			uid  int64
+			amt  float64
+			addr string
+			chain string
+		}
+		demo := []wh{
+			{1, 150000, "TSeededWithdrawAddrUser100000000001", "TRON"},
+			{2, 45000, "0xSeededWithdrawAddrUser200000000002", "ETH"},
+			{3, 30000, "TSeededWithdrawAddrUser300000000003", "TRON"},
+			{4, 60000, "1SeededWithdrawAddrUser40000000004", "BTC"},
+		}
+		for _, d := range demo {
+			ledgerSvc.SeedVerifiedWithdrawAddress(d.uid, "USDT", d.chain, d.addr)
+			if _, _, err := ledgerSvc.RequestWithdrawHold(
+				d.uid, "USDT",
+				settlement.AssetAmountFromFloat(d.amt, usdt),
+				settlement.AssetAmountFromFloat(5, usdt),
+				d.chain, d.addr,
+			); err != nil {
+				log.Warn("seed withdraw hold failed", zap.Int64("uid", d.uid), zap.Error(err))
+			}
 		}
 	}
+
+	// 演示种子充值：经链上充值（复式记账）预置 USDT，使账本从创世起即全局平衡（对账巡检不误报）。
+	// 同时登记已验证提现地址并发起若干演示提现 hold，供管理后台「充提币记录 / 大额提现人工审核」展示测试。
+	seedDemo := func() {
+		for _, uid := range []int64{1, 2, 3, 4} {
+			_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(300000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
+		}
+		seedWithdrawHoldsDemo()
+	}
+
+	// 种子标记：仅在纯内存/无快照路径播种（含账户充值、提现 hold 与链上充值网关挂起单）。
+	seeded := false
 
 	// 持久化恢复：若配置了 MySQL DSN，优先从库加载——跨进程生命周期保留坏账限制、
 	// 余额、治理提案与风控事件；加载成功跳过种子充值。库无快照行或连接失败均回退到种子。
@@ -75,14 +109,17 @@ func main() {
 			} else {
 				log.Info("no ledger snapshot in mysql, seeding demo", zap.String("dsn", dsn))
 				seedDemo()
+				seeded = true
 			}
 		} else {
 			log.Warn("ledger mysql load failed, falling back to seed deposit",
 				zap.String("dsn", dsn), zap.Error(lerr))
 			seedDemo()
+			seeded = true
 		}
 	} else {
 		seedDemo()
+		seeded = true
 	}
 
 	// 风控服务：与 cmd/risk 共享同一 MySQL 的 ce_risk_* 表（进程内依赖 risk 库），
@@ -122,6 +159,11 @@ func main() {
 	// matchingURL 指向 cmd/matching 服务，撮合收敛为单一权威（见 DEVELOPMENT_TASKS §18）。
 	server := futuresapi.NewServer(ledgerSvc, log, cfg, dsn, cfg.Matching.URL, cfg.Oracle, cfg.Settlement.ChainRPC, riskSvc, cfg.Services["user"])
 	defer server.Close()
+
+	// 演示充值记录：链上充值网关为内存挂起单（不参与账本快照持久化），仅在种子路径注入。
+	if seeded {
+		server.SeedDemoDeposits()
+	}
 
 	// 进程退出前持久化账本状态到 MySQL（正常返回或 Ctrl+C/kill 触发），保证资金安全态不丢失。
 	// 配置了 DSN 才落库；未配置则跳过（纯内存演示）。Go 的 defer 在收到信号被终止时不会执行，

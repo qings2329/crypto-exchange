@@ -604,7 +604,7 @@ func (s *Server) listDeposits(c *gin.Context) {
 					Amount: d.Amount,
 					TxHash: d.TxHash,
 					Status: d.Status,
-					Time:   time.Unix(d.CreatedAt, 0),
+					Time:   time.Unix(d.CreatedAt/1e9, d.CreatedAt%1e9), // futures created_at 为纳秒
 				}
 				if (userID == 0 || dep.UserID == userID) &&
 					(coin == "" || dep.Coin == coin) &&
@@ -1195,46 +1195,38 @@ func (s *Server) accrueWealth(c *gin.Context) {
 
 func (s *Server) listPendingWithdrawals(c *gin.Context) {
 	limit, offset := parsePage(c)
-	// 复用 listWithdrawals 逻辑，只取 pending 状态的记录
 	base := s.serviceURL("futures")
 	if base == "" {
 		s.ok(c, gin.H{"items": []gin.H{}, "total": 0})
 		return
 	}
+	// 复用 listWithdrawals 的数据源（futures holds），只取未终态（非已放行/已拒绝）的记录。
+	// 此前误用 withdrawals 键并对原始 JSON 的 status 字符串做 == "pending" 过滤，
+	// 而 futures holds 用 finalized/cancelled 布尔表示状态，导致该页恒为空（已修复）。
+	var resp futuresHolds
 	ctx := c.Request.Context()
-	var resp struct {
-		Withdrawals []Withdrawal `json:"withdrawals"`
-		Total       int          `json:"total"`
-	}
 	if err := s.up.Get(ctx, base, "/api/v1/futures/wallet/withdraw/holds", &resp); err != nil {
 		s.ok(c, gin.H{"items": []gin.H{}, "total": 0})
 		return
 	}
-	pending := make([]gin.H, 0)
-	for _, w := range resp.Withdrawals {
-		if w.Status == "pending" {
-			pending = append(pending, gin.H{
-				"id":           w.ID,
-				"user_id":      w.UserID,
-				"coin":         w.Coin,
-				"amount":       w.Amount,
-				"chain":        w.Chain,
-				"address":      w.Address,
-				"submitted_at": w.Time.Format(time.RFC3339),
-				"status":       w.Status,
-			})
+	pending := make([]gin.H, 0, len(resp.Holds))
+	for _, h := range resp.Holds {
+		if h.Finalized || h.Cancelled {
+			continue
 		}
+		pending = append(pending, gin.H{
+			"id":           h.ID,
+			"user_id":      h.UserID,
+			"coin":         h.Asset,
+			"amount":       h.Amount,
+			"chain":        h.Chain,
+			"address":      h.Address,
+			"submitted_at": h.CreatedAt.Format(time.RFC3339),
+			"status":       "pending",
+		})
 	}
-		start := offset
-		if start > len(pending) {
-			start = len(pending)
-		}
-		end := start + limit
-		if end > len(pending) {
-			end = len(pending)
-		}
-		page := pending[start:end]
-		s.ok(c, gin.H{"items": page, "total": len(pending)})
+	page, total := paginate(pending, limit, offset)
+	s.ok(c, gin.H{"items": page, "total": total})
 }
 
 func (s *Server) getWithdrawalDetail(c *gin.Context) {

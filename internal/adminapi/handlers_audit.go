@@ -52,10 +52,19 @@ func (s *Server) auditMiddleware() gin.HandlerFunc {
 }
 
 // handleAuditLogs 返回审计日志分页列表（按时间倒序）。需 audit:read 权限。
+// 支持过滤：action（操作类型）、method（HTTP 方法）、admin_id（操作人）、keyword（路由/目标关键词）。
 func (s *Server) handleAuditLogs(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	offset, _ := strconv.Atoi(c.Query("offset"))
-	logs, total, err := s.auditStore.List(limit, offset)
+	f := AuditFilter{
+		Action:  c.Query("action"),
+		Method:  c.Query("method"),
+		Keyword: c.Query("keyword"),
+	}
+	if aid, _ := strconv.ParseInt(c.Query("admin_id"), 10, 64); aid > 0 {
+		f.AdminID = aid
+	}
+	logs, total, err := s.auditStore.List(limit, offset, f)
 	if err != nil {
 		response.Error(c, http.StatusInternalServerError, 500, err.Error())
 		return

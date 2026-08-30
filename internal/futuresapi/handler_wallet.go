@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -254,6 +255,33 @@ func (s *Server) handleDeposits(c *gin.Context) {
 		}
 	}
 	response.JSON(c, gin.H{"deposits": out})
+}
+
+// SeedDemoDeposits 演示种子：向链上充值网关提交若干挂起充值记录，
+// 使管理后台「充提币记录」页面在纯内存部署下有可展示的测试数据。
+func (s *Server) SeedDemoDeposits() {
+	type dep struct {
+		uid   int64
+		asset string
+		chain settlement.Chain
+		amt   float64
+	}
+	demo := []dep{
+		{1, "USDT", settlement.ChainTRON, 25000},
+		{2, "USDT", settlement.ChainETH, 10000},
+		{3, "BTC", settlement.ChainBTC, 0.5},
+		{4, "ETH", settlement.ChainETH, 12.25},
+	}
+	for _, d := range demo {
+		amt, err := settlement.AssetAmountFromFloatSafe(d.amt, settlement.AssetDecimals(d.chain, d.asset))
+		if err != nil {
+			continue
+		}
+		addr := settlement.GenerateAddress(d.uid, d.chain)
+		if _, err := s.chainGateway.SubmitDeposit(d.uid, d.asset, d.chain, amt, addr); err != nil {
+			s.log.Error("seed deposit failed", zap.Error(err))
+		}
+	}
 }
 
 // handleDepositReorg 孤块重组回滚入口（演示用）。
