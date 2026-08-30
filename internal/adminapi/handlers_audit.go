@@ -19,9 +19,13 @@ func (s *Server) auditMiddleware() gin.HandlerFunc {
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead {
 			return
 		}
-		// 仅记录成功操作（2xx 状态码）
+		// 仅记录成功操作（2xx 状态码），跳过 MFA 绑定初始化（setup 不记审计）
 		status := c.Writer.Status()
 		if status < 200 || status >= 300 {
+			return
+		}
+		// MFA setup 是准备阶段，不产生实际变更，不记审计
+		if c.Request.URL.Path == "/api/admin/mfa/setup" {
 			return
 		}
 		uid, _ := middleware.UserID(c)

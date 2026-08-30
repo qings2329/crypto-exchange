@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/binary"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -96,14 +97,9 @@ func decodeTOTPSecret(secret string) ([]byte, error) {
 
 // OTPAuthURI 生成 otpauth:// 标准 URI（供前端生成二维码，Google Authenticator 扫码即用）。
 func OTPAuthURI(issuer, account, secret string) string {
-	issuer = urlEncode(issuer)
-	account = urlEncode(account)
+	issuer = url.QueryEscape(issuer)
+	account = url.QueryEscape(account)
 	return fmt.Sprintf("otpauth://totp/%s:%s?secret=%s&issuer=%s&period=%d&digits=%d&algorithm=SHA1",
 		issuer, account, strings.ToUpper(secret), issuer, totpStep, totpDigits)
 }
 
-// urlEncode 对 otpauth URI 的标签做最小转义（空格->%20，避免破坏 URI）。
-func urlEncode(s string) string {
-	r := strings.NewReplacer(" ", "%20", "&", "%26", "=", "%3D", "?", "%3F", "#", "%23")
-	return r.Replace(s)
-}
