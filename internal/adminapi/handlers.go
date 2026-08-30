@@ -1126,7 +1126,72 @@ func (s *Server) rejectKyc(c *gin.Context) {
 	s.ok(c, out)
 }
 
-// --- 大额提现人工审核 ---
+// --- 理财资管管理 ---
+
+func (s *Server) listWealthProducts(c *gin.Context) {
+	base := s.serviceURL("wealth")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "wealth service not configured")
+		return
+	}
+	ctx := c.Request.Context()
+	var resp gin.H
+	if err := s.up.Get(ctx, base, "/api/v1/wealth/products", &resp); err != nil {
+		s.fail(c, http.StatusBadGateway, "wealth products failed: "+err.Error())
+		return
+	}
+	s.ok(c, resp)
+}
+
+func (s *Server) createWealthProduct(c *gin.Context) {
+	base := s.serviceURL("wealth")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "wealth service not configured")
+		return
+	}
+	ctx := c.Request.Context()
+	var body any
+	if err := c.ShouldBindJSON(&body); err != nil {
+		s.fail(c, http.StatusBadRequest, "invalid body")
+		return
+	}
+	var out gin.H
+	if err := s.up.Post(ctx, base, "/api/v1/wealth/products", &out, body); err != nil {
+		s.fail(c, http.StatusBadGateway, "wealth create failed: "+err.Error())
+		return
+	}
+	s.ok(c, out)
+}
+
+func (s *Server) listWealthHoldings(c *gin.Context) {
+	base := s.serviceURL("wealth")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "wealth service not configured")
+		return
+	}
+	ctx := c.Request.Context()
+	var resp gin.H
+	if err := s.up.Get(ctx, base, "/api/v1/wealth/admin/holdings", &resp); err != nil {
+		s.fail(c, http.StatusBadGateway, "wealth holdings failed: "+err.Error())
+		return
+	}
+	s.ok(c, resp)
+}
+
+func (s *Server) accrueWealth(c *gin.Context) {
+	base := s.serviceURL("wealth")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "wealth service not configured")
+		return
+	}
+	ctx := c.Request.Context()
+	var out gin.H
+	if err := s.up.Post(ctx, base, "/api/v1/wealth/admin/accrue", &out, nil); err != nil {
+		s.fail(c, http.StatusBadGateway, "wealth accrue failed: "+err.Error())
+		return
+	}
+	s.ok(c, out)
+}
 
 func (s *Server) listPendingWithdrawals(c *gin.Context) {
 	limit, offset := parsePage(c)
