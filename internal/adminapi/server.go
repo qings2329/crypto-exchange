@@ -160,6 +160,7 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		admin.PUT("/users/:id", s.updateUser)
 		admin.POST("/users/:id/freeze", s.freezeUser)
 		admin.POST("/users/:id/unfreeze", s.unfreezeUser)
+		admin.GET("/users/:id/balances", s.getUserBalances)
 
 		// 交易对/参数配置（admin 自有持久化）
 		admin.GET("/symbols", s.listSymbols)
