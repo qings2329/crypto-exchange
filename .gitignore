@@ -19,6 +19,7 @@ internal/otc/uploads/
 /otc
 /admin
 /gateway
+/lending
 /market
 /matching
 /notification
@@ -29,6 +30,8 @@ internal/otc/uploads/
 /copytrade
 /user
 /hsm-signing-service
+# 根目录误提交过的二进制（已由 filter-repo 从历史清除，勿再提交）
+crypto-admin
 
 # agent worktree / 会话占位目录（非仓库内容）
 .codebuddy/
