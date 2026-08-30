@@ -29,6 +29,7 @@ type Server struct {
 	adminStore  AdminStore     // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
 	catalog     CatalogStore   // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
 	annH       *announcement.Handler // 公告管理（与用户服务共用同一份 ce_announcements 表与迁移版本 9401）
+	annSvc     *announcement.Service // 公告服务（演示种子注入用）
 	auditStore AuditStore    // 管理员操作审计日志（MySQL 优先，失败回退内存）
 	apiKeyStore  apikeys.Store    // API Key 管理（管理员为任意用户签发/吊销）
 	referralStore referral.Store  // 邀请佣金查询（替代每请求 sql.Open）
@@ -126,6 +127,7 @@ func NewServer(cfg *config.Config) *Server {
 		adminStore:  adminStore,
 		catalog:     catalog,
 		annH:        annH,
+		annSvc:      annSvc,
 		auditStore:  auditStore,
 		apiKeyStore: apiKeyStore,
 		referralStore: referralStore,
@@ -287,4 +289,32 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 邀请佣金管理（直查 ce_referral_commissions 表）
 		admin.GET("/referral/commissions", s.handleAdminReferralCommissions)
 	}
+}
+
+// SeedDemoAnnouncements 演示公告种子：仅纯内存（无 MySQL）部署时注入若干公告，
+// 供管理后台「公告管理」页展示测试。由 cmd/admin 在启动时显式调用（不在 NewServer 内，
+// 以免污染依赖 NewServer 的单元测试所需初始态）。
+func (s *Server) SeedDemoAnnouncements() {
+	if s.annSvc == nil || s.cfg.MySQL.DSN != "" {
+		return
+	}
+	seedDemoAnnouncements(s.annSvc)
+}
+
+// seedDemoAnnouncements 演示公告种子：仅纯内存部署时注入若干公告，避免"公告管理"页为空。
+func seedDemoAnnouncements(annSvc *announcement.Service) {
+	str := func(s string) *string { return &s }
+	active := true
+	demo := []announcement.AnnouncementInput{
+		{Level: str(announcement.LevelMaintenance), Title: str("系统升级通知"), Content: str("为提升服务稳定性，平台将于本周六 02:00-04:00 进行系统升级，期间部分功能可能短暂不可用，敬请谅解。"), Active: &active},
+		{Level: str(announcement.LevelWarning), Title: str("安全提醒"), Content: str("请勿向任何人泄露您的账户密码或验证码，谨防钓鱼网站与冒充客服的诈骗行为。"), Active: &active},
+		{Level: str(announcement.LevelInfo), Title: str("新币上线"), Content: str("平台将上线 ETH/USDT 合约交易对，敬请期待。"), Active: &active},
+		{Level: str(announcement.LevelInfo), Title: str("费率调整说明"), Content: str("自下月起基础费率维持不变，VIP 等级费率权益详见帮助中心。"), Active: &active},
+	}
+	for _, in := range demo {
+		if _, err := annSvc.Create(in); err != nil {
+			log.Printf("[admin] seed demo announcement failed: %v", err)
+		}
+	}
+	log.Printf("[admin] seeded demo announcements (in-memory mode)")
 }

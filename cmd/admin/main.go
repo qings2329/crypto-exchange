@@ -51,6 +51,10 @@ func main() {
 	r.Use(middleware.Common(logger, cfg)...)
 
 	srv := adminapi.NewServer(cfg)
+	// 演示公告种子：纯内存部署时注入若干公告，供「公告管理」页展示测试（不污染 MySQL）。
+	if cfg.MySQL.DSN == "" {
+		srv.SeedDemoAnnouncements()
+	}
 	srv.RegisterRoutes(r)
 
 	addr := cfg.Admin.Addr

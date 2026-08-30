@@ -71,6 +71,31 @@ func main() {
 				log.Warn("seed demo user update failed", zap.Int64("id", id), zap.Error(uerr))
 			}
 		}
+
+		// 额外演示用户走真实 KYC 提交路径（SubmitKYC 会写入 pending 材料），
+		// 使管理后台「KYC 审核」页有待审核记录可展示/通过/驳回。
+		kycApplicants := []struct {
+			email, realName, idType, idNumber string
+		}{
+			{"eve@test.com", "Eve Lin", "id_card", "ID1234567"},
+			{"frank@test.com", "Frank Wu", "passport", "P23456789"},
+			{"grace@test.com", "Grace Zhang", "driver_license", "D34567890"},
+		}
+		for _, k := range kycApplicants {
+			id, err := svc.AdminCreate(k.email, "test#Pwd123")
+			if err != nil {
+				if err != user.ErrUserExists {
+					log.Warn("seed kyc applicant failed", zap.Error(err))
+				}
+				continue
+			}
+			if serr := svc.SubmitKYC(id, user.KYCRequest{
+				RealName: k.realName, IDType: k.idType, IDNumber: k.idNumber,
+				DocFront: "https://demo.example.com/doc/front.png", DocBack: "https://demo.example.com/doc/back.png",
+			}); serr != nil {
+				log.Warn("seed kyc submit failed", zap.Int64("id", id), zap.Error(serr))
+			}
+		}
 		log.Info("seeded demo users (in-memory mode)")
 	}
 
