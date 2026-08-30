@@ -2,7 +2,6 @@
 BLOCKED=(
   "configs/config.yaml"
   "configs/config.dev.yaml"
-  "configs/configs/"
   "crypto-admin"
 )
 
