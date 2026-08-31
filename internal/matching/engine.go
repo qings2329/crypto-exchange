@@ -201,8 +201,17 @@ func (e *Engine) Cancel(symbol string, orderID int64) bool {
 		if m, ok := e.orders[orderID]; ok {
 			m.Status = OrderCanceled
 			m.UpdatedAt = time.Now().UnixNano()
+			pm := m.toPersisted()
+			e.ordersMu.Unlock()
+			// best-effort 持久化撤单状态（重启后仍可见 canceled 历史）。
+			if e.store != nil {
+				if err := e.store.UpsertOrder(context.Background(), pm); err != nil {
+					log.Printf("[matching] persist order(cancel) failed (id %d): %v", orderID, err)
+				}
+			}
+		} else {
+			e.ordersMu.Unlock()
 		}
-		e.ordersMu.Unlock()
 		return true
 	}
 	return false
@@ -298,11 +307,11 @@ func (e *Engine) SetMarkPrice(symbol string, price Fixed) []Trade {
 // registerOrder 登记一笔订单到登记表（幂等：已存在则跳过）。
 func (e *Engine) registerOrder(o *Order, symbol string, now int64) {
 	e.ordersMu.Lock()
-	defer e.ordersMu.Unlock()
 	if _, ok := e.orders[o.ID]; ok {
+		e.ordersMu.Unlock()
 		return
 	}
-	e.orders[o.ID] = &orderMeta{
+	m := &orderMeta{
 		ID:          o.ID,
 		UserID:      o.UserID,
 		Symbol:      symbol,
@@ -318,13 +327,24 @@ func (e *Engine) registerOrder(o *Order, symbol string, now int64) {
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
+	e.orders[o.ID] = m
 	e.userOrders[o.UserID] = append(e.userOrders[o.UserID], o.ID)
+	e.ordersMu.Unlock()
+	// best-effort 持久化新订单（重启后可经 Recover 重建历史）。
+	if e.store != nil {
+		if err := e.store.UpsertOrder(context.Background(), m.toPersisted()); err != nil {
+			log.Printf("[matching] persist order(register) failed (id %d): %v", o.ID, err)
+		}
+	}
 }
 
 // applyTrades 在撮合完成后更新订单状态并登记成交流水。
 // trades 为本笔 taker 订单产生的成交；maker 侧的 FilledQty 按 MakerOID 累加。
+// 同时 best-effort 将成交与订单状态变更持久化（接入 Store 时），供重启后恢复。
 func (e *Engine) applyTrades(symbol string, taker *Order, trades []Trade) {
 	now := time.Now().UnixNano()
+	var persistTrades []PersistedTrade
+	var persistOrders []PersistedOrder
 	e.ordersMu.Lock()
 	for _, t := range trades {
 		e.tradeSeq++
@@ -346,12 +366,14 @@ func (e *Engine) applyTrades(symbol string, taker *Order, trades []Trade) {
 		e.trades = append(e.trades, rec)
 		e.userTrades[t.TakerID] = append(e.userTrades[t.TakerID], rec.Seq)
 		e.userTrades[t.MakerID] = append(e.userTrades[t.MakerID], rec.Seq)
+		persistTrades = append(persistTrades, rec.toPersisted())
 		if m, ok := e.orders[t.MakerOID]; ok {
 			m.FilledQty = m.FilledQty.Add(t.Qty)
 			if m.FilledQty.Cmp(m.Qty) >= 0 {
 				m.Status = OrderFilled
 			}
 			m.UpdatedAt = now
+			persistOrders = append(persistOrders, m.toPersisted())
 		}
 	}
 	if tm, ok := e.orders[taker.ID]; ok {
@@ -369,8 +391,22 @@ func (e *Engine) applyTrades(symbol string, taker *Order, trades []Trade) {
 			tm.Status = OrderCanceled
 		}
 		tm.UpdatedAt = now
+		persistOrders = append(persistOrders, tm.toPersisted())
 	}
 	e.ordersMu.Unlock()
+	// best-effort 持久化：失败仅记日志，不阻断撮合（与 WAL 同策略）。
+	if e.store != nil {
+		for _, pt := range persistTrades {
+			if err := e.store.AppendTrade(context.Background(), pt); err != nil {
+				log.Printf("[matching] persist trade failed (seq %d): %v", pt.Seq, err)
+			}
+		}
+		for _, po := range persistOrders {
+			if err := e.store.UpsertOrder(context.Background(), po); err != nil {
+				log.Printf("[matching] persist order failed (id %d): %v", po.ID, err)
+			}
+		}
+	}
 }
 
 // bookHasOrder 回报指定交易对订单簿中是否仍挂有该订单 ID（判断 taker 是否留挂单）。
@@ -540,6 +576,84 @@ func (r *tradeRecord) toView() TradeView {
 	}
 }
 
+// toPersisted 转为可持久化成交流水。
+func (r *tradeRecord) toPersisted() PersistedTrade {
+	return PersistedTrade{
+		Seq:       r.Seq,
+		Symbol:    r.Symbol,
+		Market:    r.Market,
+		IsMargin:  r.IsMargin,
+		Leverage:  r.Leverage,
+		Price:     r.Price,
+		Qty:       r.Qty,
+		TakerID:   r.TakerID,
+		MakerID:   r.MakerID,
+		TakerSide: r.TakerSide,
+		TakerOID:  r.TakerOID,
+		MakerOID:  r.MakerOID,
+		Time:      r.Time,
+	}
+}
+
+// persistedToTradeRecord 由持久化记录还原内存成交条目。
+func persistedToTradeRecord(p PersistedTrade) tradeRecord {
+	return tradeRecord{
+		Seq:       p.Seq,
+		Symbol:    p.Symbol,
+		Market:    p.Market,
+		IsMargin:  p.IsMargin,
+		Leverage:  p.Leverage,
+		Price:     p.Price,
+		Qty:       p.Qty,
+		TakerID:   p.TakerID,
+		MakerID:   p.MakerID,
+		TakerSide: p.TakerSide,
+		TakerOID:  p.TakerOID,
+		MakerOID:  p.MakerOID,
+		Time:      p.Time,
+	}
+}
+
+// toPersisted 转为可持久化订单登记。
+func (m *orderMeta) toPersisted() PersistedOrder {
+	return PersistedOrder{
+		ID:          m.ID,
+		UserID:      m.UserID,
+		Symbol:      m.Symbol,
+		Market:      m.Market,
+		IsMargin:    m.IsMargin,
+		Leverage:    m.Leverage,
+		Side:        m.Side,
+		Price:       m.Price,
+		Qty:         m.Qty,
+		FilledQty:   m.FilledQty,
+		TimeInForce: m.TimeInForce,
+		Status:      m.Status,
+		CreatedAt:   m.CreatedAt,
+		UpdatedAt:   m.UpdatedAt,
+	}
+}
+
+// persistedToOrderMeta 由持久化记录还原内存订单登记。
+func persistedToOrderMeta(p PersistedOrder) *orderMeta {
+	return &orderMeta{
+		ID:          p.ID,
+		UserID:      p.UserID,
+		Symbol:      p.Symbol,
+		Market:      p.Market,
+		IsMargin:    p.IsMargin,
+		Leverage:    p.Leverage,
+		Side:        p.Side,
+		Price:       p.Price,
+		Qty:         p.Qty,
+		FilledQty:   p.FilledQty,
+		TimeInForce: p.TimeInForce,
+		Status:      p.Status,
+		CreatedAt:   p.CreatedAt,
+		UpdatedAt:   p.UpdatedAt,
+	}
+}
+
 // Depth 获取某交易对深度快照。
 func (e *Engine) Depth(symbol string) (bids, asks []Level, ok bool) {
 	e.mu.RLock()
@@ -605,8 +719,46 @@ func (e *Engine) Recover(ctx context.Context) error {
 			return err
 		}
 	}
-	// 重建 open 订单登记（历史 filled/canceled 与成交流水重启丢失，原型限制）。
+	// 重建 open 订单登记（来自当前订单簿，open 状态以簿为权威）。
 	e.rebuildOrderIndex()
+
+	// 成交流水：从持久层全量加载，重建 e.trades / e.userTrades / e.tradeSeq。
+	// 先清空内存流水（避免 reset+recover 同进程内重复累加），再以持久层为权威历史。
+	if e.store != nil {
+		if pts, lerr := e.store.LoadTrades(ctx); lerr == nil {
+			e.ordersMu.Lock()
+			e.trades = e.trades[:0]
+			e.userTrades = make(map[int64][]int64)
+			for _, pt := range pts {
+				rec := persistedToTradeRecord(pt)
+				e.trades = append(e.trades, rec)
+				e.userTrades[rec.TakerID] = append(e.userTrades[rec.TakerID], rec.Seq)
+				e.userTrades[rec.MakerID] = append(e.userTrades[rec.MakerID], rec.Seq)
+				if rec.Seq > e.tradeSeq {
+					e.tradeSeq = rec.Seq
+				}
+			}
+			e.ordersMu.Unlock()
+		} else {
+			log.Printf("[matching] load trades failed: %v", lerr)
+		}
+		// 订单登记：加载持久化订单，仅补登记「不在当前订单簿（已离场）」的订单，
+		// 使 ListOrders 在重启后仍返回完整的 filled/canceled/partial 历史。
+		if pos, lerr := e.store.LoadOrders(ctx); lerr == nil {
+			e.ordersMu.Lock()
+			for _, po := range pos {
+				if _, ok := e.orders[po.ID]; ok {
+					continue // 已在簿上：以订单簿状态（open）为准，不覆盖
+				}
+				m := persistedToOrderMeta(po)
+				e.orders[po.ID] = m
+				e.userOrders[po.UserID] = append(e.userOrders[po.UserID], po.ID)
+			}
+			e.ordersMu.Unlock()
+		} else {
+			log.Printf("[matching] load orders failed: %v", lerr)
+		}
+	}
 	log.Printf("[matching] recovered from snapshot@%d + %d wal events", version, len(events))
 	return nil
 }

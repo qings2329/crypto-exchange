@@ -10,10 +10,11 @@ import (
 )
 
 // TestNewFromConfigStatic：static 类型喂价源直接生效，聚合为均值。
+// 使用不在 DefaultDemoPrices 中的交易对，避免 demo 兜底源干扰断言。
 func TestNewFromConfigStatic(t *testing.T) {
 	conf := OracleConf{
 		Feeds: map[string][]FeedSpec{
-			"BTC_USDT": {
+			"SOL_USDT": {
 				{Name: "binance", Type: "static", Price: 50000},
 				{Name: "okx", Type: "static", Price: 50040},
 			},
@@ -23,7 +24,7 @@ func TestNewFromConfigStatic(t *testing.T) {
 	o.Start()
 	defer o.Stop()
 	time.Sleep(20 * time.Millisecond)
-	price, ok := o.IndexPrice("BTC_USDT")
+	price, ok := o.IndexPrice("SOL_USDT")
 	if !ok {
 		t.Fatal("static 配置应返回指数价")
 	}
@@ -77,6 +78,38 @@ func TestNewFromConfigHTTP(t *testing.T) {
 	// 100/101/102 均在中位 101 的 2% 容差内，最终中位 = 101。
 	if math.Abs(price-101) > 1e-6 {
 		t.Fatalf("指数价应≈101，got %v", price)
+	}
+}
+
+// TestNewFromConfigFallbackToDemo：交易对配置了真实源但全部不可达（或为空）时，
+// NewFromConfig 会追加 2 个 demo 静态源作兜底，使聚合仍可产出指数价（MidFeeds=2），
+// 避免 IndexPrice 返回 (0,false) 导致依赖方（结算/强平）跳过。不在 demo 表的交易对
+// 若无有效源则仍返回无价。
+func TestNewFromConfigFallbackToDemo(t *testing.T) {
+	// 场景一：BTC_USDT_PERP 在 DefaultDemoPrices 中，但配置里只有 URL 为空的 http 源
+	// （视为无效、不被加入 feeds），应回退到 demo 兜底样本，聚合出 50000。
+	conf := OracleConf{
+		Feeds: map[string][]FeedSpec{
+			"BTC_USDT_PERP": {
+				{Name: "binance", Type: "http", URL: "", Symbol: "BTCUSDT", Parse: "binance"},
+			},
+		},
+	}
+	o := NewFromConfig(conf)
+	o.Start()
+	defer o.Stop()
+	time.Sleep(20 * time.Millisecond)
+	price, ok := o.IndexPrice("BTC_USDT_PERP")
+	if !ok {
+		t.Fatal("demo 兜底应使 BTC_USDT_PERP 仍产出指数价")
+	}
+	if math.Abs(price-50000) > 1e-6 {
+		t.Fatalf("demo 兜底价应=50000，got %v", price)
+	}
+
+	// 场景二：不在 demo 表的交易对、且无任何有效源，仍应返回无价（不臆造价格）。
+	if _, ok := o.IndexPrice("SOL_USDT"); ok {
+		t.Fatal("不在 demo 表且无源的 SOL_USDT 不应臆造指数价")
 	}
 }
 

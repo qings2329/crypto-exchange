@@ -62,5 +62,31 @@ VALUES (1, '', '1970-01-01 00:00:00', '1970-01-01 00:00:00')
 ON DUPLICATE KEY UPDATE id = id;`,
 			Down: `DROP TABLE IF EXISTS ce_matching_leader;`,
 		},
+		{
+			Version: 204,
+			Name:    "matching_trades",
+			Up: `
+CREATE TABLE IF NOT EXISTS ce_matching_trades (
+    seq        BIGINT       NOT NULL AUTO_INCREMENT,
+    symbol     VARCHAR(32)  NOT NULL,
+    payload    JSON,
+    ts         BIGINT       NOT NULL,
+    PRIMARY KEY (seq),
+    INDEX idx_matching_trades_symbol (symbol)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+			Down: `DROP TABLE IF EXISTS ce_matching_trades;`,
+		},
+		{
+			Version: 205,
+			Name:    "matching_orders",
+			Up: `
+CREATE TABLE IF NOT EXISTS ce_matching_orders (
+    order_id   BIGINT       NOT NULL,
+    payload    JSON,
+    updated_at DATETIME(3)  NOT NULL,
+    PRIMARY KEY (order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
+			Down: `DROP TABLE IF EXISTS ce_matching_orders;`,
+		},
 	}
 }

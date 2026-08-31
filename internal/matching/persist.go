@@ -66,6 +66,57 @@ type Store interface {
 	// IsLeader 报告 node 当前是否为有效 leader（未过期）。
 	IsLeader(ctx context.Context, node string) (bool, error)
 
+	// ---- 成交流水 / 订单登记持久化（重启后历史不丢，见 DEVELOPMENT_TASKS 项2）----
+
+	// AppendTrade 持久化一笔成交（best-effort：调用方不依赖其成功，失败仅记日志）。
+	// seq 由存储后端分配（MySQL 自增 / 内存计数），与引擎内 e.tradeSeq 对齐。
+	AppendTrade(ctx context.Context, t PersistedTrade) error
+	// LoadTrades 返回全部已持久化成交流水（按 Seq 升序）；无记录返回空切片。
+	LoadTrades(ctx context.Context) ([]PersistedTrade, error)
+	// UpsertOrder 持久化/覆盖一笔订单登记（幂等：同 orderID 覆盖最新的状态与成交量）。
+	UpsertOrder(ctx context.Context, o PersistedOrder) error
+	// LoadOrders 返回全部已持久化订单登记（无序；调用方自行按 ID 索引）。
+	LoadOrders(ctx context.Context) ([]PersistedOrder, error)
+
 	// Close 释放底层资源（如 *sql.DB）。
 	Close() error
+}
+
+// PersistedTrade 是成交流水的可持久化视图，字段与引擎内部 tradeRecord 一一对应。
+// 经 Store 持久化后，撮合引擎重启可经 LoadTrades 重建 e.trades / e.userTrades，
+// 消除原「成交流水仅内存、重启即丢」的缺口（futuresapi /orders、/trades 代理此簿）。
+type PersistedTrade struct {
+	Seq       int64  `json:"seq"`
+	Symbol    string `json:"symbol"`
+	Market    string `json:"market"`
+	IsMargin  bool   `json:"is_margin"`
+	Leverage  float64 `json:"leverage"`
+	Price     Fixed  `json:"price"`
+	Qty       Fixed  `json:"qty"`
+	TakerID   int64  `json:"taker_id"`
+	MakerID   int64  `json:"maker_id"`
+	TakerSide Side   `json:"taker_side"`
+	TakerOID  int64  `json:"taker_oid"`
+	MakerOID  int64  `json:"maker_oid"`
+	Time      int64  `json:"time"`
+}
+
+// PersistedOrder 是订单登记表的可持久化视图，字段与引擎内部 orderMeta 一一对应。
+// 用于重启后重建非挂单（filled/canceled/partial 已离场）订单的历史状态，
+// 使 ListOrders 在崩溃恢复后仍返回完整订单生命周期。
+type PersistedOrder struct {
+	ID          int64       `json:"id"`
+	UserID      int64       `json:"user_id"`
+	Symbol      string      `json:"symbol"`
+	Market      string      `json:"market"`
+	IsMargin    bool        `json:"is_margin"`
+	Leverage    float64     `json:"leverage"`
+	Side        Side        `json:"side"`
+	Price       Fixed       `json:"price"`
+	Qty         Fixed       `json:"qty"`
+	FilledQty   Fixed       `json:"filled_qty"`
+	TimeInForce string      `json:"time_in_force"`
+	Status      OrderStatus `json:"status"`
+	CreatedAt   int64       `json:"created_at"`
+	UpdatedAt   int64       `json:"updated_at"`
 }

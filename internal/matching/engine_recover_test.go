@@ -31,6 +31,18 @@ func waitDepth(t *testing.T, e *matching.Engine, symbol string, wantBids, wantAs
 	t.Fatalf("depth not as expected: bids=%d asks=%d (want %d/%d)", len(bids), len(asks), wantBids, wantAsks)
 }
 
+// waitTrades 轮询直到引擎成交流水达到 want 笔（仅测试辅助）。
+func waitTrades(t *testing.T, e *matching.Engine, want int) bool {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		if len(e.ListTrades(0, "", 0)) >= want {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
 func TestSubmitWritesWAL(t *testing.T) {
 	store := persist.NewMemStore()
 	e := matching.NewEngine(nil, nil)
@@ -134,6 +146,60 @@ func TestEngineRecoverReflectsCancel(t *testing.T) {
 	bids, _, ok := e2.Depth("BTC_USDT")
 	if !ok || len(bids) != 0 {
 		t.Fatalf("cancel not reflected after recover: bids=%d ok=%v", len(bids), ok)
+	}
+}
+
+// TestEngineRecoverPersistsTradesAndOrders：成交流水与已离场订单的历史经持久层「重启」后
+// 仍可被恢复（项2：消除原「成交流水仅内存、重启即丢」的缺口）。引擎 A 撮合出成交并持久化，
+// 引擎 B 用同一 Store 恢复，应能看到这笔成交与两笔 filled 订单。
+func TestEngineRecoverPersistsTradesAndOrders(t *testing.T) {
+	store := persist.NewMemStore()
+	ctx := context.Background()
+
+	e1 := matching.NewEngine(nil, nil)
+	e1.UseStore(store, "n1", 0)
+	e1.Register("BTC_USDT")
+
+	// 互撮：买/卖同价同量 → 1 笔成交，双方 filled 离场。
+	buy := &matching.Order{UserID: 1, Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1}
+	sell := &matching.Order{UserID: 2, Side: matching.Sell, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 2}
+	if !e1.Submit("BTC_USDT", buy) || !e1.Submit("BTC_USDT", sell) {
+		t.Fatal("submit failed")
+	}
+	// 等待撮合完成（成交流水出现表示异步 run goroutine 已处理并 applyTrades）。
+	if !waitTrades(t, e1, 1) {
+		t.Fatalf("engine1 should have 1 trade")
+	}
+
+	// 引擎 A「崩溃」，引擎 B 用同一 Store 恢复历史。
+	e2 := matching.NewEngine(nil, nil)
+	e2.UseStore(store, "n2", 0)
+	if err := e2.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 成交流水恢复。
+	trades := e2.ListTrades(0, "", 0)
+	if len(trades) != 1 {
+		t.Fatalf("recovered trades should be 1, got %d", len(trades))
+	}
+	if !approx(trades[0].Price.Float(), 100, 1e-9) {
+		t.Fatalf("recovered trade price wrong: %v", trades[0].Price)
+	}
+	// 按用户维度查询也应命中（userTrades 已恢复）。
+	if ut := e2.ListTrades(1, "", 0); len(ut) != 1 {
+		t.Fatalf("user 1 trades should be 1, got %d", len(ut))
+	}
+
+	// 已离场订单历史恢复（两笔 filled）。
+	orders := e2.ListOrders(0, "", "", 0)
+	if len(orders) != 2 {
+		t.Fatalf("recovered orders should be 2, got %d", len(orders))
+	}
+	for _, o := range orders {
+		if string(o.Status) != "filled" {
+			t.Fatalf("recovered order status should be filled, got %s (id=%d)", o.Status, o.ID)
+		}
 	}
 }
 

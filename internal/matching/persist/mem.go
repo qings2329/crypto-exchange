@@ -16,6 +16,7 @@ import (
 
 // MemStore 内存实现：无持久性，仅用于开发与测试。
 // leader 选举以单 holder + 过期时间模拟；序号以原子计数器模拟。
+// 成交流水 / 订单登记同样以内存切片保存（进程退出即丢，与整体 MemStore 语义一致）。
 type MemStore struct {
 	mu        sync.Mutex
 	orderID   int64
@@ -23,6 +24,8 @@ type MemStore struct {
 	seq       int64
 	snapVer   int64
 	snap      []byte
+	trades    []matching.PersistedTrade
+	orders    map[int64]matching.PersistedOrder
 	leader    string
 	leaderExp time.Time
 }
@@ -155,6 +158,47 @@ func (m *MemStore) IsLeader(ctx context.Context, node string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.leader == node && time.Now().Before(m.leaderExp), nil
+}
+
+// AppendTrade 追加一笔成交流水（内存）。
+func (m *MemStore) AppendTrade(ctx context.Context, t matching.PersistedTrade) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seq++
+	t.Seq = m.seq
+	m.trades = append(m.trades, t)
+	return nil
+}
+
+// LoadTrades 返回内存中所有成交流水（升序，按追加顺序即 seq 序）。
+func (m *MemStore) LoadTrades(ctx context.Context) ([]matching.PersistedTrade, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]matching.PersistedTrade, len(m.trades))
+	copy(out, m.trades)
+	return out, nil
+}
+
+// UpsertOrder 覆盖写入一笔订单登记（同 ID 覆盖）。
+func (m *MemStore) UpsertOrder(ctx context.Context, o matching.PersistedOrder) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.orders == nil {
+		m.orders = make(map[int64]matching.PersistedOrder)
+	}
+	m.orders[o.ID] = o
+	return nil
+}
+
+// LoadOrders 返回内存中所有订单登记。
+func (m *MemStore) LoadOrders(ctx context.Context) ([]matching.PersistedOrder, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]matching.PersistedOrder, 0, len(m.orders))
+	for _, o := range m.orders {
+		out = append(out, o)
+	}
+	return out, nil
 }
 
 // Close 内存实现无需释放。

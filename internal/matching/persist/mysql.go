@@ -199,3 +199,74 @@ func (s *MySQLStore) IsLeader(ctx context.Context, node string) (bool, error) {
 	}
 	return holder == node && time.Now().Before(expires), nil
 }
+
+// AppendTrade 持久化一笔成交到 ce_matching_trades（seq 由自增列分配）。
+func (s *MySQLStore) AppendTrade(ctx context.Context, t matching.PersistedTrade) error {
+	payload, err := json.Marshal(t)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		"INSERT INTO ce_matching_trades (symbol, payload, ts) VALUES (?, ?, ?)",
+		t.Symbol, payload, t.Time)
+	return err
+}
+
+// LoadTrades 返回全部成交流水（按 seq 升序），payload 反序列化为 PersistedTrade。
+func (s *MySQLStore) LoadTrades(ctx context.Context) ([]matching.PersistedTrade, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT seq, payload FROM ce_matching_trades ORDER BY seq ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []matching.PersistedTrade
+	for rows.Next() {
+		var seq int64
+		var payload []byte
+		if err := rows.Scan(&seq, &payload); err != nil {
+			return nil, err
+		}
+		var t matching.PersistedTrade
+		if err := json.Unmarshal(payload, &t); err != nil {
+			return nil, err
+		}
+		t.Seq = seq
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// UpsertOrder 幂等写入/覆盖订单登记到 ce_matching_orders（同 order_id 覆盖）。
+func (s *MySQLStore) UpsertOrder(ctx context.Context, o matching.PersistedOrder) error {
+	payload, err := json.Marshal(o)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO ce_matching_orders (order_id, payload, updated_at) VALUES (?, ?, NOW(3))
+ON DUPLICATE KEY UPDATE payload=VALUES(payload), updated_at=NOW(3)`,
+		o.ID, payload)
+	return err
+}
+
+// LoadOrders 返回全部订单登记，payload 反序列化为 PersistedOrder。
+func (s *MySQLStore) LoadOrders(ctx context.Context) ([]matching.PersistedOrder, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT payload FROM ce_matching_orders")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []matching.PersistedOrder
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var o matching.PersistedOrder
+		if err := json.Unmarshal(payload, &o); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
