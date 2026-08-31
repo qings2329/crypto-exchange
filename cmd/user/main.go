@@ -44,9 +44,10 @@ func main() {
 	svc := user.NewService(store, verifier, user.NewLogNotifier(), notifSvc, user.Config{})
 	h := user.NewHandler(svc, verifier)
 
-	// 演示用户种子：仅纯内存（无 MySQL）部署时注入若干测试账号，供管理后台「用户管理」列表/详情展示。
-	// DSN 存在时走真实 MySQL，不注入，避免污染生产数据。
-	if cfg.MySQL.DSN == "" {
+	// 演示用户种子：无论内存还是连库模式都幂等注入若干测试账号，供管理后台「用户管理」列表/详情展示。
+	// AdminCreate 对已存在的账号返回 ErrUserExists 而被跳过（不重复插入），故连库时数据可持久化、重启不丢；
+	// Status/KYC 仅在新创建后回填，既有账号保持原状态。测试邮箱固定，不会重复产生数据。
+	{
 		demoUsers := []struct {
 			email  string
 			status user.Status
@@ -96,7 +97,7 @@ func main() {
 				log.Warn("seed kyc submit failed", zap.Int64("id", id), zap.Error(serr))
 			}
 		}
-		log.Info("seeded demo users (in-memory mode)")
+		log.Info("seeded demo users (idempotent: existing skipped)")
 	}
 
 	// 公告模块：与用户模块共用同一数据库（同一份 ce_schema_migrations，版本号已错开）。
