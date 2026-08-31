@@ -23,9 +23,11 @@ type UserAssetBalance struct {
 
 // UserBalances 是某用户账户余额聚合视图。
 type UserBalances struct {
-	UserID      int64              `json:"user_id"`
-	Assets      []UserAssetBalance `json:"assets"`
-	TotalAssets float64            `json:"total_assets"`
+	UserID int64              `json:"user_id"`
+	Assets []UserAssetBalance `json:"assets"`
+	// AssetTotals 按资产分别汇总（available+frozen+withdraw_frozen），避免不同币种
+	// 直接相加成无意义的单一数字（跨币种加总在财务上不成立）。
+	AssetTotals map[string]float64 `json:"asset_totals"`
 }
 
 // getUserBalances 代理 futures 钱包，聚合展示某用户的多资产余额（USDT/BTC/ETH 等）。
@@ -65,9 +67,9 @@ func (s *Server) getUserBalances(c *gin.Context) {
 		})
 	}
 
-	total := 0.0
+	assetTotals := make(map[string]float64, len(assets))
 	for _, a := range assets {
-		total += a.Available + a.Frozen + a.WithdrawFrozen
+		assetTotals[a.Asset] = a.Available + a.Frozen + a.WithdrawFrozen
 	}
 
 	if anyErr && len(assets) == 0 {
@@ -77,6 +79,6 @@ func (s *Server) getUserBalances(c *gin.Context) {
 	s.ok(c, UserBalances{
 		UserID:      uid,
 		Assets:      assets,
-		TotalAssets: total,
+		AssetTotals: assetTotals,
 	})
 }

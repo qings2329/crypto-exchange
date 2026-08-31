@@ -21,19 +21,19 @@ import (
 // 读类模块（风控/账本/服务健康/通知）通过 UpstreamClient 实时聚合上游微服务，
 // 上游不可达时优雅降级（返回已获取部分 + notes）。
 type Server struct {
-	cfg         *config.Config
-	verifier    *middleware.TokenVerifier
-	store       *Store
-	up          *UpstreamClient
-	matchClient *client.Client // 直连撮合引擎（cmd/matching），用于跨用户订单管理与撤销
-	adminStore  AdminStore     // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
-	catalog     CatalogStore   // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
-	annH       *announcement.Handler // 公告管理（与用户服务共用同一份 ce_announcements 表与迁移版本 9401）
-	annSvc     *announcement.Service // 公告服务（演示种子注入用）
-	auditStore AuditStore    // 管理员操作审计日志（MySQL 优先，失败回退内存）
-	apiKeyStore  apikeys.Store    // API Key 管理（管理员为任意用户签发/吊销）
-	referralStore referral.Store  // 邀请佣金查询（替代每请求 sql.Open）
-	loginLimiter *loginIPLimiter // 基于 IP 的登录限流（防单 IP 爆破 + 缓解账户锁定 DoS）
+	cfg           *config.Config
+	verifier      *middleware.TokenVerifier
+	store         *Store
+	up            *UpstreamClient
+	matchClient   *client.Client        // 直连撮合引擎（cmd/matching），用于跨用户订单管理与撤销
+	adminStore    AdminStore            // 管理员账户/角色/权限持久化（MySQL 优先，失败回退内存）
+	catalog       CatalogStore          // 交易对/公链/币种/本地通知等管理员自有配置持久化（MySQL 优先，失败回退内存）
+	annH          *announcement.Handler // 公告管理（与用户服务共用同一份 ce_announcements 表与迁移版本 9401）
+	annSvc        *announcement.Service // 公告服务（演示种子注入用）
+	auditStore    AuditStore            // 管理员操作审计日志（MySQL 优先，失败回退内存）
+	apiKeyStore   apikeys.Store         // API Key 管理（管理员为任意用户签发/吊销）
+	referralStore referral.Store        // 邀请佣金查询（替代每请求 sql.Open）
+	loginLimiter  *loginIPLimiter       // 基于 IP 的登录限流（防单 IP 爆破 + 缓解账户锁定 DoS）
 }
 
 // NewServer 装配管理后台服务。verifier 使用全局 auth 共享密钥（与用户 token 同一密钥，
@@ -119,17 +119,17 @@ func NewServer(cfg *config.Config) *Server {
 	}
 
 	return &Server{
-		cfg:         cfg,
-		verifier:    verifier,
-		store:       NewStore(),
-		up:          NewUpstreamClient(selfToken),
-		matchClient: client.New(cfg.Matching.URL),
-		adminStore:  adminStore,
-		catalog:     catalog,
-		annH:        annH,
-		annSvc:      annSvc,
-		auditStore:  auditStore,
-		apiKeyStore: apiKeyStore,
+		cfg:           cfg,
+		verifier:      verifier,
+		store:         NewStore(),
+		up:            NewUpstreamClient(selfToken),
+		matchClient:   client.New(cfg.Matching.URL),
+		adminStore:    adminStore,
+		catalog:       catalog,
+		annH:          annH,
+		annSvc:        annSvc,
+		auditStore:    auditStore,
+		apiKeyStore:   apiKeyStore,
 		referralStore: referralStore,
 		loginLimiter: newLoginIPLimiter(
 			cfg.Admin.LoginRateLimitPerIP,
@@ -183,8 +183,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 充值提币记录（实时聚合 futures 链上事件）
 		admin.GET("/deposits", s.listDeposits)
 		admin.GET("/withdrawals", s.listWithdrawals)
-		admin.GET("/pending-withdrawals", s.listPendingWithdrawals)
-		admin.GET("/withdrawals/:id/detail", s.getWithdrawalDetail)
+		admin.GET("/pending-withdrawals", middleware.RequirePerm(PermFinanceApprove), s.listPendingWithdrawals)
+		admin.GET("/withdrawals/:id/detail", middleware.RequirePerm(PermFinanceApprove), s.getWithdrawalDetail)
 
 		// 用户充值地址（按 userID 在各充值链确定性派生，无持久化）
 		admin.GET("/deposit-addresses", s.listUserDepositAddresses)

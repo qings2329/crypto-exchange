@@ -63,9 +63,9 @@ func main() {
 	seedWithdrawHoldsDemo := func() {
 		usdt := settlement.AssetDecimalsByName("USDT")
 		type wh struct {
-			uid  int64
-			amt  float64
-			addr string
+			uid   int64
+			amt   float64
+			addr  string
 			chain string
 		}
 		demo := []wh{
@@ -101,22 +101,30 @@ func main() {
 
 	// 持久化恢复：若配置了 MySQL DSN，优先从库加载——跨进程生命周期保留坏账限制、
 	// 余额、治理提案与风控事件；加载成功跳过种子充值。库无快照行或连接失败均回退到种子。
+	// 演示种子会在账本预置充值（经链上充值真实入账）。生产环境（配置了 MySQL DSN）
+	// 仅在显式设置 FUTURES_DEMO_SEED=1 时才播种，避免清空/误连空库时意外对账户入账。
+	// 纯内存模式（无 DSN）仍默认播种，便于本地开发演示。
+	demoSeed := os.Getenv("FUTURES_DEMO_SEED") == "1"
 	if dsn != "" {
 		if snap, ok, lerr := ledger.LoadSnapshotFromMySQL(dsn, "futures"); lerr == nil {
 			if ok {
 				ledgerSvc.Restore(snap)
 				log.Info("ledger state restored from mysql", zap.String("dsn", dsn),
 					zap.Int("accounts", len(snap.Accounts)), zap.Int("entries", len(snap.Log)))
-			} else {
-				log.Info("no ledger snapshot in mysql, seeding demo", zap.String("dsn", dsn))
+			} else if demoSeed {
+				log.Info("no ledger snapshot in mysql, seeding demo (FUTURES_DEMO_SEED=1)", zap.String("dsn", dsn))
 				seedDemo()
 				seeded = true
+			} else {
+				log.Warn("no ledger snapshot in mysql and FUTURES_DEMO_SEED not set; skipping demo seed to avoid unintended on-chain credit", zap.String("dsn", dsn))
 			}
-		} else {
-			log.Warn("ledger mysql load failed, falling back to seed deposit",
+		} else if demoSeed {
+			log.Warn("ledger mysql load failed, falling back to seed deposit (FUTURES_DEMO_SEED=1)",
 				zap.String("dsn", dsn), zap.Error(lerr))
 			seedDemo()
 			seeded = true
+		} else {
+			log.Warn("ledger mysql load failed and FUTURES_DEMO_SEED not set; skipping demo seed", zap.String("dsn", dsn), zap.Error(lerr))
 		}
 	} else {
 		seedDemo()
