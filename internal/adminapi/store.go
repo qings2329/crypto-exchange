@@ -41,7 +41,10 @@ type Chain struct {
 	Confirmations   int       `json:"confirmations"`
 	DepositEnabled  bool      `json:"deposit_enabled"`
 	WithdrawEnabled bool      `json:"withdraw_enabled"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	// RpcEndpoint 是链上 RPC 节点地址（含 user:pass@host:port 的完整 URL），
+	// 作为链清结算层连接各公链节点的单一数据源。
+	RpcEndpoint string    `json:"rpc_endpoint"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // Coin 是币种管理视图（归属公链、精度、提币手续费）。

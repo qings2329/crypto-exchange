@@ -97,6 +97,37 @@ func TestCatalogMemCRUD(t *testing.T) {
 	}
 }
 
+// TestCatalogChainRPCEndpoint 验证公链的 rpc_endpoint 字段可写入并回读（内存实现，不依赖 MySQL）。
+func TestCatalogChainRPCEndpoint(t *testing.T) {
+	s := NewMemCatalogStore()
+	ch, err := s.CreateChain(Chain{
+		Name: "Bitcoin", Symbol: "BTC", Confirmations: 3,
+		DepositEnabled: true, WithdrawEnabled: true,
+		RpcEndpoint: "http://rpcuser:rpcpass@127.0.0.1:8332",
+	})
+	if err != nil {
+		t.Fatalf("CreateChain with rpc_endpoint: %v", err)
+	}
+	if ch.RpcEndpoint != "http://rpcuser:rpcpass@127.0.0.1:8332" {
+		t.Fatalf("CreateChain 应保留 rpc_endpoint: %+v", ch)
+	}
+	// 部分更新：仅覆盖 RpcEndpoint。
+	up, err := s.UpdateChain(ch.ID, Chain{RpcEndpoint: "http://other:8332"})
+	if err != nil {
+		t.Fatalf("UpdateChain rpc_endpoint: %v", err)
+	}
+	if up.RpcEndpoint != "http://other:8332" {
+		t.Fatalf("UpdateChain 应写入 rpc_endpoint: %+v", up)
+	}
+	// 列表也应回读最新值。
+	list, _ := s.ListChains()
+	for _, x := range list {
+		if x.ID == ch.ID && x.RpcEndpoint != "http://other:8332" {
+			t.Fatalf("ListChains 应回读 rpc_endpoint: %+v", x)
+		}
+	}
+}
+
 // TestNewCatalogStoreFallback 验证工厂的回退语义：空 DSN 直接内存；
 // 非法/不可达 DSN 连接失败后也回退内存（而非返回 nil），并记录错误。
 func TestNewCatalogStoreFallback(t *testing.T) {
@@ -199,6 +230,15 @@ func TestCatalogMySQLCRUD(t *testing.T) {
 	}
 	if up.Name != "MyChain2" || up.Confirmations != 20 || up.Symbol != "MC" {
 		t.Fatalf("mysql UpdateChain 部分更新不对: %+v", up)
+	}
+	// rpc_endpoint 往返：部分更新写入后，UpdateChain 内部经 GetChain 回读并返回，
+	// 故 up2.RpcEndpoint 即验证了「写 + 读」整条链路。
+	up2, err := store.UpdateChain(ch.ID, Chain{RpcEndpoint: "http://rpcuser:rpcpass@127.0.0.1:8332"})
+	if err != nil {
+		t.Fatalf("mysql UpdateChain rpc_endpoint: %v", err)
+	}
+	if up2.RpcEndpoint != "http://rpcuser:rpcpass@127.0.0.1:8332" {
+		t.Fatalf("mysql UpdateChain rpc_endpoint 应被写入并回读: %+v", up2)
 	}
 	if _, err := store.UpdateChain(999999, Chain{Name: "x"}); !errors.Is(err, ErrCatalogNotFound) {
 		t.Fatalf("mysql 更新不存在的链应返回 ErrCatalogNotFound，实际 %v", err)

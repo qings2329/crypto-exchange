@@ -13,6 +13,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 
+	"github.com/coldlar/crypto-exchange/internal/catalog"
 	"github.com/coldlar/crypto-exchange/internal/futuresapi"
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
@@ -153,6 +154,32 @@ func main() {
 	if riskSvc == nil {
 		riskSvc = risk.New(risk.NewMemStore())
 		log.Info("risk store: in-memory (no MySQL)")
+	}
+
+	// 链上 RPC 端点以数据库 ce_admin_chains.rpc_endpoint 为单一数据源；无 DSN 的纯内存
+	// 演示模式才回退到 config.yaml / 环境变量的 settlement.chain_rpc.endpoints。
+	if dsn != "" {
+		if rdb, rderr := sql.Open("mysql", dsn); rderr == nil {
+			if rpcMap, rerr := catalog.LoadChainRPCEndpoints(rdb); rerr == nil {
+				// 管理后台目录里 Tron 的 symbol 记为 "TRX"，而 settlement 的 Chain 键为 "TRON"，
+				// 此处对齐，避免 TRON 的 RPC 端点被漏配。
+				alias := map[string]string{"TRX": "TRON"}
+				if cfg.Settlement.ChainRPC.Endpoints == nil {
+					cfg.Settlement.ChainRPC.Endpoints = map[string]string{}
+				}
+				for sym, url := range rpcMap {
+					key := sym
+					if k, ok := alias[sym]; ok {
+						key = k
+					}
+					cfg.Settlement.ChainRPC.Endpoints[key] = url
+				}
+				log.Info("rpc endpoints loaded from catalog db", zap.Int("count", len(rpcMap)))
+			} else {
+				log.Warn("load rpc endpoints from db failed, fallback to config", zap.Error(rerr))
+			}
+			_ = rdb.Close()
+		}
 	}
 
 	// 装配合约交易服务（引擎/预言机/网关/资金费循环/账本风控），不含业务逻辑。

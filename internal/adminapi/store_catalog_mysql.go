@@ -17,6 +17,7 @@ const (
 	catalogMigVerChains       = 9302
 	catalogMigVerCoins        = 9303
 	catalogMigVerNotifications = 9304
+	catalogMigVerRPCEndpoint  = 9305
 )
 
 // CatalogMigrations 是 Catalog 模块的建表迁移，运行时由 NewMySQLCatalogStore 应用。
@@ -50,6 +51,14 @@ var CatalogMigrations = []migrate.Migration{
     PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`,
 		Down: "DROP TABLE IF EXISTS ce_admin_chains;",
+	},
+	{
+		// RPC 端点入表：ce_admin_chains 增加 rpc_endpoint 列，作为链清结算层
+		// 连接各公链节点的单一数据源（替代散落的 CHAIN_RPC_ENDPOINT_* 环境变量）。
+		Version: catalogMigVerRPCEndpoint,
+		Name:    "alter_ce_admin_chains_rpc_endpoint",
+		Up:      "ALTER TABLE ce_admin_chains ADD COLUMN rpc_endpoint VARCHAR(512) NOT NULL DEFAULT ''",
+		Down:    "ALTER TABLE ce_admin_chains DROP COLUMN rpc_endpoint",
 	},
 	{
 		Version: catalogMigVerCoins,
@@ -144,7 +153,7 @@ func (s *mysqlCatalogStore) UpsertSymbol(sym SymbolConfig) (SymbolConfig, error)
 // ---- 公链 ----
 
 func (s *mysqlCatalogStore) ListChains() ([]Chain, error) {
-	rows, err := s.db.Query(`SELECT id, name, symbol, confirmations, deposit_enabled, withdraw_enabled, updated_at
+	rows, err := s.db.Query(`SELECT id, name, symbol, confirmations, deposit_enabled, withdraw_enabled, rpc_endpoint, updated_at
 		FROM ce_admin_chains ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -154,11 +163,13 @@ func (s *mysqlCatalogStore) ListChains() ([]Chain, error) {
 	for rows.Next() {
 		var ch Chain
 		var dep, wd int
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Symbol, &ch.Confirmations, &dep, &wd, &ch.UpdatedAt); err != nil {
+		var rpc string
+		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Symbol, &ch.Confirmations, &dep, &wd, &rpc, &ch.UpdatedAt); err != nil {
 			return nil, err
 		}
 		ch.DepositEnabled = dep == 1
 		ch.WithdrawEnabled = wd == 1
+		ch.RpcEndpoint = rpc
 		out = append(out, ch)
 	}
 	return out, rows.Err()
@@ -167,9 +178,9 @@ func (s *mysqlCatalogStore) ListChains() ([]Chain, error) {
 func (s *mysqlCatalogStore) CreateChain(ch Chain) (Chain, error) {
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO ce_admin_chains (name, symbol, confirmations, deposit_enabled, withdraw_enabled, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		ch.Name, ch.Symbol, ch.Confirmations, boolToInt(ch.DepositEnabled), boolToInt(ch.WithdrawEnabled), now)
+		`INSERT INTO ce_admin_chains (name, symbol, confirmations, deposit_enabled, withdraw_enabled, rpc_endpoint, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		ch.Name, ch.Symbol, ch.Confirmations, boolToInt(ch.DepositEnabled), boolToInt(ch.WithdrawEnabled), ch.RpcEndpoint, now)
 	if err != nil {
 		return Chain{}, err
 	}
@@ -186,9 +197,9 @@ func (s *mysqlCatalogStore) GetChain(id int64) (Chain, error) {
 	var ch Chain
 	var dep, wd int
 	err := s.db.QueryRow(
-		`SELECT id, name, symbol, confirmations, deposit_enabled, withdraw_enabled, updated_at
+		`SELECT id, name, symbol, confirmations, deposit_enabled, withdraw_enabled, rpc_endpoint, updated_at
 		 FROM ce_admin_chains WHERE id = ?`, id).
-		Scan(&ch.ID, &ch.Name, &ch.Symbol, &ch.Confirmations, &dep, &wd, &ch.UpdatedAt)
+		Scan(&ch.ID, &ch.Name, &ch.Symbol, &ch.Confirmations, &dep, &wd, &ch.RpcEndpoint, &ch.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return Chain{}, ErrCatalogNotFound
 	}
@@ -215,6 +226,10 @@ func (s *mysqlCatalogStore) UpdateChain(id int64, patch Chain) (Chain, error) {
 	if patch.Confirmations != 0 {
 		sets = append(sets, "confirmations=?")
 		args = append(args, patch.Confirmations)
+	}
+	if patch.RpcEndpoint != "" {
+		sets = append(sets, "rpc_endpoint=?")
+		args = append(args, patch.RpcEndpoint)
 	}
 	args = append(args, id)
 	res, err := s.db.Exec("UPDATE ce_admin_chains SET "+strings.Join(sets, ",")+" WHERE id=?", args...)

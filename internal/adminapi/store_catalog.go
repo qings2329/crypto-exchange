@@ -112,6 +112,9 @@ func (s *memCatalogStore) UpdateChain(id int64, patch Chain) (Chain, error) {
 			if patch.Confirmations != 0 {
 				s.chains[i].Confirmations = patch.Confirmations
 			}
+			if patch.RpcEndpoint != "" {
+				s.chains[i].RpcEndpoint = patch.RpcEndpoint
+			}
 			s.chains[i].DepositEnabled = patch.DepositEnabled
 			s.chains[i].WithdrawEnabled = patch.WithdrawEnabled
 			s.chains[i].UpdatedAt = time.Now()
@@ -228,11 +231,11 @@ func SeedCatalog(store CatalogStore) error {
 	if chs, _ := store.ListChains(); len(chs) == 0 {
 		now := time.Now()
 		for _, ch := range []Chain{
-			{Name: "Bitcoin", Symbol: "BTC", Confirmations: 3, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
-			{Name: "Ethereum", Symbol: "ETH", Confirmations: 12, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
-			{Name: "Tron", Symbol: "TRX", Confirmations: 20, DepositEnabled: true, WithdrawEnabled: false, UpdatedAt: now},
-			{Name: "Litecoin", Symbol: "LTC", Confirmations: 6, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
-			{Name: "Dogecoin", Symbol: "DOGE", Confirmations: 6, DepositEnabled: true, WithdrawEnabled: true, UpdatedAt: now},
+			{Name: "Bitcoin", Symbol: "BTC", Confirmations: 3, DepositEnabled: true, WithdrawEnabled: true, RpcEndpoint: "", UpdatedAt: now},
+			{Name: "Ethereum", Symbol: "ETH", Confirmations: 12, DepositEnabled: true, WithdrawEnabled: true, RpcEndpoint: "", UpdatedAt: now},
+			{Name: "Tron", Symbol: "TRX", Confirmations: 20, DepositEnabled: true, WithdrawEnabled: false, RpcEndpoint: "", UpdatedAt: now},
+			{Name: "Litecoin", Symbol: "LTC", Confirmations: 6, DepositEnabled: true, WithdrawEnabled: true, RpcEndpoint: "", UpdatedAt: now},
+			{Name: "Dogecoin", Symbol: "DOGE", Confirmations: 6, DepositEnabled: true, WithdrawEnabled: true, RpcEndpoint: "", UpdatedAt: now},
 		} {
 			if _, err := store.CreateChain(ch); err != nil {
 				return err
