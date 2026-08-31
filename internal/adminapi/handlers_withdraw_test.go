@@ -436,3 +436,87 @@ func TestAdminUsersListDegraded(t *testing.T) {
 		t.Fatalf("expected empty users items (no fake users), got %d: %s", len(env.Data.Items), w.Body.String())
 	}
 }
+
+// newFakeUserWithReset 起一个模拟 user 服务，支持用户列表与重置 2FA 端点。
+func newFakeUserWithReset(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.ServeMux{}
+	mux.HandleFunc("/api/v1/user/admin/list", func(w http.ResponseWriter, r *http.Request) {
+		users := []map[string]interface{}{
+			{"id": 1001, "username": "alice", "email": "alice@x.com", "phone": "", "status": 0, "kyc_level": 2, "level": 1, "created_at": "2026-08-16T00:00:00Z"},
+		}
+		writeEnvelope(w, gin.H{"users": users})
+	})
+	mux.HandleFunc("/api/v1/user/admin/1001/tfa/reset", func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(w, gin.H{"id": 1001, "tfa_enabled": false})
+	})
+	srv := httptest.NewServer(&mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestAdminUserListIncludesLevel(t *testing.T) {
+	fake := newFakeUserWithReset(t)
+	r, tok := newAdminWithFutures(t, "", fake.URL)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/users", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list users failed: %d %s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Data struct {
+			Items []map[string]interface{} `json:"items"`
+			Total int                      `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Data.Total != 1 || len(env.Data.Items) != 1 {
+		t.Fatalf("expected 1 user, got %+v", env.Data)
+	}
+	if lvl, ok := env.Data.Items[0]["level"]; !ok || lvl != float64(1) {
+		t.Fatalf("expected level=1 in user item, got %+v", env.Data.Items[0])
+	}
+}
+
+func TestAdminResetUserTFA(t *testing.T) {
+	fake := newFakeUserWithReset(t)
+	r, tok := newAdminWithFutures(t, "", fake.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/users/1001/tfa/reset", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset user tfa failed: %d %s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Data struct {
+			ID         int64 `json:"id"`
+			TFAEnabled bool  `json:"tfa_enabled"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Data.TFAEnabled {
+		t.Fatalf("expected tfa_enabled=false after reset, got %+v", env.Data)
+	}
+}
+
+func TestAdminResetUserTFANotConfigured(t *testing.T) {
+	// user 上游未配置时，应返回 502 而非空成功。
+	r, tok := newAdminWithFutures(t, "", "")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/users/1001/tfa/reset", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 when user upstream unconfigured, got %d %s", w.Code, w.Body.String())
+	}
+}

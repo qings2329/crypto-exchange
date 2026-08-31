@@ -255,6 +255,7 @@ type userListResp struct {
 		Phone     string    `json:"phone"`
 		Status    int       `json:"status"`
 		KYCLevel  int       `json:"kyc_level"`
+		Level     int       `json:"level"`
 		CreatedAt time.Time `json:"created_at"`
 	} `json:"users"`
 }
@@ -275,6 +276,7 @@ func (s *Server) listUsers(c *gin.Context) {
 					Email:     u.Email,
 					Status:    userStatusStr(u.Status),
 					KYC:       kycStr(u.KYCLevel),
+					Level:     u.Level,
 					CreatedAt: u.CreatedAt,
 				}
 				s.enrichBalance(ctx, &au) // 接 futures 钱包余额（§25 后续：消除恒为 0）
@@ -444,6 +446,26 @@ func (s *Server) freezeUnfreeze(c *gin.Context, frozen bool) {
 		return
 	}
 	s.ok(c, gin.H{"id": id, "frozen": frozen, "status": statusWord(frozen)})
+}
+
+// resetUserTFA 代理 user 服务 /admin/:id/tfa/reset：强制重置某用户的 Google 验证码（关闭 2FA）。
+func (s *Server) resetUserTFA(c *gin.Context) {
+	id, ok := parseInt64(c, "id")
+	if !ok {
+		s.fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	base := s.serviceURL("user")
+	if base == "" {
+		s.fail(c, http.StatusBadGateway, "user service not configured")
+		return
+	}
+	path := fmt.Sprintf("/api/v1/user/admin/%d/tfa/reset", id)
+	if err := s.up.Post(c.Request.Context(), base, path, nil, nil); err != nil {
+		s.fail(c, http.StatusBadGateway, "reset user tfa failed: "+err.Error())
+		return
+	}
+	s.ok(c, gin.H{"id": id, "tfa_enabled": false})
 }
 
 // --- 交易对/参数配置（持久化于 CatalogStore：MySQL 优先，失败回退内存）---

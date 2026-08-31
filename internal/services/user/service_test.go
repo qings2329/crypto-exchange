@@ -494,3 +494,51 @@ func TestRiskAlertOnFailedLogin(t *testing.T) {
 		t.Fatalf("successful login must not add risk_alert, got %d", len(list2))
 	}
 }
+
+func TestAdminUpdateLevel(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "level@example.com", "secret123")
+
+	if err := svc.AdminUpdate(id, AdminUpdateInput{Level: int8Ptr(3)}); err != nil {
+		t.Fatalf("set level: %v", err)
+	}
+	u, err := svc.store.GetByID(id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if u.Level != 3 {
+		t.Fatalf("expected level 3, got %d", u.Level)
+	}
+
+	// 越界等级应被拒绝
+	if err := svc.AdminUpdate(id, AdminUpdateInput{Level: int8Ptr(99)}); err != ErrInvalidUserLevel {
+		t.Fatalf("expected ErrInvalidUserLevel, got %v", err)
+	}
+}
+
+func TestAdminResetTFA(t *testing.T) {
+	svc := newTestService()
+	id := registerTestUser(t, svc, "tfa@example.com", "secret123")
+
+	// 先启用 TFA
+	if err := svc.EnableTFA(id, "000000"); err == nil {
+		// 没有 setup 时会失败，改用直接置位验证 reset 逻辑
+	}
+	u, _ := svc.store.GetByID(id)
+	u.TFAEnabled = true
+	u.TFASecret = "SECRETBASE32"
+	_ = svc.store.UpdateUser(u)
+
+	if err := svc.AdminResetTFA(id); err != nil {
+		t.Fatalf("reset tfa: %v", err)
+	}
+	u2, err := svc.store.GetByID(id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if u2.TFAEnabled || u2.TFASecret != "" {
+		t.Fatalf("expected TFA disabled and secret cleared, got enabled=%v secret=%q", u2.TFAEnabled, u2.TFASecret)
+	}
+}
+
+func int8Ptr(v int8) *int8 { return &v }

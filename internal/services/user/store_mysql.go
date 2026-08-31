@@ -35,6 +35,7 @@ const (
 	userMigVerSessions  = 9111
 	userMigVerAntiPhish = 9112
 	userMigVerPrefsTrade = 9113
+	userMigVerLevel      = 9114
 )
 
 // UserMigrations 是用户模块的建表迁移，运行时由 main 调 migrate.New(db, UserMigrations).Up()。
@@ -114,8 +115,12 @@ var UserMigrations = []migrate.Migration{
 	{
 		Version: userMigVerProfile,
 		Name:    "alter_ce_users_profile",
-		Up: `ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS nickname VARCHAR(64) NOT NULL DEFAULT '';
-ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS avatar VARCHAR(512) NOT NULL DEFAULT '';`,
+		Up: `SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ce_users' AND COLUMN_NAME = 'nickname');
+SET @s := IF(@c = 0, 'ALTER TABLE ce_users ADD COLUMN nickname VARCHAR(64) NOT NULL DEFAULT \'\'', 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ce_users' AND COLUMN_NAME = 'avatar');
+SET @s := IF(@c = 0, 'ALTER TABLE ce_users ADD COLUMN avatar VARCHAR(512) NOT NULL DEFAULT \'\'', 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;`,
 		Down: `ALTER TABLE ce_users DROP COLUMN avatar;
 ALTER TABLE ce_users DROP COLUMN nickname;`,
 	},
@@ -144,12 +149,16 @@ ALTER TABLE ce_users DROP COLUMN nickname;`,
 	{
 		Version: userMigVerReferral,
 		Name:    "alter_ce_users_referral",
-		Up: `ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS referrer_id BIGINT NOT NULL DEFAULT 0;
-ALTER TABLE ce_users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(16) NOT NULL DEFAULT '';
--- 已有行 referral_code 默认为空串，直接建唯一索引会因 '' 重复而失败；
--- 先为空值补齐「RC<id>」形式的唯一码（id 为主键，保证全局唯一），再建唯一索引。
+		Up: `SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ce_users' AND COLUMN_NAME = 'referrer_id');
+SET @s := IF(@c = 0, 'ALTER TABLE ce_users ADD COLUMN referrer_id BIGINT NOT NULL DEFAULT 0', 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ce_users' AND COLUMN_NAME = 'referral_code');
+SET @s := IF(@c = 0, 'ALTER TABLE ce_users ADD COLUMN referral_code VARCHAR(16) NOT NULL DEFAULT \'\'', 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 UPDATE ce_users SET referral_code = CONCAT('RC', id) WHERE referral_code = '' OR referral_code IS NULL;
-CREATE UNIQUE INDEX uk_referral_code ON ce_users (referral_code);`,
+SET @i := (SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ce_users' AND INDEX_NAME = 'uk_referral_code');
+SET @s := IF(@i = 0, 'CREATE UNIQUE INDEX uk_referral_code ON ce_users (referral_code)', 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;`,
 		Down: `ALTER TABLE ce_users DROP INDEX uk_referral_code;
 ALTER TABLE ce_users DROP COLUMN referral_code;
 ALTER TABLE ce_users DROP COLUMN referrer_id;`,
@@ -225,6 +234,14 @@ ALTER TABLE ce_users DROP COLUMN referrer_id;`,
 		Down: `ALTER TABLE ce_user_preferences DROP COLUMN change_basis;
 ALTER TABLE ce_user_preferences DROP COLUMN trade_interval;`,
 	},
+	{
+		Version: userMigVerLevel,
+		Name:    "alter_ce_users_level",
+		Up: `SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ce_users' AND COLUMN_NAME = 'level');
+SET @s := IF(@c = 0, 'ALTER TABLE ce_users ADD COLUMN level TINYINT NOT NULL DEFAULT 0 COMMENT \'用户等级：0=普通，1~5=VIP1~VIP5\'', 'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;`,
+		Down: "ALTER TABLE ce_users DROP COLUMN level;",
+	},
 }
 
 // mysqlStore 是 Store 的 MySQL 实现。
@@ -252,9 +269,9 @@ func NewMySQLStore(dsn string) (Store, error) {
 func (s *mysqlStore) CreateUser(u *User) error {
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO ce_users (email, phone, pass_hash, status, kyc_level, tfa_secret, tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		nullIfEmpty(u.Email), nullIfEmpty(u.Phone), u.PassHash, int(u.Status), int(u.KYCLevel),
+		`INSERT INTO ce_users (email, phone, pass_hash, status, kyc_level, level, tfa_secret, tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		nullIfEmpty(u.Email), nullIfEmpty(u.Phone), u.PassHash, int(u.Status), int(u.KYCLevel), int(u.Level),
 		u.TFASecret, boolToInt(u.TFAEnabled), boolToInt(u.EmailVerified), boolToInt(u.PhoneVerified),
 		u.Nickname, u.Avatar, u.ReferrerID, u.ReferralCode, now, now)
 	if err != nil {
@@ -274,15 +291,15 @@ func (s *mysqlStore) CreateUser(u *User) error {
 }
 
 func (s *mysqlStore) GetByEmail(email string) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE email = ?`, email)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE email = ?`, email)
 }
 
 func (s *mysqlStore) GetByPhone(phone string) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE phone = ?`, phone)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE phone = ?`, phone)
 }
 
 func (s *mysqlStore) GetByID(id int64) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE id = ?`, id)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE id = ?`, id)
 }
 
 func (s *mysqlStore) scanUser(query string, args ...interface{}) (*User, error) {
@@ -293,9 +310,9 @@ func (s *mysqlStore) scanUser(query string, args ...interface{}) (*User, error) 
 func (s *mysqlStore) scanUserRow(row scanner) (*User, error) {
 	var u User
 	var email, phone, tfaSecret, nickname, avatar, referralCode sql.NullString
-	var tfaEnabled, emailVerified, phoneVerified int
+	var tfaEnabled, emailVerified, phoneVerified, level int
 	err := row.Scan(
-		&u.ID, &email, &phone, &u.PassHash, &u.Status, &u.KYCLevel,
+		&u.ID, &email, &phone, &u.PassHash, &u.Status, &u.KYCLevel, &level,
 		&tfaSecret, &tfaEnabled, &emailVerified, &phoneVerified, &nickname, &avatar,
 		&u.ReferrerID, &referralCode, &u.CreatedAt, &u.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -306,6 +323,7 @@ func (s *mysqlStore) scanUserRow(row scanner) (*User, error) {
 	}
 	u.Email = email.String
 	u.Phone = phone.String
+	u.Level = int8(level)
 	u.TFASecret = tfaSecret.String
 	u.TFAEnabled = tfaEnabled == 1
 	u.EmailVerified = emailVerified == 1
@@ -328,9 +346,9 @@ type scanner interface {
 func (s *mysqlStore) UpdateUser(u *User) error {
 	u.UpdatedAt = time.Now()
 	res, err := s.db.Exec(
-		`UPDATE ce_users SET email=NULLIF(?,''), phone=NULLIF(?,''), pass_hash=?, status=?, kyc_level=?,
+		`UPDATE ce_users SET email=NULLIF(?,''), phone=NULLIF(?,''), pass_hash=?, status=?, kyc_level=?, level=?,
 		 tfa_secret=NULLIF(?,''), tfa_enabled=?, email_verified=?, phone_verified=?, nickname=?, avatar=?, updated_at=? WHERE id=?`,
-		u.Email, u.Phone, u.PassHash, int(u.Status), int(u.KYCLevel),
+		u.Email, u.Phone, u.PassHash, int(u.Status), int(u.KYCLevel), int(u.Level),
 		u.TFASecret, boolToInt(u.TFAEnabled), boolToInt(u.EmailVerified), boolToInt(u.PhoneVerified),
 		u.Nickname, u.Avatar, u.UpdatedAt, u.ID)
 	if err != nil {
@@ -344,7 +362,7 @@ func (s *mysqlStore) UpdateUser(u *User) error {
 
 func (s *mysqlStore) ListAll() ([]*User, error) {
 	rows, err := s.db.Query(
-		`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users ORDER BY id`)
+		`SELECT id, email, phone, pass_hash, status, kyc_level, level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -561,12 +579,12 @@ func boolToInt(b bool) int {
 }
 
 func (s *mysqlStore) GetByReferralCode(code string) (*User, error) {
-	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE referral_code = ?`, code)
+	return s.scanUser(`SELECT id, email, phone, pass_hash, status, kyc_level, level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE referral_code = ?`, code)
 }
 
 func (s *mysqlStore) GetReferrals(userID int64) ([]*User, error) {
 	rows, err := s.db.Query(
-		`SELECT id, email, phone, pass_hash, status, kyc_level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE referrer_id = ? ORDER BY id`, userID)
+		`SELECT id, email, phone, pass_hash, status, kyc_level, level, COALESCE(tfa_secret,''), tfa_enabled, email_verified, phone_verified, nickname, avatar, referrer_id, referral_code, created_at, updated_at FROM ce_users WHERE referrer_id = ? ORDER BY id`, userID)
 	if err != nil {
 		return nil, err
 	}

@@ -681,6 +681,9 @@ func (s *Service) AdminCreate(target, password string) (int64, error) {
 	} else {
 		return 0, ErrInvalidAccount
 	}
+	// 生成唯一邀请码，避免空字符串与 ce_users.uk_referral_code 唯一索引冲突（首个空值成功后，
+	// 后续空值会因重复键被判为 ErrUserExists）。与 Register 保持一致。
+	u.ReferralCode = s.generateReferralCode()
 	if err := s.store.CreateUser(u); err != nil {
 		return 0, err
 	}
@@ -689,9 +692,10 @@ func (s *Service) AdminCreate(target, password string) (int64, error) {
 
 // AdminUpdateInput 是管理后台更新用户的补丁（nil 字段表示不变）。
 type AdminUpdateInput struct {
-	Email *string
-	Status *Status
+	Email    *string
+	Status   *Status
 	KYCLevel *KYCLevel
+	Level    *int8
 }
 
 // AdminUpdate 由管理后台更新用户档案字段。
@@ -709,6 +713,24 @@ func (s *Service) AdminUpdate(id int64, in AdminUpdateInput) error {
 	if in.KYCLevel != nil {
 		u.KYCLevel = *in.KYCLevel
 	}
+	if in.Level != nil {
+		if !ValidUserLevel(*in.Level) {
+			return ErrInvalidUserLevel
+		}
+		u.Level = *in.Level
+	}
+	return s.store.UpdateUser(u)
+}
+
+// AdminResetTFA 强制关闭某用户的 2FA（清空密钥），让其重新绑定。
+// 管理员无法替用户设备生成有效 code，故只提供"重置/关闭"而非"强制开启"。
+func (s *Service) AdminResetTFA(id int64) error {
+	u, err := s.store.GetByID(id)
+	if err != nil {
+		return err
+	}
+	u.TFAEnabled = false
+	u.TFASecret = ""
 	return s.store.UpdateUser(u)
 }
 

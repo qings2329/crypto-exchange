@@ -17,6 +17,7 @@ type AdminUser struct {
 	Email     string    `json:"email"`
 	Status    string    `json:"status"` // active | frozen
 	KYC       string    `json:"kyc"`    // none | pending | verified
+	Level     int       `json:"level"`  // 用户等级：0=普通，1~5=VIP1~VIP5
 	Balance   float64   `json:"balance"`
 	CreatedAt time.Time `json:"created_at"`
 }

@@ -162,6 +162,7 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		admin.PUT("/users/:id", s.updateUser)
 		admin.POST("/users/:id/freeze", s.freezeUser)
 		admin.POST("/users/:id/unfreeze", s.unfreezeUser)
+		admin.POST("/users/:id/tfa/reset", s.resetUserTFA)
 		admin.GET("/users/:id/balances", s.getUserBalances)
 
 		// 交易对/参数配置（admin 自有持久化）
@@ -291,17 +292,18 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 	}
 }
 
-// SeedDemoAnnouncements 演示公告种子：仅纯内存（无 MySQL）部署时注入若干公告，
+// SeedDemoAnnouncements 演示公告种子：无论内存还是连库模式都幂等注入若干公告，
 // 供管理后台「公告管理」页展示测试。由 cmd/admin 在启动时显式调用（不在 NewServer 内，
-// 以免污染依赖 NewServer 的单元测试所需初始态）。
+// 以免污染依赖 NewServer 的单元测试所需初始态）。连库模式按标题判重，重启不重复插入。
 func (s *Server) SeedDemoAnnouncements() {
-	if s.annSvc == nil || s.cfg.MySQL.DSN != "" {
+	if s.annSvc == nil {
 		return
 	}
 	seedDemoAnnouncements(s.annSvc)
 }
 
-// seedDemoAnnouncements 演示公告种子：仅纯内存部署时注入若干公告，避免"公告管理"页为空。
+// seedDemoAnnouncements 演示公告种子：按标题判重幂等注入若干公告，避免「公告管理」页为空，
+// 同时避免连库模式下每次重启重复插入同一批演示公告。
 func seedDemoAnnouncements(annSvc *announcement.Service) {
 	str := func(s string) *string { return &s }
 	active := true
@@ -311,10 +313,22 @@ func seedDemoAnnouncements(annSvc *announcement.Service) {
 		{Level: str(announcement.LevelInfo), Title: str("新币上线"), Content: str("平台将上线 ETH/USDT 合约交易对，敬请期待。"), Active: &active},
 		{Level: str(announcement.LevelInfo), Title: str("费率调整说明"), Content: str("自下月起基础费率维持不变，VIP 等级费率权益详见帮助中心。"), Active: &active},
 	}
-	for _, in := range demo {
-		if _, err := annSvc.Create(in); err != nil {
-			log.Printf("[admin] seed demo announcement failed: %v", err)
+	existing := map[string]bool{}
+	if all, err := annSvc.ListAll(); err == nil {
+		for _, a := range all {
+			existing[a.Title] = true
 		}
 	}
-	log.Printf("[admin] seeded demo announcements (in-memory mode)")
+	created := 0
+	for _, in := range demo {
+		if in.Title != nil && existing[*in.Title] {
+			continue // 已有同标题公告，跳过（幂等）
+		}
+		if _, err := annSvc.Create(in); err != nil {
+			log.Printf("[admin] seed demo announcement failed: %v", err)
+			continue
+		}
+		created++
+	}
+	log.Printf("[admin] seeded demo announcements (%d created, existing skipped)", created)
 }

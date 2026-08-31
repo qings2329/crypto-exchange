@@ -23,6 +23,23 @@ const (
 	KYCRejected KYCLevel = 3
 )
 
+// 用户等级（命名等级，索引即 level 值）。后台可按等级配置权益/费率等。
+var UserTiers = []string{"普通", "VIP1", "VIP2", "VIP3", "VIP4", "VIP5"}
+
+// UserLevel 是用户等级的整数表达（0=普通，依次到 VIP5）。
+type UserLevel int8
+
+// ValidUserLevel 报告 level 是否在合法范围 [0, len(UserTiers))。
+func ValidUserLevel(l int8) bool { return l >= 0 && int(l) < len(UserTiers) }
+
+// UserTierName 返回 level 对应的中文等级名；越界返回 "未知"。
+func UserTierName(l int8) string {
+	if ValidUserLevel(l) {
+		return UserTiers[l]
+	}
+	return "未知"
+}
+
 // 验证码用途。
 const (
 	PurposeRegister = "register" // 注册时校验账号归属
@@ -39,6 +56,7 @@ type User struct {
 	PassHash     string
 	Status       Status
 	KYCLevel     KYCLevel
+	Level        int8  // 用户等级（命名等级见 UserTiers，索引即值，0=普通）
 	TFASecret    string // TOTP 密钥（base32），启用 2FA 后写入；生产应加密存储
 	TFAEnabled   bool
 	EmailVerified bool
@@ -122,4 +140,5 @@ var (
 	ErrNicknameTooLong = errors.New("nickname too long")
 	ErrAvatarTooLong   = errors.New("avatar url too long")
 	ErrPasswordTooShort = errors.New("password too short")
+	ErrInvalidUserLevel = errors.New("invalid user level")
 )

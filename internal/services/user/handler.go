@@ -71,6 +71,7 @@ func (h *Handler) Register(r *gin.Engine) {
 	adminG.PUT("/admin/:id", h.adminUpdate)
 	adminG.POST("/admin/:id/freeze", h.adminFreeze)
 	adminG.POST("/admin/:id/unfreeze", h.adminUnfreeze)
+	adminG.POST("/admin/:id/tfa/reset", h.adminResetTFA)
 }
 
 func (h *Handler) register(c *gin.Context) {
@@ -465,6 +466,7 @@ func (h *Handler) adminList(c *gin.Context) {
 			"phone":      u.Phone,
 			"status":     int(u.Status),
 			"kyc_level":  int(u.KYCLevel),
+			"level":      int(u.Level),
 			"created_at": u.CreatedAt,
 		})
 	}
@@ -511,6 +513,7 @@ func (h *Handler) adminUpdate(c *gin.Context) {
 		Email     *string `json:"email"`
 		Status    *int    `json:"status"`
 		KYCLevel  *int    `json:"kyc_level"`
+		Level     *int    `json:"level"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, 400, "invalid body")
@@ -528,11 +531,29 @@ func (h *Handler) adminUpdate(c *gin.Context) {
 		kl := KYCLevel(*req.KYCLevel)
 		in.KYCLevel = &kl
 	}
+	if req.Level != nil {
+		lvl := int8(*req.Level)
+		in.Level = &lvl
+	}
 	if err := h.svc.AdminUpdate(id, in); err != nil {
 		fail(c, err)
 		return
 	}
 	response.JSON(c, gin.H{"status": "ok"})
+}
+
+// adminResetTFA 强制重置某用户的 Google 验证码（关闭 2FA 并清空密钥），让用户重新绑定。
+func (h *Handler) adminResetTFA(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, 400, "invalid id")
+		return
+	}
+	if err := h.svc.AdminResetTFA(id); err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{"id": id, "tfa_enabled": false})
 }
 
 func (h *Handler) adminFreeze(c *gin.Context) {
