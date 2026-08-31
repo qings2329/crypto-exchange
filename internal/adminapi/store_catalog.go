@@ -14,6 +14,9 @@ import (
 // ErrCatalogNotFound 表示配置实体不存在。
 var ErrCatalogNotFound = errors.New("catalog entity not found")
 
+// ErrCatalogInvalid 表示配置更新违反约束（如启用充提但 RPC 端点为空）。
+var ErrCatalogInvalid = errors.New("invalid catalog update")
+
 // CatalogStore 抽象交易对/公链/币种/本地通知的持久化（管理员自有配置）。
 type CatalogStore interface {
 	// 交易对
@@ -98,11 +101,20 @@ func (s *memCatalogStore) CreateChain(ch Chain) (Chain, error) {
 }
 
 // UpdateChain 部分更新：字符串仅当非空、Confirmations 仅当非 0 才覆盖；布尔按 patch 值覆盖。
+// 先按现有值 + patch 计算最终值并做组合校验，校验通过再写入，避免拒绝更新时
+// 内存已被部分修改导致状态不一致。
 func (s *memCatalogStore) UpdateChain(id int64, patch Chain) (Chain, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i := range s.chains {
 		if s.chains[i].ID == id {
+			finalRpc := s.chains[i].RpcEndpoint
+			if patch.RpcEndpoint != "" {
+				finalRpc = patch.RpcEndpoint
+			}
+			if (patch.DepositEnabled || patch.WithdrawEnabled) && finalRpc == "" {
+				return Chain{}, ErrCatalogInvalid
+			}
 			if patch.Name != "" {
 				s.chains[i].Name = patch.Name
 			}

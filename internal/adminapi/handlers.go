@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -504,10 +505,61 @@ func (s *Server) listChains(c *gin.Context) {
 	s.ok(c, pageEnvelope(chs, limit, offset))
 }
 
+// isValidRPCEndpoint 校验链 RPC 端点必须是合法 URL，且协议限定为
+// http/https/ws/wss，防止恶意节点作为结算层单一数据源劫持充值确认/提现广播（F5）。
+func isValidRPCEndpoint(ep string) bool {
+	u, err := url.Parse(ep)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	switch u.Scheme {
+	case "http", "https", "ws", "wss":
+		return true
+	}
+	return false
+}
+
+// validateChainCreate 校验新建公链的关键字段：Confirmations 必须 > 0；
+// RpcEndpoint 若提供则须为合法 URL；启用充提时 RpcEndpoint 不可为空。
+func validateChainCreate(ch Chain) error {
+	if ch.Name == "" {
+		return errors.New("chain name is required")
+	}
+	if ch.Confirmations <= 0 {
+		return errors.New("confirmations must be > 0")
+	}
+	if ch.RpcEndpoint != "" && !isValidRPCEndpoint(ch.RpcEndpoint) {
+		return errors.New("rpc_endpoint must be a valid http/https/ws/wss URL")
+	}
+	if (ch.DepositEnabled || ch.WithdrawEnabled) && ch.RpcEndpoint == "" {
+		return errors.New("rpc_endpoint is required when deposit or withdraw is enabled")
+	}
+	return nil
+}
+
+// validateChainUpdate 校验部分更新：仅对显式提供的字段做校验，避免零值
+// （未提供字段）误报。启用充提但 RPC 为空的组合由 store 层兜底。
+func validateChainUpdate(patch Chain) error {
+	if patch.Confirmations != 0 && patch.Confirmations <= 0 {
+		return errors.New("confirmations must be > 0")
+	}
+	if patch.RpcEndpoint != "" && !isValidRPCEndpoint(patch.RpcEndpoint) {
+		return errors.New("rpc_endpoint must be a valid http/https/ws/wss URL")
+	}
+	return nil
+}
+
 func (s *Server) createChain(c *gin.Context) {
 	var ch Chain
-	if err := c.ShouldBindJSON(&ch); err != nil || ch.Name == "" {
-		s.fail(c, http.StatusBadRequest, "invalid chain")
+	if err := c.ShouldBindJSON(&ch); err != nil {
+		s.fail(c, http.StatusBadRequest, "invalid chain body")
+		return
+	}
+	if err := validateChainCreate(ch); err != nil {
+		s.fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
 	out, err := s.catalog.CreateChain(ch)
@@ -529,10 +581,18 @@ func (s *Server) updateChain(c *gin.Context) {
 		s.fail(c, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if err := validateChainUpdate(patch); err != nil {
+		s.fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	out, err := s.catalog.UpdateChain(id, patch)
 	if err != nil {
 		if errors.Is(err, ErrCatalogNotFound) {
 			s.fail(c, http.StatusNotFound, "chain not found")
+			return
+		}
+		if errors.Is(err, ErrCatalogInvalid) {
+			s.fail(c, http.StatusBadRequest, err.Error())
 			return
 		}
 		s.fail(c, http.StatusInternalServerError, "update chain failed: "+err.Error())

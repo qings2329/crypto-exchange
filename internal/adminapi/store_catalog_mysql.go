@@ -13,11 +13,11 @@ import (
 // 注意：必须错开 user 模块的 9101-9113（含其 DSN 默认共享同一 ce_schema_migrations 版本表），
 // 否则 user 先落版本会导致 catalog 建表迁移被跳过、回退内存存储。故使用 9301-9304。
 const (
-	catalogMigVerSymbols      = 9301
-	catalogMigVerChains       = 9302
-	catalogMigVerCoins        = 9303
+	catalogMigVerSymbols       = 9301
+	catalogMigVerChains        = 9302
+	catalogMigVerCoins         = 9303
 	catalogMigVerNotifications = 9304
-	catalogMigVerRPCEndpoint  = 9305
+	catalogMigVerRPCEndpoint   = 9305
 )
 
 // CatalogMigrations 是 Catalog 模块的建表迁移，运行时由 NewMySQLCatalogStore 应用。
@@ -213,6 +213,19 @@ func (s *mysqlCatalogStore) GetChain(id int64) (Chain, error) {
 
 // UpdateChain 部分更新：字符串仅当非空、Confirmations 仅当非 0 才覆盖；布尔按 patch 值覆盖。
 func (s *mysqlCatalogStore) UpdateChain(id int64, patch Chain) (Chain, error) {
+	cur, err := s.GetChain(id)
+	if err != nil {
+		return Chain{}, err
+	}
+	// 先按现有值 + patch 计算最终值并做组合校验，校验通过再写入，
+	// 避免拒绝更新时数据库已被部分修改。
+	finalRpc := cur.RpcEndpoint
+	if patch.RpcEndpoint != "" {
+		finalRpc = patch.RpcEndpoint
+	}
+	if (patch.DepositEnabled || patch.WithdrawEnabled) && finalRpc == "" {
+		return Chain{}, ErrCatalogInvalid
+	}
 	sets := []string{"deposit_enabled=?", "withdraw_enabled=?", "updated_at=NOW(3)"}
 	args := []interface{}{boolToInt(patch.DepositEnabled), boolToInt(patch.WithdrawEnabled)}
 	if patch.Name != "" {
