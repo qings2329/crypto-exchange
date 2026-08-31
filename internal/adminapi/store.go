@@ -128,8 +128,17 @@ type LedgerSummary struct {
 	Reconciled    bool              `json:"reconciled"`
 	Discrepancy   float64           `json:"discrepancy"`
 	Settlement    SettlementSummary `json:"settlement"`
+	// Assets 是按币种拆分的平台链上库存总量（来自 futures wallet inventory 的 onchain_total）。
+	// 用于平台资产分布统计；不进入任何资金移动路径。
+	Assets []AssetTotal `json:"assets"`
 	// Notes 记录部分上游拉取失败的信息（降级时填充）。
 	Notes string `json:"notes,omitempty"`
+}
+
+// AssetTotal 是单币种平台链上库存总量（来自 futures wallet inventory 的 onchain_total）。
+type AssetTotal struct {
+	Asset        string  `json:"asset"`
+	OnchainTotal float64 `json:"onchain_total"`
 }
 
 // SettlementSummary 是结算服务的清算聚合快照（实时取自 settlement 服务的 /stats 与 /cleared）。

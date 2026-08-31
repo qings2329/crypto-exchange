@@ -966,10 +966,7 @@ func (s *Server) handleLedger(c *gin.Context) {
 			InventoryDeviation map[string]float64 `json:"inventory_deviation"`
 		}
 		inv struct {
-			Inventory []struct {
-				Asset        string  `json:"asset"`
-				OnchainTotal float64 `json:"onchain_total"`
-			} `json:"inventory"`
+			Inventory []AssetTotal `json:"inventory"`
 		}
 	)
 	errs := []string{}
@@ -1000,6 +997,7 @@ func (s *Server) handleLedger(c *gin.Context) {
 		SettlementBal: total,
 		Reconciled:    rec.Balanced,
 		Discrepancy:   disc,
+		Assets:        inv.Inventory,
 	}
 
 	// 接入结算服务实时清算聚合：/stats 与 /cleared（若已配置 settlement 上游）。
