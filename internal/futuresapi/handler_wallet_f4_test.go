@@ -2,6 +2,7 @@ package futuresapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/ledger"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
+	"github.com/coldlar/crypto-exchange/internal/risk"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
@@ -99,7 +101,37 @@ func TestWithdrawApproveRequiresAdmin(t *testing.T) {
 	}
 }
 
-// TestWalletFeeBadAmount 验证 /wallet/fee 对非法 amount 返回 400 而非静默当 0（F5a 修复）。
+// TestWithdrawChainEnforcesRisk 验证管理员「代客直提」(/withdraw/chain) 不再绕过 risk 规则引擎
+// （RISK-F3 修复）：冻结资金前须先经 risk.CheckWithdraw，对目标用户生效——命中地址黑名单直接 403。
+func TestWithdrawChainEnforcesRisk(t *testing.T) {
+	s, r, verifier := newF4Server(t)
+	adminTok := verifier.IssueAdmin(1, middleware.RoleAdmin, nil, time.Hour)
+
+	riskSvc := risk.New(risk.NewMemStore())
+	if _, err := riskSvc.AddBlacklist("0xbad", "address", "sanctioned"); err != nil {
+		t.Fatal(err)
+	}
+	s.riskSvc = riskSvc
+	s.kycFetcherByID = func(userID int64) (int, error) { return 1, nil }
+
+	call := func(addr string) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"user_id":1,"asset":"USDT","chain":"Ethereum","amount":10,"address":%q}`, addr)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/futures/wallet/withdraw/chain", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+adminTok)
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	// 黑名单地址 → 403：代客直提不得绕过风控（此前静默放行即资金失窃面）。
+	if w := call("0xbad"); w.Code != http.StatusForbidden {
+		t.Fatalf("blacklisted address should be rejected 403, got %d: %s", w.Code, w.Body.String())
+	}
+	// 已确认白名单地址 0xabc → 通过风控，进入后续冻结/广播流程（非 403）。
+	if w := call("0xabc"); w.Code == http.StatusForbidden {
+		t.Fatalf("clean address should pass risk gate, got 403: %s", w.Body.String())
+	}
+}
 // 该端点受全局 Auth 保护，故需携带合法 token 才能越过鉴权、到达参数校验。
 func TestWalletFeeBadAmount(t *testing.T) {
 	_, r, verifier := newF4Server(t)

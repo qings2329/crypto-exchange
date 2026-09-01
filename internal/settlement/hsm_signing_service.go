@@ -1,11 +1,15 @@
 package settlement
 
 import (
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
+	"strings"
+	"sync"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
@@ -25,6 +29,12 @@ type SigningService struct {
 	// "der" → {signature: DER-hex}（AWS KMS Sign / Vault transit 常见返回，经
 	// ParseExternalDERSignature 解出）。两种形态密码学等价、可互验。
 	mode string
+	// authToken 是 /sign 端点的静态 Bearer 令牌（与网关侧 HSMConfig.APIKey 对齐）。
+	// 留空表示「无鉴权兼容模式」：仅打印一次安全告警并放行（便于本地联调/测试），
+	// 生产部署必须显式设置，否则任意能访问端点的请求者都能对任意 digest 签名（资金失窃面）。
+	authToken string
+	// warnOnce 保证无鉴权模式的告警只打印一次。
+	warnOnce sync.Once
 }
 
 // NewSigningService 生成一枚全新 secp256k1 私钥（模拟 HSM 密钥生成/注入）。生产应改为从
@@ -65,6 +75,11 @@ func (s *SigningService) SetResponseMode(mode string) error {
 	return nil
 }
 
+// SetAuthToken 设置 /sign 端点的静态 Bearer 令牌。一旦设置，所有签名请求都必须携带
+// `Authorization: Bearer <token>`（与网关侧 HSMConfig.APIKey 一致），否则返回 401——即
+// 令牌是「配置即强制」的：不依赖调用方是否发送。留空保持兼容模式（无鉴权，仅告警）。
+func (s *SigningService) SetAuthToken(token string) { s.authToken = token }
+
 // signDigest 对 32 字节摘要做真实 secp256k1 ECDSA 签名，返回 (r, s)（与软件后端同一原语，
 // 仅私钥驻留本服务而非 settlement 进程——这正是离线签名边界要隔离的）。
 func (s *SigningService) signDigest(digest [32]byte) (*big.Int, *big.Int, error) {
@@ -76,6 +91,13 @@ func (s *SigningService) signDigest(digest [32]byte) (*big.Int, *big.Int, error)
 //   - GET  /pubkey：返回 {"public_key":"<压缩 hex>"}，供运营核对/注入。
 //   - GET  /health：就绪探针。
 func (s *SigningService) Handler() http.Handler {
+	// 无鉴权兼容模式仅打印一次安全告警，避免生产误部署为开放签名端点。
+	if s.authToken == "" {
+		s.warnOnce.Do(func() {
+			log.Printf("SECURITY WARNING: HSM 签名服务以「无鉴权兼容模式」启动，/sign 端点对任何人开放。" +
+				"生产部署务必通过 -auth-token / HSM_AUTH_TOKEN 设置 Bearer 令牌，并在网关侧配置相同的 HSMConfig.APIKey。")
+		})
+	}
 	mux := http.NewServeMux()
 	// /sign 是约定的签名端点（HSM_ENDPOINT 指向它）；同时接受根路径 POST，便于单测与
 	// 把服务直接挂在根下的简易部署。
@@ -100,6 +122,15 @@ func (s *SigningService) handleSign(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	// /sign 鉴权：仅在配置了 authToken 时强制。配置即强制，不依赖调用方是否携带令牌。
+	if s.authToken != "" {
+		const prefix = "Bearer "
+		got := r.Header.Get("Authorization")
+		if !strings.HasPrefix(got, prefix) || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(got, prefix)), []byte(s.authToken)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 	var in struct {
 		Digest string `json:"digest"`

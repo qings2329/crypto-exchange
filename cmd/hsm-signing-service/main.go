@@ -37,6 +37,7 @@ func main() {
 	addr := flag.String("addr", ":9100", "监听地址，如 :9100")
 	key := flag.String("key", "", "可选：32 字节 hex 私钥（0x 可选）；留空则生成新密钥并打印公钥")
 	mode := flag.String("mode", "rs", "响应形态：rs -> {r,s}(hex)；der -> {signature: DER-hex}")
+	authToken := flag.String("auth-token", os.Getenv("HSM_AUTH_TOKEN"), "必需（生产）：/sign 端点的静态 Bearer 令牌；须在网关侧 HSMConfig.APIKey 配置相同值。留空则开放签名端点（仅告警）")
 	flag.Parse()
 
 	log, err := logger.New("release")
@@ -58,6 +59,12 @@ func main() {
 	}
 	if err := svc.SetResponseMode(*mode); err != nil {
 		log.Fatal("响应模式非法", zap.Error(err))
+	}
+	svc.SetAuthToken(*authToken)
+	if *authToken != "" {
+		log.Info("签名服务已启用 Bearer 鉴权（/sign 需携带正确令牌）")
+	} else {
+		log.Warn("签名服务未配置 -auth-token：/sign 端点对任何人开放，生产环境禁止此配置")
 	}
 
 	// 打印供运营注入网关的环境变量（与 remoteHSMKeySigner 契约对齐）。

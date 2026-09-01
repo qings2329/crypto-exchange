@@ -68,6 +68,7 @@ func (h *Handler) Register(r *gin.Engine) {
 	adminG.GET("/admin/kyc-reviews/:id", h.getKycReviewDetail)
 	adminG.GET("/admin/list", h.adminList)
 	adminG.POST("/admin", h.adminCreate)
+	adminG.GET("/admin/:id", h.adminGet) // 风控/提现网关按 user_id 取 KYC 等级（仅管理员）
 	adminG.PUT("/admin/:id", h.adminUpdate)
 	adminG.POST("/admin/:id/freeze", h.adminFreeze)
 	adminG.POST("/admin/:id/unfreeze", h.adminUnfreeze)
@@ -540,6 +541,30 @@ func (h *Handler) adminUpdate(c *gin.Context) {
 		return
 	}
 	response.JSON(c, gin.H{"status": "ok"})
+}
+
+// adminGet 按 user_id 返回用户档案（含 kyc_level），供风控/提现网关在不持有 user 服务的内部
+// 上下文下按目标用户取 KYC 等级。仅管理员可调用（adminG 已叠加 AdminGuard）。
+func (h *Handler) adminGet(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		response.Error(c, http.StatusBadRequest, 400, "invalid id")
+		return
+	}
+	u, _, err := h.svc.GetProfile(id)
+	if err != nil {
+		fail(c, err)
+		return
+	}
+	response.JSON(c, gin.H{
+		"id":         u.ID,
+		"email":      u.Email,
+		"phone":      u.Phone,
+		"status":     int(u.Status),
+		"kyc_level":  int(u.KYCLevel),
+		"level":      int(u.Level),
+		"created_at": u.CreatedAt,
+	})
 }
 
 // adminResetTFA 强制重置某用户的 Google 验证码（关闭 2FA 并清空密钥），让用户重新绑定。

@@ -66,7 +66,10 @@ type Server struct {
 	// 风控：提现强制路径在冻结资金前调用 riskSvc.CheckWithdraw 网关。
 	riskSvc    *risk.Service
 	userSvcURL string
-	kycFetcher func(c *gin.Context) (int, error) // 可注入，便于测试；默认从 user 服务取 kyc_level
+	kycFetcher func(c *gin.Context) (int, error) // 可注入，便于测试；默认从 user 服务取（调用方）kyc_level
+	// kycFetcherByID 按目标 user_id 取 KYC 等级，供管理员「代客直提」路径（/withdraw/chain）
+	// 对目标用户而非管理员本人施加风控限额/黑名单（RISK-F3 修复）。可注入便于测试。
+	kycFetcherByID func(userID int64) (int, error)
 
 	// 交易白名单（地址簿）：用户维护的可信提现/转账地址。
 	addrBookMu sync.Mutex
@@ -117,9 +120,10 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 		ctx:       ctx,
 		cancel:    cancel,
 
-		riskSvc:    riskSvc,
-		userSvcURL: userSvcURL,
-		kycFetcher: newKYCFetcher(userSvcURL),
+		riskSvc:       riskSvc,
+		userSvcURL:    userSvcURL,
+		kycFetcher:    newKYCFetcher(userSvcURL),
+		kycFetcherByID: newKYCFetcherByID(userSvcURL),
 
 		addrBook:   make(map[int64][]AddrBookEntry),
 		marginAcct: make(map[int64]map[string]float64),
@@ -887,6 +891,39 @@ func newKYCFetcher(userSvcURL string) func(c *gin.Context) (int, error) {
 		}
 		if auth := c.GetHeader("Authorization"); auth != "" {
 			req.Header.Set("Authorization", auth)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return 0, fmt.Errorf("user service returned status %d", resp.StatusCode)
+		}
+		var body struct {
+			KYCLevel int `json:"kyc_level"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return 0, err
+		}
+		return body.KYCLevel, nil
+	}
+}
+
+// newKYCFetcherByID 返回按目标 user_id 取 kyc_level 的函数（注入到 Server，便于测试替换）。
+// 用于管理员「代客直提」路径（/withdraw/chain）：风控限额/黑名单须对目标用户而非管理员本人生效
+// （RISK-F3 修复）。userSvcURL 为空时 KYC 视为最高级、恒过（与 newKYCFetcher 一致）；生产必须
+// 配置 user 服务。实现转发管理员 Authorization，调用 user 服务 GET /api/v1/user/admin/{id}。
+func newKYCFetcherByID(userSvcURL string) func(userID int64) (int, error) {
+	if userSvcURL == "" {
+		return func(userID int64) (int, error) { return math.MaxInt, nil }
+	}
+	base := strings.TrimRight(userSvcURL, "/")
+	client := &http.Client{Timeout: 3 * time.Second}
+	return func(userID int64) (int, error) {
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/api/v1/user/admin/%d", base, userID), nil)
+		if err != nil {
+			return 0, err
 		}
 		resp, err := client.Do(req)
 		if err != nil {

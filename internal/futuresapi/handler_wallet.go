@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -373,6 +374,29 @@ func (s *Server) handleWithdrawChain(c *gin.Context) {
 	if s.ledgerSvc.IsOutflowRestricted(req.UserID, asset) {
 		response.Error(c, 403, 403, "outflow restricted: repay outstanding bad debt first")
 		return
+	}
+	// RISK-F3 修复：管理员「代客直提」路径此前绕过 risk 规则引擎（黑名单/限额/低 KYC/负金额），
+	// 现与用户端 /withdraw/request 一致——冻结资金前先经 risk.CheckWithdraw，对目标用户生效。
+	// 命中黑名单/超限额/低 KYC/负金额一律拒绝（403）；user 服务不可达 fail-closed（503）。
+	if s.riskSvc != nil {
+		kyc := math.MaxInt
+		if s.kycFetcherByID != nil {
+			k, kerr := s.kycFetcherByID(req.UserID)
+			if kerr != nil {
+				response.Error(c, 503, 503, "risk: cannot verify kyc")
+				return
+			}
+			kyc = k
+		}
+		res, rerr := s.riskSvc.CheckWithdraw(req.UserID, asset, req.Amount, kyc, req.Address)
+		if rerr != nil {
+			response.Error(c, 500, 500, rerr.Error())
+			return
+		}
+		if !res.Allowed {
+			response.Error(c, 403, 403, res.Reason)
+			return
+		}
 	}
 	// M4 + 真实 hold 绑定：经 ledger.RequestWithdrawHold 创建提现冻结记录（内部已做余额、
 	// 地址白名单、风控引擎、每日限额校验），取得 holdID 作为离线签名器来源校验锚点。账本划出

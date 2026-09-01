@@ -312,3 +312,160 @@ func TestDeploymentKeyRotationChangesAddress(t *testing.T) {
 		t.Fatalf("B 地址应与 B 公钥派生地址一致")
 	}
 }
+
+// doReqAuth 是 doReq 的变体：可携带额外的请求头（用于鉴权令牌）。
+func doReqAuth(t *testing.T, method, url string, body interface{}, auth string) (int, map[string]string) {
+	t.Helper()
+	var r *http.Request
+	var err error
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		r, err = http.NewRequest(method, url, strings.NewReader(string(raw)))
+	} else {
+		r, err = http.NewRequest(method, url, nil)
+	}
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	r.Header.Set("Content-Type", "application/json")
+	if auth != "" {
+		r.Header.Set("Authorization", auth)
+	}
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	out := map[string]string{}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+// TestSigningServiceAuthToken 验证 /sign 的 Bearer 令牌鉴权（item #1）：
+//   - 配置令牌后，正确令牌 → 200 并正常签名；
+//   - 缺少令牌 / 错误令牌 → 401（fail-closed，拒绝签名）；
+//   - 未配置令牌（兼容模式）→ 放行（仅告警）。
+func TestSigningServiceAuthToken(t *testing.T) {
+	const digest = "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabca"
+	const token = "super-secret-hsm-token"
+
+	// 1) 配置令牌且携带正确令牌 → 200 + 可恢复签名。
+	svcTok := mustSvc(t, knownVectorPriv)
+	svcTok.SetAuthToken(token)
+	srvTok := httptest.NewServer(svcTok.Handler())
+	defer srvTok.Close()
+	okCode, okSig := doReqAuth(t, http.MethodPost, srvTok.URL+"/sign", map[string]string{"digest": digest}, "Bearer "+token)
+	if okCode != 200 {
+		t.Fatalf("正确令牌应 200，got %d", okCode)
+	}
+	if okSig["r"] == "" || okSig["s"] == "" {
+		t.Fatalf("正确令牌下应返回签名，got %v", okSig)
+	}
+	recoverAndCheck(t, digest, okSig["r"], okSig["s"], svcTok.Public())
+
+	// 2) 配置令牌但缺失令牌 → 401（拒绝签名，不得泄露任何 r/s）。
+	missCode, missSig := doReqAuth(t, http.MethodPost, srvTok.URL+"/sign", map[string]string{"digest": digest}, "")
+	if missCode != 401 {
+		t.Fatalf("缺失令牌应 401，got %d", missCode)
+	}
+	if missSig["r"] != "" || missSig["s"] != "" {
+		t.Fatalf("缺失令牌下不得返回签名（资金失窃面），got %v", missSig)
+	}
+
+	// 3) 配置令牌但错误令牌 → 401。
+	badCode, _ := doReqAuth(t, http.MethodPost, srvTok.URL+"/sign", map[string]string{"digest": digest}, "Bearer wrong")
+	if badCode != 401 {
+		t.Fatalf("错误令牌应 401，got %d", badCode)
+	}
+
+	// 4) 兼容模式（未配置令牌）→ 放行。
+	svcOpen := mustSvc(t, knownVectorPriv)
+	srvOpen := httptest.NewServer(svcOpen.Handler())
+	defer srvOpen.Close()
+	openCode, openSig := doReqAuth(t, http.MethodPost, srvOpen.URL+"/sign", map[string]string{"digest": digest}, "")
+	if openCode != 200 {
+		t.Fatalf("兼容模式应放行 200，got %d", openCode)
+	}
+	if openSig["r"] == "" || openSig["s"] == "" {
+		t.Fatalf("兼容模式应正常签名，got %v", openSig)
+	}
+}
+
+// TestDeploymentGatewaySignsViaHSMServiceWithAuth 验证端到端「网关与签名服务均启用 Bearer 鉴权」
+// 主路径：网关侧 HSMConfig.APIKey 与签名服务 -auth-token 一致时，离线签名成功并经 SendRaw 广播。
+func TestDeploymentGatewaySignsViaHSMServiceWithAuth(t *testing.T) {
+	const token = "shared-gateway-hsm-token"
+	svc := mustSvc(t, knownVectorPriv)
+	svc.SetAuthToken(token)
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+	pubHex := svc.PublicKeyHex()
+
+	var rawSeen string
+	var gotNonce, gotGas bool
+	node := ethNodeMock(t, &rawSeen, &gotNonce, &gotGas)
+	defer node.Close()
+
+	g := NewWithdrawGateway(ChainRPCConfig{
+		Enabled:   true,
+		Endpoints: map[string]string{"ETH": node.URL},
+		HotWallet: HotWalletConfig{
+			Enabled:       true,
+			SignerType:    "hsm",
+			SignerBackend: "external",
+			SignerKey:     "hsm-deploy-auth",
+			EthChainID:    1,
+			EthGasLimit:   21000,
+			HSM:           HSMConfig{Kind: "remote-http", Endpoint: srv.URL + "/sign", PublicKey: pubHex, APIKey: token},
+		},
+	})
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0x3535353535353535353535353535353535353535", "")
+	if _, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0x3535353535353535353535353535353535353535", false); err != nil {
+		t.Fatalf("鉴权主路径 SubmitWithdraw 不应报错: %v", err)
+	}
+	if rawSeen == "" {
+		t.Fatalf("鉴权主路径应经 SendRaw 广播离线签名 raw")
+	}
+	verifyETHSignature(t, rawSeen, svc.Public())
+}
+
+// TestDeploymentGatewaySignsViaHSMServiceAuthMismatch 验证网关与签名服务令牌不一致时，
+// 请求被 401 拒绝，网关 fail-degraded 回退节点广播（不得用未授权签名）。
+func TestDeploymentGatewaySignsViaHSMServiceAuthMismatch(t *testing.T) {
+	svc := mustSvc(t, knownVectorPriv)
+	svc.SetAuthToken("server-token")
+	srv := httptest.NewServer(svc.Handler())
+	defer srv.Close()
+	pubHex := svc.PublicKeyHex()
+
+	var rawSeen string
+	var gotNonce, gotGas bool
+	node := ethNodeMock(t, &rawSeen, &gotNonce, &gotGas)
+	defer node.Close()
+
+	g := NewWithdrawGateway(ChainRPCConfig{
+		Enabled:   true,
+		Endpoints: map[string]string{"ETH": node.URL},
+		HotWallet: HotWalletConfig{
+			Enabled:       true,
+			SignerType:    "hsm",
+			SignerBackend: "external",
+			SignerKey:     "hsm-deploy-mismatch",
+			EthChainID:    1,
+			EthGasLimit:   21000,
+			// 网关携带错误令牌 → 应被签名服务 401 拒绝 → 回退节点广播。
+			HSM: HSMConfig{Kind: "remote-http", Endpoint: srv.URL + "/sign", PublicKey: pubHex, APIKey: "wrong-token"},
+		},
+	})
+	g.(*RPCWithdrawGateway).AuthorizeWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0x3535353535353535353535353535353535353535", "")
+	ev, err := g.SubmitWithdraw(1, "ETH", ChainETH, amt(ChainETH, 1.0), amt(ChainETH, 0.001), "0x3535353535353535353535353535353535353535", false)
+	if err != nil {
+		t.Fatalf("令牌不一致应 fail-degraded 回退而非报错: %v", err)
+	}
+	if ev.TxHash != "0xnodefallback" {
+		t.Fatalf("令牌不一致应回退节点广播，got %q", ev.TxHash)
+	}
+	if rawSeen != "" {
+		t.Fatalf("令牌不一致不得走 SendRaw（拒绝未授权签名），却收到 raw: %s", rawSeen)
+	}
+}
