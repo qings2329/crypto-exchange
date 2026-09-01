@@ -18,9 +18,13 @@ const (
 // 权限 key 常量（与前端 PERMISSIONS 对齐）。
 const (
 	// 看板与风控
-	PermOpsView  = "ops:view"  // 运营看板（账本/服务健康）
-	PermRiskView = "risk:view" // 风控大盘查看
+	PermOpsView    = "ops:view"    // 运营看板（账本/服务健康）
+	PermRiskView   = "risk:view"   // 风控大盘查看
 	PermRiskManage = "risk:manage" // 风控规则/黑名单管理（增删）
+
+	// 期货交易管理
+	PermFuturesView   = "futures:view"   // 期货持仓/资金费查看
+	PermFuturesManage = "futures:manage" // 期货交易管理（手工充值/代客直提/应急冻结/风控开关/社会化坏账）
 
 	// 用户与账户
 	PermUserView  = "user:view"  // 用户列表查看
@@ -69,6 +73,8 @@ var allPermissionDefs = []PermissionDef{
 	{Key: PermOpsView, Name: "运营看板（账本/服务健康）", Group: "看板"},
 	{Key: PermRiskView, Name: "风控大盘查看", Group: "看板"},
 	{Key: PermRiskManage, Name: "风控规则/黑名单管理（增删）", Group: "看板"},
+	{Key: PermFuturesView, Name: "期货持仓/资金费查看", Group: "期货"},
+	{Key: PermFuturesManage, Name: "期货交易管理（充值/代客直提/应急冻结/风控开关/坏账分摊）", Group: "期货"},
 
 	{Key: PermUserView, Name: "用户列表查看", Group: "用户"},
 	{Key: PermUserWrite, Name: "用户写入（创建/冻结/解冻）", Group: "用户"},

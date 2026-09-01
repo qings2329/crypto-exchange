@@ -168,6 +168,21 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 			risk.POST("/check/withdraw", s.handleRiskCheckWithdraw)
 		}
 
+		// 期货交易管理（代理 futures 服务：持仓/资金费/钱包管理）。读需 futures:view，写需 futures:manage。
+		futuresMgmt := admin.Group("/futures", middleware.RequirePerm(PermFuturesView))
+		{
+			futuresMgmt.GET("/positions", s.handleFuturesPositions)
+			futuresMgmt.GET("/funding", s.handleFuturesFunding)
+			futuresMgmt.GET("/funding-history", s.handleFuturesFundingHistory)
+			futuresMgmt.POST("/deposit", middleware.RequirePerm(PermFuturesManage), s.handleFuturesDeposit)
+			futuresMgmt.POST("/withdraw/chain", middleware.RequirePerm(PermFuturesManage), s.handleFuturesWithdrawChain)
+			futuresMgmt.POST("/withdraw/emergency/freeze", middleware.RequirePerm(PermFuturesManage), s.handleFuturesEmergencyFreeze)
+			futuresMgmt.POST("/withdraw/emergency/resume", middleware.RequirePerm(PermFuturesManage), s.handleFuturesEmergencyResume)
+			futuresMgmt.POST("/risk/enable", middleware.RequirePerm(PermFuturesManage), s.handleFuturesRiskEnable)
+			futuresMgmt.POST("/baddebt/socialize/propose", middleware.RequirePerm(PermFuturesManage), s.handleFuturesSocializePropose)
+			futuresMgmt.POST("/baddebt/socialize/approve", middleware.RequirePerm(PermFuturesManage), s.handleFuturesSocializeApprove)
+		}
+
 		// 用户与账户管理（代理 user 服务 /admin/* 真实持久化）
 		admin.GET("/users", s.listUsers)
 		admin.POST("/users", s.createUser)
