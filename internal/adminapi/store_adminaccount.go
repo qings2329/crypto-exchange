@@ -358,7 +358,10 @@ func SeedBootstrap(store AdminStore, bootstrapUsername, bootstrapHash string) er
 		return errors.New("bootstrap admin password hash is empty")
 	}
 
-	// 1. 确保 super_admin 角色存在，并刷成全量权限。
+	// 1. 确保 super_admin 角色存在，并始终刷成全量权限。
+	//    注意：即便角色已存在也强制覆盖为全量权限，避免后续新增的权限 key（如
+	//    futures:view/futures:manage/risk:manage）因「仅创建时写入」而漏给既有 super_admin 角色，
+	//    导致前端按 me.permissions 过滤侧边菜单时隐藏对应页面。
 	super, err := store.GetRoleByName(RoleSuperAdmin)
 	if errors.Is(err, ErrAdminNotFound) {
 		super = &Role{Name: RoleSuperAdmin, Description: "超级管理员（全部权限）"}
