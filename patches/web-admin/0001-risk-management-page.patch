@@ -1,0 +1,226 @@
+diff --git a/src/pages/RiskManagement.tsx b/src/pages/RiskManagement.tsx
+new file mode 100644
+index 0000000..451e35d
+--- /dev/null
++++ b/src/pages/RiskManagement.tsx
+@@ -0,0 +1,220 @@
++import { useCallback, useEffect, useState } from "react";
++
++/**
++ * 风控管理页面（管理后台 web-admin）
++ * --------------------------------------------------------------------------
++ * 对应后端 adminapi 新增的「风控管理」模块（代理 internal/risk 服务）：
++ *   GET    /api/admin/risk/rules            读（需 risk:view）
++ *   POST   /api/admin/risk/rules            写（需 risk:manage）
++ *   GET    /api/admin/risk/blacklist        读
++ *   POST   /api/admin/risk/blacklist        写
++ *   DELETE /api/admin/risk/blacklist?target= 写
++ *   GET    /api/admin/risk/blacklist/check?target= 读
++ *   POST   /api/admin/risk/check/withdraw   读（提现风控预检）
++ *
++ * 约定（按你们 web-admin 实际约定调整）：
++ *   - `api.get/post/delete` 已自动附加 admin token，并返回完整信封 {code,data,message}，
++ *     这里统一用 `.data` 取业务数据。
++ *   - 鉴权报错（401/403）由全局拦截器处理，本页只展示业务 error。
++ *   - 样式用了内联 style 占位，请替换为你们实际的 UI 组件库（Ant Design / MUI 等）。
++ */
++
++type RiskRule = {
++  id?: number;
++  kind: string;
++  asset: string;
++  scope?: string;
++  max_amount_per_day?: number;
++  min_kyc_level?: number;
++  enabled?: boolean;
++};
++
++type BlacklistEntry = {
++  target: string;
++  kind: string;
++  reason?: string;
++};
++
++type CheckResult = { allowed: boolean; reason?: string };
++
++const card: React.CSSProperties = {
++  border: "1px solid #e5e7eb",
++  borderRadius: 8,
++  padding: 16,
++  marginBottom: 16,
++};
++const btn: React.CSSProperties = { marginLeft: 8, padding: "4px 10px" };
++
++export default function RiskManagement() {
++  const [rules, setRules] = useState<RiskRule[]>([]);
++  const [bl, setBl] = useState<BlacklistEntry[]>([]);
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  const [rule, setRule] = useState<RiskRule>({
++    kind: "withdraw_limit",
++    asset: "BTC",
++    max_amount_per_day: 1000,
++    min_kyc_level: 1,
++  });
++  const [blForm, setBlForm] = useState<BlacklistEntry>({ target: "", kind: "address", reason: "" });
++
++  const [checkTarget, setCheckTarget] = useState("");
++  const [checkRes, setCheckRes] = useState<{ blacklisted: boolean } | null>(null);
++  const [wd, setWd] = useState({ user_id: 1, asset: "BTC", amount: 10, address: "" });
++  const [wdRes, setWdRes] = useState<CheckResult | null>(null);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError(null);
++    try {
++      const [r, b] = await Promise.all([
++        api.get("/risk/rules"),
++        api.get("/risk/blacklist"),
++      ]);
++      setRules((r.data?.items as RiskRule[]) ?? []);
++      setBl((b.data?.items as BlacklistEntry[]) ?? []);
++    } catch (e: any) {
++      setError(e?.message ?? "加载失败");
++    } finally {
++      setLoading(false);
++    }
++  }, []);
++
++  useEffect(() => { load(); }, [load]);
++
++  const addRule = async () => {
++    try {
++      await api.post("/risk/rules", rule);
++      setError(null);
++      load();
++    } catch (e: any) { setError(e?.message ?? "新建规则失败"); }
++  };
++
++  const addBl = async () => {
++    if (!blForm.target) { setError("target 必填"); return; }
++    try {
++      await api.post("/risk/blacklist", blForm);
++      setBlForm({ target: "", kind: "address", reason: "" });
++      setError(null);
++      load();
++    } catch (e: any) { setError(e?.message ?? "加黑名单失败"); }
++  };
++
++  const delBl = async (target: string) => {
++    if (!window.confirm(`确认将 ${target} 移出黑名单？`)) return;
++    try {
++      await api.delete(`/risk/blacklist?target=${encodeURIComponent(target)}`);
++      setError(null);
++      load();
++    } catch (e: any) { setError(e?.message ?? "移除黑名单失败"); }
++  };
++
++  const doCheck = async () => {
++    if (!checkTarget) return;
++    try {
++      const r = await api.get(`/risk/blacklist/check?target=${encodeURIComponent(checkTarget)}`);
++      setCheckRes(r.data as { blacklisted: boolean });
++    } catch (e: any) { setError(e?.message ?? "查询失败"); }
++  };
++
++  const doWdCheck = async () => {
++    try {
++      const r = await api.post("/risk/check/withdraw", wd);
++      setWdRes(r.data as CheckResult);
++    } catch (e: any) { setError(e?.message ?? "预检失败"); }
++  };
++
++  return (
++    <div style={{ padding: 24, maxWidth: 960, margin: "0 auto" }}>
++      <h1>风控管理</h1>
++      {error && <div style={{ color: "#b91c1c", marginBottom: 12 }}>错误：{error}</div>}
++      {loading && <div style={{ marginBottom: 12 }}>加载中…</div>}
++
++      <section style={card}>
++        <h2>风控规则</h2>
++        <ul>
++          {rules.map((r, i) => (
++            <li key={i}>
++              {r.kind} / {r.asset} / 限额 {r.max_amount_per_day ?? "-"} / KYC≥{r.min_kyc_level ?? 0}
++              {r.enabled === false ? "（已禁用）" : ""}
++            </li>
++          ))}
++          {rules.length === 0 && <li>暂无规则</li>}
++        </ul>
++        <h3>新建 / 更新规则</h3>
++        <div>
++          <input placeholder="kind" value={rule.kind}
++            onChange={(e) => setRule({ ...rule, kind: e.target.value })} />
++          <input placeholder="asset" value={rule.asset}
++            onChange={(e) => setRule({ ...rule, asset: e.target.value })} />
++          <input placeholder="限额" type="number" value={rule.max_amount_per_day}
++            onChange={(e) => setRule({ ...rule, max_amount_per_day: +e.target.value })} />
++          <input placeholder="最低KYC" type="number" value={rule.min_kyc_level}
++            onChange={(e) => setRule({ ...rule, min_kyc_level: +e.target.value })} />
++          <button style={btn} onClick={addRule}>提交</button>
++        </div>
++      </section>
++
++      <section style={card}>
++        <h2>黑名单</h2>
++        <ul>
++          {bl.map((b, i) => (
++            <li key={i}>
++              [{b.kind}] {b.target} {b.reason ? `（${b.reason}）` : ""}
++              <button style={btn} onClick={() => delBl(b.target)}>移除</button>
++            </li>
++          ))}
++          {bl.length === 0 && <li>暂无黑名单</li>}
++        </ul>
++        <h3>加入黑名单</h3>
++        <div>
++          <input placeholder="target（用户ID或链上地址）" value={blForm.target}
++            onChange={(e) => setBlForm({ ...blForm, target: e.target.value })} />
++          <input placeholder="kind（user/address）" value={blForm.kind}
++            onChange={(e) => setBlForm({ ...blForm, kind: e.target.value })} />
++          <input placeholder="reason" value={blForm.reason}
++            onChange={(e) => setBlForm({ ...blForm, reason: e.target.value })} />
++          <button style={btn} onClick={addBl}>加入</button>
++        </div>
++      </section>
++
++      <section style={card}>
++        <h2>黑名单查询</h2>
++        <div>
++          <input placeholder="target" value={checkTarget}
++            onChange={(e) => setCheckTarget(e.target.value)} />
++          <button style={btn} onClick={doCheck}>查询</button>
++          {checkRes && <span> → {checkRes.blacklisted ? "已命中黑名单" : "未命中"}</span>}
++        </div>
++      </section>
++
++      <section style={card}>
++        <h2>提现风控预检</h2>
++        <div>
++          <input placeholder="user_id" type="number" value={wd.user_id}
++            onChange={(e) => setWd({ ...wd, user_id: +e.target.value })} />
++          <input placeholder="asset" value={wd.asset}
++            onChange={(e) => setWd({ ...wd, asset: e.target.value })} />
++          <input placeholder="amount" type="number" value={wd.amount}
++            onChange={(e) => setWd({ ...wd, amount: +e.target.value })} />
++          <input placeholder="address" value={wd.address}
++            onChange={(e) => setWd({ ...wd, address: e.target.value })} />
++          <button style={btn} onClick={doWdCheck}>预检</button>
++        </div>
++        {wdRes && (
++          <div style={{ marginTop: 8 }}>
++            结果：{wdRes.allowed ? "放行" : "拒绝"} {wdRes.reason ? `（${wdRes.reason}）` : ""}
++          </div>
++        )}
++      </section>
++    </div>
++  );
++}
++
++// 与 web-admin 的 api 客户端对齐：这里仅做类型占位，编译时请确保 import 你们真实的 api 模块。
++declare const api: {
++  get: (p: string) => Promise<any>;
++  post: (p: string, body: any) => Promise<any>;
++  delete: (p: string) => Promise<any>;
++};
