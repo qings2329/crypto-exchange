@@ -312,6 +312,7 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 - `internal/matching/engine_recover_test.go`（外部包 `matching_test`，规避 import 环）：`TestSubmitWritesWAL`（Submit 同步落 WAL 且分配 ID）、`TestEngineRecoverFromStore`（共享 MemStore 模拟崩溃：引擎 B 恢复出 A 写入的订单簿、新 ID 不复用）、`TestEngineRecoverReflectsCancel`（撤单经 WAL 恢复后生效）、`TestEngineRecoverIdempotent`（Recover 幂等）。
 - `go build/vet/test ./...` 全绿（无回归）。
 - **真实 MySQL 端到端（sqlpub 远端库）**：启动 `cmd/matching` node-A（:8085）获 leader 并写入订单 1/2 → 启动 node-B（:8086）为 standby（拒绝服务 503）→ `TaskStop` 杀 A → B 在租约过期后接管为 leader，从 MySQL 恢复出订单 1/2（**不丢单**），新订单拿到 ID 3（**全局唯一不复用**）。证明多实例单写者 + 崩溃恢复成立。
+- **真实 MySQL 端到端（项2：成交流水/订单登记持久化恢复）**：`internal/matching/persist/mysql_test.go` 新增 `TestMySQLTradeRoundtrip` / `TestMySQLOrderRoundtrip`（验证 `ce_matching_trades` / `ce_matching_orders` 经 JSON 落库并往返一致、同 `order_id` 幂等覆盖）；`internal/matching/engine_recover_test.go` 新增 `TestEngineRecoverPersistsTradesAndOrdersMySQL`（引擎 A 撮合出成交并持久化 → 引擎 B 用同一 `MySQLStore` 从 MySQL「重启」恢复出成交流水与订单登记，**重启不丢历史**）。二者均门控于 `MYSQL_TEST_DSN`（本地 MariaDB / sqlpub 远端库均可跑），与上面订单簿/WAL 恢复验证同源；`setupMySQLStore` 每次测试前 `TRUNCATE` 各表并重置 `ce_matching_seq`/`ce_matching_leader`，使共用同一库时用例互不污染、可重复运行。证明 `Engine.Recover` 在真实 MySQL 下完整重建 open 订单簿 + 历史成交流水 + 历史订单登记。
 
 ## 18. 撮合收敛：spot/futures 改为调用 cmd/matching 的 HTTP 客户端（服务网格级重构）
 
@@ -350,7 +351,7 @@ T-14 最后一项业务线（用户"继续"在 otc 收尾后立项）。理财�
 
 **设计**：
 - 撮合引擎新增**订单/成交登记簿**（`Engine.orders`/`userOrders`/`trades`/`userTrades`）：`registerOrder` 在 `Submit`/`MatchNow` 时写入不可变快照 + `FilledQty` 累加器（避免止盈止损激活副本导致的指针错位）；`applyTrades` 按 `TakerOID/MakerOID` 累加成交并派生状态（open/partial/filled/canceled）；`ListOrders/GetOrder/ListTrades` 支持 `user_id`/`symbol`/`status`/`market`/`limit` 过滤（`user_id=0` 返回全部，供管理后台）。`Recover` 后 `rebuildOrderIndex` 重建 open 订单索引。
-- `matching.Order` 新增 `Market` 字段（`spot`/`futures`），下游下单时写入；`OrderView`/`TradeView` 透出 `market`，使现货/合约共用同一登记簿时仍能按市场区分。**注意**：当前为内存簿，重启后仅 open 订单经 `Recover` 重建，历史 filled/canceled 与成交流水不重建（原型限制）。
+- `matching.Order` 新增 `Market` 字段（`spot`/`futures`），下游下单时写入；`OrderView`/`TradeView` 透出 `market`，使现货/合约共用同一登记簿时仍能按市场区分。**成交流水与订单登记持久化（项2，2026-08-31 提交 `43cb06b` 已补齐）**：`Engine.Recover` 从 `ce_matching_trades` / `ce_matching_orders`（迁移版本 204/205）重建历史 filled/canceled 与成交流水，**重启不丢历史**，并经真实 MySQL 端到端验证（见 §17.1）。
 - **杠杆标记（2026-08-15 补）**：`matching.Order` 新增 `IsMargin`/`Leverage` 字段；现货杠杆单由 `spot.handleOrder` 透传（`is_margin`/`leverage`），合约单在 `futuresapi.handleOrder` 强制 `IsMargin=true` 并透传 `Leverage`；`OrderView` 透出二者。语义：`IsMargin`=该单为杠杆单（现货杠杆单与合约单均为 true，普通现货单为 false）。`OrderView.MarginMatches(q)` 统一过滤：`q` 为空/"all" 全部通过，"1"/"true"/"margin" 仅杠杆单，"0"/"false" 仅非杠杆单。用户侧 `GET /api/v1/spot/orders` 与 `/api/v1/futures/orders`、管理后台 `GET /api/admin/orders` 均支持 `?margin=` 过滤（同时修正了 spot `/orders` 此前未过滤 `market=spot`、会泄漏合约单的问题）。
 - **成交流水杠杆筛选（2026-08-15 续）**：`TradeView` 新增 `IsMargin`/`Leverage`，由 `applyTrades` 从**吃单（taker）订单**继承（合约成交天然带杠杆；现货杠杆单成交亦带标记）；`TradeView.MarginMatches(q)` 与订单共用 `marginMatches` 逻辑。用户侧 `GET /api/v1/spot/trades`、`/api/v1/futures/trades` 与管理后台 `GET /api/admin/trades` 均支持 `?margin=` 过滤（可叠加 `market`/`symbol`/`user_id`）。
 - `matching.Matcher` 接口新增 `Cancel(symbol, orderID) bool`；`*client.Client` 包一层 `CancelOrder` 实现它，使 futures 能以统一接口撤单。

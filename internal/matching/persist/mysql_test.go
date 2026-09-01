@@ -10,6 +10,15 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 )
 
+// closeF 是浮点近似比较（Fixed 经 Float() 还原后可能含微小舍入，仅用于测试断言）。
+func closeF(a, b float64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= 1e-9
+}
+
 // setupMySQLStore 创建一个带完整迁移的 MySQLStore（仅在 MYSQL_TEST_DSN 可用时运行）。
 func setupMySQLStore(t *testing.T) *MySQLStore {
 	t.Helper()
@@ -26,6 +35,20 @@ func setupMySQLStore(t *testing.T) *MySQLStore {
 	r := migrate.New(s.DB(), Migrations())
 	if err := r.Up(); err != nil {
 		t.Fatalf("migrate Up: %v", err)
+	}
+	// 每个测试从干净状态开始，避免共用同一库时用例间互相污染
+	//（既有测试均假设空表/干净 leader；此前依赖每次用全新库才能通过）。
+	for _, q := range []string{
+		"TRUNCATE ce_matching_wal",
+		"TRUNCATE ce_matching_trades",
+		"TRUNCATE ce_matching_orders",
+		"TRUNCATE ce_matching_snapshot",
+		"UPDATE ce_matching_seq SET val=0 WHERE id=1",
+		"UPDATE ce_matching_leader SET holder='', expires_at='1970-01-01 00:00:00', heartbeat='1970-01-01 00:00:00' WHERE id=1",
+	} {
+		if _, err := s.DB().ExecContext(context.Background(), q); err != nil {
+			t.Fatalf("clean matching tables: %v", err)
+		}
 	}
 	return s
 }
@@ -228,5 +251,95 @@ func TestMySQLStoreClose(t *testing.T) {
 	s := setupMySQLStore(t)
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestMySQLTradeRoundtrip 验证成交流水经 ce_matching_trades 持久化后往返一致（项2 的 MySQL 落库路径）。
+// 这是 §17.1 原有 MySQL 端到端验证未覆盖的部分：重启后成交流水从历史库重建。
+func TestMySQLTradeRoundtrip(t *testing.T) {
+	s := setupMySQLStore(t)
+	ctx := context.Background()
+	pt := matching.PersistedTrade{
+		Seq:       1,
+		Symbol:    "BTC_USDT",
+		Market:    "spot",
+		IsMargin:  false,
+		Leverage:  0,
+		Price:     matching.FixedFromFloat(100, 2),
+		Qty:       matching.FixedFromFloat(1, 8),
+		TakerID:   1,
+		MakerID:   2,
+		TakerSide: matching.Buy,
+		TakerOID:  10,
+		MakerOID:  20,
+		Time:      time.Now().UnixNano(),
+	}
+	if err := s.AppendTrade(ctx, pt); err != nil {
+		t.Fatalf("AppendTrade: %v", err)
+	}
+	pts, err := s.LoadTrades(ctx)
+	if err != nil {
+		t.Fatalf("LoadTrades: %v", err)
+	}
+	if len(pts) != 1 {
+		t.Fatalf("want 1 trade, got %d", len(pts))
+	}
+	got := pts[0]
+	if got.Symbol != pt.Symbol || got.Market != pt.Market || got.IsMargin != pt.IsMargin {
+		t.Fatalf("trade meta mismatch: %+v", got)
+	}
+	if got.TakerID != pt.TakerID || got.MakerID != pt.MakerID || got.TakerSide != pt.TakerSide {
+		t.Fatalf("trade party mismatch: %+v", got)
+	}
+	if !closeF(got.Price.Float(), 100) || !closeF(got.Qty.Float(), 1) {
+		t.Fatalf("trade amount mismatch: price=%v qty=%v", got.Price, got.Qty)
+	}
+}
+
+// TestMySQLOrderRoundtrip 验证订单登记经 ce_matching_orders 持久化且同 order_id 幂等覆盖（项2 的 MySQL 落库路径）。
+func TestMySQLOrderRoundtrip(t *testing.T) {
+	s := setupMySQLStore(t)
+	ctx := context.Background()
+	po := matching.PersistedOrder{
+		ID:          42,
+		UserID:      7,
+		Symbol:      "BTC_USDT",
+		Market:      "futures",
+		IsMargin:    true,
+		Leverage:    10,
+		Side:        matching.Buy,
+		Price:       matching.FixedFromFloat(100, 2),
+		Qty:         matching.FixedFromFloat(1, 8),
+		FilledQty:   matching.FixedFromFloat(0.5, 8),
+		TimeInForce: "GTC",
+		Status:      matching.OrderStatus("filled"),
+		CreatedAt:   1,
+		UpdatedAt:   2,
+	}
+	if err := s.UpsertOrder(ctx, po); err != nil {
+		t.Fatalf("UpsertOrder: %v", err)
+	}
+	// 同 order_id 覆盖：状态改为 canceled、成交量补满（幂等）。
+	po.Status = matching.OrderStatus("canceled")
+	po.FilledQty = matching.FixedFromFloat(1, 8)
+	if err := s.UpsertOrder(ctx, po); err != nil {
+		t.Fatalf("UpsertOrder overwrite: %v", err)
+	}
+	pos, err := s.LoadOrders(ctx)
+	if err != nil {
+		t.Fatalf("LoadOrders: %v", err)
+	}
+	if len(pos) != 1 {
+		t.Fatalf("upsert should be idempotent (1 row), got %d", len(pos))
+	}
+	got := pos[0]
+	if got.ID != po.ID || got.UserID != po.UserID || got.Symbol != po.Symbol {
+		t.Fatalf("order meta mismatch: %+v", got)
+	}
+	if got.Status != matching.OrderStatus("canceled") {
+		t.Fatalf("upsert should overwrite status, got %v", got.Status)
+	}
+	if !closeF(got.FilledQty.Float(), 1) {
+		t.Fatalf("filled qty mismatch: %v", got.FilledQty)
 	}
 }

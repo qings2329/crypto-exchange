@@ -2,11 +2,13 @@ package matching_test
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/persist"
+	"github.com/coldlar/crypto-exchange/internal/pkg/migrate"
 )
 
 func approx(a, b, eps float64) bool {
@@ -214,5 +216,50 @@ func TestEngineRecoverIdempotent(t *testing.T) {
 	}
 	if err := e.Recover(ctx); err != nil { // 第二次应为 no-op（recovered 标记）
 		t.Fatal(err)
+	}
+}
+
+// TestEngineRecoverPersistsTradesAndOrdersMySQL 在真实 MySQLStore 上验证项2：
+// 引擎 A 撮合出成交并持久化到 ce_matching_trades / ce_matching_orders → 引擎 B 用同一 Store
+// 从 MySQL「重启」恢复出成交流水与订单登记（不丢历史）。需 MYSQL_TEST_DSN；无则跳过
+// （与 §17.1 的 MySQL 端到端同门控）。这补齐了 §17.1 仅验证订单簿/WAL 恢复的缺口。
+func TestEngineRecoverPersistsTradesAndOrdersMySQL(t *testing.T) {
+	dsn := os.Getenv("MYSQL_TEST_DSN")
+	if dsn == "" {
+		t.Skip("MYSQL_TEST_DSN not set; skipping MySQL engine recover test")
+	}
+	store, err := persist.NewMySQLStore(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := migrate.New(store.DB(), persist.Migrations()).Up(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 引擎 A 撮合出 1 笔成交（双方 filled 离场），落库。
+	e1 := matching.NewEngine(nil, nil)
+	e1.UseStore(store, "n1", 0)
+	e1.Register("BTC_USDT")
+	buy := &matching.Order{UserID: 1, Side: matching.Buy, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 1}
+	sell := &matching.Order{UserID: 2, Side: matching.Sell, Price: matching.FixedFromFloat(100, 2), Qty: matching.FixedFromFloat(1, 8), Time: 2}
+	if !e1.Submit("BTC_USDT", buy) || !e1.Submit("BTC_USDT", sell) {
+		t.Fatal("submit failed")
+	}
+	if !waitTrades(t, e1, 1) {
+		t.Fatal("e1 should have 1 trade")
+	}
+
+	// 引擎 B 用同一 Store 从 MySQL 恢复（模拟进程崩溃→新节点接管）。
+	e2 := matching.NewEngine(nil, nil)
+	e2.UseStore(store, "n2", 0)
+	if err := e2.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if trades := e2.ListTrades(0, "", 0); len(trades) != 1 {
+		t.Fatalf("recovered trades want 1 got %d", len(trades))
+	}
+	if orders := e2.ListOrders(0, "", "", 0); len(orders) != 2 {
+		t.Fatalf("recovered orders want 2 got %d", len(orders))
 	}
 }
