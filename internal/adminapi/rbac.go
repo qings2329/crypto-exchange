@@ -20,6 +20,7 @@ const (
 	// 看板与风控
 	PermOpsView  = "ops:view"  // 运营看板（账本/服务健康）
 	PermRiskView = "risk:view" // 风控大盘查看
+	PermRiskManage = "risk:manage" // 风控规则/黑名单管理（增删）
 
 	// 用户与账户
 	PermUserView  = "user:view"  // 用户列表查看
@@ -67,6 +68,7 @@ type PermissionDef struct {
 var allPermissionDefs = []PermissionDef{
 	{Key: PermOpsView, Name: "运营看板（账本/服务健康）", Group: "看板"},
 	{Key: PermRiskView, Name: "风控大盘查看", Group: "看板"},
+	{Key: PermRiskManage, Name: "风控规则/黑名单管理（增删）", Group: "看板"},
 
 	{Key: PermUserView, Name: "用户列表查看", Group: "用户"},
 	{Key: PermUserWrite, Name: "用户写入（创建/冻结/解冻）", Group: "用户"},

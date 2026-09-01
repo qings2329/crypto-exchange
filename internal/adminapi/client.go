@@ -144,3 +144,9 @@ func (c *UpstreamClient) Post(ctx context.Context, baseURL, path string, out, bo
 func (c *UpstreamClient) Put(ctx context.Context, baseURL, path string, out, body interface{}) error {
 	return c.do(ctx, http.MethodPut, baseURL, path, body, out)
 }
+
+// Delete 调用上游 DELETE 并解包 data 到 out（out 可为 nil）。用于删除类管理操作
+// （如风控黑名单移除）。
+func (c *UpstreamClient) Delete(ctx context.Context, baseURL, path string, out interface{}) error {
+	return c.do(ctx, http.MethodDelete, baseURL, path, nil, out)
+}

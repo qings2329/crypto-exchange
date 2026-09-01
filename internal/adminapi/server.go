@@ -156,6 +156,18 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		// 风控与强平监控（实时聚合 futures）
 		admin.GET("/risk", s.handleRisk)
 
+		// 风控管理（代理 risk 服务规则/黑名单 CRUD）。读需 risk:view，增删需 risk:manage。
+		risk := admin.Group("/risk", middleware.RequirePerm(PermRiskView))
+		{
+			risk.GET("/rules", s.handleRiskRulesList)
+			risk.POST("/rules", middleware.RequirePerm(PermRiskManage), s.handleRiskRuleCreate)
+			risk.GET("/blacklist", s.handleRiskBlacklistList)
+			risk.POST("/blacklist", middleware.RequirePerm(PermRiskManage), s.handleRiskBlacklistCreate)
+			risk.DELETE("/blacklist", middleware.RequirePerm(PermRiskManage), s.handleRiskBlacklistDelete)
+			risk.GET("/blacklist/check", s.handleRiskBlacklistCheck)
+			risk.POST("/check/withdraw", s.handleRiskCheckWithdraw)
+		}
+
 		// 用户与账户管理（代理 user 服务 /admin/* 真实持久化）
 		admin.GET("/users", s.listUsers)
 		admin.POST("/users", s.createUser)
