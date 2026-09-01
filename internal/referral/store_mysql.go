@@ -57,8 +57,11 @@ func (s *mysqlStore) runMigrations() error {
 
 func (s *mysqlStore) RecordCommission(c *ReferralCommission) error {
 	now := time.Now()
+	// 用普通 INSERT 而非 INSERT IGNORE：IGNORE 会把重复键降级为警告（err=nil、0 行受影响），
+	// 使下面的 isDuplicate 成为死代码——重复 biz_ref 不会被识别为幂等命中，且所有其他插入
+	// 错误（截断/约束）也会被静默吞掉，造成丢单却上报成功。
 	res, err := s.db.Exec(
-		`INSERT IGNORE INTO ce_referral_commissions (referrer_id, taker_id, asset, amount, rate, status, biz_ref, created_at, updated_at)
+		`INSERT INTO ce_referral_commissions (referrer_id, taker_id, asset, amount, rate, status, biz_ref, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ReferrerID, c.TakerID, c.Asset, c.Amount, c.Rate, int(c.Status), c.BizRef, now, now)
 	if err != nil {

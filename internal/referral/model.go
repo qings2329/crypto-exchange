@@ -38,11 +38,14 @@ type ReferralCommission struct {
 	UpdatedAt  time.Time        `json:"updated_at"`
 }
 
+// MaxCommissionRate 佣金比例安全上限：佣金不得超过手续费本身，否则平台倒贴。
+const MaxCommissionRate = 1.0
+
 // SystemAccount 佣金系统账户定义
 var SystemAccountCommission int64 = -15
 
 var (
-	ErrCommissionExists = fmt.Errorf("commission record already exists")
-	ErrAssetRequired    = fmt.Errorf("asset is required")
-	ErrAmountInvalid    = fmt.Errorf("commission amount must be positive")
+	ErrCommissionExists  = fmt.Errorf("commission record already exists")
+	ErrInvalidRate       = fmt.Errorf("commission rate must be finite and within (0, 1]")
+	ErrUnsupportedAsset  = fmt.Errorf("unsupported asset")
 )

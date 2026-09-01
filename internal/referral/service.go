@@ -2,6 +2,8 @@ package referral
 
 import (
 	"go.uber.org/zap"
+
+	"github.com/coldlar/crypto-exchange/internal/settlement"
 )
 
 // Service 佣金业务逻辑。
@@ -22,8 +24,15 @@ func (s *Service) RecordTradeCommission(referrerID, takerID int64, asset string,
 	if feeAmount <= 0 {
 		return nil // 无手续费则跳过
 	}
-	if rate <= 0 {
-		return nil // 佣金率为 0 则跳过
+	// F5：佣金率必须有限且落在 (0, MaxCommissionRate]。
+	// - rate > 1 会让佣金大于手续费本身（平台倒贴）；
+	// - NaN/Inf 下 float64→int64 转换结果依赖实现，会往账里写入天文数字或负数。
+	if rate != rate || rate <= 0 || rate > MaxCommissionRate {
+		return ErrInvalidRate
+	}
+	// F5：资产必须已知，否则会往佣金表写入任意符号污染按资产汇总。
+	if !settlement.KnownAsset(asset) {
+		return ErrUnsupportedAsset
 	}
 
 	commissionAmt := int64(float64(feeAmount) * rate)

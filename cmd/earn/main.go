@@ -101,7 +101,8 @@ func main() {
 			},
 		}
 		if err := svc.CreateProject(p); err == nil {
-			_, _ = svc.FundProject(1, p.ID, 1_000_000) // 预充 NEW 奖励池（演示）
+			// 幂等键使重复启动不会重复扣款（F1）
+			_, _ = svc.FundProject(1, p.ID, 1_000_000, "seed-launchpool-new")
 		} else {
 			log.Warn("seed launch project failed", zap.Error(err))
 		}

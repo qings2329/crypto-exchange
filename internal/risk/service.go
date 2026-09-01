@@ -72,17 +72,30 @@ func (s *Service) ListEvents(userID int64, limit int) ([]*RiskEvent, error) {
 // 规则校验单笔限额与 KYC 等级。返回是否放行。
 func (s *Service) CheckWithdraw(userID int64, asset string, amount float64, kycLevel int, addr string) (CheckResult, error) {
 	uidStr := strconv.FormatInt(userID, 10)
-	if ok, _ := s.store.IsBlacklisted(uidStr); ok {
+	// 黑名单查询出错必须 fail-closed：丢弃错误会让 DB 抖动期间黑名单完全失效，
+	// 被封用户/地址照样放行提现。
+	ok, err := s.store.IsBlacklisted(uidStr)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "blacklist lookup failed"}, err
+	}
+	if ok {
 		s.record(userID, KindWithdrawLimit, fmt.Sprintf("user %s in blacklist", uidStr))
 		return CheckResult{Allowed: false, Reason: "user blacklisted"}, nil
 	}
 	if addr != "" {
-		if ok, _ := s.store.IsBlacklisted(addr); ok {
+		ok, err := s.store.IsBlacklisted(addr)
+		if err != nil {
+			return CheckResult{Allowed: false, Reason: "blacklist lookup failed"}, err
+		}
+		if ok {
 			s.record(userID, KindWithdrawLimit, fmt.Sprintf("address %s in blacklist", addr))
 			return CheckResult{Allowed: false, Reason: "address blacklisted"}, nil
 		}
 	}
-	rule := s.matchRule(KindWithdrawLimit, asset, userID)
+	rule, err := s.matchRule(KindWithdrawLimit, asset, userID)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "risk rule lookup failed"}, err
+	}
 	if rule == nil {
 		return CheckResult{Allowed: true}, nil
 	}
@@ -111,11 +124,18 @@ func (s *Service) CheckWithdraw(userID int64, asset string, amount float64, kycL
 // CheckOrder 评估下单风控：按 order_limit 规则校验单笔数额与 KYC 等级。
 func (s *Service) CheckOrder(userID int64, asset string, qty float64, kycLevel int) (CheckResult, error) {
 	uidStr := strconv.FormatInt(userID, 10)
-	if ok, _ := s.store.IsBlacklisted(uidStr); ok {
+	ok, err := s.store.IsBlacklisted(uidStr)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "blacklist lookup failed"}, err
+	}
+	if ok {
 		s.record(userID, KindOrderLimit, fmt.Sprintf("user %s in blacklist", uidStr))
 		return CheckResult{Allowed: false, Reason: "user blacklisted"}, nil
 	}
-	rule := s.matchRule(KindOrderLimit, asset, userID)
+	rule, err := s.matchRule(KindOrderLimit, asset, userID)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "risk rule lookup failed"}, err
+	}
 	if rule == nil {
 		return CheckResult{Allowed: true}, nil
 	}
@@ -145,11 +165,18 @@ func (s *Service) CheckOrder(userID int64, asset string, qty float64, kycLevel i
 // 超过 position_limit 规则的 MaxAmountPerDay 时拒绝。
 func (s *Service) CheckPosition(userID int64, asset string, positionSize float64, kycLevel int) (CheckResult, error) {
 	uidStr := strconv.FormatInt(userID, 10)
-	if ok, _ := s.store.IsBlacklisted(uidStr); ok {
+	ok, err := s.store.IsBlacklisted(uidStr)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "blacklist lookup failed"}, err
+	}
+	if ok {
 		s.record(userID, KindPositionLimit, fmt.Sprintf("user %s in blacklist", uidStr))
 		return CheckResult{Allowed: false, Reason: "user blacklisted"}, nil
 	}
-	rule := s.matchRule(KindPositionLimit, asset, userID)
+	rule, err := s.matchRule(KindPositionLimit, asset, userID)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "risk rule lookup failed"}, err
+	}
 	if rule == nil {
 		return CheckResult{Allowed: true}, nil
 	}
@@ -179,11 +206,18 @@ func (s *Service) CheckPosition(userID int64, asset string, positionSize float64
 // 每次调用会原子递增计数器（在 window 窗口内），超过 MaxCountPerDay 时拒绝。
 func (s *Service) CheckFrequency(userID int64, action string, window time.Duration) (CheckResult, error) {
 	uidStr := strconv.FormatInt(userID, 10)
-	if ok, _ := s.store.IsBlacklisted(uidStr); ok {
+	ok, err := s.store.IsBlacklisted(uidStr)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "blacklist lookup failed"}, err
+	}
+	if ok {
 		s.record(userID, KindFreqLimit, fmt.Sprintf("user %s in blacklist", uidStr))
 		return CheckResult{Allowed: false, Reason: "user blacklisted"}, nil
 	}
-	rule := s.matchRule(KindFreqLimit, "", userID)
+	rule, err := s.matchRule(KindFreqLimit, "", userID)
+	if err != nil {
+		return CheckResult{Allowed: false, Reason: "risk rule lookup failed"}, err
+	}
 	if rule == nil {
 		return CheckResult{Allowed: true}, nil
 	}
@@ -200,10 +234,12 @@ func (s *Service) CheckFrequency(userID int64, action string, window time.Durati
 }
 
 // matchRule 匹配作用域与资产都命中的第一条启用规则。
-func (s *Service) matchRule(kind, asset string, userID int64) *RiskRule {
+// 列出规则失败时返回 error：静默返回 nil 会被调用方理解为「无匹配规则」从而放行，
+// 等于 DB 抖动期间所有限额都被绕过，故须由调用方 fail-closed。
+func (s *Service) matchRule(kind, asset string, userID int64) (*RiskRule, error) {
 	rules, err := s.store.ListRules(kind)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	for _, r := range rules {
 		if !r.Enabled {
@@ -215,9 +251,9 @@ func (s *Service) matchRule(kind, asset string, userID int64) *RiskRule {
 		if r.Asset != "" && r.Asset != asset {
 			continue
 		}
-		return r
+		return r, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func (s *Service) record(userID int64, kind, detail string) {

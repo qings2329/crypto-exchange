@@ -24,7 +24,13 @@ func setupRouter(h *Handler) *gin.Engine {
 	return r
 }
 
+// authHeader 签发管理员 token：/api/v1/risk 全组路由均为运营/管理向，要求 RoleAdmin（F4）。
 func authHeader(uid int64) string {
+	return "Bearer " + testVerifier.IssueAdmin(uid, "admin", nil, time.Hour)
+}
+
+// userHeader 签发普通用户 token，用于验证非管理员被拒。
+func userHeader(uid int64) string {
 	return "Bearer " + testVerifier.Issue(uid, time.Hour)
 }
 
@@ -69,6 +75,43 @@ func TestHandlerUnauthorized(t *testing.T) {
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s: expect 401, got %d", rt.method, rt.path, w.Code)
+		}
+	}
+}
+
+// 非管理员（普通登录用户）访问风控管理接口一律 403（F4 回归）。
+// 修复前本组只有全局 Auth，任意登录用户可改规则/删黑名单/读全量黑名单。
+func TestHandlerNonAdminForbidden(t *testing.T) {
+	h := NewHandler(New(NewMemStore()))
+	r := setupRouter(h)
+
+	routes := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{"GET", "/api/v1/risk/rules", ""},
+		{"POST", "/api/v1/risk/rules", `{"kind":"withdraw_limit"}`},
+		{"GET", "/api/v1/risk/blacklist", ""},
+		{"POST", "/api/v1/risk/blacklist", `{"target":"1","kind":"user"}`},
+		{"DELETE", "/api/v1/risk/blacklist?target=x", ""},
+		{"GET", "/api/v1/risk/events", ""},
+		{"POST", "/api/v1/risk/check/withdraw", `{"user_id":1,"amount":1}`},
+		{"POST", "/api/v1/risk/check/frequency", `{"user_id":1,"action":"withdraw"}`},
+	}
+	for _, rt := range routes {
+		w := httptest.NewRecorder()
+		var body *strings.Reader
+		if rt.body == "" {
+			body = strings.NewReader("")
+		} else {
+			body = strings.NewReader(rt.body)
+		}
+		req, _ := http.NewRequest(rt.method, rt.path, body)
+		req.Header.Set("Authorization", userHeader(2))
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s %s: expect 403 for non-admin, got %d body=%s", rt.method, rt.path, w.Code, w.Body.String())
 		}
 	}
 }

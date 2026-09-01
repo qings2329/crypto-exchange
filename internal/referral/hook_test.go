@@ -51,6 +51,9 @@ func (f *fakeUserStore) GetKYC(int64) (*user.KYCSubmission, error) {
 	return nil, errors.New("n/a")
 }
 func (f *fakeUserStore) UpdateKYC(*user.KYCSubmission) error      { return nil }
+func (f *fakeUserStore) ListPendingKYC() ([]*user.KYCSubmission, error) {
+	return nil, nil
+}
 func (f *fakeUserStore) GetPreferences(int64) (*user.UserPreferences, error) {
 	return nil, errors.New("n/a")
 }

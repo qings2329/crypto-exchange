@@ -195,7 +195,7 @@ func TestLaunchpadStakeHarvestFlow(t *testing.T) {
 	s.SetNowFunc(func() time.Time { return now })
 
 	p := ongoingProject(t, s)
-	if _, err := s.FundProject(1, p.ID, 100000); err != nil {
+	if _, err := s.FundProject(1, p.ID, 100000, "seed"); err != nil {
 		t.Fatalf("fund: %v", err)
 	}
 
@@ -212,23 +212,26 @@ func TestLaunchpadStakeHarvestFlow(t *testing.T) {
 		t.Fatalf("expect nothing to harvest, got %v", err)
 	}
 
-	// 推进半年：奖励 = 20000 * 15% / 2 = 1500 NEW
+	// 推进半年：奖励 = 20000 × 15% × 经过时长/年。
+	// 期望值按实际经过时长计算，不写死天数——"半年" 在不同起始月份是 181~184 天不等，
+	// 写死天数会让断言随运行日期崩掉。
 	now = base.AddDate(0, 6, 0)
 	claimed, err := s.Harvest(2, pos.ID)
 	if err != nil {
 		t.Fatalf("harvest: %v", err)
 	}
-	// AddDate 半年 ≈ 184 天：20000 × 15% × 184/365 ≈ 1512（区间断言容忍日历天数差）
-	if claimed.HumanFloat() < 1490 || claimed.HumanFloat() > 1520 {
-		t.Fatalf("claimed=%v want ~1500 NEW", claimed.HumanFloat())
+	want := 20000.0 * 0.15 * now.Sub(base).Hours() / (365 * 24)
+	const eps = 0.01 // 定点整除截断误差远小于此
+	if diff := claimed.HumanFloat() - want; diff < -eps || diff > eps {
+		t.Fatalf("claimed=%v want %v NEW", claimed.HumanFloat(), want)
 	}
 	newBal, _, _ := l.Balance(2, "NEW")
-	if newBal.HumanFloat() < 1490 || newBal.HumanFloat() > 1520 {
-		t.Fatalf("user NEW balance=%v", newBal.HumanFloat())
+	if diff := newBal.HumanFloat() - want; diff < -eps || diff > eps {
+		t.Fatalf("user NEW balance=%v want %v", newBal.HumanFloat(), want)
 	}
 	pool, _, _ := l.Balance(ledger.SysStakingReward, "NEW")
-	if pool.HumanFloat() < 98480 || pool.HumanFloat() > 98510 {
-		t.Fatalf("reward pool=%v want ~98500", pool.HumanFloat())
+	if diff := pool.HumanFloat() - (100000 - want); diff < -eps || diff > eps {
+		t.Fatalf("reward pool=%v want %v", pool.HumanFloat(), 100000-want)
 	}
 
 	// 全额解押
@@ -269,7 +272,7 @@ func TestLaunchpadStatusGatesAndBudgetFailsafe(t *testing.T) {
 	}
 
 	// 预算不足 fail-safe：只充 100 NEW，两年利息远超预算 → 领取失败且 Pending 不丢
-	if _, err := s.FundProject(1, p.ID, 100); err != nil {
+	if _, err := s.FundProject(1, p.ID, 100, "small"); err != nil {
 		t.Fatal(err)
 	}
 	pos, err := s.Stake(1, p.ID, "usdt", 20000) // USDT 池 apy=15%
@@ -292,7 +295,7 @@ func TestLaunchpadStatusGatesAndBudgetFailsafe(t *testing.T) {
 func TestLaunchpadRepeatedStakeNotDedupedByIdempotency(t *testing.T) {
 	s, l := newTestService(t)
 	p := ongoingProject(t, s)
-	if _, err := s.FundProject(1, p.ID, 10_000); err != nil {
+	if _, err := s.FundProject(1, p.ID, 10_000, "seed"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -343,5 +346,48 @@ func TestLaunchpadUnstakePartialAndGuards(t *testing.T) {
 	}
 	if !l.IsBalanced() {
 		t.Fatal("ledger unbalanced")
+	}
+}
+
+// TestLaunchpadRewardsStopAtProjectEnd 回归 EARN-F1：挖矿奖励必须按项目 EndsAt 截断。
+// 修复前，已结束项目的仓位会无限累积奖励；而 SysStakingReward 是按 token 跨项目共享的单一
+// 池、Harvest 只校验池余额不区分项目归属，窗口外的累积会挪用其他项目充值的预算。
+func TestLaunchpadRewardsStopAtProjectEnd(t *testing.T) {
+	s, _ := newTestService(t)
+	base := time.Now()
+	now := base
+	s.SetNowFunc(func() time.Time { return now })
+
+	p := &LaunchProject{
+		Name: "限时挖矿", Token: "NEW",
+		StartsAt: base.Add(-time.Hour), EndsAt: base.AddDate(0, 0, 30),
+		Pools: []LaunchPool{{ID: "usdt", Asset: "USDT", APY: 0.15}},
+	}
+	if err := s.CreateProject(p); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if _, err := s.FundProject(1, p.ID, 100000, "seed"); err != nil {
+		t.Fatalf("fund: %v", err)
+	}
+	pos, err := s.Stake(2, p.ID, "usdt", 20000)
+	if err != nil {
+		t.Fatalf("stake: %v", err)
+	}
+
+	// 活动结束两年后才来领取：只应结算 30 天窗口内的奖励（20000×15%×30/365≈246.58）
+	now = base.AddDate(2, 0, 0)
+	claimed, err := s.Harvest(2, pos.ID)
+	if err != nil {
+		t.Fatalf("harvest: %v", err)
+	}
+	want := 20000.0 * 0.15 * 30 / 365
+	if diff := claimed.HumanFloat() - want; diff < -0.01 || diff > 0.01 {
+		t.Fatalf("claimed=%v want %v（奖励必须在项目结束时停止累积）", claimed.HumanFloat(), want)
+	}
+
+	// 窗口外继续推进时间不得再产生任何奖励（否则会持续侵蚀共享奖励池）
+	now = base.AddDate(5, 0, 0)
+	if _, err := s.Harvest(2, pos.ID); err != ErrNothingToHarvest {
+		t.Fatalf("expect ErrNothingToHarvest after window, got %v", err)
 	}
 }

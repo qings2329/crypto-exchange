@@ -167,7 +167,17 @@ func (s *Service) Subscribe(userID, productID int64, amount float64, agreed bool
 	}
 	sub.Status = SubActive
 	if err := s.store.UpdateSubscription(sub); err != nil {
-		return nil, err
+		// 本金已划入 SysWealth 但申购仍停在 funding（不可赎回）：补偿反向划转（F3）。
+		if rerr := s.ledger.Transfer(ledger.SysWealth, userID, p.Asset, amt, "earn_subscribe_rollback",
+			ref+" rollback"); rerr != nil {
+			if s.log != nil {
+				s.log.Error("earn subscribe: compensating rollback failed",
+					zap.Int64("sub", sub.ID), zap.Int64("user", userID), zap.Error(rerr))
+			}
+			return nil, fmt.Errorf("activate subscription: %w (rollback failed: %v)", err, rerr)
+		}
+		_ = s.store.DeleteSubscription(sub.ID)
+		return nil, fmt.Errorf("activate subscription: %w", err)
 	}
 	return sub, nil
 }
@@ -388,8 +398,10 @@ func (s *Service) ListProjects() ([]*LaunchProject, error) {
 }
 
 // FundProject 为项目充值奖励预算（管理员）：从管理员账户把 token 划入 SysStakingReward 池。
-// F1 幂等：ref 带序号时间戳；预算不足后续领取会 fail-safe 失败，不会凭空发币。
-func (s *Service) FundProject(adminUserID, projectID int64, amount float64) (settlement.AssetAmount, error) {
+// idemRef 为调用方提供的幂等键（可空）：非空时 ref 由 (project, admin, idemRef) 决定，
+// 同一键重复提交被账本指纹去重，避免超时重试双扣管理员账户（F1）；为空则 ref 带时间戳，
+// 每次调用都是一笔独立充值。预算不足后续领取会 fail-safe 失败，不会凭空发币。
+func (s *Service) FundProject(adminUserID, projectID int64, amount float64, idemRef string) (settlement.AssetAmount, error) {
 	if adminUserID <= 0 {
 		return settlement.AssetAmount{}, fmt.Errorf("admin user required")
 	}
@@ -409,6 +421,9 @@ func (s *Service) FundProject(adminUserID, projectID int64, amount float64) (set
 		return settlement.AssetAmount{}, err
 	}
 	ref := fmt.Sprintf("lp_fund project=%d admin=%d t=%d", projectID, adminUserID, s.now().UnixNano())
+	if idemRef != "" {
+		ref = fmt.Sprintf("lp_fund project=%d admin=%d key=%s", projectID, adminUserID, idemRef)
+	}
 	if err := s.ledger.Transfer(adminUserID, ledger.SysStakingReward, p.Token, amt, "lp_fund", ref); err != nil {
 		return settlement.AssetAmount{}, fmt.Errorf("fund reward pool: %w", err)
 	}
@@ -421,14 +436,22 @@ func (s *Service) FundProject(adminUserID, projectID int64, amount float64) (set
 // accruePos 把自 LastAccrualAt 以来的挖矿奖励增量结入 RewardsPending（纯业务侧累计，不动账本；
 // 账本在 Harvest 时经预充值的 SysStakingReward 池支出）。奖励以 token 计价，与质押资产按
 // 1:1 约定换算（演示口径；生产应由预言机定价或按每小时定额发放表）。
-func (s *Service) accruePos(pos *LaunchPosition, poolAPY float64, now time.Time) {
+//
+// end 为项目活动结束时间（EARN-F1）：计息上界钳制到 end，窗口外不再产生奖励。否则已结束
+// 项目的仓位会无限累积奖励；而 SysStakingReward 是按 token 跨项目共享的单一池，Harvest 只
+// 校验池余额，不区分项目归属——持续累积的奖励会挪用其他项目充值的预算。
+func (s *Service) accruePos(pos *LaunchPosition, poolAPY float64, now, end time.Time) {
 	from := pos.LastAccrualAt
 	if from.IsZero() {
 		from = pos.CreatedAt
 	}
+	if !end.IsZero() && now.After(end) {
+		now = end
+	}
 	nanos := now.Sub(from).Nanoseconds()
 	rateScaled := int64(poolAPY*1e8 + 0.5)
-	if nanos <= 0 || rateScaled <= 0 || pos.Staked.Value.Sign() <= 0 {
+	// Sign() 而非 Value.Sign()：脏数据（金额列解析失败）下 Value 为 nil，直接解引用会 panic。
+	if nanos <= 0 || rateScaled <= 0 || pos.Staked.Sign() <= 0 {
 		if nanos > 0 {
 			pos.LastAccrualAt = now
 		}
@@ -507,7 +530,7 @@ func (s *Service) Stake(userID, projectID int64, poolID string, amount float64) 
 			return nil, err
 		}
 	} else {
-		_ = s.accruePosBeforeMutation(pos, pool.APY, now)
+		_ = s.accruePosBeforeMutation(pos, pool.APY, now, p.EndsAt)
 	}
 	pos.StakeSeq++
 	if err := s.ledger.Transfer(userID, ledger.SysStaking, pool.Asset, amt, "lp_stake",
@@ -521,15 +544,28 @@ func (s *Service) Stake(userID, projectID int64, poolID string, amount float64) 
 	pos.Staked = pos.Staked.Add(amt)
 	pos.Status = PosActive
 	if err := s.store.UpsertPosition(pos); err != nil {
-		return nil, err
+		// 本金已划入 SysStaking 但仓位未持久化：补偿反向划转，避免本金滞留托管账户（F3）。
+		// 反向划转失败则保留仓位记录并上报，交由对账/人工介入，不静默吞掉资金。
+		if rerr := s.ledger.Transfer(ledger.SysStaking, userID, pool.Asset, amt, "lp_stake_rollback",
+			fmt.Sprintf("lp_stake_rollback pos=%d seq=%d", pos.ID, pos.StakeSeq)); rerr != nil {
+			if s.log != nil {
+				s.log.Error("earn stake: compensating rollback failed",
+					zap.Int64("pos", pos.ID), zap.Int64("user", userID), zap.Error(rerr))
+			}
+			return nil, fmt.Errorf("persist position: %w (rollback failed: %v)", err, rerr)
+		}
+		if wasNew {
+			_ = s.store.DeletePosition(pos.ID)
+		}
+		return nil, fmt.Errorf("persist position: %w", err)
 	}
 	return pos, nil
 }
 
 // accruePosBeforeMutation 变更质押额前先把存量质押期的奖励结入 Pending（防基数跳变吞奖励）。
-func (s *Service) accruePosBeforeMutation(pos *LaunchPosition, poolAPY float64, now time.Time) bool {
+func (s *Service) accruePosBeforeMutation(pos *LaunchPosition, poolAPY float64, now, end time.Time) bool {
 	before := pos.RewardsPending.Value.String()
-	s.accruePos(pos, poolAPY, now)
+	s.accruePos(pos, poolAPY, now, end)
 	return pos.RewardsPending.Value.String() != before
 }
 
@@ -562,7 +598,7 @@ func (s *Service) Unstake(userID, positionID int64, amount float64) (*LaunchPosi
 	if err != nil {
 		return nil, err
 	}
-	_ = s.accruePosBeforeMutation(pos, pool.APY, now)
+	_ = s.accruePosBeforeMutation(pos, pool.APY, now, p.EndsAt)
 
 	amt := pos.Staked
 	if amount > 0 {
@@ -618,7 +654,7 @@ func (s *Service) Harvest(userID, positionID int64) (claimed settlement.AssetAmo
 		return settlement.AssetAmount{}, perr
 	}
 	if pool, perr2 := poolOf(p, pos.PoolID); perr2 == nil {
-		_ = s.accruePosBeforeMutation(pos, pool.APY, now)
+		_ = s.accruePosBeforeMutation(pos, pool.APY, now, p.EndsAt)
 	}
 	if pos.RewardsPending.Sign() <= 0 {
 		return settlement.AssetAmount{}, ErrNothingToHarvest
@@ -679,14 +715,14 @@ func (s *Service) MyPositions(userID int64) ([]*PositionView, error) {
 			if p, ok := projCache[pos.ProjectID]; ok {
 				if pool, e := poolOf(p, pos.PoolID); e == nil {
 					cp := *pos
-					s.accruePos(&cp, pool.APY, now)
+					s.accruePos(&cp, pool.APY, now, p.EndsAt)
 					rewards = cp.RewardsPending
 				}
 			} else if p, e := s.store.GetProject(pos.ProjectID); e == nil {
 				projCache[pos.ProjectID] = p
 				if pool, e2 := poolOf(p, pos.PoolID); e2 == nil {
 					cp := *pos
-					s.accruePos(&cp, pool.APY, now)
+					s.accruePos(&cp, pool.APY, now, p.EndsAt)
 					rewards = cp.RewardsPending
 				}
 			}
@@ -729,14 +765,8 @@ func (s *Service) Reconcile() map[string]settlement.AssetAmount {
 	harvestedByToken := map[string]settlement.AssetAmount{}
 	stakedByAsset := map[string]settlement.AssetAmount{}
 	for _, pos := range positions {
-		prev := stakedByAsset[pos.Asset]
-		if prev.Value == nil {
-			prev = zeroAmt(pos.Staked.Decimals)
-		}
-		stakedByAsset[pos.Asset] = settlement.AssetAmount{
-			Value:    new(big.Int).Add(prev.Value, pos.Staked.Value),
-			Decimals: pos.Staked.Decimals,
-		}
+		// 用 Add 而非直接 .Value 相加：金额列解析失败时 Value 为 nil，直接解引用会 panic。
+		stakedByAsset[pos.Asset] = stakedByAsset[pos.Asset].Add(pos.Staked)
 		hv := harvestedByToken[pos.Token]
 		if hv.Value == nil {
 			hv = zeroAmt(pos.HarvestedTotal.Decimals)

@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
 	"github.com/coldlar/crypto-exchange/internal/pkg/response"
 )
 
@@ -19,9 +20,13 @@ func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
 }
 
-// RegisterRoutes 注册路由（均受 middleware.Auth 保护）。
+// RegisterRoutes 注册路由。
+// 全部为运营/管理向接口，一律要求管理员（F4）：本组原本只有全局 middleware.Auth，
+// 意味着任意登录用户都能改风控规则（关掉全站提现限额）、删黑名单解封自己、
+// 或读取全量 AML 黑名单与他人风控事件。
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	g := r.Group("/api/v1/risk")
+	g.Use(middleware.AdminGuard())
 	{
 		g.POST("/rules", h.addRule)
 		g.GET("/rules", h.listRules)

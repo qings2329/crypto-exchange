@@ -248,6 +248,7 @@ func (s *Service) handleCreateProject(c *gin.Context) {
 type fundReq struct {
 	ProjectID int64   `json:"project_id"`
 	Amount    float64 `json:"amount"`
+	Ref       string  `json:"ref"` // 幂等键（F1）：同一 ref 重复提交只扣款一次
 }
 
 func (s *Service) handleFundProject(c *gin.Context) {
@@ -261,7 +262,7 @@ func (s *Service) handleFundProject(c *gin.Context) {
 		response.Error(c, 400, 4000, "invalid body")
 		return
 	}
-	amt, err := s.FundProject(uid, req.ProjectID, req.Amount)
+	amt, err := s.FundProject(uid, req.ProjectID, req.Amount, req.Ref)
 	if err != nil {
 		response.Error(c, 400, 4002, err.Error())
 		return
