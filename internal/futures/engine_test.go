@@ -574,3 +574,108 @@ func TestLiquidationPartialFillFromEngine(t *testing.T) {
 	}
 	t.Logf("强平经撮合引擎分批成交并完整清算：实现盈亏 %.2f，仓位已清空", evs[0].Realized)
 }
+
+// 演示：用户主动平仓（action=close）的持仓账本结算：整仓/部分、逐仓/全仓。
+func TestClosePositionIsolated(t *testing.T) {
+	sym := "BTC_USDT_PERP"
+	liq := NewLiquidator(nil)
+	liq.Register(sym)
+	book, _ := liq.Book(sym)
+	book.SetMarkPrice(52000) // 平仓价（经 closer 成交均价）为标记价
+
+	// 用户 1001 以 50000 开多 2 BTC，10x，锁定保证金 = 10000
+	book.Open(1001, sym, Long, 2, 50000, 10000, 10, 0)
+
+	// 整仓平仓（qty<=0 → 全部 2 BTC）：realized = (52000-50000)*2 = 4000
+	res := liq.ClosePosition(sym, 1001, Long, 0)
+	if !res.OK || !res.FullyClosed || res.Mode != Isolated {
+		t.Fatalf("整仓平仓状态错误: %+v", res)
+	}
+	if !approx(res.Realized, 4000, 1e-6) {
+		t.Fatalf("整仓实现盈亏错误: got %.2f want 4000", res.Realized)
+	}
+	if !approx(res.MarginReleased, 10000, 1e-6) {
+		t.Fatalf("整仓释放保证金错误: got %.2f want 10000", res.MarginReleased)
+	}
+	if _, ok := book.pos[1001]; ok {
+		t.Fatal("整仓平完后持仓应被移除")
+	}
+
+	// 部分平仓：重新开仓 2 BTC，平 1 BTC：realized = (52000-50000)*1 = 2000
+	book.Open(1001, sym, Long, 2, 50000, 10000, 10, 0)
+	res = liq.ClosePosition(sym, 1001, Long, 1)
+	if !res.OK || res.FullyClosed || res.Mode != Isolated {
+		t.Fatalf("部分平仓状态错误: %+v", res)
+	}
+	if !approx(res.Realized, 2000, 1e-6) {
+		t.Fatalf("部分实现盈亏错误: got %.2f want 2000", res.Realized)
+	}
+	if !approx(res.MarginReleased, 5000, 1e-6) {
+		t.Fatalf("部分释放保证金错误: got %.2f want 5000", res.MarginReleased)
+	}
+	p, ok := book.pos[1001]
+	if !ok || !approx(p.Size, 1, 1e-9) {
+		t.Fatalf("部分平仓后剩余仓位错误: ok=%v size=%v", ok, p.Size)
+	}
+
+	// 无持仓时平仓应失败
+	if res := liq.ClosePosition(sym, 9999, Long, 0); res.OK {
+		t.Fatal("无持仓平仓应返回 OK=false")
+	}
+	// 方向不匹配应失败（该用户仅持多）
+	book.Open(1002, sym, Long, 1, 50000, 5000, 10, 0)
+	if res := liq.ClosePosition(sym, 1002, Short, 0); res.OK {
+		t.Fatal("方向不匹配平仓应返回 OK=false")
+	}
+}
+
+// 演示：全仓用户主动平仓：整户平完移除账户；部分平按盈亏调整共享池。
+func TestClosePositionCross(t *testing.T) {
+	sym := "BTC_USDT_PERP"
+	liq := NewLiquidator(nil)
+	liq.Register(sym)
+	book, _ := liq.Book(sym)
+	book.SetMarkPrice(52000)
+
+	// 用户 2001 以 50000 开多 1 BTC，全仓，共享池 10000
+	liq.OpenCross(sym, 2001, Long, 1, 50000, 10000, 10, 0)
+	if liq.ModeOf(sym, 2001) != Cross {
+		t.Fatal("应为全仓模式")
+	}
+	res := liq.ClosePosition(sym, 2001, Long, 0)
+	if !res.OK || !res.FullyClosed || res.Mode != Cross {
+		t.Fatalf("全仓整平状态错误: %+v", res)
+	}
+	if !approx(res.Realized, 2000, 1e-6) {
+		t.Fatalf("全仓实现盈亏错误: got %.2f want 2000", res.Realized)
+	}
+	if cb, ok := liq.crossBookOf(sym); ok {
+		cb.mu.RLock()
+		_, still := cb.accs[2001]
+		cb.mu.RUnlock()
+		if still {
+			t.Fatal("全仓整平后账户应移除")
+		}
+	}
+
+	// 部分平：开仓 2 BTC，平 1，共享池应由 10000 增至 12000
+	liq.OpenCross(sym, 2002, Long, 2, 50000, 10000, 10, 0)
+	res = liq.ClosePosition(sym, 2002, Long, 1)
+	if !res.OK || res.FullyClosed || res.Mode != Cross {
+		t.Fatalf("全仓部分平状态错误: %+v", res)
+	}
+	if !approx(res.Realized, 2000, 1e-6) {
+		t.Fatalf("全仓部分实现盈亏错误: got %.2f want 2000", res.Realized)
+	}
+	if bal := liq.CrossBalance(sym, 2002); !approx(bal, 12000, 1e-6) {
+		t.Fatalf("全仓部分平后共享池错误: got %.2f want 12000", bal)
+	}
+	// 剩余腿规模应为 1
+	cb, _ := liq.crossBookOf(sym)
+	cb.mu.RLock()
+	acc := cb.accs[2002]
+	cb.mu.RUnlock()
+	if acc == nil || acc.Long == nil || !approx(acc.Long.Size, 1, 1e-9) {
+		t.Fatalf("全仓部分平后剩余腿规模错误")
+	}
+}

@@ -88,9 +88,9 @@ type Server struct {
 
 	// 通知服务（§37 业务事件→通知）：强平/保证金预警等业务事件写入站内信。
 	// 内存存储，重启后已读状态丢失，不影响通知内容。
-	notifSvc        *notification.Service
-	marginWarned    map[string]bool // "uid:symbol" → 已预警（防止重复发送）
-	marginWarnedMu  sync.Mutex
+	notifSvc       *notification.Service
+	marginWarned   map[string]bool // "uid:symbol" → 已预警（防止重复发送）
+	marginWarnedMu sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -120,9 +120,9 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 		ctx:       ctx,
 		cancel:    cancel,
 
-		riskSvc:       riskSvc,
-		userSvcURL:    userSvcURL,
-		kycFetcher:    newKYCFetcher(userSvcURL),
+		riskSvc:        riskSvc,
+		userSvcURL:     userSvcURL,
+		kycFetcher:     newKYCFetcher(userSvcURL),
 		kycFetcherByID: newKYCFetcherByID(userSvcURL),
 
 		addrBook:   make(map[int64][]AddrBookEntry),
@@ -450,12 +450,12 @@ func (s *Server) startChainWatchers() {
 						s.log.Error("withdraw settle failed", zap.String("tx", ev.TxHash), zap.Error(err))
 						continue
 					}
-				s.log.Info("on-chain withdraw settled",
-					zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
-					zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
-					zap.String("tx", ev.TxHash))
-				s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
-				s.publishWithdrawNotice(ev)
+					s.log.Info("on-chain withdraw settled",
+						zap.Int64("user", ev.UserID), zap.String("asset", ev.Asset),
+						zap.Float64("amount", ev.Amount.HumanFloat()), zap.Float64("fee", ev.Fee.HumanFloat()),
+						zap.String("tx", ev.TxHash))
+					s.hub.Broadcast("SYS", ginH{"type": "chain_withdraw", "data": ev})
+					s.publishWithdrawNotice(ev)
 				case settlement.WithdrawFailed:
 					if err := s.ledgerSvc.UnfreezeWithdraw(ev.UserID, ev.Asset, total); err != nil {
 						s.log.Error("withdraw rollback failed", zap.String("tx", ev.TxHash), zap.Error(err))
@@ -576,6 +576,76 @@ func (s *Server) onLiquidation(ev futures.LiquidationEvent) {
 		zap.Float64("margin_forfeited", ev.Margin),
 		zap.Float64("closed", ev.Size),
 		zap.Float64("realized", ev.Realized))
+}
+
+// settleClose 结算用户主动平仓的资金闭环（与 onLiquidation 对称，但盈亏归属用户而非保险基金）。
+//
+//   - 逐仓：OpUnfreeze(释放冻结保证金) + OpCredit/OpDebit(实现盈亏) 整体 Batch。
+//   - 全仓：frozen 钱包镜像共享池——每次平仓据实现盈亏同步 Credit/Debit(改总权益) + Freeze/Unfreeze(镜像池)；
+//     整户平完时再 Unfreeze 整个共享池余额，把原始保证金与累计盈亏一并释放回可用。
+//
+// M5：金额落账前经 AssetAmountFromFloatSafe 拦截 NaN/Inf，非法值跳过整组结算。
+func (s *Server) settleClose(uid int64, symbol string, res futures.CloseResult) {
+	ref := fmt.Sprintf("close:%d:%s", uid, symbol)
+
+	if res.Mode == futures.Cross {
+		realizedAmt, err := settlement.AssetAmountFromFloatSafe(res.Realized, settlement.AssetDecimalsByName("USDT"))
+		if err != nil {
+			s.log.Error("close settle skipped: invalid realized float", zap.Int64("user", uid), zap.Error(err))
+			return
+		}
+		ops := make([]ledger.Op, 0, 2)
+		if res.Realized >= 0 {
+			ops = append(ops,
+				ledger.Op{Kind: ledger.OpCredit, User: uid, Asset: "USDT", Amount: realizedAmt, Biz: "close", Ref: ref},
+				ledger.Op{Kind: ledger.OpFreeze, User: uid, Asset: "USDT", Amount: realizedAmt},
+			)
+		} else {
+			ops = append(ops,
+				ledger.Op{Kind: ledger.OpDebit, User: uid, Asset: "USDT", Amount: realizedAmt.Neg(), Biz: "close", Ref: ref},
+				ledger.Op{Kind: ledger.OpUnfreeze, User: uid, Asset: "USDT", Amount: realizedAmt.Neg()},
+			)
+		}
+		// 整户平完：释放整个共享池余额（原始保证金 + 累计盈亏）回可用。
+		if res.FullyClosed {
+			if poolAmt, perr := settlement.AssetAmountFromFloatSafe(res.PoolBalance, settlement.AssetDecimalsByName("USDT")); perr == nil && res.PoolBalance > 0 {
+				ops = append(ops, ledger.Op{Kind: ledger.OpUnfreeze, User: uid, Asset: "USDT", Amount: poolAmt})
+			}
+		}
+		if len(ops) > 0 {
+			if err := s.ledgerSvc.Batch(ops); err != nil {
+				s.log.Error("cross close settle failed", zap.Int64("user", uid), zap.Error(err))
+			}
+		}
+		s.log.Info("cross position closed",
+			zap.Int64("user", uid), zap.String("symbol", symbol),
+			zap.Float64("realized", res.Realized), zap.Bool("full", res.FullyClosed))
+		return
+	}
+
+	// 逐仓：释放冻结保证金 + 结算实现盈亏（F3 原子 Batch）。
+	marginAmt, err := settlement.AssetAmountFromFloatSafe(res.MarginReleased, settlement.AssetDecimalsByName("USDT"))
+	if err != nil {
+		s.log.Error("close settle skipped: invalid margin float", zap.Int64("user", uid), zap.Error(err))
+		return
+	}
+	realizedAmt, err := settlement.AssetAmountFromFloatSafe(res.Realized, settlement.AssetDecimalsByName("USDT"))
+	if err != nil {
+		s.log.Error("close settle skipped: invalid realized float", zap.Int64("user", uid), zap.Error(err))
+		return
+	}
+	ops := []ledger.Op{{Kind: ledger.OpUnfreeze, User: uid, Asset: "USDT", Amount: marginAmt}}
+	if res.Realized >= 0 {
+		ops = append(ops, ledger.Op{Kind: ledger.OpCredit, User: uid, Asset: "USDT", Amount: realizedAmt, Biz: "close", Ref: ref})
+	} else {
+		ops = append(ops, ledger.Op{Kind: ledger.OpDebit, User: uid, Asset: "USDT", Amount: realizedAmt.Neg(), Biz: "close", Ref: ref})
+	}
+	if err := s.ledgerSvc.Batch(ops); err != nil {
+		s.log.Error("close settle failed", zap.Int64("user", uid), zap.Error(err))
+	}
+	s.log.Info("isolated position closed",
+		zap.Int64("user", uid), zap.String("symbol", symbol),
+		zap.Float64("margin_released", res.MarginReleased), zap.Float64("realized", res.Realized))
 }
 
 // liquidationCloser 强平平仓执行器：把强平单作为市价单同步送入撮合引擎成交，

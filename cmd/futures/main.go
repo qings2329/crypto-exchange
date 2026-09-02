@@ -90,7 +90,8 @@ func main() {
 	// 演示种子充值：经链上充值（复式记账）预置 USDT，使账本从创世起即全局平衡（对账巡检不误报）。
 	// 同时登记已验证提现地址并发起若干演示提现 hold，供管理后台「充提币记录 / 大额提现人工审核」展示测试。
 	seedDemo := func() {
-		for _, uid := range []int64{1, 2, 3, 4} {
+		// 联调用：演示种子覆盖更宽 uid 区间，确保经 user 服务登录的演示账号（uid 由 user 服务自增分配）均有余额。
+		for _, uid := range []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40} {
 			_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(300000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
 		}
 		seedWithdrawHoldsDemo()

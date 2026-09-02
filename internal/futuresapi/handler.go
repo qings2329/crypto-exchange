@@ -98,43 +98,72 @@ func (s *Server) handleOrder(c *gin.Context) {
 		IsMargin: true,
 		Leverage: req.Leverage,
 	}
-	if !s.matcher.Submit(req.Symbol, o) {
-		response.Error(c, 400, 400, "unknown symbol or matching unavailable")
-		return
-	}
-	if req.Action == "open" && req.Price > 0 {
-		if book, ok := s.liquidator.Book(req.Symbol); ok {
-			lev := req.Leverage
-			if lev <= 0 {
-				lev = 10
-			}
-			margin := req.Margin
-			if margin <= 0 {
-				margin = price.Mul(qty).Float() / lev
-			}
-			mode := futures.Isolated
-			if req.MarginMode == "cross" {
-				mode = futures.Cross
-			}
-			// 资金闭环：开仓前从钱包冻结保证金；余额不足则拒绝开仓。
-			// M5：margin 来自用户请求（或价格派生），须经 Safe 拦截 NaN/Inf，避免冻结 0 金额造成无抵押开仓。
-			marginAmt, err := settlement.AssetAmountFromFloatSafe(margin, settlement.AssetDecimalsByName("USDT"))
-			if err != nil {
-				response.Error(c, 400, 400, "invalid margin: "+err.Error())
-				return
-			}
-			if err := s.ledgerSvc.Freeze(uid, "USDT", marginAmt); err != nil {
-				response.Error(c, 400, 400, "insufficient margin: "+err.Error())
-				return
-			}
-			if mode == futures.Cross {
-				s.liquidator.OpenCross(req.Symbol, uid, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
-			} else {
-				book.Open(uid, req.Symbol, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
+
+	// 开/平分离：开仓单送入撮合引擎（成交后由 onTrade 驱动标记价/强平）；
+	// 平仓单不经过公开订单簿，而是经 Liquidator.closer 真实成交并原地减仓，避免产生游离挂单。
+	switch req.Action {
+	case "open":
+		if !s.matcher.Submit(req.Symbol, o) {
+			response.Error(c, 400, 400, "unknown symbol or matching unavailable")
+			return
+		}
+		if req.Price > 0 {
+			if book, ok := s.liquidator.Book(req.Symbol); ok {
+				lev := req.Leverage
+				if lev <= 0 {
+					lev = 10
+				}
+				margin := req.Margin
+				if margin <= 0 {
+					margin = price.Mul(qty).Float() / lev
+				}
+				mode := futures.Isolated
+				if req.MarginMode == "cross" {
+					mode = futures.Cross
+				}
+				// 资金闭环：开仓前从钱包冻结保证金；余额不足则拒绝开仓。
+				// M5：margin 来自用户请求（或价格派生），须经 Safe 拦截 NaN/Inf，避免冻结 0 金额造成无抵押开仓。
+				marginAmt, err := settlement.AssetAmountFromFloatSafe(margin, settlement.AssetDecimalsByName("USDT"))
+				if err != nil {
+					response.Error(c, 400, 400, "invalid margin: "+err.Error())
+					return
+				}
+				if err := s.ledgerSvc.Freeze(uid, "USDT", marginAmt); err != nil {
+					response.Error(c, 400, 400, "insufficient margin: "+err.Error())
+					return
+				}
+				if mode == futures.Cross {
+					s.liquidator.OpenCross(req.Symbol, uid, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
+				} else {
+					book.Open(uid, req.Symbol, ps, req.Qty, req.Price, margin, lev, time.Now().UnixNano())
+				}
 			}
 		}
+		response.JSON(c, gin.H{"order_id": o.ID, "status": "accepted"})
+
+	case "close":
+		// 平仓：经撮合引擎真实成交（复用 Liquidator.closer，与强平同源），原地减仓并据盈亏调整保证金；
+		// 资金闭环（释放保证金 + 结算实现盈亏）在 settleClose 内统一完成。
+		res := s.liquidator.ClosePosition(req.Symbol, uid, ps, req.Qty)
+		if !res.OK {
+			response.JSON(c, gin.H{
+				"order_id":     o.ID,
+				"status":       "rejected",
+				"reason":       "no_open_position",
+				"realized_pnl": 0,
+			})
+			return
+		}
+		s.settleClose(uid, req.Symbol, res)
+		response.JSON(c, gin.H{
+			"order_id":     o.ID,
+			"status":       "accepted",
+			"realized_pnl": res.Realized,
+		})
+
+	default:
+		response.Error(c, 400, 400, "unknown action")
 	}
-	response.JSON(c, gin.H{"order_id": o.ID, "status": "accepted"})
 }
 
 // handleOrders 返回当前用户本人的合约订单列表，可按 symbol/status 过滤、limit 分页。

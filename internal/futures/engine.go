@@ -98,8 +98,8 @@ type Liquidator struct {
 	partialRatio float64        // 部分强平比例（1.0=整仓/整户）
 	insurance    func() float64 // 保险基金余额查询（由上层注入钱包余额）
 
-	events []LiquidationEvent // 最近强平记录（演示用，生产应落库/发 Kafka）
-	adls   []ADLEvent         // 最近 ADL 记录
+	events []LiquidationEvent    // 最近强平记录（演示用，生产应落库/发 Kafka）
+	adls   []ADLEvent            // 最近 ADL 记录
 	socs   []SocializedLossEvent // 最近社会化分摊记录
 }
 
@@ -272,6 +272,111 @@ func (l *Liquidator) AllPositions(symbol string) []Position {
 		cb.mu.RUnlock()
 	}
 	return out
+}
+
+// CloseResult 用户主动平仓的结算结果（资金闭环由上层 handler 完成）。
+type CloseResult struct {
+	OK             bool       // 是否找到并成功平仓
+	Mode           MarginMode // 逐仓 / 全仓
+	Side           PosSide    // 被平持仓方向
+	Realized       float64    // 本次平仓实现盈亏（多：(price-entry)*q；空：(entry-price)*q）
+	ClosedQty      float64    // 实际平仓张数
+	MarginReleased float64    // 逐仓：本次释放的冻结保证金；全仓为 0（见 PoolBalance）
+	PoolBalance    float64    // 全仓：平仓后共享池余额（整户平完时即应释放回钱包的金额）
+	FullyClosed    bool       // 是否彻底清仓（逐仓清掉仓位 / 全仓清空双腿）
+}
+
+// ClosePosition 用户主动平仓：把平仓单经撮合引擎真实成交（复用注入的 closer，与强平同源），
+// 据真实成交均价回填持仓、据盈亏调整保证金/共享池，并返回结算所需信息。
+//
+// 与 Open 对称：仅做持仓账本的"原地减仓"，不触碰账本/钱包（资金闭环在 handler.settleClose）。
+// qty<=0 表示全部平仓；否则按 qty 部分平仓（不会超过持仓规模）。
+// 优先按全仓处理（用户在该 symbol 存在 CrossAccount 时），否则回落逐仓账本。
+func (l *Liquidator) ClosePosition(symbol string, userID int64, side PosSide, qty float64) CloseResult {
+	res := CloseResult{OK: false, Side: side}
+	book, ok := l.Book(symbol)
+	if !ok {
+		return res
+	}
+	mark := book.MarkPrice()
+
+	// 全仓：用户在该 symbol 存在 CrossAccount 则按全仓处理（按方向定位具体的多/空腿）。
+	if cb, ok := l.crossBookOf(symbol); ok {
+		cb.mu.Lock()
+		if a, ok := cb.accs[userID]; ok {
+			var pos *Position
+			if side == Long {
+				pos = a.Long
+			} else {
+				pos = a.Short
+			}
+			if pos != nil && pos.Size > 1e-9 {
+				closeQty := closeTargetQty(qty, pos.Size)
+				fill := l.closer(symbol, userID, side, closeQty, mark)
+				if fill.Filled <= 1e-9 || !validMark(fill.AvgPrice) {
+					// 无成交/异常均价：保守按标记价整腿平仓，避免持仓不降导致卡死。
+					r, _, fc := pos.closeBy(mark, pos.Size)
+					a.Balance += r
+					res.OK, res.Mode, res.Realized, res.ClosedQty, res.FullyClosed = true, Cross, r, pos.Size, fc
+				} else {
+					r, _, fc := pos.closeBy(fill.AvgPrice, fill.Filled)
+					a.Balance += r
+					res.OK, res.Mode, res.Realized, res.ClosedQty, res.FullyClosed = true, Cross, r, fill.Filled, fc
+				}
+				res.PoolBalance = a.Balance
+				if res.FullyClosed {
+					if side == Long {
+						a.Long = nil
+					} else {
+						a.Short = nil
+					}
+					if a.Long == nil && a.Short == nil {
+						delete(cb.accs, userID)
+					}
+				}
+				cb.mu.Unlock()
+				return res
+			}
+		}
+		cb.mu.Unlock()
+	}
+
+	// 逐仓：单用户每交易对一本持仓账本，按 userID 查（同用户同对仅一笔单向持仓）。
+	book.mu.Lock()
+	p, ok := book.pos[userID]
+	if !ok || p.Side != side || p.Size <= 1e-9 {
+		book.mu.Unlock()
+		return res
+	}
+	closeQty := closeTargetQty(qty, p.Size)
+	released := p.Margin * (closeQty / p.Size) // closeBy 按同比例扣减保证金，先记录释放额供上层解冻。
+	fill := l.closer(symbol, userID, side, closeQty, mark)
+	if fill.Filled <= 1e-9 || !validMark(fill.AvgPrice) {
+		// 无成交/异常均价：保守按标记价整仓平仓。
+		r, _, fc := p.closeBy(mark, p.Size)
+		res.OK, res.Mode, res.Realized, res.MarginReleased, res.ClosedQty, res.FullyClosed = true, Isolated, r, p.Margin, p.Size, fc
+		if fc {
+			delete(book.pos, userID)
+		}
+		book.mu.Unlock()
+		return res
+	}
+	r, _, fc := p.closeBy(fill.AvgPrice, fill.Filled)
+	res.OK, res.Mode, res.Realized, res.MarginReleased, res.ClosedQty, res.FullyClosed =
+		true, Isolated, r, released, fill.Filled, fc
+	if fc {
+		delete(book.pos, userID)
+	}
+	book.mu.Unlock()
+	return res
+}
+
+// closeTargetQty 计算本次平仓张数：qty<=0 或超出持仓规模时取全部持仓。
+func closeTargetQty(qty, size float64) float64 {
+	if qty <= 0 || qty > size {
+		return size
+	}
+	return qty
 }
 
 // UpdateMarkPrice 更新标记价格并对该交易对所有持仓做强平扫描。
