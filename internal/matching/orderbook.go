@@ -267,8 +267,17 @@ func (ob *OrderBook) matchCore(in *Order, rest bool) []Trade {
 			}
 		}
 		level := opposite[p]
-		for len(level.Orders) > 0 && !in.IsFilled() {
-			maker := level.Orders[0]
+		idx := 0
+		for idx < len(level.Orders) && !in.IsFilled() {
+			maker := level.Orders[idx]
+			// 自成交防护（STP）：taker 不与同一用户的挂单成交，避免用户自己开/平仓相互对冲
+			// 导致盈亏失真（例如平仓单吃掉自己开仓时挂的限价单，成交价=开仓价 → realized=0）。
+			// 仅跳过、不移除该挂单，保持其在簿上供其他对手方成交。
+			// 注意：UserID==0 视为未归属的匿名/种子单，不参与 STP（避免误杀测试播种流动性）。
+			if maker.UserID != 0 && maker.UserID == in.UserID {
+				idx++
+				continue
+			}
 			qty := in.Remaining()
 			if maker.Remaining().Cmp(qty) < 0 {
 				qty = maker.Remaining()
@@ -285,9 +294,12 @@ func (ob *OrderBook) matchCore(in *Order, rest bool) []Trade {
 				MakerOID:  maker.ID,
 			})
 			if maker.IsFilled() {
-				level.Orders = level.Orders[1:]
+				level.Orders = append(level.Orders[:idx], level.Orders[idx+1:]...)
+			} else {
+				idx++
 			}
 		}
+		// opposite[p] 为 *Level 指针，上面 level.Orders 的增删已直接反映到簿上；空档位则清理。
 		if len(level.Orders) == 0 {
 			delete(opposite, p)
 		}

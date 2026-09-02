@@ -113,12 +113,10 @@ func buildRouter(cfg *config.Config, log *zap.Logger) *gin.Engine {
 		r.Any(path, proxy(target))
 	}
 
-	// 通知中心契约路径为 /api/v1/user/notifications*，但实际由 cmd/notification 提供。
-	// 该前缀比通用 /api/v1/user/* 更具体（含静态段 notifications），httprouter 会优先匹配，
-	// 故显式反代到 notification 服务，避免误命中 user 服务（其未注册通知路由）。
-	if nt := cfg.Services["notification"]; nt != "" {
-		r.Any("/api/v1/user/notifications/*path", proxy(nt))
-	}
+	// 注意：原代码曾尝试单独注册 /api/v1/user/notifications/*path 以将通知路由到
+	// notification 服务，但 gin 的 httprouter 不允许与已注册的 /api/v1/user/*path 通配符
+	// 重叠（启动即 panic）。此处移除该冲突路由——通知不在当前联调范围，且 /api/v1/user/*path
+	// 已能代理到 user 服务；如需精确分流通知，应在 user 代理内按路径前缀做中间件分发。
 
 	// 管理后台（cmd/admin）反代：admin 是独立鉴权域（admin token），不在 cfg.Services 内，
 	// 故单独反代。目标地址由 admin.addr 推导（同机部署，演示/默认即 localhost:<port>）；
