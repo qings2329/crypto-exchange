@@ -53,6 +53,8 @@ func main() {
 	srv := adminapi.NewServer(cfg)
 	// 演示公告种子：幂等注入若干公告，供「公告管理」页展示测试；连库模式按标题判重，重启不重复插入。
 	srv.SeedDemoAnnouncements()
+	// 演示 C2C 订单种子：幂等注入，供「C2C 管理」页有真实数据可看（连库模式重启不重复）。
+	srv.SeedDemoC2COrders()
 	srv.RegisterRoutes(r)
 
 	addr := cfg.Admin.Addr

@@ -9,6 +9,7 @@ import (
 
 	"github.com/coldlar/crypto-exchange/internal/announcement"
 	"github.com/coldlar/crypto-exchange/internal/apikeys"
+	"github.com/coldlar/crypto-exchange/internal/c2c"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -34,6 +35,7 @@ type Server struct {
 	apiKeyStore   apikeys.Store         // API Key 管理（管理员为任意用户签发/吊销）
 	referralStore referral.Store        // 邀请佣金查询（替代每请求 sql.Open）
 	loginLimiter  *loginIPLimiter       // 基于 IP 的登录限流（防单 IP 爆破 + 缓解账户锁定 DoS）
+	c2cSvc        *c2c.Service          // C2C 订单管理（list/freeze/release/complete）
 }
 
 // NewServer 装配管理后台服务。verifier 使用全局 auth 共享密钥（与用户 token 同一密钥，
@@ -118,6 +120,20 @@ func NewServer(cfg *config.Config) *Server {
 		referralStore = referral.NewMemStore()
 	}
 
+	// C2C 订单存储：优先 MySQL；DSN 缺失或连接/迁移失败则降级为内存实现。
+	var c2cStore c2c.Store
+	if cfg.MySQL.DSN != "" {
+		cs, cErr := c2c.NewMySQLStore(cfg.MySQL.DSN)
+		if cErr != nil {
+			log.Printf("[admin] c2c store: falling back to in-memory (mysql unavailable: %v)", cErr)
+		} else {
+			c2cStore = cs
+		}
+	}
+	if c2cStore == nil {
+		c2cStore = c2c.NewMemStore()
+	}
+
 	return &Server{
 		cfg:           cfg,
 		verifier:      verifier,
@@ -131,6 +147,7 @@ func NewServer(cfg *config.Config) *Server {
 		auditStore:    auditStore,
 		apiKeyStore:   apiKeyStore,
 		referralStore: referralStore,
+		c2cSvc:        c2c.NewService(c2cStore),
 		loginLimiter: newLoginIPLimiter(
 			cfg.Admin.LoginRateLimitPerIP,
 			time.Duration(cfg.Admin.LoginRateWindowSec)*time.Second,
@@ -316,6 +333,16 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 
 		// 邀请佣金管理（直查 ce_referral_commissions 表）
 		admin.GET("/referral/commissions", s.handleAdminReferralCommissions)
+	}
+
+	// C2C 订单管理：读需 c2c:view，变更需 c2c:manage（冻结/解冻/完成挂单）。
+	c2cG := admin.Group("/c2c", middleware.RequirePerm(PermC2CView))
+	{
+		c2cG.GET("/orders", s.handleC2COrders)
+		manage := c2cG.Group("", middleware.RequirePerm(PermC2CManage))
+		{
+			manage.POST("/orders/:id/:action", s.handleC2COrderAction)
+		}
 	}
 }
 

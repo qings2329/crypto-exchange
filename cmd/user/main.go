@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/coldlar/crypto-exchange/internal/announcement"
+	"github.com/coldlar/crypto-exchange/internal/c2c"
 	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/logger"
@@ -115,6 +116,20 @@ func main() {
 	aSvc := announcement.NewService(aStore)
 	aH := announcement.NewHandler(aSvc)
 
+	// C2C 订单模块：优先 MySQL；DSN 缺失则降级为内存实现。
+	var c2cStore c2c.Store
+	if cfg.MySQL.DSN != "" {
+		c2cStore, err = c2c.NewMySQLStore(cfg.MySQL.DSN)
+		if err != nil {
+			log.Warn("c2c: mysql unavailable, fallback to in-memory store", zap.Error(err))
+		}
+	}
+	if c2cStore == nil {
+		c2cStore = c2c.NewMemStore()
+	}
+	c2cSvc := c2c.NewService(c2cStore)
+	c2cH := c2c.NewHandler(c2cSvc, verifier)
+
 	r := gin.New()
 	// 配置受信任代理后，c.ClientIP() 从 X-Forwarded-For 取真实客户端 IP；
 	// 留空则不信任任何代理，使用直连对端 IP（RemoteAddr）。这让审计 IP、全局限流
@@ -123,6 +138,8 @@ func main() {
 	r.Use(middleware.Common(log, cfg)...)
 	h.Register(r)
 	aH.Register(r, verifier)
+	c2cH.Register(r)
+	c2cH.RegisterAdmin(r)
 
 	log.Info("user service starting", zap.String("addr", *addr))
 	if err := cfg.Listen(r, *addr); err != nil {
