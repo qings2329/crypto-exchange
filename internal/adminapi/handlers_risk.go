@@ -109,3 +109,17 @@ func (s *Server) handleRiskBlacklistCheck(c *gin.Context) {
 func (s *Server) handleRiskCheckWithdraw(c *gin.Context) {
 	s.proxyRiskPost(c, "/api/v1/risk/check/withdraw")
 }
+
+// handleRiskEventList 代理 risk 引擎的触发事件列表（真实风控告警源），供风控大盘实时流使用。
+func (s *Server) handleRiskEventList(c *gin.Context) {
+	qs := ""
+	uid := c.Query("user_id")
+	limit := c.Query("limit")
+	if uid != "" {
+		qs += "user_id=" + uid + "&"
+	}
+	if limit != "" {
+		qs += "limit=" + limit + "&"
+	}
+	s.proxyRiskGet(c, "/api/v1/risk/events?"+qs)
+}

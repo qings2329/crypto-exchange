@@ -136,6 +136,15 @@ func TestRiskManagementProxyForwards(t *testing.T) {
 	if m, p, _ := cap.last(); m != http.MethodPost || p != "/api/v1/risk/check/withdraw" {
 		t.Fatalf("withdraw check forwarded wrong: method=%s path=%s", m, p)
 	}
+
+	// 风控事件列表 GET（真实告警源，带 limit/user_id query）
+	code, _ = getJSON(t, r, "/api/admin/risk/events?limit=20&user_id=7", tok)
+	if code != http.StatusOK {
+		t.Fatalf("GET /risk/events: expected 200, got %d", code)
+	}
+	if m, p, q := cap.last(); m != http.MethodGet || p != "/api/v1/risk/events" || !strings.Contains(q, "limit=20") || !strings.Contains(q, "user_id=7") {
+		t.Fatalf("risk events forwarded wrong: method=%s path=%s query=%s", m, p, q)
+	}
 }
 
 // TestRiskManagementRBAC 验证：仅 risk:view 的 token 可读但不可写（增删规则/黑名单应 403）。
@@ -150,6 +159,12 @@ func TestRiskManagementRBAC(t *testing.T) {
 	code, _ := getJSON(t, r, "/api/admin/risk/rules", viewOnly)
 	if code != http.StatusOK {
 		t.Fatalf("risk:view should allow GET /risk/rules, got %d", code)
+	}
+
+	// 读风控事件（真实告警源）：也应通过（仅需 risk:view）。
+	code, _ = getJSON(t, r, "/api/admin/risk/events?limit=10", viewOnly)
+	if code != http.StatusOK {
+		t.Fatalf("risk:view should allow GET /risk/events, got %d", code)
 	}
 
 	// 写（创建规则）：应被 RequirePerm(risk:manage) 拒绝（403）。

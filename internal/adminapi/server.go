@@ -183,6 +183,7 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 			risk.DELETE("/blacklist", middleware.RequirePerm(PermRiskManage), s.handleRiskBlacklistDelete)
 			risk.GET("/blacklist/check", s.handleRiskBlacklistCheck)
 			risk.POST("/check/withdraw", s.handleRiskCheckWithdraw)
+			risk.GET("/events", s.handleRiskEventList)
 		}
 
 		// 期货交易管理（代理 futures 服务：持仓/资金费/钱包管理）。读需 futures:view，写需 futures:manage。
