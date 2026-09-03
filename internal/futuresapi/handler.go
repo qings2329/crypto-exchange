@@ -103,16 +103,27 @@ func (s *Server) handleOrder(c *gin.Context) {
 	// 平仓单不经过公开订单簿，而是经 Liquidator.closer 真实成交并原地减仓，避免产生游离挂单。
 	switch req.Action {
 	case "open":
+		// 杠杆钳制：不允许超过最大杠杆（前端滑条上限 125x 与服务端一致，防绕过前端抬高风险敞口）。
+		// 0/负数视为未指定 → 默认 10x；超过 MaxLeverage 直接拒绝，与 margin 服务的 ErrOverMaxLeverage 语义对齐。
+		maxLev := s.cfg.MaxLeverage()
+		lev := req.Leverage
+		if lev <= 0 {
+			lev = 10
+		}
+		if lev > float64(maxLev) {
+			response.Error(c, 400, 400, "leverage exceeds max "+strconv.Itoa(maxLev))
+			return
+		}
+		req.Leverage = lev
+		o.Leverage = lev
 		if !s.matcher.Submit(req.Symbol, o) {
 			response.Error(c, 400, 400, "unknown symbol or matching unavailable")
 			return
 		}
 		if req.Price > 0 {
 			if book, ok := s.liquidator.Book(req.Symbol); ok {
+				// lev 已在外部完成默认(<=0→10x)与上限钳制(<=MaxLeverage)，此处直接复用。
 				lev := req.Leverage
-				if lev <= 0 {
-					lev = 10
-				}
 				margin := req.Margin
 				if margin <= 0 {
 					margin = price.Mul(qty).Float() / lev

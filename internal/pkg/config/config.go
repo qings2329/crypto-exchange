@@ -122,6 +122,24 @@ type Config struct {
 
 	// Oracle 是指数价预言机配置（internal/oracle）。为空时各服务回退到内置演示喂价。
 	Oracle oracle.OracleConf `yaml:"oracle"`
+
+	// Futures 是合约（永续）交易配置（cmd/futures + internal/futuresapi）。
+	Futures FuturesConfig `yaml:"futures"`
+}
+
+// FuturesConfig 是合约交易配置（internal/futuresapi）。
+type FuturesConfig struct {
+	// MaxLeverage 是允许的最大杠杆倍数（服务端钳制）。<=0 时用硬兜底 125，
+	// 与前端滑条上限（1-125x）对齐，防止绕过前端直接调 API 抬高高杠杆敞口。
+	MaxLeverage int `yaml:"max_leverage"`
+}
+
+// MaxLeverage 返回合约允许的最大杠杆倍数；未配置时用硬兜底 125。
+func (c *Config) MaxLeverage() int {
+	if c.Futures.MaxLeverage > 0 {
+		return c.Futures.MaxLeverage
+	}
+	return 125
 }
 
 // AdminConfig 是管理后台后端（cmd/admin）配置。
