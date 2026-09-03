@@ -10,6 +10,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/announcement"
 	"github.com/coldlar/crypto-exchange/internal/apikeys"
 	"github.com/coldlar/crypto-exchange/internal/c2c"
+	"github.com/coldlar/crypto-exchange/internal/matching"
 	"github.com/coldlar/crypto-exchange/internal/matching/client"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
 	"github.com/coldlar/crypto-exchange/internal/pkg/middleware"
@@ -36,6 +37,7 @@ type Server struct {
 	referralStore referral.Store        // 邀请佣金查询（替代每请求 sql.Open）
 	loginLimiter  *loginIPLimiter       // 基于 IP 的登录限流（防单 IP 爆破 + 缓解账户锁定 DoS）
 	c2cSvc        *c2c.Service          // C2C 订单管理（list/freeze/release/complete）
+	feeModel      *matching.TradeFeeModel // 交易手续费模型（全局/VIP/交易对）
 }
 
 // NewServer 装配管理后台服务。verifier 使用全局 auth 共享密钥（与用户 token 同一密钥，
@@ -148,6 +150,7 @@ func NewServer(cfg *config.Config) *Server {
 		apiKeyStore:   apiKeyStore,
 		referralStore: referralStore,
 		c2cSvc:        c2c.NewService(c2cStore),
+		feeModel:      matching.NewTradeFeeModel(cfg.TradingFee.GlobalTakerRate, cfg.TradingFee.GlobalMakerRate),
 		loginLimiter: newLoginIPLimiter(
 			cfg.Admin.LoginRateLimitPerIP,
 			time.Duration(cfg.Admin.LoginRateWindowSec)*time.Second,
@@ -343,6 +346,16 @@ func (s *Server) RegisterRoutes(r *gin.Engine) {
 		manage := c2cG.Group("", middleware.RequirePerm(PermC2CManage))
 		{
 			manage.POST("/orders/:id/:action", s.handleC2COrderAction)
+		}
+	}
+
+	// 交易手续费管理：读需 trade:view，变更需 trade:manage。
+	tradeFeeG := admin.Group("/trading-fees", middleware.RequirePerm(PermTradeView))
+	{
+		tradeFeeG.GET("", s.handleTradingFeeGet)
+		manageTF := tradeFeeG.Group("", middleware.RequirePerm(PermTradeManage))
+		{
+			manageTF.PUT("", s.handleTradingFeeSet)
 		}
 	}
 }

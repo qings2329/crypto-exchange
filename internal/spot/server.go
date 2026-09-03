@@ -3,6 +3,7 @@ package spot
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"sort"
 	"strconv"
 	"sync"
@@ -55,6 +56,9 @@ type matcherClient interface {
 //   - F5 拒绝 price<=0 订单；结算纵深拦截零/负额转账。
 //   - F2 预冻结额以 settlement.AssetAmount 跟踪，结算钳位到真实剩余，消除浮点漂移/残留。
 //   - F3 两腿结算经账本 Batch 原子执行（解冻+转账整体回滚），提供 admin/reconcile 对账。
+// userLevelGetter 是按 user_id 查询用户等级的回调（注入式，便于单测）。
+type userLevelGetter func(userID int64) (int8, error)
+
 type Server struct {
 	log    *zap.Logger
 	client matcherClient
@@ -62,6 +66,8 @@ type Server struct {
 	hub    *ws.Hub
 
 	ledgerSvc *ledger.Ledger // 现货自有复式记账账本（与合约服务各自独立实例，见计划说明）
+	feeModel  *matching.TradeFeeModel
+	levelGet  userLevelGetter // 用于按 user_id 查询 VIP 等级（nil 表示未知等级，退全局默认）
 
 	freezeMu     sync.Mutex
 	openOrders   map[int64]*freezeRec // orderID -> 预冻结记录，供成交递减与撤单释放
@@ -77,12 +83,37 @@ type Server struct {
 // NewServer 装配现货交易服务：创建撮合客户端并订阅行情 WebSocket，转发到前端 hub。
 func NewServer(ledgerSvc *ledger.Ledger, cfg *config.Config, log *zap.Logger) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
+	feeModel := matching.NewTradeFeeModel(cfg.TradingFee.GlobalTakerRate, cfg.TradingFee.GlobalMakerRate)
+	// VIP 折扣
+	if len(cfg.TradingFee.VIPDiscounts) > 0 {
+		vips := make([]matching.VIPDiscount, 0, len(cfg.TradingFee.VIPDiscounts))
+		for _, d := range cfg.TradingFee.VIPDiscounts {
+			vips = append(vips, matching.VIPDiscount{
+				Level:         d.Level,
+				TakerDiscount: d.TakerDiscount,
+				MakerDiscount: d.MakerDiscount,
+			})
+		}
+		feeModel.SetVIPDiscounts(vips)
+	}
+	// 交易对覆盖
+	if len(cfg.TradingFee.SymbolOverrides) > 0 {
+		overrides := make(map[string]matching.SymbolFeeConfig, len(cfg.TradingFee.SymbolOverrides))
+		for sym, c := range cfg.TradingFee.SymbolOverrides {
+			overrides[sym] = matching.SymbolFeeConfig{
+				TakerRate: c.TakerRate,
+				MakerRate: c.MakerRate,
+			}
+		}
+		feeModel.SetSymbolOverrides(overrides)
+	}
 	s := &Server{
 		log:          log,
 		client:       client.New(cfg.Matching.URL),
 		cfg:          cfg,
 		hub:          ws.NewHub(),
 		ledgerSvc:    ledgerSvc,
+		feeModel:     feeModel,
 		openOrders:   make(map[int64]*freezeRec),
 		clientOIDMap: make(map[string]int64),
 		settledRefs:  make(map[string]bool),
@@ -385,6 +416,25 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 	// F3 原子结算：两条腿（解冻+转账）整体经账本 Batch 执行，任一失败即整组回滚，
 	// 杜绝"计价腿成功、基础腿失败"造成的部分结算（买方付讫却未收到基础资产、卖方凭空获利）。
 	// 两条 Transfer 共用同一 ref，但指纹含 from/to/asset/amount，互不冲突（见 ledger.transferFingerprint）。
+	// 交易手续费：从吃单方（buyer）扣除，转入交易所账户（user_id=0）。
+	const houseAccount int64 = 0
+	var takerFeeAmt settlement.AssetAmount
+	if s.feeModel != nil {
+		userLevel := int8(0)
+		if s.levelGet != nil {
+			if lvl, err := s.levelGet(t.TakerID); err == nil {
+				userLevel = lvl
+			}
+		}
+		rate := s.feeModel.TakerRate(symbol, userLevel)
+		if rate > 0 && !quoteAmt.IsZero() {
+			feeRaw := matching.ComputeTakerFee(quoteAmt.Value.Int64(), rate)
+			if feeRaw > 0 {
+				takerFeeAmt = settlement.AssetAmount{Value: new(big.Int).SetInt64(feeRaw), Decimals: quoteDec}
+			}
+		}
+	}
+
 	var ops []ledger.Op
 	if !quoteAmt.IsZero() {
 		if buyRec != nil {
@@ -397,6 +447,11 @@ func (s *Server) settleFill(symbol string, t matching.Trade) error {
 			ops = append(ops, ledger.Op{Kind: ledger.OpUnfreeze, User: seller, Asset: base, Amount: baseAmt})
 		}
 		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: seller, To: buyer, Asset: base, Amount: baseAmt, Biz: "spot_trade", Ref: ref})
+	}
+	// 手续费转账：taker -> 交易所账户（house），独立 ref 避免与主成交 ref 冲突。
+	if !takerFeeAmt.IsZero() {
+		feeRef := ref + ":fee"
+		ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: t.TakerID, To: houseAccount, Asset: quote, Amount: takerFeeAmt, Biz: "spot_trade_fee", Ref: feeRef})
 	}
 	if len(ops) > 0 {
 		if err := s.ledgerSvc.Batch(ops); err != nil {

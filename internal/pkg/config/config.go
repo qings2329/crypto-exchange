@@ -100,6 +100,26 @@ type Config struct {
 		ChainRPC settlement.ChainRPCConfig `yaml:"chain_rpc"`
 	} `yaml:"settlement"`
 
+	// TradingFee 是交易手续费模型配置（全局基础费率 + VIP 折扣 + 交易对覆盖）。
+	TradingFee struct {
+		// GlobalTakerRate 是全局 taker 基础费率（如 0.001=0.1%）；<=0 时默认 0.001。
+		GlobalTakerRate float64 `yaml:"global_taker_rate"`
+		// GlobalMakerRate 是全局 maker 基础费率（如 0=免佣，-0.0005=返佣 0.05%）；<=0 时默认 0。
+		GlobalMakerRate float64 `yaml:"global_maker_rate"`
+		// VIPDiscounts 是按用户等级生效的费率扣减比例（level 0=普通，1=VIP1 … 5=VIP5）。
+		// discount=0.3 表示实收原费率的 70%。未配置等级退全局默认。
+		VIPDiscounts []struct {
+			Level           int8    `yaml:"level"`
+			TakerDiscount   float64 `yaml:"taker_discount"`
+			MakerDiscount   float64 `yaml:"maker_discount"`
+		} `yaml:"vip_discounts"`
+		// SymbolOverrides 是交易对维度的单独覆盖（key 为 symbol，如 BTC_USDT）。
+		SymbolOverrides map[string]struct {
+			TakerRate float64 `yaml:"taker_rate"`
+			MakerRate float64 `yaml:"maker_rate"`
+		} `yaml:"symbol_overrides"`
+	} `yaml:"trading_fee"`
+
 	// InfluxDB 是行情 K 线持久化配置（T-16）：已收盘 K 线写入时序库，
 	// 供行情服务在内存环形缓冲（klineCap=500）之外回取更长历史。
 	// URL 为空时行情服务仅用内存，不连接 InfluxDB（fail-degraded）。
