@@ -32,6 +32,7 @@ import (
 	"github.com/coldlar/crypto-exchange/internal/notification"
 	"github.com/coldlar/crypto-exchange/internal/oracle"
 	"github.com/coldlar/crypto-exchange/internal/pkg/config"
+	"github.com/coldlar/crypto-exchange/internal/pkg/response"
 	"github.com/coldlar/crypto-exchange/internal/risk"
 	"github.com/coldlar/crypto-exchange/internal/settlement"
 	"github.com/coldlar/crypto-exchange/internal/ws"
@@ -79,6 +80,10 @@ type Server struct {
 	// 内部划转：资金账户(可用) ⇄ 合约保证金(冻结)。与账本可用余额分离计账。
 	marginMu   sync.Mutex
 	marginAcct map[int64]map[string]float64 // uid -> asset -> 保证金余额
+
+	// 交易手续费模型：全局基础费率 + VIP 折扣 + 交易对覆盖（与 spot 服务同源）。
+	// 用于在平仓结算时从吃单方扣除 taker 交易手续费，归集至交易所账户（user_id=0）。
+	tradeFeeModel *matching.TradeFeeModel
 
 	// 持仓止盈止损（TP/SL）：按 (uid|symbol|side) 持久化。
 	// tpsl     内存热缓存；tpslStore 写穿持久化层（MySQL 或 mem 降级），重启恢复。
@@ -345,6 +350,28 @@ func NewServer(ledgerSvc *ledger.Ledger, log *zap.Logger, cfg *config.Config, ds
 	s.feeModel.Register(settlement.ChainTRON, "USDT", 1, 0)
 	s.feeModel.Register(settlement.ChainLTC, "LTC", 0.001, 0) // 原生 LTC（8 位小数，对标 BTC 尘额）
 	s.feeModel.Register(settlement.ChainDOGE, "DOGE", 1.0, 0) // 原生 DOGE（8 位小数）
+
+	// 交易手续费模型：全局基础费率 + VIP 折扣 + 交易对覆盖。
+	// 在 settleClose 中从吃单方（user）扣除 taker 手续费，归集至交易所账户（user_id=0）。
+	s.tradeFeeModel = matching.NewTradeFeeModel(cfg.TradingFee.GlobalTakerRate, cfg.TradingFee.GlobalMakerRate)
+	if len(cfg.TradingFee.VIPDiscounts) > 0 {
+		vips := make([]matching.VIPDiscount, 0, len(cfg.TradingFee.VIPDiscounts))
+		for _, d := range cfg.TradingFee.VIPDiscounts {
+			vips = append(vips, matching.VIPDiscount{
+				Level:         d.Level,
+				TakerDiscount: d.TakerDiscount,
+				MakerDiscount: d.MakerDiscount,
+			})
+		}
+		s.tradeFeeModel.SetVIPDiscounts(vips)
+	}
+	if len(cfg.TradingFee.SymbolOverrides) > 0 {
+		overrides := make(map[string]matching.SymbolFeeConfig, len(cfg.TradingFee.SymbolOverrides))
+		for sym, c := range cfg.TradingFee.SymbolOverrides {
+			overrides[sym] = matching.SymbolFeeConfig{TakerRate: c.TakerRate, MakerRate: c.MakerRate}
+		}
+		s.tradeFeeModel.SetSymbolOverrides(overrides)
+	}
 
 	// 链上充提网关及其事件监听。充值/提现网关均按配置在「真实 RPC」与「模拟」间切换
 	// （T-03 链上 RPC 半边脚手架，fail-degraded：未配置回退模拟）。
@@ -624,6 +651,7 @@ func (s *Server) settleClose(uid int64, symbol string, res futures.CloseResult) 
 	}
 
 	// 逐仓：释放冻结保证金 + 结算实现盈亏（F3 原子 Batch）。
+	// 交易手续费：从用户仓位中扣除 taker 手续费，归集至交易所账户（user_id=0）。
 	marginAmt, err := settlement.AssetAmountFromFloatSafe(res.MarginReleased, settlement.AssetDecimalsByName("USDT"))
 	if err != nil {
 		s.log.Error("close settle skipped: invalid margin float", zap.Int64("user", uid), zap.Error(err))
@@ -639,6 +667,27 @@ func (s *Server) settleClose(uid int64, symbol string, res futures.CloseResult) 
 		ops = append(ops, ledger.Op{Kind: ledger.OpCredit, User: uid, Asset: "USDT", Amount: realizedAmt, Biz: "close", Ref: ref})
 	} else {
 		ops = append(ops, ledger.Op{Kind: ledger.OpDebit, User: uid, Asset: "USDT", Amount: realizedAmt.Neg(), Biz: "close", Ref: ref})
+	}
+	// 交易手续费：notional = ClosedQty * markPrice，taker_rate 来自 TradeFeeModel。
+	if s.tradeFeeModel != nil && res.ClosedQty > 0 {
+		if mc, ok := s.markCalcs[symbol]; ok {
+			mark := mc.MarkPrice()
+			notional := res.ClosedQty * mark
+			if notional > 0 {
+				rate := s.tradeFeeModel.TakerRate(symbol, 0)
+				if rate > 0 {
+					feeAmt, ferr := settlement.AssetAmountFromFloatSafe(notional*rate, settlement.AssetDecimalsByName("USDT"))
+					if ferr == nil && feeAmt.Value.Int64() > 0 {
+						feeRef := ref + ":fee"
+						ops = append(ops, ledger.Op{Kind: ledger.OpTransfer, From: uid, To: 0, Asset: "USDT", Amount: feeAmt, Biz: "futures_trade_fee", Ref: feeRef})
+						s.log.Info("futures trade fee collected",
+							zap.Int64("user", uid), zap.String("symbol", symbol),
+							zap.Float64("notional", notional), zap.Float64("rate", rate),
+							zap.Int64("fee", feeAmt.Value.Int64()))
+					}
+				}
+			}
+		}
 	}
 	if err := s.ledgerSvc.Batch(ops); err != nil {
 		s.log.Error("close settle failed", zap.Int64("user", uid), zap.Error(err))
@@ -1058,4 +1107,31 @@ func tpslCount(m map[int64]map[string]TPState) int {
 		c += len(km)
 	}
 	return c
+}
+
+// RefreshSymbolOverrides 从外部源（如 catalog store）同步交易对维度的费率覆盖到 tradeFeeModel。
+// 调用方在管理员修改 symbol 的 fee_rate 后调用，使变更即时生效（无需重启）。
+func (s *Server) RefreshSymbolOverrides(overrides map[string]float64) {
+	if s.tradeFeeModel == nil || len(overrides) == 0 {
+		return
+	}
+	symCfg := make(map[string]matching.SymbolFeeConfig, len(overrides))
+	for sym, rate := range overrides {
+		symCfg[sym] = matching.SymbolFeeConfig{TakerRate: rate}
+	}
+	s.tradeFeeModel.SetSymbolOverrides(symCfg)
+}
+
+// HandleTradingFeeRefresh 管理员 HTTP 端点：按请求体中的 symbol→rate 映射刷新 feeModel。
+// 受 AdminGuard 保护，供 adminapi 在 upsertSymbol 后调用。
+func (s *Server) HandleTradingFeeRefresh(c *gin.Context) {
+	var body struct {
+		Overrides map[string]float64 `json:"overrides"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Overrides == nil {
+		response.Error(c, 400, 400, "invalid body: overrides required")
+		return
+	}
+	s.RefreshSymbolOverrides(body.Overrides)
+	response.JSON(c, s.tradeFeeModel.GetSnapshot())
 }

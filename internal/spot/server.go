@@ -165,6 +165,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 	r.GET("/api/v1/spot/trades", s.handleTrades)
 	// 资金对账：仅管理员。
 	r.GET("/api/v1/spot/admin/reconcile", middleware.AdminGuard(), s.handleReconcile)
+	// 交易手续费模型刷新：仅管理员，供 adminapi 在 upsertSymbol 后调用以同步费率。
+	r.PUT("/api/v1/spot/admin/trading-fees/refresh", middleware.AdminGuard(), s.HandleTradingFeeRefresh)
 }
 
 // handleOrder 提交一笔现货订单（买/卖），经 cmd/matching 撮合，并在撮合前预冻结资金。
@@ -754,4 +756,31 @@ func viewToTrade(v matching.TradeView) matching.Trade {
 // 不调用则为 nil（纯内存），重启间隙幂等映射清零，重启+重试双冻防护失效（仅演示）。
 func (s *Server) SetStore(store Store) {
 	s.store = store
+}
+
+// RefreshSymbolOverrides 从外部源（如 catalog store）同步交易对维度的费率覆盖到 feeModel。
+// 调用方在管理员修改 symbol 的 fee_rate 后调用，使变更即时生效（无需重启）。
+func (s *Server) RefreshSymbolOverrides(overrides map[string]float64) {
+	if s.feeModel == nil || len(overrides) == 0 {
+		return
+	}
+	symCfg := make(map[string]matching.SymbolFeeConfig, len(overrides))
+	for sym, rate := range overrides {
+		symCfg[sym] = matching.SymbolFeeConfig{TakerRate: rate}
+	}
+	s.feeModel.SetSymbolOverrides(symCfg)
+}
+
+// HandleTradingFeeRefresh 管理员 HTTP 端点：按请求体中的 symbol→rate 映射刷新 feeModel。
+// 受 AdminGuard 保护，供 adminapi 在 upsertSymbol 后调用。
+func (s *Server) HandleTradingFeeRefresh(c *gin.Context) {
+	var body struct {
+		Overrides map[string]float64 `json:"overrides"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Overrides == nil {
+		response.Error(c, 400, 400, "invalid body: overrides required")
+		return
+	}
+	s.RefreshSymbolOverrides(body.Overrides)
+	response.JSON(c, s.feeModel.GetSnapshot())
 }

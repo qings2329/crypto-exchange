@@ -491,7 +491,30 @@ func (s *Server) upsertSymbol(c *gin.Context) {
 		s.fail(c, http.StatusInternalServerError, "upsert symbol failed: "+err.Error())
 		return
 	}
+	// 同步交易对费率到下游交易服务（spot + futures）的 TradeFeeModel，使变更即时生效。
+	s.refreshTradingFees(c.Request.Context(), sym.Symbol, sym.FeeRate)
 	s.ok(c, out)
+}
+
+// refreshTradingFees 把单个交易对的费率更新推送给 spot 和 futures 上游服务。
+// 失败仅打日志，不影响主流程（防 cascading failure）。
+func (s *Server) refreshTradingFees(ctx context.Context, symbol string, feeRate float64) {
+	if feeRate <= 0 {
+		return
+	}
+	overrides := map[string]float64{symbol: feeRate}
+	// spot 服务
+	if base := s.serviceURL("spot"); base != "" {
+		if err := s.up.Put(ctx, base, "/api/v1/spot/admin/trading-fees/refresh", nil, overrides); err != nil {
+			log.Printf("[admin] refresh spot trading fees failed: %v", err)
+		}
+	}
+	// futures 服务
+	if base := s.serviceURL("futures"); base != "" {
+		if err := s.up.Put(ctx, base, "/api/v1/futures/admin/trading-fees/refresh", nil, overrides); err != nil {
+			log.Printf("[admin] refresh futures trading fees failed: %v", err)
+		}
+	}
 }
 
 // --- 公链管理（持久化于 CatalogStore）---

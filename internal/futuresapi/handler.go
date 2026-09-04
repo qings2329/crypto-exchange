@@ -45,6 +45,8 @@ func (s *Server) RegisterRoutes(r *gin.Engine, verifier *middleware.TokenVerifie
 	s.registerWalletRoutes(r)
 	// 补齐端点：地址簿白名单 / 内部划转 / 持仓 TP-SL（契约对齐 mock 网关）
 	s.registerGapRoutes(r)
+	// 管理端点：交易手续费模型刷新（供 adminapi 在 upsertSymbol 后调用）。
+	r.PUT("/api/v1/futures/admin/trading-fees/refresh", middleware.AdminGuard(), s.HandleTradingFeeRefresh)
 }
 
 // handleOrder 开/平仓：action=open 开仓，action=close 平仓（骨架仅支持整仓反向市价/限价）。
