@@ -42,3 +42,4 @@ configs/config.dev.yaml
 configs/*.local.yaml
 configs/configs/
 crypto-admin
+configs/
