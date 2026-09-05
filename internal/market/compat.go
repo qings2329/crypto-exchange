@@ -2,6 +2,7 @@ package market
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -61,8 +62,8 @@ func (s *Server) handleKlineCompat(c *gin.Context) {
 }
 
 // handleKlineWSCompat 是 /api/v1/market/kline/ws 的兼容端点：
-// 连接即按 ?symbol=&interval= 过滤（与 dev mock 一致，无需发送订阅消息），
-// 初始推送当前蜡烛，之后每笔成交仅把匹配周期的 Candle 转成币安风格推送给本连接。
+// 连接即按 ?symbol=&interval= 过滤（interval 支持逗号分隔的多周期，与 mock 网关一致），
+// 初始推送各周期的当前蜡烛，之后每笔成交仅把匹配周期的 Candle 转成币安风格推送给本连接。
 // 与既有 /ws（Hub + 全周期广播）协议不同，但互不干扰：本端点独立维护订阅表。
 func (s *Server) handleKlineWSCompat(c *gin.Context) {
 	sym := c.Query("symbol")
@@ -70,11 +71,26 @@ func (s *Server) handleKlineWSCompat(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "symbol required"})
 		return
 	}
-	interval := c.Query("interval")
-	if interval == "" {
-		interval = "1m"
+	rawInterval := c.Query("interval")
+	if rawInterval == "" {
+		rawInterval = "1m"
 	}
-	if !IsValidInterval(interval) {
+	intervals := strings.Split(rawInterval, ",")
+	for i, iv := range intervals {
+		intervals[i] = strings.TrimSpace(iv)
+	}
+	// 过滤无效周期；全部无效时回退 1m
+	valid := intervals[:0]
+	for _, iv := range intervals {
+		if iv == "" {
+			continue
+		}
+		if !IsValidInterval(iv) {
+			continue
+		}
+		valid = append(valid, iv)
+	}
+	if len(valid) == 0 {
 		c.JSON(400, gin.H{"error": "invalid interval", "valid": Intervals})
 		return
 	}
@@ -83,30 +99,55 @@ func (s *Server) handleKlineWSCompat(c *gin.Context) {
 	if err != nil {
 		return
 	}
-	// 初始推送当前蜡烛（与 dev mock 行为对齐，保证连上即有起点）。
-	if cur := s.market.CurrentCandle(sym, interval); cur != nil {
-		_ = conn.WriteJSON(gin.H{"type": "kline", "data": toBinanceKline(cur)})
+	// 为每个周期建立独立子订阅；同一 conn 可复用，dispatch 时按需投递。
+	type connSub struct {
+		sub  *klineSub
+		sent int64 // 上次推送时间，用于去重（同 candle 不重复推送）
 	}
-	sub := &klineSub{symbol: sym, interval: interval, ch: make(chan BinanceKline, 64)}
-	s.klineSubsMu.Lock()
-	s.klineSubs = append(s.klineSubs, sub)
-	s.klineSubsMu.Unlock()
-	defer func() {
+	conns := make([]connSub, 0, len(valid))
+	for _, iv := range valid {
+		if cur := s.market.CurrentCandle(sym, iv); cur != nil {
+			bk := toBinanceKline(cur)
+			_ = conn.WriteJSON(gin.H{"type": "kline", "symbol": sym, "interval": iv, "data": bk})
+		}
+		sub := &klineSub{symbol: sym, interval: iv, ch: make(chan BinanceKline, 64)}
 		s.klineSubsMu.Lock()
-		for i, x := range s.klineSubs {
-			if x == sub {
-				s.klineSubs = append(s.klineSubs[:i], s.klineSubs[i+1:]...)
-				break
+		s.klineSubs = append(s.klineSubs, sub)
+		s.klineSubsMu.Unlock()
+		conns = append(conns, connSub{sub: sub, sent: 0})
+	}
+	cleaned := conns // 闭包捕获
+	// 每周期独立协程：收到新蜡烛即推送给 conn，携带 interval 字段供前端路由。
+	done := make(chan struct{})
+	defer func() {
+		close(done) // 通知所有协程退出
+		s.klineSubsMu.Lock()
+		for _, cs := range cleaned {
+			for i, x := range s.klineSubs {
+				if x == cs.sub {
+					s.klineSubs = append(s.klineSubs[:i], s.klineSubs[i+1:]...)
+					break
+				}
 			}
 		}
 		s.klineSubsMu.Unlock()
 		_ = conn.Close()
 	}()
-	for bk := range sub.ch {
-		if err := conn.WriteJSON(gin.H{"type": "kline", "data": bk}); err != nil {
-			return
-		}
+	for _, cs := range conns {
+		go func(sub *klineSub, iv string) {
+			for bk := range sub.ch {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if err := conn.WriteJSON(gin.H{"type": "kline", "symbol": sym, "interval": iv, "data": bk}); err != nil {
+					return
+				}
+			}
+		}(cs.sub, cs.sub.interval)
 	}
+	<-done
 }
 
 // dispatchKlineCompat 在每笔成交后，把匹配 symbol+interval 的当前蜡烛推送给前端兼容订阅者。
