@@ -58,6 +58,7 @@ func (s *Server) registerWalletRoutes(r *gin.Engine) {
 	r.DELETE("/api/v1/futures/wallet/withdraw/address", s.handleWithdrawAddressDelete)
 	r.GET("/api/v1/futures/wallet/withdraw/addresses", s.handleWithdrawAddresses)
 	r.GET("/api/v1/futures/wallet/balance", s.handleWalletBalance)
+	r.GET("/api/v1/futures/wallet/balances", s.handleWalletBalances)
 	// 用户侧资金流水（本人，按 token uid 过滤；忽略请求体 user_id 防冒充，F4）。
 	// 可选 ?asset= 按资产过滤、?limit= 截断条数（0/不传表示全部）。倒序（最新在前）。
 	r.GET("/api/v1/futures/wallet/ledger", s.handleLedgerHistory)
@@ -925,6 +926,35 @@ func (s *Server) handleWalletBalance(c *gin.Context) {
 		return
 	}
 	response.JSON(c, s.walletSummary(uid, asset))
+}
+
+// handleWalletBalances 用户侧全资产余额（本人）。身份强制来自鉴权 token（F4），
+// 忽略任何 user_id 查询参数/请求体，防止冒充他人查询。返回该用户 USDT/BTC/ETH
+// 各资产的可用/冻结/提现冻结汇总，等价于 mock 网关 /futures/wallet/balance 的数组契约，
+// 供前端下单面板/资产总览直接使用。
+func (s *Server) handleWalletBalances(c *gin.Context) {
+	uid, ok := middleware.UserID(c)
+	if !ok || uid <= 0 {
+		response.Error(c, http.StatusUnauthorized, 401, "unauthorized")
+		return
+	}
+	rows := make([]gin.H, 0, 3)
+	for _, asset := range strings.Split(selfDepositAssets, ",") {
+		avail, frozen, okB := s.ledgerSvc.Balance(uid, asset)
+		wf, _ := s.ledgerSvc.WithdrawFrozenBalance(uid, asset)
+		if !okB && avail.IsZero() && frozen.IsZero() && wf.IsZero() {
+			// 无任何持仓/流水的资产不返回（对齐 mock：仅返回发生过资金活动的资产）。
+			continue
+		}
+		rows = append(rows, gin.H{
+			"asset":           asset,
+			"available":       avail,
+			"frozen":          frozen,
+			"withdraw_frozen": wf,
+			"exists":          okB,
+		})
+	}
+	response.JSON(c, rows)
 }
 
 // handleLedgerHistory 用户侧资金流水（本人）。身份强制来自鉴权 token（F4），

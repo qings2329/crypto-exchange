@@ -3,6 +3,7 @@ package futuresapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -316,5 +317,66 @@ func TestWithdrawRequestIgnoresBodyUserID(t *testing.T) {
 	}
 	if holds := s.ledgerSvc.ListWithdrawHolds(999); len(holds) != 0 {
 		t.Fatalf("withdraw hold must NOT be created under forged user_id=999")
+	}
+}
+
+func callBalances(s *Server, userID int64, withIdentity bool) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	if withIdentity {
+		c.Set("user_id", userID) // 模拟已鉴权身份（F4：uid 取 token）
+	}
+	c.Request, _ = http.NewRequest(http.MethodGet, "/api/v1/futures/wallet/balances", nil)
+	if !withIdentity {
+		c.Request.URL.RawQuery = "user_id=" + fmt.Sprint(userID) + "&asset=USDT"
+	}
+	s.handleWalletBalances(c)
+	return w
+}
+
+// TestWalletBalancesReturnsOwnAssets 验证全资产余额接口：已鉴权用户返回本人
+// USDT/BTC/ETH 汇总（仅含发生过资金活动的资产），且忽略传入的 user_id 查询参数。
+func TestWalletBalancesReturnsOwnAssets(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", amt("USDT", 5000), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Deposit(1, "BTC", amt("BTC", 0.5), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{ledgerSvc: l}
+	w := callBalances(s, 1, true)
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(decodeData(t, w), &rows); err != nil {
+		t.Fatalf("decode rows: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 assets (USDT+BTC), got %d: %v", len(rows), rows)
+	}
+	byAsset := map[string]float64{}
+	for _, r := range rows {
+		byAsset[r["asset"].(string)] = r["available"].(float64)
+	}
+	if byAsset["USDT"] != 5000 || byAsset["BTC"] != 0.5 {
+		t.Fatalf("unexpected balances: %v", byAsset)
+	}
+	// ETH 未充值，不应出现在结果里
+	for _, r := range rows {
+		if r["asset"] == "ETH" {
+			t.Fatalf("ETH should be absent, got rows=%v", rows)
+		}
+	}
+}
+
+// TestWalletBalancesRequiresAuth 验证未鉴权请求被拒绝（403/401），即使带了 user_id 查询参数。
+func TestWalletBalancesRequiresAuth(t *testing.T) {
+	l := ledger.New()
+	if err := l.Deposit(1, "USDT", amt("USDT", 5000), "seed"); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{ledgerSvc: l}
+	w := callBalances(s, 1, false)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d (%s)", w.Code, w.Body.String())
 	}
 }
