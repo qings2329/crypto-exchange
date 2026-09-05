@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -51,10 +52,15 @@ func main() {
 	r.Use(middleware.Common(logger, cfg)...)
 
 	srv := adminapi.NewServer(cfg)
-	// 演示公告种子：幂等注入若干公告，供「公告管理」页展示测试；连库模式按标题判重，重启不重复插入。
-	srv.SeedDemoAnnouncements()
-	// 演示 C2C 订单种子：幂等注入，供「C2C 管理」页有真实数据可看（连库模式重启不重复）。
-	srv.SeedDemoC2COrders()
+	// 演示种子仅在显式开启时注入：--mem-only（内存演示）默认注入；连库模式必须设置
+	// ADMIN_DEMO_SEED=1 才注入，避免向生产/真实库中混入演示公告与 C2C 订单。
+	demoSeed := *memOnly || os.Getenv("ADMIN_DEMO_SEED") == "1"
+	if demoSeed {
+		// 演示公告种子：幂等注入若干公告，供「公告管理」页展示测试；连库模式按标题判重，重启不重复插入。
+		srv.SeedDemoAnnouncements()
+		// 演示 C2C 订单种子：幂等注入，供「C2C 管理」页有真实数据可看（连库模式重启不重复）。
+		srv.SeedDemoC2COrders()
+	}
 	srv.RegisterRoutes(r)
 
 	addr := cfg.Admin.Addr
