@@ -42,11 +42,10 @@ type Service struct {
 	log     *zap.Logger
 }
 
-// NewService 构造质押服务。backend 为 nil 时退化为 MockBackend（演示/测试）。
+// NewService 构造质押服务。backend 必须显式提供：演示/测试传 NewMockBackend()，
+// 生产须注入真实链上后端（TronBackend 等）；不允许传 nil，否则质押将静默走 mock 路径，
+// 造成「看似成交、实则未上链」的假成功（发现 9 类伪数据原则）。
 func NewService(store Store, l *ledger.Ledger, backend ChainBackend, cfg Config, log *zap.Logger) *Service {
-	if backend == nil {
-		backend = NewMockBackend()
-	}
 	return &Service{store: store, ledger: l, backend: backend, cfg: cfg, log: log}
 }
 

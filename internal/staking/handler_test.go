@@ -51,7 +51,7 @@ func respData(t *testing.T, w *httptest.ResponseRecorder) map[string]interface{}
 func newHandlerTestService() *Service {
 	store := NewMemStore()
 	l := ledger.New()
-	return NewService(store, l, nil, Config{AccrueInterval: 0}, zap.NewNop())
+	return NewService(store, l, NewMockBackend(), Config{AccrueInterval: 0}, zap.NewNop())
 }
 
 // createTestProduct 通过 store 直接创建一个测试产品，返回 ID。

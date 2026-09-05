@@ -37,11 +37,6 @@ func main() {
 
 	// 钱包总账（复式记账），质押本金锁定于 SysStaking、奖励负债记 SysStakingReward。
 	ledgerSvc := ledger.New()
-	// 演示种子充值：保持账本创世平衡（与 wealth 等一致）。
-	for _, uid := range []int64{1, 2, 3, 4} {
-		_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
-		_ = ledgerSvc.ReceiveOnChain(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), fmt.Sprintf("seed:%d:BTC", uid))
-	}
 	ledgerSvc.SetReconcileAlertHook(func(dev map[string]settlement.AssetAmount) {
 		log.Warn("LEDGER_IMBALANCE detected by reconciler", zap.Any("deviation", dev))
 	})
@@ -70,7 +65,34 @@ func main() {
 		log.Info("staking store: in-memory")
 	}
 
-	svc := staking.NewService(store, ledgerSvc, nil, staking.Config{
+	// 演示模式判定：纯内存（无 DSN）默认允许演示种子与 MockBackend；连库模式必须显式
+	// 设置 STAKING_DEMO=1 才启用，避免向真实账本混入演示余额或静默走未上链的 mock 质押。
+	demoSeed := dsn == "" || os.Getenv("STAKING_DEMO") == "1"
+	if demoSeed {
+		// 演示种子充值：仅在演示路径注入，保持账本创世平衡（与 wealth 等一致）。
+		for _, uid := range []int64{1, 2, 3, 4} {
+			_ = ledgerSvc.ReceiveOnChain(uid, "USDT", settlement.AssetAmountFromFloat(100000, settlement.AssetDecimalsByName("USDT")), fmt.Sprintf("seed:%d:USDT", uid))
+			_ = ledgerSvc.ReceiveOnChain(uid, "BTC", settlement.AssetAmountFromFloat(10, settlement.AssetDecimalsByName("BTC")), fmt.Sprintf("seed:%d:BTC", uid))
+		}
+		// 演示：若无在售产品，发行一个 ETH 质押示例产品。
+		seedDemoProducts(store, log)
+	}
+
+	// 链上质押后端必须显式提供：演示模式显式用 MockBackend（不广播真实交易）；
+	// 非演示模式且未装配真实后端（TronBackend 等）时直接拒启，绝不允许静默降级 mock。
+	var backend staking.ChainBackend
+	switch {
+	case demoSeed:
+		backend = staking.NewMockBackend()
+		log.Warn("staking backend: MockBackend (demo mode, no real on-chain broadcast)")
+	case cfg.Settlement.ChainRPC.Enabled:
+		// 真实链上质押后端接入点：复用 settlement ChainRPC 实现 TronBackend。
+		log.Fatal("staking: real chain backend not wired yet; refusing to run with mock (set STAKING_DEMO=1 to demo)")
+	default:
+		log.Fatal("staking: no chain backend configured and STAKING_DEMO not set; refusing to run with mock")
+	}
+
+	svc := staking.NewService(store, ledgerSvc, backend, staking.Config{
 		AccrueInterval:    60 * time.Second,
 		ReconcileInterval: 60 * time.Second,
 	}, log)
@@ -78,9 +100,6 @@ func main() {
 	verifier := middleware.NewTokenVerifier(cfg.Auth.Secret)
 	r := gin.New()
 	svc.RegisterRoutes(r, verifier)
-
-	// 演示：若无在售产品，发行一个 ETH 质押示例产品。
-	seedDemoProducts(store, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
